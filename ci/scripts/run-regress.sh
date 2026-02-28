@@ -17,7 +17,7 @@ CONTAINER="pg-tde-regress-$$"
 cleanup() { stop_container "$CONTAINER"; }
 trap cleanup EXIT
 
-log_stage "REGRESSION TESTS (48 tests)"
+log_stage "REGRESSION TESTS (52 v1.4 + 20 v1.5 TDD = 72 total)"
 
 build_pg_test_image
 
@@ -29,20 +29,45 @@ container_psql "$CONTAINER" -c \
     "SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_vault_tde';"
 
 # Copy fresh regression SQL (in case image is cached with old version)
-$RT cp "$REPO_ROOT/sql/regression_test.sql" "$CONTAINER:/tmp/regression_test.sql"
+$RT cp "$REPO_ROOT/sql/regression_test.sql"    "$CONTAINER:/tmp/regression_test.sql"
+$RT cp "$REPO_ROOT/sql/regression_test_v15.sql" "$CONTAINER:/tmp/regression_test_v15.sql"
+$RT cp "$REPO_ROOT/sql/pg_vault_tde--1.4--1.5.sql" \
+        "$CONTAINER:/tmp/pg_vault_tde--1.4--1.5.sql"
 
-# Run the regression suite
-log_info "Running regression_test.sql ..."
+# ── Phase 1: v1.4 baseline (52 tests) ────────────────────────────────────
+log_info "Running v1.4 regression_test.sql (52 tests) ..."
 START=$(timer_start)
-
-if container_psql "$CONTAINER" -f /tmp/regression_test.sql; then
+if ! container_psql "$CONTAINER" -f /tmp/regression_test.sql; then
     ELAPSED=$(timer_elapsed "$START")
-    log_ok "REGRESSION: ALL 48 TESTS PASSED ($(timer_fmt "$ELAPSED"))"
-    exit 0
-else
-    ELAPSED=$(timer_elapsed "$START")
-    log_error "REGRESSION: FAILED after $(timer_fmt "$ELAPSED")"
-    # Dump server log for diagnostics
+    log_error "REGRESSION v1.4: FAILED after $(timer_fmt "$ELAPSED")"
     $RT logs "$CONTAINER" --tail 50 2>/dev/null || true
     exit 2
 fi
+log_ok "v1.4 baseline: ALL 52 TESTS PASSED ($(timer_fmt "$(timer_elapsed "$START")"))"
+
+# ── Phase 2: Apply v1.4 → v1.5 upgrade ──────────────────────────────────
+log_info "Applying v1.4 → v1.5 upgrade script ..."
+if ! container_psql "$CONTAINER" -f /tmp/pg_vault_tde--1.4--1.5.sql; then
+    log_error "REGRESSION: v1.4→v1.5 upgrade script FAILED"
+    $RT logs "$CONTAINER" --tail 50 2>/dev/null || true
+    exit 2
+fi
+log_info "Installing v1.5 upgrade into extension catalog ..."
+container_psql "$CONTAINER" -c \
+    "ALTER EXTENSION pg_vault_tde UPDATE TO '1.5';" 2>/dev/null || true
+
+# ── Phase 3: v1.5 TDD tests (20 tests, numbers 53-72) ───────────────────
+log_info "Running v1.5 TDD regression_test_v15.sql (tests 53-72) ..."
+START=$(timer_start)
+if container_psql "$CONTAINER" -f /tmp/regression_test_v15.sql; then
+    ELAPSED=$(timer_elapsed "$START")
+    log_ok "REGRESSION v1.5 TDD: ALL 20 TESTS PASSED ($(timer_fmt "$ELAPSED"))"
+else
+    ELAPSED=$(timer_elapsed "$START")
+    log_error "REGRESSION v1.5 TDD: FAILED after $(timer_fmt "$ELAPSED")"
+    $RT logs "$CONTAINER" --tail 80 2>/dev/null || true
+    exit 2
+fi
+
+log_ok "REGRESSION COMPLETE: ALL 72 TESTS PASSED (v1.4 × 52 + v1.5 × 20)"
+exit 0

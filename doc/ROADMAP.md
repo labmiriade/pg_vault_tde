@@ -181,7 +181,7 @@ This release focused on infrastructure quality:
 
 ## v1.5 — Foundation Hardening + Local Wallet — Phase 1 (Q4 2026)
 
-> Status: 🔜 Planning
+> Status: � In Progress (started 2026-02-28 — implementation branch active)
 > **Target**: 70 regression tests — PG 17 + PG 18 + PG 19 (audit complete), zero compiler warnings.
 
 **Focus**: Close the most critical data-leak

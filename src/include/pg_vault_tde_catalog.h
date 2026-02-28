@@ -1,0 +1,152 @@
+/*
+ * pg_vault_tde_catalog.h — Per-table DEK catalog + shmem cache (v1.5)
+ *
+ * Copyright (c) 2026 Miriade S.r.l.
+ * Licensed under the PostgreSQL License (BSD).
+ *
+ * WHY THIS EXISTS:
+ * ----------------
+ * v1.4 stored a single global DEK in shared memory (TdeKmsSharedState.dek).
+ * v1.5 introduces per-table key isolation: each encrypted_heap relation has
+ * its own DEK, fetched from the active KMS provider and cached in a fixed-size
+ * shared memory array (TdeRelDekCache).
+ *
+ * On-disk persistence: pg_vault_tde_catalog(relid, vault_key_name, generation,
+ * wrapped_dek, created_at).  The in-memory cache is authoritative at runtime;
+ * the catalog is the authoritative source for DEK wrapping/unwrapping at
+ * startup and after a server restart.
+ *
+ * Backward compatibility sentinel:
+ *   relid = 0 (InvalidOid) is reserved for the v1.4 single-DEK path.
+ *   Tables created before v1.5 that have no catalog entry are implicitly
+ *   associated with the global DEK from the v1.4 shmem layout.
+ *
+ * OWNERSHIP: @SecurityKMS (shmem + KMS APIs) and @Architect (catalog SQL
+ * and ProcessUtility_hook for DROP TABLE cleanup) share this header.
+ */
+#ifndef PG_VAULT_TDE_CATALOG_H
+#define PG_VAULT_TDE_CATALOG_H
+
+#include "postgres.h"
+#include "storage/lwlock.h"
+#include "utils/relcache.h"
+
+#include "src/include/pg_vault_tde_kms.h"   /* TDE_DEK_LEN */
+
+/*
+ * Maximum number of independently-keyed encrypted relations that may be
+ * open simultaneously.  Configurable via pg_vault_tde.max_encrypted_relations
+ * (PGC_POSTMASTER, range 64–65536, default 1024).
+ *
+ * This constant is only used as a compile-time fallback default; the actual
+ * size is derived from the GUC at shmem_request time.
+ */
+#define TDE_REL_DEK_CACHE_DEFAULT  1024
+
+/*
+ * TdeRelDekEntry — one slot in the per-table DEK cache.
+ *
+ * Stored in the TdeRelDekCache shmem array.  relid == InvalidOid means the
+ * slot is empty.
+ *
+ * KEY HYGIENE: dek[] and prev_dek[] MUST be OPENSSL_cleanse'd before the
+ * entry is evicted or the slot is reused.
+ */
+typedef struct TdeRelDekEntry
+{
+    Oid          relid;                 /* InvalidOid = empty slot */
+    char         dek[TDE_DEK_LEN];     /* current AES-256 DEK, 32 bytes */
+    char         prev_dek[TDE_DEK_LEN];/* previous DEK (valid during rotation) */
+    uint64       generation;            /* rotation epoch for this relation */
+    bool         dek_valid;             /* true iff dek[] holds a live key */
+    bool         prev_dek_valid;        /* true iff prev_dek[] is populated */
+} TdeRelDekEntry;
+
+/*
+ * TdeRelDekCache — the shmem structure holding all per-table DEK entries.
+ *
+ * Allocated once from shmem_startup_hook.  Protected by a single LWLock
+ * embedded by value (never a pointer — would be a virtual address specific
+ * to the initialising process, invalid in all other backends).
+ *
+ * For lookup, a linear scan is acceptable at <= 1024 tables (< 1 µs per
+ * lookup for cache sizes the hardware typically prefetches).  A hash table
+ * is a future optimisation for v1.6+ workloads with thousands of tables.
+ */
+typedef struct TdeRelDekCache
+{
+    LWLock          lock;           /* embedded LWLock; acquired LW_SHARED for
+                                     * read, LW_EXCLUSIVE for insert/evict */
+    int             capacity;       /* total slots (from GUC at shmem_request) */
+    int             used;           /* live entries (relid != InvalidOid) */
+    TdeRelDekEntry  entries[FLEXIBLE_ARRAY_MEMBER];
+} TdeRelDekCache;
+
+/*
+ * Shared memory management.
+ * Follows the same two-phase protocol as the global DEK shmem:
+ *   pg_vault_tde_catalog_shmem_request() from shmem_request_hook
+ *   pg_vault_tde_catalog_shmem_init()    from shmem_startup_hook
+ */
+void pg_vault_tde_catalog_shmem_request(void);
+void pg_vault_tde_catalog_shmem_init(void);
+
+/*
+ * Per-table DEK accessors.
+ *
+ * pg_vault_tde_kms_get_rel_dek:
+ *   Fill dek_out[dek_len] with the DEK for relation relid.
+ *   Checks the in-memory cache first (LW_SHARED).  On cache miss:
+ *     1. Reads the wrapped DEK from pg_vault_tde_catalog.
+ *     2. Calls tde_active_kms_provider->unwrap_dek().
+ *     3. Inserts the plaintext DEK into the shmem cache (LW_EXCLUSIVE).
+ *   Returns true on success, false if the relation has no catalog entry
+ *   (caller decides error policy).
+ *
+ * This function REPLACES pg_vault_tde_kms_get_dek() for all table-level
+ * encrypt/decrypt paths.  The old function is kept as a compatibility shim
+ * that calls get_rel_dek(InvalidOid, ...) for v1.4 tables.
+ *
+ * CALLER RESPONSIBILITY: OPENSSL_cleanse(dek_out, dek_len) after use.
+ */
+bool pg_vault_tde_kms_get_rel_dek(Oid relid,
+                                   unsigned char *dek_out, int dek_len);
+
+/*
+ * pg_vault_tde_kms_get_rel_prev_dek:
+ *   Fill prev_dek_out with the previous DEK for the given relation
+ *   (populated during online rotation).  Returns false if none exists.
+ */
+bool pg_vault_tde_kms_get_rel_prev_dek(Oid relid,
+                                        unsigned char *prev_dek_out, int dek_len);
+
+/*
+ * pg_vault_tde_catalog_register_rel:
+ *   Called from the ProcessUtility_hook on CREATE TABLE USING encrypted_heap.
+ *   1. Asks the active KMS provider to generate + wrap a new DEK.
+ *   2. Inserts a row into pg_vault_tde_catalog via SPI.
+ *   3. Loads the DEK into the shmem cache.
+ *
+ *   vault_key_name: for Vault provider, the named Transit key (e.g.
+ *   "pg-tde-rel-<relfilenode>"). For local wallet, the slot label.
+ *   May be NULL — provider generates a name from the relfilenode.
+ */
+void pg_vault_tde_catalog_register_rel(Oid relid, const char *vault_key_name);
+
+/*
+ * pg_vault_tde_catalog_deregister_rel:
+ *   Called from DROP TABLE hook.  Evicts the cache entry (with
+ *   OPENSSL_cleanse), removes the pg_vault_tde_catalog row, and asks the
+ *   KMS to delete the key (provider-specific; best-effort, non-fatal).
+ */
+void pg_vault_tde_catalog_deregister_rel(Oid relid);
+
+/*
+ * pg_vault_tde_catalog_evict_rel:
+ *   Evict a cached DEK without removing the catalog entry.
+ *   Called after online key rotation completes so the next access reloads
+ *   the new DEK via the full unwrap path.
+ */
+void pg_vault_tde_catalog_evict_rel(Oid relid);
+
+#endif /* PG_VAULT_TDE_CATALOG_H */

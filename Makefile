@@ -61,6 +61,9 @@ MODULE_big  = pg_vault_tde
 OBJS = \
 	src/pg_vault_tde.o \
 	src/kms/pg_vault_tde_kms.o \
+	src/kms/pg_vault_tde_kms_local.o \
+	src/kms/pg_vault_tde_catalog.o \
+	src/kms/pg_vault_tde_rotation_bgw.o \
 	src/crypto/pg_vault_tde_crypto.o \
 	src/crypto/pg_vault_tde_hw_accel.o \
 	src/tam/pg_vault_tde_tam.o \
@@ -70,7 +73,9 @@ OBJS = \
 	src/logical/pg_vault_tde_pgoutput.o
 
 # SQL scripts installed as part of the extension
-DATA = sql/pg_vault_tde--1.0.sql
+# Always list the base install AND every upgrade path.
+DATA = sql/pg_vault_tde--1.0.sql \
+       sql/pg_vault_tde--1.4--1.5.sql
 
 # pg_regress test targets (filenames without .sql suffix)
 REGRESS = pg_vault_tde_init

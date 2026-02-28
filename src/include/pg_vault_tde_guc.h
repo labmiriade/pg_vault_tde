@@ -92,4 +92,55 @@ extern char       *pg_vault_tde_crypto_provider;
 extern bool        pg_vault_tde_bgw_enabled;
 extern int         pg_vault_tde_token_renewal_interval;
 
+/* -----------------------------------------------------------------------
+ * v1.5 GUCs
+ * -----------------------------------------------------------------------*/
+
+/*
+ * KMS provider selector (PGC_POSTMASTER).
+ * Valid values: "vault" (default), "local".
+ * Future: "pkcs11" (v1.7), "kmip" (v1.8).
+ * Controls which TdeKmsProvider vtable is loaded into
+ * tde_active_kms_provider at startup.
+ */
+extern char       *pg_vault_tde_kms_provider;
+
+/*
+ * Local wallet path (PGC_POSTMASTER).
+ * Absolute path to the PKCS#12 wallet file.
+ * Default: $PGDATA/pg_vault_tde/wallet.p12 (resolved at runtime).
+ * Used only when kms_provider = 'local'.
+ */
+extern char       *pg_vault_tde_wallet_path;
+
+/*
+ * Environment variable name that holds the wallet passphrase
+ * (PGC_POSTMASTER).  NEVER the passphrase itself — only the NAME of the
+ * environment variable.  Example: "PG_TDE_WALLET_PASS".
+ * Used only when kms_provider = 'local'.
+ */
+extern char       *pg_vault_tde_wallet_passphrase_env;
+
+/*
+ * Auto-open wallet on startup if the passphrase env var is set
+ * (PGC_POSTMASTER, default: true).
+ * When false, the wallet is opened on the first DEK request.
+ */
+extern bool        pg_vault_tde_wallet_auto_open;
+
+/*
+ * Maximum number of independently-keyed encrypted_heap relations that may
+ * be cached in shmem simultaneously (PGC_POSTMASTER, range 64–65536,
+ * default 1024).  Determines the size of TdeRelDekCache at startup.
+ */
+extern int         pg_vault_tde_max_encrypted_relations;
+
+/*
+ * TOAST-level encryption switch (PGC_SIGHUP, default: true).
+ * When true, TOAST tables for encrypted_heap relations use encrypted_heap
+ * AM and their chunk_data columns are AES-256-GCM encrypted.
+ * Set to false only for debugging or backward compatibility testing.
+ */
+extern bool        pg_vault_tde_toast_encryption;
+
 #endif /* PG_VAULT_TDE_GUC_H */
