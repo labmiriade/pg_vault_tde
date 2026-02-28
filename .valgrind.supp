@@ -1,0 +1,45 @@
+# .valgrind.supp - Valgrind suppressions for pg_vault_tde
+#
+# Suppress known false positives from OpenSSL 3.x and libcurl that are
+# not related to our code.  These are well-documented upstream issues.
+
+# OpenSSL 3.x PRNG initialization (one-time allocation, not a leak)
+{
+   openssl_prng_init
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:RAND_poll
+   ...
+}
+
+# OpenSSL EVP cipher context error-path cleanup (upstream known)
+{
+   openssl_evp_ctx_free
+   Memcheck:Cond
+   ...
+   fun:EVP_CIPHER_CTX_free
+   ...
+}
+
+# libcurl SSL context setup (one-time per handle)
+{
+   curl_ssl_ctx
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:curl_easy_init
+   ...
+}
+
+# PostgreSQL palloc arena: we use PostgreSQL's allocator, not malloc.
+# Valgrind sees palloc'd memory as "still reachable" at exit, which is
+# correct: PostgreSQL does not free MemoryContexts on normal shutdown.
+{
+   pg_palloc_arena
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:AllocSetAlloc
+   ...
+}

@@ -1,0 +1,95 @@
+/*
+ * pg_vault_tde_guc.h - GUC parameter extern declarations
+ *
+ * Copyright (c) 2026 Miriade Srl  
+ * Licensed under the PostgreSQL License.
+ *
+ * All GUC variables are defined as static in pg_vault_tde.c and exposed
+ * here so that kms.c, tam.c, and other translation units can read them
+ * without re-registering them.
+ */
+#ifndef PG_VAULT_TDE_GUC_H
+#define PG_VAULT_TDE_GUC_H
+
+#include "postgres.h"
+
+/* Vault endpoint URL (e.g. "https://vault.example.com:8200") */
+extern char *pg_vault_tde_vault_url;
+
+/* Vault namespace (enterprise only; empty for community edition) */
+extern char *pg_vault_tde_vault_namespace;
+
+/* Vault token — not shown in pg_settings (GUC_SUPERONLY | GUC_NOT_IN_SAMPLE) */
+extern char *pg_vault_tde_vault_token;
+
+/* Transit engine mount path (default: "transit") */
+extern char *pg_vault_tde_vault_transit_mount;
+
+/* Transit key name for DEK wrapping (default: "pg-tde-dek") */
+extern char *pg_vault_tde_vault_key_name;
+
+/* Path to CA certificate bundle for Vault TLS verification */
+extern char *pg_vault_tde_vault_ca_cert;
+
+/* Vault HTTP request timeout in milliseconds (0 = no timeout) */
+extern int         pg_vault_tde_vault_timeout_ms;
+
+/*
+ * Master enable/disable switch.
+ * When false, tde_encrypt_heap_tuple and tde_decrypt_heap_tuple become
+ * identity functions (copy verbatim) to allow overhead benchmarking.
+ */
+extern bool        pg_vault_tde_enabled;
+
+/*
+ * DEK cache TTL in seconds (v1.1).
+ * When > 0, the per-backend local DEK copy expires after this many seconds,
+ * forcing a reload from shmem regardless of generation.  0 = disabled
+ * (local copy only expires on generation mismatch, i.e. key rotation).
+ */
+extern int         pg_vault_tde_dek_cache_ttl;
+
+/*
+ * Vault authentication method (v1.1): "token", "approle", or "kubernetes".
+ * Default: "token" (use pg_vault_tde.vault_token directly).
+ */
+extern char       *pg_vault_tde_vault_auth_method;
+
+/*
+ * AppRole credentials (v1.1).  Used only when vault_auth_method = "approle".
+ */
+extern char       *pg_vault_tde_vault_role_id;
+extern char       *pg_vault_tde_vault_secret_id;
+
+/*
+ * AppRole role name (v1.4): the Vault role NAME (as opposed to role_id UUID).
+ * Required for AppRole secret_id rotation (secret-id/destroy endpoint).
+ * When empty, secret_id rotation is skipped after login.
+ * Example: "pg-tde" for a role created with `vault write auth/approle/role/pg-tde ...`
+ */
+extern char       *pg_vault_tde_vault_role_name;
+
+/*
+ * Kubernetes auth path and role (v1.1).
+ * Used only when vault_auth_method = "kubernetes".
+ */
+extern char       *pg_vault_tde_vault_k8s_role;
+extern char       *pg_vault_tde_vault_k8s_mount;
+
+/*
+ * OpenSSL 3.x provider name for hardware acceleration (v1.1).
+ * Empty (default) = use built-in AES-NI/ARM CE auto-dispatch.
+ * "qatprovider" = Intel QAT co-processor offload.
+ * "fips" = FIPS 140-2/3 validated provider.
+ */
+extern char       *pg_vault_tde_crypto_provider;
+
+/*
+ * Background worker for token renewal (v1.3).
+ * bgw_enabled: whether to start the token renewal BGW (default: false).
+ * token_renewal_interval: seconds between renewal attempts (default: 3600).
+ */
+extern bool        pg_vault_tde_bgw_enabled;
+extern int         pg_vault_tde_token_renewal_interval;
+
+#endif /* PG_VAULT_TDE_GUC_H */

@@ -1,0 +1,5 @@
+-- pg_vault_tde_init.sql
+ extname      
+-------------
+ pg_vault_tde
+(1 row)

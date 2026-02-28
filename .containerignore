@@ -1,0 +1,14 @@
+# .containerignore — exclude build artifacts from COPY context
+*.o
+*.bc
+*.so
+*.a
+tmp_check/
+tmp_check_iso/
+results/
+regression.diffs
+regression.out
+output_iso/
+log/
+tmp_pgext/
+.git/

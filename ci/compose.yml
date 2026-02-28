@@ -1,0 +1,130 @@
+# ci/compose.yml — Podman/Docker Compose orchestration for pg_vault_tde tests
+#
+# Usage:
+#   podman-compose -f ci/compose.yml up -d
+#   podman-compose -f ci/compose.yml down -v
+#
+# The pg-test service depends on vault-mock being healthy before starting.
+# Both containers share a bridge network so pg-test can reach Vault at
+# http://vault-mock:8200.
+
+services:
+
+  # ── Mock Vault Transit API ────────────────────────────────────────────
+  vault-mock:
+    build:
+      context: ..
+      dockerfile: ci/containers/vault-mock.Containerfile
+    image: ${VAULT_MOCK_IMAGE:-vault-mock}:latest
+    container_name: vault-mock
+    environment:
+      VAULT_MOCK_PORT: ${VAULT_MOCK_PORT:-8200}
+      VAULT_MOCK_TOKEN: ${VAULT_MOCK_TOKEN:-test-token}
+      VAULT_MOCK_MOUNT: ${VAULT_MOCK_MOUNT:-transit}
+      VAULT_MOCK_KEY_NAME: ${VAULT_MOCK_KEY_NAME:-pg-tde-dek}
+    ports:
+      - "${VAULT_MOCK_PORT:-8200}:8200"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8200/v1/sys/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 5
+      start_period: 2s
+    networks:
+      - tde-test
+
+  # ── PostgreSQL + pg_vault_tde test image ───────────────────────────────
+  pg-test:
+    build:
+      context: ..
+      dockerfile: ci/containers/pg-test.Containerfile
+    image: ${PG_TEST_IMAGE:-pg-tde-test}:latest
+    container_name: pg-tde-test
+    environment:
+      POSTGRES_PASSWORD: postgres
+      # Vault connection (reachable via compose network)
+      VAULT_ADDR: http://vault-mock:8200
+      VAULT_TOKEN: ${VAULT_MOCK_TOKEN:-test-token}
+      VAULT_MOUNT: ${VAULT_MOCK_MOUNT:-transit}
+      VAULT_KEY_NAME: ${VAULT_MOCK_KEY_NAME:-pg-tde-dek}
+    command: >
+      postgres
+        -c shared_preload_libraries=pg_vault_tde
+        -c log_min_messages=warning
+    ports:
+      - "${PG_TEST_PORT:-15432}:5432"
+    depends_on:
+      vault-mock:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+      start_period: 5s
+    networks:
+      - tde-test
+
+  # ── PostgreSQL with page checksums ────────────────────────────────────
+  pg-checksums:
+    build:
+      context: ..
+      dockerfile: ci/containers/pg-test.Containerfile
+    image: ${PG_TEST_IMAGE:-pg-tde-test}:latest
+    container_name: pg-tde-checksums
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_INITDB_ARGS: "-k"
+    command: >
+      postgres
+        -c shared_preload_libraries=pg_vault_tde
+        -c log_min_messages=warning
+    ports:
+      - "${PG_CHECKSUMS_PORT:-15433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+      start_period: 5s
+    networks:
+      - tde-test
+
+  # ── PostgreSQL with Vault integration ─────────────────────────────────
+  pg-vault:
+    build:
+      context: ..
+      dockerfile: ci/containers/pg-test.Containerfile
+    image: ${PG_TEST_IMAGE:-pg-tde-test}:latest
+    container_name: pg-tde-vault
+    environment:
+      POSTGRES_PASSWORD: postgres
+      VAULT_ADDR: http://vault-mock:8200
+      VAULT_TOKEN: ${VAULT_MOCK_TOKEN:-test-token}
+      VAULT_MOUNT: ${VAULT_MOCK_MOUNT:-transit}
+      VAULT_KEY_NAME: ${VAULT_MOCK_KEY_NAME:-pg-tde-dek}
+    command: >
+      postgres
+        -c shared_preload_libraries=pg_vault_tde
+        -c pg_vault_tde.vault_url=http://vault-mock:8200
+        -c pg_vault_tde.vault_token=test-token
+        -c pg_vault_tde.vault_mount=transit
+        -c pg_vault_tde.vault_key_name=pg-tde-dek
+        -c log_min_messages=warning
+    ports:
+      - "${PG_VAULT_PORT:-15434}:5432"
+    depends_on:
+      vault-mock:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+      start_period: 5s
+    networks:
+      - tde-test
+
+networks:
+  tde-test:
+    driver: bridge

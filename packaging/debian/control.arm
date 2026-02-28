@@ -1,0 +1,8 @@
+Package: postgresql-18-pg-vault-tde-armce
+Architecture: arm64
+Depends: postgresql-18-pg-vault-tde (= ${binary:Version}), ${misc:Depends}
+Description: pg_vault_tde ARM Crypto Extensions optimized build
+ Recompiled with -march=armv8-a+crypto flags for ARM CPUs with
+ Cryptographic Extensions hardware support.
+ .
+ CPU requirement: ARM Cortex-A53+, Apple M1/M2, AWS Graviton 2/3.

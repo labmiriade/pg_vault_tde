@@ -1,0 +1,23 @@
+#!/usr/bin/make -f
+# Debian rules for pg_vault_tde
+# Uses debhelper 13 with PGXS build system
+
+%:
+	dh $@ --with pgxs
+
+override_dh_auto_build:
+	$(MAKE) PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
+
+override_dh_auto_install:
+	$(MAKE) PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config install \
+		DESTDIR=$(CURDIR)/debian/postgresql-18-pg-vault-tde
+
+override_dh_auto_test:
+	# Tests require a running PostgreSQL server; skip in package build
+	: skipping dpkg-build tests
+
+override_dh_installchangelogs:
+	dh_installchangelogs
+
+override_dh_compress:
+	dh_compress -X.sql -X.control

@@ -1,0 +1,8 @@
+postgresql-pg-vault-tde (1.0-1) unstable; urgency=medium
+
+  * Initial release.
+  * AES-256-GCM transparent encryption via Table Access Method API.
+  * Support for PostgreSQL 18.
+  * All 24 regression tests pass, including page-checksum compatibility.
+
+ -- Miriade Srl <info@miriade.it>  Fri, 27 Feb 2026 00:00:00 +0100
