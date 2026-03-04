@@ -642,3 +642,58 @@ pg_vault_tde_catalog_evict_rel(Oid relid)
     }
     LWLockRelease(&rel_dek_cache->lock);
 }
+
+/* -------------------------------------------------------------------------
+ * pg_vault_tde_catalog_evict_all — flush all cached DEKs from shared memory
+ *
+ * OPENSSL_cleanse every dek[] and prev_dek[] buffer, then reset used = 0.
+ * The pg_vault_tde_catalog rows are NOT removed; DEKs are reloaded from
+ * the catalog on the next pg_vault_tde_kms_get_rel_dek() call.
+ *
+ * Used by pg_vault_tde_wallet_lock() to ensure plaintext key material does
+ * not persist in shared memory after the wallet is administratively locked.
+ * -------------------------------------------------------------------------*/
+void
+pg_vault_tde_catalog_evict_all(void)
+{
+    int i;
+
+    if (!rel_dek_cache)
+        return;
+
+    LWLockAcquire(&rel_dek_cache->lock, LW_EXCLUSIVE);
+    for (i = 0; i < rel_dek_cache->capacity; i++)
+    {
+        TdeRelDekEntry *e = &rel_dek_cache->entries[i];
+        if (e->relid != InvalidOid)
+        {
+            OPENSSL_cleanse(e->dek, TDE_DEK_LEN);
+            OPENSSL_cleanse(e->prev_dek, TDE_DEK_LEN);
+            e->relid          = InvalidOid;
+            e->dek_valid      = false;
+            e->prev_dek_valid = false;
+        }
+    }
+    rel_dek_cache->used = 0;
+    LWLockRelease(&rel_dek_cache->lock);
+
+    ereport(LOG, errmsg("pg_vault_tde: all DEKs evicted from shared memory cache"));
+}
+
+/* -------------------------------------------------------------------------
+ * pg_vault_tde_catalog_get_dek_count — count live shmem DEK entries
+ * -------------------------------------------------------------------------*/
+int
+pg_vault_tde_catalog_get_dek_count(void)
+{
+    int count;
+
+    if (!rel_dek_cache)
+        return 0;
+
+    LWLockAcquire(&rel_dek_cache->lock, LW_SHARED);
+    count = rel_dek_cache->used;
+    LWLockRelease(&rel_dek_cache->lock);
+
+    return count;
+}

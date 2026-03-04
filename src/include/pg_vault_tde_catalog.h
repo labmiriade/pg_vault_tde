@@ -149,4 +149,25 @@ void pg_vault_tde_catalog_deregister_rel(Oid relid);
  */
 void pg_vault_tde_catalog_evict_rel(Oid relid);
 
+/*
+ * pg_vault_tde_catalog_evict_all:
+ *   Evict ALL per-table DEK entries from shared memory, OPENSSL_cleanse'ing
+ *   every dek[] and prev_dek[] buffer in the process.  The catalog rows are
+ *   NOT touched — DEKs are reloaded from the catalog on next access.
+ *
+ *   Called by pg_vault_tde_wallet_lock() to flush all plaintext key material
+ *   from shared memory (effective across ALL backends because the cache lives
+ *   in shared memory, not per-backend memory).
+ *
+ *   Acquires LW_EXCLUSIVE on the cache lock for the duration.
+ */
+void pg_vault_tde_catalog_evict_all(void);
+
+/*
+ * pg_vault_tde_catalog_get_dek_count:
+ *   Return the number of live DEK entries currently held in the shmem cache.
+ *   Acquires LW_SHARED; safe to call from any backend at any time.
+ */
+int  pg_vault_tde_catalog_get_dek_count(void);
+
 #endif /* PG_VAULT_TDE_CATALOG_H */

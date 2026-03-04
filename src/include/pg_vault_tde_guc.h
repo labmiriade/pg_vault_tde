@@ -143,4 +143,43 @@ extern int         pg_vault_tde_max_encrypted_relations;
  */
 extern bool        pg_vault_tde_toast_encryption;
 
+/* -----------------------------------------------------------------------
+ * v1.6 GUCs — Flexible wallet passphrase ingestion
+ * -----------------------------------------------------------------------*/
+
+/*
+ * Path to a file that contains the wallet passphrase (PGC_POSTMASTER).
+ * The file is read once at startup and its contents trimmed of whitespace.
+ * Permission must be 0400 or 0600 (owner-only); wider permissions are
+ * rejected with ereport(FATAL).
+ * Incompatible with wallet_passphrase_env if both are non-empty.
+ */
+extern char       *pg_vault_tde_wallet_passphrase_file;
+
+/*
+ * Shell command whose stdout is the wallet passphrase (PGC_POSTMASTER).
+ * Analogous to PostgreSQL's ssl_passphrase_command.  Output is trimmed
+ * to at most 4095 characters and NUL-terminated.  Command runs in a
+ * popen() subprocess with a reduced environment; stdout is the passphrase.
+ * Example: "systemd-creds decrypt pg-tde-pass"
+ * Example: "aws secretsmanager get-secret-value --query SecretString --output text --secret-id pg-tde-wallet"
+ * Takes priority over wallet_passphrase_env and wallet_passphrase_file
+ * when non-empty.
+ */
+extern char       *pg_vault_tde_wallet_passphrase_command;
+
+/*
+ * Dev-mode inline passphrase (PGC_USERSET).
+ * ONLY honoured when pg_vault_tde.dev_mode = on.
+ * Emits ereport(WARNING) on every use.  Never set in production configs.
+ */
+extern char       *pg_vault_tde_wallet_dev_mode_passphrase;
+
+/*
+ * Dev-mode enable flag (PGC_POSTMASTER, default false).
+ * When false, wallet_dev_mode_passphrase is silently ignored.
+ * When true, ereport(WARNING) is emitted on every dev-mode passphrase use.
+ */
+extern bool        pg_vault_tde_dev_mode;
+
 #endif /* PG_VAULT_TDE_GUC_H */

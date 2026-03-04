@@ -68,6 +68,14 @@ bool  pg_vault_tde_wallet_auto_open       = true;
 int   pg_vault_tde_max_encrypted_relations = 1024;
 bool  pg_vault_tde_toast_encryption       = true;
 
+/* -----------------------------------------------------------------------
+ * v1.6 GUC definitions — flexible passphrase ingestion
+ * ----------------------------------------------------------------------- */
+char *pg_vault_tde_wallet_passphrase_file    = NULL; /* path to passphrase file */
+char *pg_vault_tde_wallet_passphrase_command = NULL; /* shell command → passphrase */
+char *pg_vault_tde_wallet_dev_mode_passphrase = NULL;/* dev-mode only; never prod */
+bool  pg_vault_tde_dev_mode                  = false;/* enables dev conveniences */
+
 /*
  * tde_active_kms_provider — selected KMS backend (set in _PG_init).
  * All callers that need KMS operations go through this pointer.
@@ -610,6 +618,65 @@ _PG_init(void)
         "relations use encrypted_heap AM and encrypt each chunk with "
         "AES-256-GCM.  Set to false only for debugging or migration.",
         &pg_vault_tde_toast_encryption, true, PGC_SIGHUP,
+        0, NULL, NULL, NULL);
+
+    /* ----------------------------------------------------------------
+     * v1.6 GUC registrations — flexible wallet passphrase ingestion
+     * ---------------------------------------------------------------- */
+
+    /*
+     * wallet_passphrase_file — read passphrase from a file (v1.6).
+     * Takes second priority after wallet_passphrase_command.
+     * File must be owned by the postgres OS user, mode 0400 or 0600.
+     */
+    DefineCustomStringVariable("pg_vault_tde.wallet_passphrase_file",
+        "Path to a file containing the wallet passphrase",
+        "The wallet passphrase is read from this file at startup.  "
+        "The file must be mode 0400 or 0600 (owner-only).  "
+        "Incompatible with wallet_passphrase_env if both are set.  "
+        "wallet_passphrase_command takes priority if set.",
+        &pg_vault_tde_wallet_passphrase_file, "",
+        PGC_POSTMASTER, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+
+    /*
+     * wallet_passphrase_command — shell command whose stdout is the
+     * passphrase (v1.6).  Highest priority passphrase source.
+     * Examples: "systemd-creds decrypt pg-tde-pass"
+     *           "aws secretsmanager get-secret-value --query SecretString
+     *             --output text --secret-id pg/tde/wallet"
+     */
+    DefineCustomStringVariable("pg_vault_tde.wallet_passphrase_command",
+        "Shell command whose stdout is the wallet passphrase",
+        "Analogous to ssl_passphrase_command.  Output is trimmed and "
+        "used as passphrase.  Takes priority over wallet_passphrase_env "
+        "and wallet_passphrase_file.  Never use in production without "
+        "securing the command output.",
+        &pg_vault_tde_wallet_passphrase_command, "",
+        PGC_POSTMASTER, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+
+    /*
+     * wallet_dev_mode_passphrase — literal plaintext passphrase for
+     * development/CI only (v1.6).  IGNORED unless dev_mode = on.
+     * Emits WARNING on every use.  NEVER set in production configs.
+     */
+    DefineCustomStringVariable("pg_vault_tde.wallet_dev_mode_passphrase",
+        "Dev-mode inline passphrase (ONLY when dev_mode = on)",
+        "Convenience for CI pipelines.  Never set in production.  "
+        "Emits a WARNING on every use.  Ignored when dev_mode = off.",
+        &pg_vault_tde_wallet_dev_mode_passphrase, "",
+        PGC_USERSET, GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE,
+        NULL, NULL, NULL);
+
+    /*
+     * dev_mode — enable development conveniences (v1.6).
+     * When false (default), wallet_dev_mode_passphrase is silently ignored.
+     * When true, ereport(WARNING) fires on every dev passphrase read.
+     */
+    DefineCustomBoolVariable("pg_vault_tde.dev_mode",
+        "Enable development-only conveniences (insecure in production)",
+        "When true, pg_vault_tde.wallet_dev_mode_passphrase may be used "
+        "as the wallet passphrase.  Always false in production.",
+        &pg_vault_tde_dev_mode, false, PGC_POSTMASTER,
         0, NULL, NULL, NULL);
 
     /* Chain hooks so other extensions coexist correctly. */
