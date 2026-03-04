@@ -247,8 +247,8 @@ BEGIN
 
     CREATE TABLE tde_toast_copy_test (id int, val text) USING encrypted_heap;
 
-    -- Insert 10 rows each with a 3 kB payload via standard INSERT loop
-    -- (COPY FROM STDIN is not easily scriptable in DO $$ blocks;
+    -- Insert 10 rows each with a 3 kB payload via standard INSERT loop.
+    -- (COPY FROM STDIN is not easily scriptable in anonymous DO blocks;
     --  we use INSERT which exercises the same multi_insert code path.)
     INSERT INTO tde_toast_copy_test
     SELECT i, repeat('toast_copy_row_', 210)  /* ~3 kB */
@@ -375,6 +375,13 @@ BEGIN
     -- Rotate key for table A only; table B must remain readable
     gen_a_before := pg_vault_tde_key_generation();
     PERFORM pg_vault_tde_rotate_key();
+    /*
+     * rotate_key() wipes the current DEK (valid=false) and saves it as
+     * prev_dek.  We must inject a new test DEK so that the re-encryption
+     * path has a valid current key to encrypt with.  The old rows are
+     * decryptable via the prev_dek fallback in tde_gcm_decrypt.
+     */
+    PERFORM pg_vault_tde_set_test_dek();
     gen_a_after := pg_vault_tde_key_generation();
 
     -- Re-encrypt table A with the new key
@@ -644,22 +651,22 @@ $$;
 -- Passes on v1.5: function registered; rotation BGW starts and inserts
 -- a progress row.
 --
--- Note: we immediately check that a progress row was created and the
--- status becomes 'complete' within 10 seconds (1000 rows × small batches).
+-- IMPORTANT: table setup is done in separate top-level statements
+-- (auto-committed) so that the BGW's new connection can see the
+-- committed relation.  Mixing CREATE TABLE + rotate_online inside a
+-- single DO $$ block prevents the BGW from finding the table.
 -- ================================================================
+SELECT pg_vault_tde_set_test_dek();
+CREATE TABLE tde_rotate_online_test (id int, val text) USING encrypted_heap;
+INSERT INTO tde_rotate_online_test
+    SELECT i, 'rotation_test_row_' || i::text
+    FROM generate_series(1, 50) AS s(i);
+
 DO $$
 DECLARE
     status_row   record;
     wait_count   int := 0;
 BEGIN
-    PERFORM pg_vault_tde_set_test_dek();
-
-    CREATE TABLE tde_rotate_online_test (id int, val text) USING encrypted_heap;
-
-    INSERT INTO tde_rotate_online_test
-    SELECT i, 'rotation_test_row_' || i::text
-    FROM generate_series(1, 50) AS s(i);
-
     -- Trigger online rotation with batch_size=10
     PERFORM pg_vault_tde_rotate_online('tde_rotate_online_test', 10);
 
@@ -676,8 +683,6 @@ BEGIN
         wait_count := wait_count + 1;
     END LOOP;
 
-    DROP TABLE tde_rotate_online_test;
-
     IF status_row IS NULL THEN
         RAISE EXCEPTION
             'TEST 70 FAILED: no progress row found for online rotation';
@@ -693,6 +698,7 @@ BEGIN
                  status_row.status, status_row.tuples_done;
 END;
 $$;
+DROP TABLE tde_rotate_online_test;
 
 -- ================================================================
 -- TEST 71: Online rotation — concurrent SELECTs succeed during rotation
@@ -702,17 +708,18 @@ $$;
 -- This is verified by the isolation test suite (isolation/dek_rotation.spec).
 -- Here we test the simpler invariant: reading before and after rotation
 -- returns the same values.
+--
+-- Table setup committed separately so the BGW can see the relation.
 -- ================================================================
+SELECT pg_vault_tde_set_test_dek();
+CREATE TABLE tde_concurrent_read_test (id int, val text) USING encrypted_heap;
+INSERT INTO tde_concurrent_read_test VALUES (1, 'concurrent_read_value');
+
 DO $$
 DECLARE
     val_before    text;
     val_after     text;
 BEGIN
-    PERFORM pg_vault_tde_set_test_dek();
-
-    CREATE TABLE tde_concurrent_read_test (id int, val text) USING encrypted_heap;
-    INSERT INTO tde_concurrent_read_test VALUES (1, 'concurrent_read_value');
-
     -- Capture value before rotation
     SELECT val INTO val_before FROM tde_concurrent_read_test WHERE id = 1;
 
@@ -723,8 +730,6 @@ BEGIN
     -- Read during (or after) rotation
     SELECT val INTO val_after FROM tde_concurrent_read_test WHERE id = 1;
 
-    DROP TABLE tde_concurrent_read_test;
-
     IF val_after IS DISTINCT FROM val_before THEN
         RAISE EXCEPTION
             'TEST 71 FAILED: value changed during rotation '
@@ -734,25 +739,25 @@ BEGIN
     RAISE NOTICE 'TEST 71 PASSED: value consistent before/after online rotation';
 END;
 $$;
+DROP TABLE tde_concurrent_read_test;
 
 -- ================================================================
 -- TEST 72: Online rotation progress tracking
 --
 -- pg_vault_tde_rotation_status view must reflect tuples_done progress.
+-- Table setup committed separately so the BGW can see the relation.
 -- ================================================================
+SELECT pg_vault_tde_set_test_dek();
+CREATE TABLE tde_rotation_progress_test (id int, val text)
+    USING encrypted_heap;
+INSERT INTO tde_rotation_progress_test
+    SELECT i, 'progress_row_' || i::text
+    FROM generate_series(1, 20) AS s(i);
+
 DO $$
 DECLARE
     final_row    record;
 BEGIN
-    PERFORM pg_vault_tde_set_test_dek();
-
-    CREATE TABLE tde_rotation_progress_test (id int, val text)
-        USING encrypted_heap;
-
-    INSERT INTO tde_rotation_progress_test
-    SELECT i, 'progress_row_' || i::text
-    FROM generate_series(1, 20) AS s(i);
-
     PERFORM pg_vault_tde_rotate_online('tde_rotation_progress_test', 5);
 
     -- Poll for completion
@@ -768,8 +773,6 @@ BEGIN
             waited := waited + 1;
         END LOOP;
     END;
-
-    DROP TABLE tde_rotation_progress_test;
 
     IF final_row IS NULL THEN
         RAISE EXCEPTION
@@ -792,6 +795,7 @@ BEGIN
                  final_row.tuples_done, final_row.status;
 END;
 $$;
+DROP TABLE tde_rotation_progress_test;
 
 -- ================================================================
 -- PHASE SUMMARY

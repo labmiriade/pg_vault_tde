@@ -76,6 +76,60 @@ tde_rel_dek_cache_size(int capacity)
            + (Size) capacity * sizeof(TdeRelDekEntry);
 }
 
+/*
+ * tde_rel_dek_cache_store_fallback
+ *
+ * Cache the global fallback DEK under a specific relid so that subsequent
+ * calls to pg_vault_tde_kms_get_rel_dek hit the fast (no-SPI) shmem path.
+ *
+ * Called when pg_vault_tde_catalog has no wrapped_dek entry for relid and
+ * we fell back to the v1.4 global DEK.  Without this caching, every decrypt
+ * call would re-enter the SPI catalog lookup — which fails when called during
+ * CommitTransaction (e.g., PostgreSQL materialising a WITH HOLD cursor).
+ *
+ * The cached entry uses the global DEK as-is.  If the global DEK is later
+ * rotated, pg_vault_tde_catalog_evict_rel() should be called for this relid
+ * to force a fresh lookup on the next decrypt.  This is a v1.5 simplification;
+ * proper per-entry generation tracking is deferred to v1.6.
+ */
+static void
+tde_rel_dek_cache_store_fallback(Oid relid, const unsigned char *dek)
+{
+    TdeRelDekEntry *empty_slot = NULL;
+    int             j;
+
+    if (!rel_dek_cache)
+        return;
+
+    LWLockAcquire(&rel_dek_cache->lock, LW_EXCLUSIVE);
+    for (j = 0; j < rel_dek_cache->capacity; j++)
+    {
+        TdeRelDekEntry *e = &rel_dek_cache->entries[j];
+
+        if (e->relid == relid)
+        {
+            /* Another backend already cached an entry for this relid */
+            LWLockRelease(&rel_dek_cache->lock);
+            return;
+        }
+        if (!empty_slot && e->relid == InvalidOid)
+            empty_slot = e;
+    }
+
+    if (!empty_slot)
+    {
+        /* Cache full — skip rather than evicting a potentially-valid entry */
+        LWLockRelease(&rel_dek_cache->lock);
+        return;
+    }
+
+    memcpy(empty_slot->dek, dek, TDE_DEK_LEN);
+    empty_slot->relid     = relid;
+    empty_slot->dek_valid = true;
+    rel_dek_cache->used++;
+    LWLockRelease(&rel_dek_cache->lock);
+}
+
 /* -------------------------------------------------------------------------
  * pg_vault_tde_catalog_shmem_request — reserve shmem space (PG 15+ hook)
  * -------------------------------------------------------------------------*/
@@ -255,15 +309,25 @@ pg_vault_tde_kms_get_rel_dek(Oid relid,
 
         if (spi_rc != SPI_OK_SELECT || SPI_processed == 0)
         {
+            bool got_dek;
+
             SPI_finish();
             /*
              * No catalog entry: fall back to global DEK (v1.4 tables have
              * no entry; treat them as relid=0).
+             *
+             * Also populate rel_dek_cache so subsequent calls for this relid
+             * take the fast (no-SPI) path.  This is critical for WITH HOLD
+             * cursor materialisation during CommitTransaction, where SPI
+             * cannot be re-entered.  See tde_rel_dek_cache_store_fallback.
              */
             ereport(DEBUG1,
                     errmsg("pg_vault_tde: no catalog entry for relid=%u, "
                            "falling back to global DEK", relid));
-            return pg_vault_tde_kms_get_dek((char *) dek_out, dek_len);
+            got_dek = pg_vault_tde_kms_get_dek((char *) dek_out, dek_len);
+            if (got_dek)
+                tde_rel_dek_cache_store_fallback(relid, (unsigned char *) dek_out);
+            return got_dek;
         }
 
         tuptable = SPI_tuptable;
@@ -273,11 +337,16 @@ pg_vault_tde_kms_get_rel_dek(Oid relid,
         wrapped_datum = SPI_getbinval(tuple, tupdesc, 1, &isnull);
         if (isnull)
         {
+            bool got_dek;
+
             SPI_finish();
             ereport(DEBUG1,
                     errmsg("pg_vault_tde: wrapped_dek IS NULL for "
                            "relid=%u, falling back to global DEK", relid));
-            return pg_vault_tde_kms_get_dek((char *) dek_out, dek_len);
+            got_dek = pg_vault_tde_kms_get_dek((char *) dek_out, dek_len);
+            if (got_dek)
+                tde_rel_dek_cache_store_fallback(relid, (unsigned char *) dek_out);
+            return got_dek;
         }
 
         wrapped_bytea = DatumGetByteaPP(wrapped_datum);

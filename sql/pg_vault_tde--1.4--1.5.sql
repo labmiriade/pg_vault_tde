@@ -168,7 +168,7 @@ CREATE OPERATOR CLASS tde_text_ops FOR TYPE text USING tde_btree AS
     OPERATOR 3 =  (text, text),
     OPERATOR 4 >= (text, text),
     OPERATOR 5 >  (text, text),
-    FUNCTION 1 texticmp(text, text);
+    FUNCTION 1 bttextcmp(text, text);
 
 -- int4 (integer)
 CREATE OPERATOR CLASS tde_int4_ops FOR TYPE int4 USING tde_btree AS
@@ -249,9 +249,12 @@ $$;
 -- ============================================================================
 -- 7. Health check extension (v1.5 adds kms_provider and aad_binding columns)
 -- ============================================================================
--- Drops any existing pg_vault_tde_health_check() so we can replace it with
--- the v1.5 version that includes the new fields.
-
+-- Detach the old health_check from the extension so we can drop and recreate
+-- it with the new v1.5 return type (adds kms_provider, aad_binding,
+-- wallet_open columns).  Inside ALTER EXTENSION UPDATE, owned objects
+-- cannot be dropped with DROP FUNCTION directly — we must first disassociate
+-- them with ALTER EXTENSION ... DROP FUNCTION.
+ALTER EXTENSION pg_vault_tde DROP FUNCTION pg_vault_tde_health_check();
 DROP FUNCTION IF EXISTS pg_vault_tde_health_check();
 
 CREATE FUNCTION pg_vault_tde_health_check()
@@ -295,51 +298,23 @@ END;
 $$;
 
 -- ============================================================================
--- 8. pg_vault_tde_reencrypt_table(rel text, batch_size int) — synchronous
---    re-encryption helper used by tests and ad-hoc rotation scripts.
+-- 8. pg_vault_tde_reencrypt_table(rel text, batch_size int) — thin wrapper
 --
--- Calls pg_vault_tde_rotate_online() and polls the progress table until
--- status is not 'running' (or times out after 30 s with a WARNING).
+-- Provides a text-typed overload for the C function
+-- pg_vault_tde_reencrypt_table(regclass, int).  Callers that pass a table
+-- name as text (rather than an explicit regclass cast) are routed here.
+--
+-- This wrapper runs SYNCHRONOUSLY in the calling session — it does NOT start
+-- a background worker.  For non-blocking online rotation, call
+-- pg_vault_tde_rotate_online(rel::regclass, batch_size) directly.
 -- ============================================================================
 CREATE OR REPLACE FUNCTION pg_vault_tde_reencrypt_table(
         rel         text,
         batch_size  int DEFAULT 1000
     )
     RETURNS void
-    LANGUAGE plpgsql SECURITY DEFINER AS $$
-DECLARE
-    relid      oid  := rel::regclass::oid;
-    tick       int  := 0;
-    st         text;
-BEGIN
-    -- Trigger async BGW rotation
-    PERFORM pg_vault_tde_rotate_online(rel::regclass, batch_size);
-
-    -- Poll until complete (max 30 s)
-    LOOP
-        SELECT status INTO st
-        FROM   pg_vault_tde_rotation_progress
-        WHERE  relid = relid;
-
-        EXIT WHEN st IN ('complete', 'done', 'failed');
-        EXIT WHEN tick > 60;   /* 60 × 500ms = 30 s */
-
-        PERFORM pg_sleep(0.5);
-        tick := tick + 1;
-    END LOOP;
-
-    IF st IS NULL THEN
-        RAISE WARNING
-            'pg_vault_tde_reencrypt_table: no progress row found for %', rel;
-    ELSIF st = 'failed' THEN
-        RAISE EXCEPTION
-            'pg_vault_tde_reencrypt_table: rotation failed for %', rel;
-    ELSIF tick > 60 THEN
-        RAISE WARNING
-            'pg_vault_tde_reencrypt_table: timed out waiting for rotation '
-            'to complete on %', rel;
-    END IF;
-END;
+    LANGUAGE SQL SECURITY DEFINER AS $$
+        SELECT pg_vault_tde_reencrypt_table(rel::regclass, batch_size);
 $$;
 
 REVOKE ALL   ON FUNCTION pg_vault_tde_reencrypt_table(text, int) FROM PUBLIC;

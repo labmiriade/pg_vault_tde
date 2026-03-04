@@ -43,6 +43,8 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
+#include <openssl/crypto.h>     /* OPENSSL_cleanse */
+
 #include "src/include/pg_vault_tde_kms.h"
 #include "src/include/pg_vault_tde_catalog.h"
 #include "src/include/pg_vault_tde_guc.h"
@@ -146,6 +148,43 @@ pg_vault_tde_rotate_online_sql(PG_FUNCTION_ARGS)
     PG_RETURN_VOID();
 }
 
+/*
+ * tde_bgw_record_failure — best-effort: update rotation_progress to 'failed'.
+ *
+ * Called from the PG_CATCH handler of pg_vault_tde_rotation_bgw_main.
+ * Must be a separate function so that its own PG_TRY/PG_CATCH local
+ * variables (from elog.h macros) do not shadow those of the outer handler
+ * (which would trigger -Wshadow warnings / build errors under zero-warning
+ * policy).
+ */
+static void
+tde_bgw_record_failure(Oid relid)
+{
+    char sql[256];
+
+    PG_TRY();
+    {
+        SetCurrentStatementStartTimestamp();
+        StartTransactionCommand();
+        SPI_connect();
+        snprintf(sql, sizeof(sql),
+                 "UPDATE pg_vault_tde_rotation_progress "
+                 "SET status = 'failed', updated_at = now() "
+                 "WHERE relid = %u",
+                 relid);
+        SPI_execute(sql, false, 0);
+        SPI_finish();
+        CommitTransactionCommand();
+    }
+    PG_CATCH();
+    {
+        FlushErrorState();
+        AbortCurrentTransaction();
+        /* Best-effort; ignore failure to update progress row */
+    }
+    PG_END_TRY();
+}
+
 /* =========================================================================
  * BGW main entry point — runs in a dedicated backend process.
  * =========================================================================*/
@@ -155,8 +194,8 @@ pg_vault_tde_rotation_bgw_main(Datum main_arg)
     TdeRotationArgs args;
     char            sql[512];
     int             rc;
-    int64           tuples_done    = 0;
-    int64           tuples_total   = 0;
+    volatile int64  tuples_done  = 0;
+    volatile int64  tuples_total = 0;
     /*
      * Name of the first non-dropped user column, quoted for SQL injection
      * safety.  Used in the per-row re-encryption UPDATE — a self-update of any
@@ -173,6 +212,15 @@ pg_vault_tde_rotation_bgw_main(Datum main_arg)
     BackgroundWorkerUnblockSignals();
 
     BackgroundWorkerInitializeConnectionByOid(args.dboid, InvalidOid, 0);
+
+    /*
+     * Top-level error guard: catch any ERROR from any phase, record it as
+     * status='failed' in the progress table (so polls see 'failed' quickly
+     * instead of timing out on 'running'), then log the message at WARNING
+     * level so it appears in the server log even with log_min_messages=warning.
+     */
+    PG_TRY();
+    {
 
     /*
      * Phase 1: Determine total row count so that the progress view can
@@ -242,58 +290,125 @@ pg_vault_tde_rotation_bgw_main(Datum main_arg)
     CommitTransactionCommand();
 
     /*
-     * Phase 2: Cursor-based re-encryption loop.
+     * Phase 1b: Prime the shmem rel_dek_cache for this relation.
      *
-     * We open a HOLD cursor over the encrypted table (so it survives commit),
-     * then FETCH batch_size rows per iteration, decrypt with prev_dek,
-     * re-encrypt with the current dek, and UPDATE the row in-place.
+     * PostgreSQL materialises WITH HOLD cursors during CommitTransaction by
+     * calling ExecutorRun.  The TAM decrypt callbacks call
+     * pg_vault_tde_kms_get_rel_dek().  If that function finds a cold cache
+     * it calls SPI_connect() to do a catalog lookup — but SPI cannot be
+     * entered during commit, so the BGW crashes.
      *
-     * Each iteration is an autonomous transaction — this means:
-     *  a) No long-held RowExclusiveLock that would block concurrent SELECT.
-     *  b) If the BGW crashes mid-batch, the last committed batch is safe.
-     *  c) Any row skipped by the cursor (concurrent DELETE) is silently OK.
-     *
-     * Note: the actual per-row decrypt/re-encrypt happens inside the TAM
-     * callbacks during the UPDATE.  The caller only needs to do a trivial
-     * UPDATE t SET ctid = ctid — but that is a no-op in heapam.  Instead we
-     * use a sentinel column update.  The canonical approach is to call
-     * pg_vault_tde_reencrypt_tuple(TID) which is registered in the SQL layer.
-     *
-     * TODO (v1.5 RTM): implement pg_vault_tde_reencrypt_tuple() in TAM layer
-     * so the BGW does not need to do a trivial UPDATE.
-     *
-     * For now we execute:
-     *   UPDATE <rel> SET _tde_rotation_marker = _tde_rotation_marker
-     *   WHERE ctid = ANY(<batch_ctids>)
-     * using a cursor over "SELECT ctid FROM <rel>".
+     * The safe fix: call pg_vault_tde_kms_get_rel_dek() directly here, in a
+     * normal transaction context (NOT from inside an SPI executor call).
+     * That function will do its own SPI connection internally if needed,
+     * then (via the tde_rel_dek_cache_store_fallback() path in catalog.c)
+     * store the result in rel_dek_cache.  All subsequent calls — including
+     * those fired during the Phase 2 cursor commit — hit the fast shmem
+     * path (LW_SHARED, no SPI) and succeed.
      */
+    {
+        unsigned char   prime_dek[TDE_DEK_LEN];
 
-    SetCurrentStatementStartTimestamp();
-    StartTransactionCommand();
-    PushActiveSnapshot(GetTransactionSnapshot());
-    SPI_connect();
+        SetCurrentStatementStartTimestamp();
+        StartTransactionCommand();
+        PushActiveSnapshot(GetTransactionSnapshot());
 
-    /* Open a WITH HOLD cursor for the ctid scan */
-    snprintf(sql, sizeof(sql),
-             "DECLARE tde_rot_%u SCROLL CURSOR WITH HOLD FOR "
-             "SELECT ctid FROM ONLY %s",
-             args.relid,
-             quote_identifier(get_rel_name(args.relid)));
-    rc = SPI_execute(sql, false, 0);
-    if (rc != SPI_OK_UTILITY)
-        ereport(ERROR,
-                (errmsg("pg_vault_tde: rotation BGW: could not open cursor "
-                        "for relid=%u (rc=%d)", args.relid, rc)));
+        /*
+         * pg_vault_tde_kms_get_rel_dek() opens and closes its own SPI
+         * connection internally.  We are NOT inside an SPI_execute() call
+         * here, so there is no nested-SPI issue.
+         */
+        (void) pg_vault_tde_kms_get_rel_dek(args.relid,
+                                             prime_dek, TDE_DEK_LEN);
+        OPENSSL_cleanse(prime_dek, TDE_DEK_LEN);
 
-    SPI_finish();
-    PopActiveSnapshot();
-    CommitTransactionCommand();
+        PopActiveSnapshot();
+        CommitTransactionCommand();
+    }
 
-    /* Main batch loop */
+    /*
+     * Phase 2: Collect all CTIDs into a session-local temp table.
+     *
+     * SPI_finish() drops portals owned by the current SPI level — including
+     * WITH HOLD cursors declared via SPI — before CommitTransactionCommand()
+     * can call PersistHoldablePortal() to materialise them.  This means a
+     * WITH HOLD cursor declared in one SPI session and then SPI_finish()ed
+     * always disappears before commit, leaving the batch loop with no cursor.
+     *
+     * A session-local temp table avoids this: it is a regular table that
+     * persists across transaction boundaries within this backend session.
+     *
+     * The INSERT ... SELECT fires the TAM seqscan decrypt path for each row.
+     * Phase 1b ensures rel_dek_cache is warm, so kms_get_rel_dek() takes the
+     * fast shmem LW_SHARED path (no SPI_connect) on every row — there is no
+     * nested-SPI issue.
+     *
+     * IMPORTANT: get_rel_name() requires an active transaction (syscache).
+     * It must be called AFTER StartTransactionCommand(), not between
+     * transactions.
+     */
+    {
+        const char *relname_for_load;
+
+        SetCurrentStatementStartTimestamp();
+        StartTransactionCommand();
+        PushActiveSnapshot(GetTransactionSnapshot());
+        SPI_connect();
+
+        /* Resolve the relation name inside an active transaction */
+        relname_for_load = get_rel_name(args.relid);
+        if (relname_for_load == NULL)
+            ereport(ERROR,
+                    (errmsg("pg_vault_tde rotation BGW: relation %u not found "
+                            "(was it created in an uncommitted transaction? "
+                            "Commit before calling pg_vault_tde_rotate_online.)",
+                            args.relid)));
+
+        snprintf(sql, sizeof(sql),
+                 "CREATE TEMP TABLE IF NOT EXISTS tde_rot_%u "
+                 "(rowctid tid) ON COMMIT PRESERVE ROWS",
+                 args.relid);
+        rc = SPI_execute(sql, false, 0);
+        if (rc != SPI_OK_UTILITY)
+            ereport(ERROR,
+                    (errmsg("pg_vault_tde: rotation BGW: could not create "
+                            "temp table for relid=%u (rc=%d)",
+                            args.relid, rc)));
+
+        /* Truncate in case this is a retry after crash */
+        snprintf(sql, sizeof(sql), "TRUNCATE tde_rot_%u", args.relid);
+        SPI_execute(sql, false, 0);
+
+        /*
+         * Load all CTIDs.  kms_get_rel_dek() for each row uses the fast
+         * shmem path (warm cache from Phase 1b), so no nested SPI.
+         */
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO tde_rot_%u SELECT ctid FROM ONLY %s",
+                 args.relid,
+                 quote_identifier(relname_for_load));
+        rc = SPI_execute(sql, false, 0);
+        if (rc != SPI_OK_INSERT)
+            ereport(ERROR,
+                    (errmsg("pg_vault_tde: rotation BGW: INSERT SELECT ctid "
+                            "failed for relid=%u (rc=%d)", args.relid, rc)));
+
+        SPI_finish();
+        PopActiveSnapshot();
+        CommitTransactionCommand();
+    }
+
+    /* Main batch loop — process CTIDs in batches from the temp table */
     for (;;)
     {
         int     fetched;
         bool    done = false;
+        /*
+         * Save CTIDs before any subsequent SPI call invalidates tuptable.
+         * Batch size is caller-controlled; cap at a safe per-iteration max.
+         */
+        ItemPointerData ctid_batch[4096];
+        int             nbatch = 0;
 
         CHECK_FOR_INTERRUPTS();
 
@@ -302,15 +417,17 @@ pg_vault_tde_rotation_bgw_main(Datum main_arg)
         PushActiveSnapshot(GetTransactionSnapshot());
         SPI_connect();
 
+        /* Pop up to batch_size CTIDs from the temp table */
         snprintf(sql, sizeof(sql),
-                 "FETCH %d FROM tde_rot_%u",
-                 args.batch_size, args.relid);
+                 "SELECT rowctid FROM tde_rot_%u LIMIT %d",
+                 args.relid, args.batch_size);
         rc = SPI_execute(sql, true, 0);
-        if (rc != SPI_OK_FETCH)
+        if (rc != SPI_OK_SELECT)
         {
             ereport(WARNING,
-                    (errmsg("pg_vault_tde: rotation BGW: FETCH failed "
-                            "for relid=%u (rc=%d)", args.relid, rc)));
+                    (errmsg("pg_vault_tde: rotation BGW: SELECT from "
+                            "temp table failed for relid=%u (rc=%d)",
+                            args.relid, rc)));
             SPI_finish();
             PopActiveSnapshot();
             AbortCurrentTransaction();
@@ -319,55 +436,92 @@ pg_vault_tde_rotation_bgw_main(Datum main_arg)
 
         fetched = (int) SPI_processed;
         if (fetched == 0)
+        {
             done = true;
+        }
         else
         {
-            /*
-             * Re-encrypt each row via a minimal UPDATE.
-             * The TAM encrypt callback will use the current DEK; the decrypt
-             * callback on the read path will transparently try both the
-             * current DEK and the prev_dek slot (multi-DEK read window).
-             *
-             * TODO: invoke pg_vault_tde_reencrypt_tuple(ctid) instead once
-             * the TAM intrinsic is implemented.
-             */
-            for (int i = 0; i < fetched; i++)
+            int         i;
+            int         batch_cap = (int) (sizeof(ctid_batch) /
+                                           sizeof(ctid_batch[0]));
+            const char *rname;
+
+            /* Cap batch at the C array size */
+            if (fetched > batch_cap)
+                fetched = batch_cap;
+
+            /* Copy CTIDs out before subsequent SPI calls clobber tuptable */
+            for (i = 0; i < fetched; i++)
             {
-                ItemPointer ctid;
-                bool        isnull;
-                Datum       d;
+                bool  isnull;
+                Datum d = SPI_getbinval(SPI_tuptable->vals[i],
+                                        SPI_tuptable->tupdesc,
+                                        1, &isnull);
+                if (isnull)
+                    ItemPointerSetInvalid(&ctid_batch[i]);
+                else
+                    ctid_batch[i] = *DatumGetItemPointer(d);
+            }
+            nbatch = fetched;
 
-                d    = SPI_getbinval(SPI_tuptable->vals[i],
-                                     SPI_tuptable->tupdesc, 1, &isnull);
-                if (isnull) continue;
-                ctid = DatumGetItemPointer(d);
-
+            rname = get_rel_name(args.relid);
+            if (rname == NULL)
+            {
+                ereport(WARNING,
+                        (errmsg("pg_vault_tde rotation BGW: relation %u "
+                                "vanished during re-encryption; stopping.",
+                                args.relid)));
+                SPI_finish();
+                PopActiveSnapshot();
+                CommitTransactionCommand();
+                done = true;
+            }
+            else
+            {
                 /*
-                 * Re-encrypt this row by performing a self-update on the
-                 * first regular column.  The TAM's tuple_update path decrypts
-                 * the row (using prev_dek if the row was written with an older
-                 * key generation) and re-encrypts it with the current DEK.
-                 * System columns are not updatable, hence first_col.
+                 * Re-encrypt each row via a self-UPDATE.  The TAM decrypt
+                 * path then re-encrypts the tuple with the current DEK.
                  */
+                for (i = 0; i < nbatch; i++)
+                {
+                    if (!ItemPointerIsValid(&ctid_batch[i]))
+                        continue;
+
+                    snprintf(sql, sizeof(sql),
+                             "UPDATE ONLY %s SET %s = %s "
+                             "WHERE ctid = '(%u,%u)'::tid",
+                             quote_identifier(rname),
+                             first_col, first_col,
+                             ItemPointerGetBlockNumber(&ctid_batch[i]),
+                             ItemPointerGetOffsetNumber(&ctid_batch[i]));
+                    SPI_execute(sql, false, 0);
+                }
+
+                /* Remove processed CTIDs from the temp table */
+                for (i = 0; i < nbatch; i++)
+                {
+                    if (!ItemPointerIsValid(&ctid_batch[i]))
+                        continue;
+
+                    snprintf(sql, sizeof(sql),
+                             "DELETE FROM tde_rot_%u "
+                             "WHERE rowctid = '(%u,%u)'::tid",
+                             args.relid,
+                             ItemPointerGetBlockNumber(&ctid_batch[i]),
+                             ItemPointerGetOffsetNumber(&ctid_batch[i]));
+                    SPI_execute(sql, false, 0);
+                }
+
+                tuples_done += nbatch;
+
+                /* Update progress row */
                 snprintf(sql, sizeof(sql),
-                         "UPDATE ONLY %s SET %s = %s "
-                         "WHERE ctid = '(%u,%u)'::tid",
-                         quote_identifier(get_rel_name(args.relid)),
-                         first_col, first_col,
-                         ItemPointerGetBlockNumber(ctid),
-                         ItemPointerGetOffsetNumber(ctid));
+                         "UPDATE pg_vault_tde_rotation_progress "
+                         "SET tuples_done = %lld, updated_at = now() "
+                         "WHERE relid = %u",
+                         (long long) tuples_done, args.relid);
                 SPI_execute(sql, false, 0);
             }
-
-            tuples_done += fetched;
-
-            /* Update progress row */
-            snprintf(sql, sizeof(sql),
-                     "UPDATE pg_vault_tde_rotation_progress "
-                     "SET tuples_done = %lld, updated_at = now() "
-                     "WHERE relid = %u",
-                     (long long) tuples_done, args.relid);
-            SPI_execute(sql, false, 0);
         }
 
         SPI_finish();
@@ -379,16 +533,16 @@ pg_vault_tde_rotation_bgw_main(Datum main_arg)
     }
 
     /*
-     * Phase 3: Finalise — mark progress row as 'done', clear prev_dek shmem
-     * slot, and evict the old catalog generation.
+     * Phase 3: Finalise — drop the temp table, mark progress row as
+     * 'complete', clear prev_dek shmem slot.
      */
     SetCurrentStatementStartTimestamp();
     StartTransactionCommand();
     PushActiveSnapshot(GetTransactionSnapshot());
     SPI_connect();
 
-    /* Close cursor */
-    snprintf(sql, sizeof(sql), "CLOSE tde_rot_%u", args.relid);
+    /* Drop temp table (best-effort; session cleanup handles it too) */
+    snprintf(sql, sizeof(sql), "DROP TABLE IF EXISTS tde_rot_%u", args.relid);
     SPI_execute(sql, false, 0);
 
     /* Mark rotation complete — tests poll for 'complete' or 'failed' */
@@ -413,4 +567,34 @@ pg_vault_tde_rotation_bgw_main(Datum main_arg)
             (errmsg("pg_vault_tde: online rotation complete for relid=%u "
                     "(%lld tuples re-encrypted)",
                     args.relid, (long long) tuples_done)));
-}
+
+    } /* end PG_TRY body */
+    PG_CATCH();
+    {
+        /*
+         * An ERROR occurred somewhere in the rotation pipeline.  Capture the
+         * error message, abort the failed transaction, then try to record
+         * status='failed' in the progress table so callers do not need to
+         * wait for a timeout.  Log the message at WARNING so it is visible
+         * even with log_min_messages=warning.
+         *
+         * If the progress-table UPDATE itself fails (e.g., because the table
+         * was dropped), we ignore the secondary error and just log the
+         * original one.
+         */
+        ErrorData  *edata = CopyErrorData();
+
+        FlushErrorState();
+
+        /* Rollback whatever transaction was active when the error fired */
+        AbortCurrentTransaction();
+
+        /* Record the failure in the progress table (best-effort) */
+        tde_bgw_record_failure(args.relid);
+
+        ereport(WARNING,
+                (errmsg("pg_vault_tde: rotation BGW failed for relid=%u: %s",
+                        args.relid, edata->message)));
+        FreeErrorData(edata);
+    }
+    PG_END_TRY();}

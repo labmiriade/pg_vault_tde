@@ -35,7 +35,12 @@ char *tde_iam_decrypt_key(const char *ciphertext, Size ciphertext_len,
 extern bool tde_iam_build_in_progress;
 
 /*
- * tde_iam_encrypt_index_datum — encrypt a bytea Datum using AES-256-SIV.
+ * tde_iam_encrypt_index_datum — encrypt a typed Datum using AES-256-SIV.
+ *
+ * Accepts the attribute type metadata (typbyval, typlen) so that
+ * pass-by-value types (int4, int8, date, timestamptz, bool …) are
+ * serialised directly from the Datum scalar, while varlena types
+ * (text, numeric, uuid, bytea …) are detoasted first.
  *
  * Called from pg_vault_tde_index_build_range_scan when
  * tde_iam_build_in_progress is true, to encrypt index key values before
@@ -44,7 +49,7 @@ extern bool tde_iam_build_in_progress;
  * Returns a new palloc'd bytea Datum.  The caller should pfree it after
  * the index tuple has been formed (i.e., after btbuildCallback returns).
  */
-Datum tde_iam_encrypt_index_datum(Datum datum);
+Datum tde_iam_encrypt_index_datum(Datum datum, bool typbyval, int16 typlen);
 
 /* Exported registration function for CREATE ACCESS METHOD */
 const IndexAmRoutine *pg_vault_tde_get_iam_routine(void);

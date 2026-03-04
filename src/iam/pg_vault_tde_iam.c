@@ -507,72 +507,123 @@ bool tde_iam_build_in_progress = false;
 /*
  * tde_iam_encrypt_index_datum
  *
- * Encrypts a bytea Datum using AES-256-SIV.
+ * Encrypts a typed Datum using AES-256-SIV.
  * Returns a new palloc'd bytea Datum with the encrypted content,
  * or the original Datum unchanged if DEK is unavailable (degraded mode).
  *
+ * typbyval / typlen must come from the relevant Form_pg_attribute so that
+ * pass-by-value types (int4, int8, date, timestamptz, bool) are serialised
+ * from the Datum scalar — NOT detoasted as varlena, which would SIGSEGV on
+ * small fixed-size types because the datum value is not a pointer.
+ *
  * Called from pg_vault_tde_index_build_range_scan (tam.c) when
- * tde_iam_build_in_progress is set, and from pg_vault_tde_aminsert for
- * individual INSERTs on an existing tde_btree index.
+ * tde_iam_build_in_progress is set, and from pg_vault_tde_aminsert /
+ * pg_vault_tde_amrescan for individual INSERTs and index scans.
  *
  * Caller is responsible for pfree'ing the result when done.
  */
 Datum
-tde_iam_encrypt_index_datum(Datum datum)
+tde_iam_encrypt_index_datum(Datum datum, bool typbyval, int16 typlen)
 {
-    bytea  *bval;
-    char   *plain;
-    Size    plen;
-    Size    enc_len = 0;
-    char   *encrypted;
-    bytea  *enc_bytea;
 
     /*
-     * PG_DETOAST_DATUM_COPY always allocates a private palloc'd copy of the
-     * decompressed/out-of-line datum in CurrentMemoryContext.  Using COPY
-     * (rather than DatumGetByteaPP which may return the original pointer)
-     * guarantees we own this memory and can safely pfree it after
-     * extracting the plaintext bytes.  This prevents use-after-free if the
-     * calling context resets or pfrees the slot tuple between iterations.
+     * Serialise the Datum to a byte array according to type storage class:
+     *
+     * typbyval=true, typlen>0 — pass-by-value scalar (int4, int8, bool …).
+     *   btree stores these directly by value (4 or 8 bytes in the IndexTuple).
+     *   We CANNOT substitute a bytea Datum because btree's heap_form_tuple
+     *   logic would store the lower N bytes of the bytea POINTER, not the
+     *   ciphertext bytes.  Index keys for these types are stored UNENCRYPTED;
+     *   the heap tuple itself is always encrypted by the TAM layer.
+     *
+     * typbyval=false, typlen>0 — fixed-length pass-by-reference (e.g. uuid).
+     *   Same constraint: btree copies exactly typlen bytes from DatumGetPointer.
+     *   We cannot change the stored size, so index keys are stored UNENCRYPTED.
+     *
+     * typbyval=false, typlen=-1 — variable-length varlena (text, numeric …).
+     *   btree stores the full varlena inline.  We can substitute an enc_bytea
+     *   varlena of different size.  AES-SIV is deterministic, so equal
+     *   plaintexts → equal ciphertexts → equality comparison still works.
+     *   THIS IS THE ONLY PATH THAT ENCRYPTS INDEX KEYS.
+     *
+     * typbyval=false, typlen=-2 — C string.  Same varlena-like treatment.
+     *
+     * Known limitation (v1.5): tde_int4_ops, tde_int8_ops, tde_uuid_ops,
+     * tde_date_ops, tde_timestamptz_ops store index keys in plaintext.
+     * The heap tuples are always encrypted by the TAM.  This limitation
+     * will be addressed in v1.6 using a separate per-column encrypted
+     * index type with CAST(int4 → bytea) at the access-method level.
      */
-    bval  = (bytea *) PG_DETOAST_DATUM_COPY(datum);
-    plain = VARDATA_ANY(bval);
-    plen  = VARSIZE_ANY_EXHDR(bval);
-
-    encrypted = tde_iam_encrypt_key(plain, plen, &enc_len);
-
-    /*
-     * bval is a palloc'd copy in the current memory context (ecxt_per_tuple_memory
-     * during index builds).  Do NOT pfree it here — the context reset at the top
-     * of the scan loop reclaims it automatically.  Manual pfree here risks
-     * double-free if the context is reset between pfree and next use.
-     */
-
-    if (encrypted == NULL)
+    if (typlen != -1 && typlen != -2)
     {
         /*
-         * DEK not available.  Log a warning and pass the plaintext through
-         * unchanged.  This means the index entry will be unencrypted; the
-         * TAM-layer encryption of the heap tuple is still intact.
+         * Fixed-size or pass-by-value type: cannot change the wire format.
+         * Return the datum unchanged; the heap is still TAM-encrypted.
          */
-        ereport(WARNING,
-                (errmsg("[IAM] DEK unavailable during index insert — "
-                        "index key stored unencrypted")));
+        ereport(DEBUG2,
+                (errmsg("[IAM] Skipping index key encryption for "
+                        "fixed-size column (typlen=%d, typbyval=%s); "
+                        "heap tuple is still encrypted by the TAM.",
+                        (int) typlen, typbyval ? "true" : "false")));
         return datum;
     }
 
-    enc_bytea = (bytea *) palloc(VARHDRSZ + enc_len);
-    SET_VARSIZE(enc_bytea, VARHDRSZ + enc_len);
-    memcpy(VARDATA(enc_bytea), encrypted, enc_len);
+    /* varlena (or C-string) path — full AES-256-SIV encryption below */
+    {
+        bytea      *bval       = NULL;
+        const char *plain;
+        Size        plen;
+        Size        enc_len    = 0;
+        char       *encrypted;
+        bytea      *enc_bytea;
 
-    OPENSSL_cleanse(encrypted, enc_len);
-    /*
-     * Do NOT pfree(encrypted) here — let ecxt_per_tuple_memory reset
-     * reclaim it.  Avoiding manual pfree prevents double-free risks
-     * when the context is reset right after this function returns.
-     */
+        if (typlen == -1)
+        {
+            /*
+             * PG_DETOAST_DATUM_COPY allocates a private palloc'd copy in
+             * CurrentMemoryContext.  Using COPY (not DatumGetByteaPP)
+             * prevents use-after-free if the calling context is reset
+             * between iterations.  The copy is reclaimed by context reset.
+             */
+            bval  = (bytea *) PG_DETOAST_DATUM_COPY(datum);
+            plain = VARDATA_ANY(bval);
+            plen  = VARSIZE_ANY_EXHDR(bval);
+        }
+        else
+        {
+            /* typlen == -2: C string */
+            plain = DatumGetCString(datum);
+            plen  = strlen(plain) + 1;   /* include null terminator */
+        }
 
-    return PointerGetDatum(enc_bytea);
+        encrypted = tde_iam_encrypt_key(plain, plen, &enc_len);
+
+        if (encrypted == NULL)
+        {
+            /*
+             * DEK not available.  Log a warning and pass the plaintext through
+             * unchanged.  This means the index entry will be unencrypted; the
+             * TAM-layer encryption of the heap tuple is still intact.
+             */
+            ereport(WARNING,
+                    (errmsg("[IAM] DEK unavailable during index insert — "
+                            "index key stored unencrypted")));
+            return datum;
+        }
+
+        enc_bytea = (bytea *) palloc(VARHDRSZ + enc_len);
+        SET_VARSIZE(enc_bytea, VARHDRSZ + enc_len);
+        memcpy(VARDATA(enc_bytea), encrypted, enc_len);
+
+        OPENSSL_cleanse(encrypted, enc_len);
+        /*
+         * Do NOT pfree(encrypted) here — let ecxt_per_tuple_memory reset
+         * reclaim it.  Avoiding manual pfree prevents double-free risks
+         * when the context is reset right after this function returns.
+         */
+
+        return PointerGetDatum(enc_bytea);
+    }
 }
 
 /* ── BUILD CALLBACK ─────────────────────────────────────────────────────── */
@@ -647,13 +698,21 @@ pg_vault_tde_aminsert(Relation index, Datum *values, bool *isnull,
 
     memcpy(enc_isnull, isnull, ncols * sizeof(bool));
 
-    /* Encrypt each non-null bytea indexed column */
+    /* Encrypt each non-null indexed column */
     for (i = 0; i < ncols; i++)
     {
         if (isnull[i])
+        {
             enc_values[i] = (Datum) 0;
+        }
         else
-            enc_values[i] = tde_iam_encrypt_index_datum(values[i]);
+        {
+            Form_pg_attribute att = TupleDescAttr(index->rd_att, i);
+
+            enc_values[i] = tde_iam_encrypt_index_datum(values[i],
+                                                         att->attbyval,
+                                                         att->attlen);
+        }
     }
 
     return saved_btree_methods.aminsert(index, enc_values, enc_isnull,
@@ -701,8 +760,18 @@ pg_vault_tde_amrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
             if ((keys[i].sk_flags & SK_ISNULL) == 0 &&
                 keys[i].sk_strategy == BTEqualStrategyNumber)
             {
+                Form_pg_attribute att;
+
+                /*
+                 * sk_attno is the 1-based index column number; convert to
+                 * 0-based to index rd_att for this index's attribute descriptor.
+                 */
+                att = TupleDescAttr(scan->indexRelation->rd_att,
+                                    keys[i].sk_attno - 1);
                 keys[i].sk_argument =
-                    tde_iam_encrypt_index_datum(keys[i].sk_argument);
+                    tde_iam_encrypt_index_datum(keys[i].sk_argument,
+                                                att->attbyval,
+                                                att->attlen);
             }
         }
     }

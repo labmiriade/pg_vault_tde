@@ -705,7 +705,14 @@ pg_vault_tde_index_build_range_scan(Relation heap_rel,
                 for (kcol = 0; kcol < nbuildcols; kcol++)
                 {
                     if (!enc_isnull[kcol])
-                        enc_values[kcol] = tde_iam_encrypt_index_datum(enc_values[kcol]);
+                    {
+                        Form_pg_attribute att = TupleDescAttr(index_rel->rd_att, kcol);
+
+                        enc_values[kcol] = tde_iam_encrypt_index_datum(
+                                               enc_values[kcol],
+                                               att->attbyval,
+                                               att->attlen);
+                    }
                 }
 
                 MemoryContextSwitchTo(oldcxt);

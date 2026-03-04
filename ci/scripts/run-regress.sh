@@ -31,8 +31,6 @@ container_psql "$CONTAINER" -c \
 # Copy fresh regression SQL (in case image is cached with old version)
 $RT cp "$REPO_ROOT/sql/regression_test.sql"    "$CONTAINER:/tmp/regression_test.sql"
 $RT cp "$REPO_ROOT/sql/regression_test_v15.sql" "$CONTAINER:/tmp/regression_test_v15.sql"
-$RT cp "$REPO_ROOT/sql/pg_vault_tde--1.4--1.5.sql" \
-        "$CONTAINER:/tmp/pg_vault_tde--1.4--1.5.sql"
 
 # ── Phase 1: v1.4 baseline (52 tests) ────────────────────────────────────
 log_info "Running v1.4 regression_test.sql (52 tests) ..."
@@ -45,16 +43,19 @@ if ! container_psql "$CONTAINER" -f /tmp/regression_test.sql; then
 fi
 log_ok "v1.4 baseline: ALL 52 TESTS PASSED ($(timer_fmt "$(timer_elapsed "$START")"))"
 
-# ── Phase 2: Apply v1.4 → v1.5 upgrade ──────────────────────────────────
-log_info "Applying v1.4 → v1.5 upgrade script ..."
-if ! container_psql "$CONTAINER" -f /tmp/pg_vault_tde--1.4--1.5.sql; then
-    log_error "REGRESSION: v1.4→v1.5 upgrade script FAILED"
+# ── Phase 2: Apply v1.4 → v1.5 upgrade via extension mechanism ──────────────────
+# Use ALTER EXTENSION UPDATE so PostgreSQL reads the installed upgrade
+# script from $sharedir/extension/ where MODULE_PATHNAME has already
+# been substituted by 'make install' (build stage in pg-test.Containerfile).
+# The upgrade chain 1.0 → 1.4 → 1.5 is resolved automatically by PG.
+log_info "Upgrading pg_vault_tde 1.0 → 1.5 (ALTER EXTENSION UPDATE) ..."
+if ! container_psql "$CONTAINER" -v ON_ERROR_STOP=1 -c \
+        "ALTER EXTENSION pg_vault_tde UPDATE TO '1.5';"; then
+    log_error "REGRESSION: pg_vault_tde 1.0→1.5 upgrade FAILED"
     $RT logs "$CONTAINER" --tail 50 2>/dev/null || true
     exit 2
 fi
-log_info "Installing v1.5 upgrade into extension catalog ..."
-container_psql "$CONTAINER" -c \
-    "ALTER EXTENSION pg_vault_tde UPDATE TO '1.5';" 2>/dev/null || true
+log_ok "pg_vault_tde upgraded to v1.5"
 
 # ── Phase 3: v1.5 TDD tests (20 tests, numbers 53-72) ───────────────────
 log_info "Running v1.5 TDD regression_test_v15.sql (tests 53-72) ..."
