@@ -19,6 +19,33 @@ char *tde_iam_encrypt_key(const char *plaintext, Size plaintext_len,
 char *tde_iam_decrypt_key(const char *ciphertext, Size ciphertext_len,
                           Size *out_len);
 
+/*
+ * tde_iam_build_in_progress — process-local flag coordinating index build.
+ *
+ * Set to true by pg_vault_tde_ambuild (iam.c) before calling
+ * saved_btree_am->ambuild, cleared after it returns.  PostgreSQL is
+ * multi-process (not multi-thread), so this backend-local variable is
+ * safe for the synchronous ambuild call chain.
+ *
+ * pg_vault_tde_index_build_range_scan (tam.c) reads this flag to decide
+ * whether to encrypt index key values before passing them to the btree
+ * build callback (btbuildCallback).  This ensures consistency between
+ * the bulk-built index entries and those inserted via aminsert.
+ */
+extern bool tde_iam_build_in_progress;
+
+/*
+ * tde_iam_encrypt_index_datum — encrypt a bytea Datum using AES-256-SIV.
+ *
+ * Called from pg_vault_tde_index_build_range_scan when
+ * tde_iam_build_in_progress is true, to encrypt index key values before
+ * they reach btree's internal spool.
+ *
+ * Returns a new palloc'd bytea Datum.  The caller should pfree it after
+ * the index tuple has been formed (i.e., after btbuildCallback returns).
+ */
+Datum tde_iam_encrypt_index_datum(Datum datum);
+
 /* Exported registration function for CREATE ACCESS METHOD */
 const IndexAmRoutine *pg_vault_tde_get_iam_routine(void);
 

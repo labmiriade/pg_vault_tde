@@ -32,17 +32,43 @@
 #define TDE_V2_OVERHEAD      (1 + TDE_V2_GEN_LEN + TDE_GCM_IV_LEN + TDE_GCM_TAG_LEN)
 
 /*
- * Encrypt plaintext_len bytes. Returns palloc'd [IV|CT|TAG] buffer.
+ * Wire format v3 constants (v1.5+):
+ *   [VERSION(1=0x03) | GENERATION(8) | IV(12) | CIPHERTEXT | TAG(16)]
+ *
+ * Identical structure to v2.  The only difference is VERSION = 0x03, which
+ * signals that GCM Additional Authenticated Data (AAD) was applied at
+ * encrypt time.  The AAD is:
+ *   [MyDatabaseId(4 LE) | relid(4 LE) | generation(8 LE)]  = 16 bytes
+ *
+ * The AAD is NOT stored in the wire format (zero overhead); it is
+ * recomputed from the stored GENERATION and the current database/relid.
+ * Cross-table ciphertext paste attacks are detected because the recomputed
+ * AAD will differ, causing GCM tag authentication to fail.
+ *
+ * Backward compatibility:
+ *   v3 tuples: apply AAD in decrypt
+ *   v2 tuples: skip AAD (v1.4 legacy, AAD was not set at encrypt)
+ *   v1 tuples: skip AAD and v2 header (completely legacy path)
+ */
+#define TDE_V3_VERSION_BYTE  ((unsigned char) 0x03u)
+#define TDE_V3_AAD_LEN       16  /* 4 (dboid) + 4 (relid) + 8 (generation) */
+/* TDE_V3_OVERHEAD is the same as TDE_V2_OVERHEAD; no new wire bytes */
+
+/*
+ * Encrypt plaintext_len bytes using the DEK for the given relation.
+ * relid == InvalidOid selects the v1.4 global DEK (backward compat).
+ * Returns palloc'd [VERSION|GEN|IV|CT|TAG] buffer (v2 wire format).
  * Caller MUST: OPENSSL_cleanse(buf, out_len); pfree(buf);
  */
-char *tde_gcm_encrypt(const char *plaintext, Size plaintext_len,
+char *tde_gcm_encrypt(Oid relid, const char *plaintext, Size plaintext_len,
                       Size *out_len);
 
 /*
  * Decrypt a buffer produced by tde_gcm_encrypt. Verifies GCM tag.
+ * relid == InvalidOid selects the v1.4 global DEK (backward compat).
  * Returns palloc'd plaintext. Caller MUST: OPENSSL_cleanse + pfree.
  */
-char *tde_gcm_decrypt(const char *ciphertext, Size ciphertext_len,
+char *tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len,
                       Size *out_len);
 
 /*

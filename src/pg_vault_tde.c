@@ -6,6 +6,7 @@
  */
 #include "postgres.h"
 #include "fmgr.h"
+#include "access/relation.h"    /* try_relation_open / relation_close */
 #include "access/tableam.h"
 #include "catalog/namespace.h"
 #include "commands/defrem.h"
@@ -232,6 +233,7 @@ tde_process_utility_hook(PlannedStmt *pstmt,
         Oid         relid;
         char        sql[512];
         int         rc;
+        Oid         public_ns;
 
         relid = RangeVarGetRelid(stmt->relation, NoLock, true /* missing_ok */);
         if (!OidIsValid(relid))
@@ -241,6 +243,24 @@ tde_process_utility_hook(PlannedStmt *pstmt,
                             "encrypted_heap relation '%s' for catalog "
                             "registration",
                             stmt->relation->relname)));
+            return;
+        }
+
+        /*
+         * Guard: pg_vault_tde_catalog is created by the v1.5 upgrade script
+         * (pg_vault_tde--1.4--1.5.sql).  On a v1.0 deployment that has not
+         * yet been upgraded, the table does not exist and we skip the INSERT
+         * gracefully.  Encrypted tables still work using the global DEK.
+         */
+        public_ns = get_namespace_oid("public", true /* missing_ok */);
+        if (!OidIsValid(public_ns) ||
+            !OidIsValid(get_relname_relid("pg_vault_tde_catalog", public_ns)))
+        {
+            ereport(DEBUG1,
+                    (errmsg("pg_vault_tde: skipping per-table DEK registration "
+                            "for relid=%u (pg_vault_tde_catalog not found; "
+                            "upgrade to v1.5 to enable per-table DEK isolation)",
+                            relid)));
             return;
         }
 
@@ -281,8 +301,21 @@ tde_process_utility_hook(PlannedStmt *pstmt,
     if (drop_encrypted_oids != NIL)
     {
         ListCell *lc;
+        Oid       public_ns;
+        bool      catalog_exists;
 
-        SPI_connect();
+        /*
+         * Check once whether pg_vault_tde_catalog exists (v1.5+ only).
+         * On pre-v1.5 deployments the table is absent and we skip the DELETE,
+         * but still evict the shmem DEK cache entries.
+         */
+        public_ns      = get_namespace_oid("public", true);
+        catalog_exists = OidIsValid(public_ns) &&
+                         OidIsValid(get_relname_relid("pg_vault_tde_catalog",
+                                                      public_ns));
+
+        if (catalog_exists)
+            SPI_connect();
 
         foreach(lc, drop_encrypted_oids)
         {
@@ -290,15 +323,18 @@ tde_process_utility_hook(PlannedStmt *pstmt,
             char        sql[256];
             int         rc;
 
-            snprintf(sql, sizeof(sql),
-                     "DELETE FROM pg_vault_tde_catalog WHERE relid = %u",
-                     relid);
-            rc = SPI_execute(sql, false, 0);
-            if (rc < 0)
-                ereport(WARNING,
-                        (errmsg("pg_vault_tde: could not remove catalog "
-                                "entry for dropped relation %u (SPI rc=%d)",
-                                relid, rc)));
+            if (catalog_exists)
+            {
+                snprintf(sql, sizeof(sql),
+                         "DELETE FROM pg_vault_tde_catalog WHERE relid = %u",
+                         relid);
+                rc = SPI_execute(sql, false, 0);
+                if (rc < 0)
+                    ereport(WARNING,
+                            (errmsg("pg_vault_tde: could not remove catalog "
+                                    "entry for dropped relation %u (SPI rc=%d)",
+                                    relid, rc)));
+            }
 
             /* Evict shmem slot — this holds the LWLock briefly */
             pg_vault_tde_catalog_evict_rel(relid);
@@ -308,7 +344,8 @@ tde_process_utility_hook(PlannedStmt *pstmt,
                             "DEK catalog", relid)));
         }
 
-        SPI_finish();
+        if (catalog_exists)
+            SPI_finish();
         list_free(drop_encrypted_oids);
     }
 }

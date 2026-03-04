@@ -44,6 +44,8 @@
 #include "utils/memutils.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
+#include "utils/lsyscache.h"     /* get_relname_relid */
+#include "catalog/namespace.h"  /* get_namespace_oid */
 #include "postmaster/postmaster.h"
 
 #include <openssl/crypto.h>     /* OPENSSL_cleanse */
@@ -124,8 +126,15 @@ pg_vault_tde_catalog_shmem_init(void)
          * virtual-address pointer.
          */
         MemSet(rel_dek_cache, 0, seg_size);
-        LWLockInitialize(&rel_dek_cache->lock,
-                         GetNamedLWLockTranche("TdeRelDekCache"));
+        {
+            /*
+             * GetNamedLWLockTranche returns a LWLockPadded array; extract the
+             * tranche ID from the first slot to initialise our embedded lock.
+             */
+            LWLockPadded *named_locks = GetNamedLWLockTranche("TdeRelDekCache");
+            LWLockInitialize(&rel_dek_cache->lock,
+                             named_locks[0].lock.tranche);
+        }
         rel_dek_cache->capacity = capacity;
         rel_dek_cache->used     = 0;
     }
@@ -206,6 +215,24 @@ pg_vault_tde_kms_get_rel_dek(Oid relid,
         int           wrapped_len;
         unsigned char dek_temp[TDE_DEK_LEN];
         bool          unwrap_ok;
+
+        /*
+         * Guard: pg_vault_tde_catalog only exists after the v1.4→v1.5
+         * upgrade.  On vanilla v1.0/v1.4 deployments the table is absent;
+         * fall back to the global DEK rather than throwing an ERROR.
+         */
+        {
+            Oid  pub_ns = get_namespace_oid("public", true /* missing_ok */);
+
+            if (!OidIsValid(pub_ns) ||
+                !OidIsValid(get_relname_relid("pg_vault_tde_catalog", pub_ns)))
+            {
+                ereport(DEBUG1,
+                        errmsg("pg_vault_tde: catalog table absent, "
+                               "using global DEK for relid=%u", relid));
+                return pg_vault_tde_kms_get_dek((char *) dek_out, dek_len);
+            }
+        }
 
         if (SPI_connect() != SPI_OK_CONNECT)
         {
@@ -369,7 +396,16 @@ pg_vault_tde_kms_get_rel_prev_dek(Oid relid,
     }
     LWLockRelease(&rel_dek_cache->lock);
 
-    return found;
+    if (found)
+        return true;
+
+    /*
+     * Per-table prev_dek not found (relid has no catalog entry — v1.4 table
+     * using the global DEK).  Fall back to the global prev_dek stored in
+     * TdeKmsShmem; this handles the reencrypt_table() path where the caller
+     * rotated the global DEK and now needs to re-read old-DEK rows.
+     */
+    return pg_vault_tde_kms_get_prev_dek((char *) prev_dek_out, dek_len);
 }
 
 /* -------------------------------------------------------------------------
@@ -481,8 +517,6 @@ pg_vault_tde_catalog_register_rel(Oid relid, const char *vault_key_name)
 void
 pg_vault_tde_catalog_deregister_rel(Oid relid)
 {
-    int i;
-
     /* Evict from shmem cache with OPENSSL_cleanse */
     pg_vault_tde_catalog_evict_rel(relid);
 

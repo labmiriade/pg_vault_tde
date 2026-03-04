@@ -36,7 +36,7 @@
 #include <openssl/pkcs12.h>
 #include <openssl/x509.h>
 #include <openssl/err.h>
-#include <openssl/wrap.h>   /* AES-256-WRAP */
+#include <openssl/aes.h>    /* AES_wrap_key / AES_unwrap_key (legacy), AES_WRAP */
 #include <openssl/crypto.h>
 
 #include <sys/stat.h>
@@ -243,27 +243,9 @@ local_wrap_dek(const unsigned char *dek, int dek_len,
     OPENSSL_cleanse(pass, sizeof(pass));
 
     /*
-     * AES-256-WRAP (RFC 3394) requires that output is exactly
-     * plaintext_len + 8 bytes.  The caller must supply a buffer of at
-     * least LOCAL_WRAPPED_DEK_LEN bytes.
-     */
-    wrap_len = AES_wrap_key(NULL,   /* use default IV */
-                            NULL,   /* default IV pointer */
-                            (unsigned char *) wrapped_out,
-                            dek,
-                            dek_len);
-
-    /*
-     * AES_wrap_key is the legacy OpenSSL API.  For OpenSSL 3.x we use the
-     * EVP_CIPHER-based wrap:
-     *
-     *   EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-     *   EVP_EncryptInit_ex2(ctx, EVP_aes_256_wrap(), kek, NULL, NULL);
-     *   EVP_EncryptUpdate(ctx, wrapped_out, &wrap_len, dek, dek_len);
-     *   EVP_EncryptFinal_ex(ctx, wrapped_out + wrap_len, &final_len);
-     *   EVP_CIPHER_CTX_free(ctx);
-     *
-     * The OpenSSL 3.x EVP path is preferred; we use it here:
+     * AES-256-WRAP (RFC 3394) via OpenSSL 3.x EVP interface.
+     * EVP_aes_256_wrap() uses the default IV 0xA6A6A6A6A6A6A6A6.
+     * Output is always plaintext_len + 8 = LOCAL_WRAPPED_DEK_LEN bytes.
      */
     {
         EVP_CIPHER_CTX *ctx;
@@ -675,28 +657,31 @@ pg_vault_tde_wallet_init_sql(PG_FUNCTION_ARGS)
      *
      * We pass NULL for pkey/cert/ca — passphrase-only bag.
      */
-    p12 = PKCS12_create_ex2(passphrase,
-                             "pg_vault_tde wallet",
-                             NULL,      /* no private key */
-                             NULL,      /* no certificate */
-                             NULL,      /* no CA chain */
-                             NID_aes_256_cbc,   /* nid_key */
-                             NID_aes_256_cbc,   /* nid_cert */
-                             PKCS12_DEFAULT_ITER,   /* iter */
-                             PKCS12_DEFAULT_ITER,   /* maciter */
-                             0,         /* default keytype */
-                             NULL,      /* libctx */
-                             NULL,      /* propq */
-                             NULL,      /* cb */
-                             NULL       /* cbarg */
-                             );
+    /*
+     * PKCS12_create_ex2 was introduced in OpenSSL 3.3+.  We use
+     * PKCS12_create_ex which is available in OpenSSL 3.0+ and provides
+     * the same functionality (libctx / propq parameters, no callback).
+     */
+    p12 = PKCS12_create_ex(passphrase,
+                            "pg_vault_tde wallet",
+                            NULL,      /* no private key */
+                            NULL,      /* no certificate */
+                            NULL,      /* no CA chain */
+                            NID_aes_256_cbc,       /* nid_key */
+                            NID_aes_256_cbc,       /* nid_cert */
+                            PKCS12_DEFAULT_ITER,   /* iter */
+                            PKCS12_DEFAULT_ITER,   /* maciter */
+                            0,                     /* default keytype */
+                            NULL,                  /* libctx */
+                            NULL                   /* propq */
+                            );
 
     if (!p12)
     {
         OPENSSL_cleanse(passphrase, strlen(passphrase));
         pfree(passphrase);
         ereport(ERROR,
-                errmsg("pg_vault_tde: PKCS12_create_ex2 failed: %s",
+                errmsg("pg_vault_tde: PKCS12_create_ex failed: %s",
                        ERR_reason_error_string(ERR_get_error())));
     }
 

@@ -59,17 +59,17 @@
  * @returns            palloc'd encrypted buffer; caller cleans up
  */
 char *
-tde_toast_encrypt_chunk(const char *chunk_data, Size chunk_len, Size *out_len)
+tde_toast_encrypt_chunk(Oid parent_relid, const char *chunk_data, Size chunk_len, Size *out_len)
 {
     Assert(chunk_data != NULL);
     Assert(chunk_len > 0 && chunk_len <= TOAST_MAX_CHUNK_SIZE);
 
     /*
-     * Delegate to the shared AES-256-GCM primitive.  The [IV|CT|TAG] wire
-     * format is self-contained, so each chunk carries its own IV; no
-     * external IV storage or sequencing is needed.
+     * Delegate to the shared AES-256-GCM primitive with the parent
+     * relation's DEK.  The [VERSION|GEN|IV|CT|TAG] wire format is
+     * self-contained: each chunk carries its own IV.
      */
-    return tde_gcm_encrypt(chunk_data, chunk_len, out_len);
+    return tde_gcm_encrypt(parent_relid, chunk_data, chunk_len, out_len);
 }
 
 /*
@@ -85,38 +85,30 @@ tde_toast_encrypt_chunk(const char *chunk_data, Size chunk_len, Size *out_len)
  * @returns            palloc'd plaintext chunk; caller cleans up
  */
 char *
-tde_toast_decrypt_chunk(const char *enc_data, Size enc_len, Size *out_len)
+tde_toast_decrypt_chunk(Oid parent_relid, const char *enc_data, Size enc_len, Size *out_len)
 {
     Assert(enc_data != NULL);
     Assert(enc_len > TDE_GCM_OVERHEAD);
 
-    return tde_gcm_decrypt(enc_data, enc_len, out_len);
+    return tde_gcm_decrypt(parent_relid, enc_data, enc_len, out_len);
 }
 
 /*
- * tde_toast_reassemble
+ * TOAST read path note:
  *
- * Reassembles and decrypts an external TOAST value from its chunks.
- * Iterates over the chunk sequence in the TOAST table, decrypts each one,
- * and concatenates them into a single palloc'd plaintext Datum.
+ * An explicit tde_toast_reassemble() function is NOT required.  When the
+ * TOAST table uses encrypted_heap AM (pg_vault_tde.toast_encryption = on),
+ * the standard PG read path already decrypts chunks transparently:
  *
- * This is the entry point called from our TAM's detoasting path, replacing
- * the standard toast_fetch_datum() for TDE-encrypted TOAST tables.
+ *   heap_fetch_toast_slice(toastrel, ...)
+ *     └─ systable_beginscan_ordered(toastrel, toastidx, ...)
+ *          └─ index_getnext_slot()
+ *               └─ table_index_fetch_tuple()          ← dispatches via rd_tableam
+ *                    └─ tde_index_fetch_tuple()        ← our TAM override
+ *                         └─ decode_slot()             ← decrypts each chunk tuple
+ *                              └─ tde_decrypt_heap_tuple(chunk, toastrel_oid)
  *
- * NOTE: This is a skeleton.  Full implementation requires knowing the TOAST
- * table OID from the external varattrib pointer, iterating its tuples via
- * table_beginscan/table_getnextslot (using the TDE TAM), and concatenating
- * the decrypted chunks.  This will be fleshed out in a subsequent step.
+ * Each TOAST chunk tuple is decrypted before fastgetattr() extracts
+ * chunk_data, so heap_fetch_toast_slice reassembles plaintext chunks
+ * into the final Datum without any TDE-specific logic at its level.
  */
-Datum
-tde_toast_reassemble(varattrib_4b *attr)
-{
-    /*
-     * TODO: extract TOAST table OID and chunk sequence from attr;
-     * iterate chunks via table scan; decrypt each via tde_toast_decrypt_chunk;
-     * palloc and assemble final Datum.
-     */
-    ereport(DEBUG1,
-            (errmsg("[TOAST] tde_toast_reassemble called (skeleton)")));
-    return PointerGetDatum(NULL); /* placeholder */
-}

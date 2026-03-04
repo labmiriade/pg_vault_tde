@@ -159,11 +159,13 @@ tde_backup_encrypt_block(const char *block_data, Size block_len,
     Assert(block_len > 0 && block_len <= TDE_BACKUP_BLOCK_SIZE);
 
     /*
+     * Backup blocks are not table-scoped, so we use InvalidOid which selects
+     * the v1.4 global DEK.  A per-table backup DEK (v1.7) will pass the
+     * correct relid once the backup bundle format is redesigned.
      * TODO: pass block_seq as GCM AAD via EVP_EncryptUpdate with a NULL
      * output pointer (standard GCM AAD pattern) before encrypting payload.
-     * For now delegate to the generic primitive.
      */
-    encrypted = tde_gcm_encrypt(block_data, block_len, &enc_len);
+    encrypted = tde_gcm_encrypt(InvalidOid, block_data, block_len, &enc_len);
 
     memcpy(out_buf, encrypted, enc_len);
     *out_len = enc_len;

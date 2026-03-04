@@ -157,6 +157,13 @@ pg_vault_tde_rotation_bgw_main(Datum main_arg)
     int             rc;
     int64           tuples_done    = 0;
     int64           tuples_total   = 0;
+    /*
+     * Name of the first non-dropped user column, quoted for SQL injection
+     * safety.  Used in the per-row re-encryption UPDATE — a self-update of any
+     * regular column forces a full TAM round-trip (decrypt + re-encrypt).
+     * System columns (tableoid, xmin, …) are NOT updatable via regular SQL.
+     */
+    char            first_col[2 * NAMEDATALEN + 8] = "";
 
     /* Copy args from bgw_extra (safe: we set it above) */
     memcpy(&args, MyBgworkerEntry->bgw_extra, sizeof(args));
@@ -206,6 +213,29 @@ pg_vault_tde_rotation_bgw_main(Datum main_arg)
         ereport(WARNING,
                 (errmsg("pg_vault_tde: rotation BGW: could not upsert "
                         "rotation_progress for relid=%u", args.relid)));
+
+    /*
+     * Determine the first non-dropped regular column for the per-row
+     * re-encryption UPDATE.  We need at least one updatable column; every
+     * user-visible table has at least one (attnum > 0, not dropped).
+     */
+    snprintf(sql, sizeof(sql),
+             "SELECT quote_ident(attname) "
+             "FROM pg_attribute "
+             "WHERE attrelid = %u AND attnum > 0 AND NOT attisdropped "
+             "ORDER BY attnum LIMIT 1",
+             args.relid);
+    rc = SPI_execute(sql, true, 1);
+    if (rc == SPI_OK_SELECT && SPI_processed == 1)
+    {
+        bool isnull;
+        Datum d = SPI_getbinval(SPI_tuptable->vals[0],
+                                SPI_tuptable->tupdesc, 1, &isnull);
+        if (!isnull)
+            strlcpy(first_col, TextDatumGetCString(d), sizeof(first_col));
+    }
+    if (first_col[0] == '\0')
+        strlcpy(first_col, "tableoid", sizeof(first_col)); /* last-resort fallback */
 
     SPI_finish();
     PopActiveSnapshot();
@@ -312,10 +342,18 @@ pg_vault_tde_rotation_bgw_main(Datum main_arg)
                 if (isnull) continue;
                 ctid = DatumGetItemPointer(d);
 
+                /*
+                 * Re-encrypt this row by performing a self-update on the
+                 * first regular column.  The TAM's tuple_update path decrypts
+                 * the row (using prev_dek if the row was written with an older
+                 * key generation) and re-encrypts it with the current DEK.
+                 * System columns are not updatable, hence first_col.
+                 */
                 snprintf(sql, sizeof(sql),
-                         "UPDATE ONLY %s SET tableoid = tableoid "
+                         "UPDATE ONLY %s SET %s = %s "
                          "WHERE ctid = '(%u,%u)'::tid",
                          quote_identifier(get_rel_name(args.relid)),
+                         first_col, first_col,
                          ItemPointerGetBlockNumber(ctid),
                          ItemPointerGetOffsetNumber(ctid));
                 SPI_execute(sql, false, 0);
@@ -353,10 +391,10 @@ pg_vault_tde_rotation_bgw_main(Datum main_arg)
     snprintf(sql, sizeof(sql), "CLOSE tde_rot_%u", args.relid);
     SPI_execute(sql, false, 0);
 
-    /* Mark rotation complete */
+    /* Mark rotation complete — tests poll for 'complete' or 'failed' */
     snprintf(sql, sizeof(sql),
              "UPDATE pg_vault_tde_rotation_progress "
-             "SET status = 'done', updated_at = now() "
+             "SET status = 'complete', updated_at = now() "
              "WHERE relid = %u",
              args.relid);
     SPI_execute(sql, false, 0);

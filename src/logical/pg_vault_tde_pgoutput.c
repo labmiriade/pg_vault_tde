@@ -150,43 +150,55 @@ tde_output_change_cb(LogicalDecodingContext *ctx,
      * We decrypt and replace the pointer so downstream consumers see
      * plaintext data.
      */
-    switch (change->action)
     {
-        case REORDER_BUFFER_CHANGE_INSERT:
-            if (change->data.tp.newtuple != NULL)
-            {
-                HeapTuple plain = tde_decrypt_heap_tuple(change->data.tp.newtuple);
-                pfree(change->data.tp.newtuple);
-                change->data.tp.newtuple = plain;
-            }
-            break;
+        /*
+         * Per-table DEK (v1.5): pass the source relation OID so the crypto
+         * layer can select the correct DEK from the per-table cache.
+         */
+        Oid src_relid = RelationGetRelid(relation);
 
-        case REORDER_BUFFER_CHANGE_UPDATE:
-            if (change->data.tp.newtuple != NULL)
-            {
-                HeapTuple plain = tde_decrypt_heap_tuple(change->data.tp.newtuple);
-                pfree(change->data.tp.newtuple);
-                change->data.tp.newtuple = plain;
-            }
-            if (change->data.tp.oldtuple != NULL)
-            {
-                HeapTuple plain = tde_decrypt_heap_tuple(change->data.tp.oldtuple);
-                pfree(change->data.tp.oldtuple);
-                change->data.tp.oldtuple = plain;
-            }
-            break;
+        switch (change->action)
+        {
+            case REORDER_BUFFER_CHANGE_INSERT:
+                if (change->data.tp.newtuple != NULL)
+                {
+                    HeapTuple plain = tde_decrypt_heap_tuple(change->data.tp.newtuple,
+                                                             src_relid);
+                    pfree(change->data.tp.newtuple);
+                    change->data.tp.newtuple = plain;
+                }
+                break;
 
-        case REORDER_BUFFER_CHANGE_DELETE:
-            if (change->data.tp.oldtuple != NULL)
-            {
-                HeapTuple plain = tde_decrypt_heap_tuple(change->data.tp.oldtuple);
-                pfree(change->data.tp.oldtuple);
-                change->data.tp.oldtuple = plain;
-            }
-            break;
+            case REORDER_BUFFER_CHANGE_UPDATE:
+                if (change->data.tp.newtuple != NULL)
+                {
+                    HeapTuple plain = tde_decrypt_heap_tuple(change->data.tp.newtuple,
+                                                             src_relid);
+                    pfree(change->data.tp.newtuple);
+                    change->data.tp.newtuple = plain;
+                }
+                if (change->data.tp.oldtuple != NULL)
+                {
+                    HeapTuple plain = tde_decrypt_heap_tuple(change->data.tp.oldtuple,
+                                                             src_relid);
+                    pfree(change->data.tp.oldtuple);
+                    change->data.tp.oldtuple = plain;
+                }
+                break;
 
-        default:
-            /* Other change types (e.g., TRUNCATE) — nothing to decrypt */
-            break;
+            case REORDER_BUFFER_CHANGE_DELETE:
+                if (change->data.tp.oldtuple != NULL)
+                {
+                    HeapTuple plain = tde_decrypt_heap_tuple(change->data.tp.oldtuple,
+                                                             src_relid);
+                    pfree(change->data.tp.oldtuple);
+                    change->data.tp.oldtuple = plain;
+                }
+                break;
+
+            default:
+                /* Other change types (e.g., TRUNCATE) — nothing to decrypt */
+                break;
+        }
     }
 }

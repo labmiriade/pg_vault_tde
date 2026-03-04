@@ -37,6 +37,7 @@
 #include "executor/executor.h"      /* CreateExecutorState, FreeExecutorState,
                                        GetPerTupleExprContext */
 #include "catalog/pg_am_d.h"        /* HEAP_TABLE_AM_OID */
+#include "commands/defrem.h"        /* get_table_am_oid — used by toast_am */
 #include "utils/rel.h"              /* RelationGetRelid */
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"          /* GetLatestSnapshot, RegisterSnapshot,
@@ -47,6 +48,8 @@
                                                   TDE_GCM_OVERHEAD */
 #include "src/include/pg_vault_tde_tam.h"
 #include "src/include/pg_vault_tde_guc.h"      /* pg_vault_tde_enabled */
+#include "src/include/pg_vault_tde_iam.h"      /* tde_iam_build_in_progress,
+                                                  tde_iam_encrypt_index_datum */
 
 #include <openssl/crypto.h>         /* OPENSSL_cleanse */
 #include <string.h>                 /* memcpy */
@@ -133,7 +136,7 @@ static TM_Result  (*heapam_tuple_lock_cb)(Relation, ItemPointer, Snapshot,
  * Caller must pfree the returned tuple; no need to cleanse (it is ciphertext).
  */
 static HeapTuple
-tde_encrypt_heap_tuple(HeapTuple plain)
+tde_encrypt_heap_tuple(HeapTuple plain, Oid relid)
 {
     Size        hdr_len   = plain->t_data->t_hoff;
     char       *user_data = (char *) plain->t_data + hdr_len;
@@ -161,7 +164,7 @@ tde_encrypt_heap_tuple(HeapTuple plain)
         return copy;
     }
 
-    enc_buf = tde_gcm_encrypt(user_data, user_len, &enc_len);
+    enc_buf = tde_gcm_encrypt(relid, user_data, user_len, &enc_len);
     Assert(enc_len == user_len + TDE_GCM_OVERHEAD);
 
     enc = (HeapTuple) palloc0(HEAPTUPLESIZE + hdr_len + enc_len);
@@ -192,7 +195,7 @@ tde_encrypt_heap_tuple(HeapTuple plain)
  * WAL-sourced tuples from encrypted_heap relations.
  */
 HeapTuple
-tde_decrypt_heap_tuple(HeapTuple enc)
+tde_decrypt_heap_tuple(HeapTuple enc, Oid relid)
 {
     Size        hdr_len   = enc->t_data->t_hoff;
     char       *enc_data  = (char *) enc->t_data + hdr_len;
@@ -217,7 +220,7 @@ tde_decrypt_heap_tuple(HeapTuple enc)
                  errmsg("pg_vault_tde: encrypted tuple too short (%zu bytes)",
                         enc_len)));
 
-    pt_buf = tde_gcm_decrypt(enc_data, enc_len, &pt_len);
+    pt_buf = tde_gcm_decrypt(relid, enc_data, enc_len, &pt_len);
     Assert(pt_len == enc_len - TDE_GCM_OVERHEAD);
 
     plain = (HeapTuple) palloc0(HEAPTUPLESIZE + hdr_len + pt_len);
@@ -288,7 +291,16 @@ pg_vault_tde_decode_slot(TupleTableSlot *slot)
     ExecClearTuple(slot);
 
     /* Decrypt (verifies GCM tag; ereport(ERROR) on tamper) */
-    plain = tde_decrypt_heap_tuple(enc_copy);
+    /*
+     * Extract the relation OID from the encrypted tuple copy.
+     * heapam sets t_tableOid = RelationGetRelid(scan->rs_rd) when filling
+     * slots during a heap scan, so this is valid here (buffer still pinned
+     * when heap_copytuple runs above).
+     * For tuples from index scans, t_tableOid is also set by heap_hot_search_buffer.
+     * Fall back to InvalidOid for legacy v1.4 global-DEK tables.
+     */
+    plain = tde_decrypt_heap_tuple(enc_copy, enc_copy->t_tableOid);
+
     pfree(enc_copy);
 
     /* Stamp physical address onto decrypted tuple */
@@ -304,6 +316,7 @@ pg_vault_tde_decode_slot(TupleTableSlot *slot)
      * We must set tts_tid manually after the call.
      */
     ExecForceStoreHeapTuple(plain, slot, true);
+
     ItemPointerCopy(&saved_tid, &slot->tts_tid);
 }
 
@@ -571,39 +584,143 @@ pg_vault_tde_index_build_range_scan(Relation heap_rel,
 
     /*
      * Main scan loop.  table_scan_getnextslot dispatches through
-     * rd_tableam->scan_getnextslot, which is our decrypt wrapper.
+     * rd_tableam->scan_getnextslot, which is our decrypt wrapper
+     * (pg_vault_tde_scan_getnextslot → pg_vault_tde_decode_slot).
      * The slot receives decrypted plaintext data.
+     *
+     * MEMORY CONTEXT DISCIPLINE — why we switch contexts around the scan:
+     *
+     * decode_slot allocates the decrypted HeapTuple via palloc in
+     * CurrentMemoryContext and stores it in the slot with shouldFree=true
+     * (ExecForceStoreHeapTuple).  The slot takes ownership: the next
+     * ExecClearTuple will pfree the tuple.
+     *
+     * We also have a per-tuple ExprContext (ecxt_per_tuple_memory) that
+     * is reset each iteration to reclaim FormIndexDatum temporaries and
+     * encrypted index datums.
+     *
+     * BUG (fixed): if table_scan_getnextslot is called while
+     * CurrentMemoryContext == ecxt_per_tuple_memory, the decrypted tuple
+     * ends up IN that context.  MemoryContextReset then frees it (zeroing
+     * the palloc chunk header).  On the next iteration, ExecClearTuple
+     * sees TTS_FLAG_SHOULDFREE and calls pfree on the now-dead pointer
+     * → "pfree called with invalid pointer (header 0x0000000000000000)".
+     *
+     * Fix: capture the caller's MemoryContext ("scan_mcxt") BEFORE the
+     * loop, and switch to it for the table_scan_getnextslot call.  This
+     * ensures decode_slot's decrypted tuple lives in a stable context
+     * that is NOT reset per-tuple.  Only FormIndexDatum evaluation and
+     * index-key encryption run in ecxt_per_tuple_memory.
      */
-    while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
     {
-        HeapTuple   heapTuple;
-        bool        tupleIsAlive = true;
+        MemoryContext scan_mcxt = CurrentMemoryContext;
 
-        CHECK_FOR_INTERRUPTS();
+        for (;;)
+        {
+            HeapTuple       heapTuple;
+            bool            tupleIsAlive = true;
+            MemoryContext   oldcxt;
 
-        MemoryContextReset(econtext->ecxt_per_tuple_memory);
+            CHECK_FOR_INTERRUPTS();
 
-        /*
-         * For MVCC snapshots all returned tuples are visible.
-         * For SnapshotAny (used during some non-concurrent index builds)
-         * we'd need to check visibility explicitly, but CREATE INDEX
-         * CONCURRENTLY takes a different code path.
-         */
-        if (!tupleIsAlive)
-            continue;
+            /*
+             * Reset per-tuple memory from the previous iteration.  This
+             * frees FormIndexDatum temporaries and encrypted index datums.
+             * The decrypted HeapTuple in the slot is NOT in this context
+             * (it lives in scan_mcxt), so this is safe.
+             */
+            ResetExprContext(econtext);
 
-        /*
-         * Extract index-key values from the decrypted slot and invoke
-         * the index AM's callback to insert the index tuple.
-         */
-        FormIndexDatum(index_info, slot, estate, values, isnull);
+            /*
+             * Proactively clear the slot to pfree the decoded tuple from
+             * the previous iteration NOW, while its palloc chunk header
+             * is still valid.  Without this, the pfree happens inside
+             * heapam's tts_buffer_heap_store_tuple (called during the
+             * next table_scan_getnextslot), which is too late if any
+             * intermediate operation corrupted the chunk header.
+             *
+             * On the first iteration the slot is empty, so this is a
+             * no-op.  On subsequent iterations the slot holds a decoded
+             * plaintext tuple with TTS_FLAG_SHOULDFREE, allocated in
+             * scan_mcxt by ExecForceStoreHeapTuple → heap_copytuple.
+             * ExecClearTuple calls tts_buffer_heap_clear which does
+             * heap_freetuple (pfree) and resets the slot to empty state.
+             */
+            ExecClearTuple(slot);
 
-        heapTuple = ExecFetchSlotHeapTuple(slot, false, NULL);
+            /*
+             * Fetch the next decrypted tuple.  We explicitly switch to
+             * scan_mcxt so that decode_slot's palloc (inside
+             * tde_decrypt_heap_tuple) allocates the decrypted HeapTuple
+             * in the stable context, not in ecxt_per_tuple_memory.
+             */
+            oldcxt = MemoryContextSwitchTo(scan_mcxt);
+            if (!table_scan_getnextslot(scan, ForwardScanDirection, slot))
+            {
+                MemoryContextSwitchTo(oldcxt);
+                break;
+            }
+            MemoryContextSwitchTo(oldcxt);
 
-        callback(index_rel, &heapTuple->t_self, values, isnull,
-                 tupleIsAlive, callback_state);
+            /*
+             * For SnapshotAny (used during some non-concurrent index builds)
+             * we'd need to check visibility explicitly, but CREATE INDEX
+             * CONCURRENTLY takes a different code path.
+             */
+            if (!tupleIsAlive)
+                continue;
 
-        reltuples += 1;
+            /*
+             * Switch to per-tuple context for FormIndexDatum evaluation
+             * and index-key encryption.  These allocations are ephemeral
+             * and will be reclaimed by ResetExprContext at the top of the
+             * next iteration.
+             */
+            oldcxt = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+
+            FormIndexDatum(index_info, slot, estate, values, isnull);
+
+            heapTuple = ExecFetchSlotHeapTuple(slot, false, NULL);
+
+            /*
+             * If a tde_btree index is being built (signalled by IAM's
+             * ambuild), encrypt each non-null index key value with
+             * AES-256-SIV before passing it to the btree build callback.
+             *
+             * We build a SEPARATE enc_values[] array rather than modifying
+             * values[] in-place.  _bt_spool copies the datum bytes into
+             * its own IndexTuple buffer immediately, so the palloc'd
+             * enc_bytea does not need to outlive the callback call.
+             */
+            if (tde_iam_build_in_progress)
+            {
+                Datum  enc_values[INDEX_MAX_KEYS];
+                bool   enc_isnull[INDEX_MAX_KEYS];
+                int    nbuildcols = index_info->ii_NumIndexAttrs;
+                int    kcol;
+
+                memcpy(enc_values, values, nbuildcols * sizeof(Datum));
+                memcpy(enc_isnull, isnull, nbuildcols * sizeof(bool));
+
+                for (kcol = 0; kcol < nbuildcols; kcol++)
+                {
+                    if (!enc_isnull[kcol])
+                        enc_values[kcol] = tde_iam_encrypt_index_datum(enc_values[kcol]);
+                }
+
+                MemoryContextSwitchTo(oldcxt);
+                callback(index_rel, &heapTuple->t_self, enc_values, enc_isnull,
+                         tupleIsAlive, callback_state);
+            }
+            else
+            {
+                MemoryContextSwitchTo(oldcxt);
+                callback(index_rel, &heapTuple->t_self, values, isnull,
+                         tupleIsAlive, callback_state);
+            }
+
+            reltuples += 1;
+        }
     }
 
     if (own_scan)
@@ -716,7 +833,7 @@ pg_vault_tde_tuple_insert(Relation rel, TupleTableSlot *slot,
     else
         toasted = plain;
 
-    enc = tde_encrypt_heap_tuple(toasted);
+    enc = tde_encrypt_heap_tuple(toasted, RelationGetRelid(rel));
     enc->t_tableOid = plain->t_tableOid;
 
     /*
@@ -789,7 +906,7 @@ pg_vault_tde_tuple_insert_speculative(Relation rel, TupleTableSlot *slot,
     else
         toasted = plain;
 
-    enc = tde_encrypt_heap_tuple(toasted);
+    enc = tde_encrypt_heap_tuple(toasted, RelationGetRelid(rel));
     enc->t_tableOid = plain->t_tableOid;
 
     saved_toastrelid = rel->rd_rel->reltoastrelid;
@@ -892,7 +1009,7 @@ pg_vault_tde_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
             else
                 toasted = plain;
 
-            enc_tuples[i] = tde_encrypt_heap_tuple(toasted);
+            enc_tuples[i] = tde_encrypt_heap_tuple(toasted, RelationGetRelid(rel));
             enc_tuples[i]->t_tableOid = table_oid;
 
             /* Create a temporary slot and store the encrypted tuple in it */
@@ -1001,7 +1118,7 @@ pg_vault_tde_tuple_update(Relation rel, ItemPointer otid,
     else
         toasted = plain;
 
-    enc = tde_encrypt_heap_tuple(toasted);
+    enc = tde_encrypt_heap_tuple(toasted, RelationGetRelid(rel));
     enc->t_tableOid = plain->t_tableOid;
 
     saved_toastrelid = rel->rd_rel->reltoastrelid;
@@ -1053,24 +1170,48 @@ pg_vault_tde_tuple_update(Relation rel, ItemPointer otid,
 /*
  * pg_vault_tde_toast_am
  *
- * Forces TOAST tables for encrypted_heap relations to use the standard heap AM
- * (HEAP_TABLE_AM_OID = 2).  Without this, PG18 creates TOAST tables using the
- * parent's AM (via create_toast_table → table_relation_toast_am → relam).  A
- * TOAST table with encrypted_heap AM triggers a guard in heap_getnext():
- *   if (rd_tableam != GetHeapamTableAmRoutine()) ERROR "only heap AM is supported"
- * because our tde_methods copy lives at a different address than heapam's
- * static const struct.
+ * Selects the AM for TOAST tables created for encrypted_heap relations.
  *
- * LIMITATION: Column values that exceed the TOAST threshold (~2 kB) are stored
- * in the heap-based TOAST table and are NOT individually encrypted.  Only
- * inline column values (stored directly in the encrypted_heap page) are
- * encrypted.  Full per-chunk TOAST encryption is on the roadmap.
+ * When pg_vault_tde.toast_encryption = on (default), we return the OID of
+ * the encrypted_heap AM so that TOAST chunks are stored encrypted.
+ * Each chunk passes through our tuple_insert hook (tde_gcm_encrypt) and is
+ * read back via our scan_getnextslot (tde_gcm_decrypt).  The external TOAST
+ * pointer in the main table is unencrypted (it carries only OIDs and sequence
+ * numbers, no payload).
+ *
+ * When toast_encryption = off, or when the encrypted_heap AM cannot be found
+ * (e.g. during bootstrap), we fall back to HEAP_TABLE_AM_OID.  This keeps
+ * the PG18 guard in heap_getnext() from triggering: without impersonation,
+ * the TOAST index build calls heap_getnext() on the TOAST table which asserts
+ * rd_tableam == GetHeapamTableAmRoutine().  Our pg_vault_tde_index_build_range_scan
+ * correctly handles this via a custom scan loop, so the encrypted_heap AM
+ * is safe here.
  */
 static Oid
 pg_vault_tde_toast_am(Relation rel)
 {
     (void) rel;
-    return HEAP_TABLE_AM_OID;  /* standard heap AM, always safe for TOAST */
+
+    if (pg_vault_tde_toast_encryption)
+    {
+        /*
+         * Look up the registered encrypted_heap AM OID from the catalog.
+         * missing_ok = true so that if the AM is somehow unregistered (e.g.
+         * during extension drop) we degrade gracefully to plain TOAST storage
+         * rather than ERROR-ing out at CREATE TABLE time.
+         */
+        Oid encheap_oid = get_table_am_oid("encrypted_heap", true);
+
+        if (OidIsValid(encheap_oid))
+            return encheap_oid;
+
+        ereport(WARNING,
+                (errmsg("[TDE] encrypted_heap AM not found; TOAST will use standard heap"),
+                 errhint("Ensure pg_vault_tde is installed and pg_vault_tde.toast_encryption=on is intentional.")));
+    }
+
+    /* Fallback: standard heap AM for TOAST (unencrypted chunks) */
+    return HEAP_TABLE_AM_OID;
 }
 
 /* ============================================================
@@ -1329,7 +1470,8 @@ pg_vault_tde_verify_integrity(PG_FUNCTION_ARGS)
              */
             PG_TRY(2);
             {
-                HeapTuple plain = tde_decrypt_heap_tuple(bslot->base.tuple);
+                HeapTuple plain = tde_decrypt_heap_tuple(bslot->base.tuple,
+                                                          RelationGetRelid(rel));
                 pfree(plain);
             }
             PG_CATCH(2);

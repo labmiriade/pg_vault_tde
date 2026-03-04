@@ -1,6 +1,6 @@
 # pg_vault_tde Roadmap
 
-> Last updated: 2026-02-28 — v1.5–v1.8 roadmap defined
+> Last updated: 2026-03-02 — v1.5 sub-features: per-table DEK, TOAST AM, wire format v3 AAD completed
 
 ---
 
@@ -171,8 +171,8 @@ This release focused on infrastructure quality:
 
 ### Known Limitations (Carried Forward)
 
-- **TOAST chunks unencrypted** — deferred to v1.5 (requires TOAST TAM override)
-- **Logical replication TOAST gap** — TOAST columns not decoded in output plugin - deferred to v1.5
+- **TOAST chunks unencrypted** — ✅ TOAST AM override implemented in v1.5 (`pg_vault_tde_toast_am()` with `toast_encryption` GUC); `tde_toast_reassemble()` skeleton (full implementation pending)
+- **Logical replication TOAST gap** — TOAST columns not decoded in output plugin - deferred to v1.5 (still pending: `tde_toast_decrypt_chunk` path in pgoutput)
 - **tde_btree bytea-only** — only `bytea` columns supported in v1.4; other column types require explicit `CAST(col AS bytea)` in index definition
 - **tde_btree range scans** — `WHERE col > x` returns empty; AES-SIV does not preserve ordering (by design)
 - **WAL unencrypted** — requires a core hook in PostgreSQL WAL writer
@@ -182,8 +182,7 @@ This release focused on infrastructure quality:
 ## v1.5 — Foundation Hardening + Local Wallet — Phase 1 (Q4 2026)
 
 > Status: � In Progress (started 2026-02-28 — implementation branch active)
-> **Target**: 70 regression tests — PG 17 + PG 18 + PG 19 (audit complete), zero compiler warnings.
-
+> **Target**: 70 regression tests — PG 17 + PG 18 + PG 19 (audit complete), zero compiler warnings.> **Completed sub-features**: Per-Table DEK isolation (§3), TOAST AM override (§2 partial), Wire Format v3 AEAD AAD (§5).
 **Focus**: Close the most critical data-leak
 Introduce the **Local Wallet KMS provider** (offline, no external service) as a first-class KMS backend alongside Vault/OpenBao. Expand `tde_btree`
 to native types. Harden the wire format with AEAD AAD binding. Enable online key rotation
@@ -253,7 +252,7 @@ chunks. This is a data breach for any PII workload.
 
 | Sub-feature | Priority | Notes |
 |-------------|----------|-------|
-| `pg_vault_tde_toast_am()` returns `encrypted_heap` OID | 🔴 Critical | Replaces `HEAP_TABLE_AM_OID` stub; guarded by `toast_encryption` GUC |
+| `pg_vault_tde_toast_am()` returns `encrypted_heap` OID | ✅ Done | Replaces `HEAP_TABLE_AM_OID` stub; guarded by `toast_encryption` GUC; uses `get_table_am_oid()` with `missing_ok=true` fallback |
 | TOAST chunk encrypt at `toast_save_datum()` interception | 🔴 Critical | TAM-level; each chunk encrypted independently |
 | TOAST chunk decrypt at `toast_fetch_datum()` interception | 🔴 Critical | `pg_vault_tde_detoast_datum()` wrapper |
 | GUC `pg_vault_tde.toast_encryption = on` | Medium | Default `on`; `off` only for debugging and migration from v1.4 |
@@ -283,9 +282,9 @@ disclosure compromises all tables simultaneously. Desiderata is  optionally a ke
 
 | Sub-feature | Priority | Notes |
 |-------------|----------|-------|
-| `pg_vault_tde_catalog` catalog table | 🔴 Critical | Migration script from v1.4 single-DEK included |
-| `TdeRelDekCache` shmem redesign | 🔴 Critical | Fixed-size array; max via `pg_vault_tde.max_encrypted_relations` GUC |
-| `pg_vault_tde_kms_get_rel_dek(Oid relid, ...)` | 🔴 Critical | Replaces `pg_vault_tde_kms_get_dek()` globally |
+| `pg_vault_tde_catalog` catalog table | ✅ Done | Migration script `sql/pg_vault_tde--1.4--1.5.sql` complete |
+| `TdeRelDekCache` shmem redesign | ✅ Done | Fixed-size array; max via `pg_vault_tde.max_encrypted_relations` GUC; `LWLockInitialize` tranche fix applied |
+| `pg_vault_tde_kms_get_rel_dek(Oid relid, ...)` | ✅ Done | Wired into `tde_gcm_encrypt/decrypt`, all TAM callbacks, TOAST, pgoutput, backup |
 | GUC `pg_vault_tde.max_encrypted_relations` (64–65536, default 1024) | High | `PGC_POSTMASTER` |
 | `DROP TABLE` → KMS key cleanup hook | High | `ProcessUtility_hook` intercepts `DROP TABLE` |
 | Tests 62–64: two tables with different DEKs; DEK of table-A cannot decrypt table-B; DROP TABLE cleans KMS key | 🔴 Critical | |
@@ -319,9 +318,9 @@ ciphertext was moved to a different relation.
 
 | Sub-feature | Priority | Notes |
 |-------------|----------|-------|
-| `tde_compute_aad(Oid dboid, Oid relfilenode, uint64 generation, uchar *out)` helper | Medium | 16 bytes, no malloc |
-| Updated `tde_gcm_encrypt_tuple()` / `tde_gcm_decrypt_tuple()` to pass AAD | Medium | `EVP_EncryptUpdate` with AAD before data |
-| Backward compatible: v1/v2-no-AAD tuples skip AAD check (trial-decryption path) | Medium | `is_v2` flag already present; add `has_aad` sub-flag |
+| `tde_compute_aad(Oid dboid, Oid relfilenode, uint64 generation, uchar *out)` helper | ✅ Done | Static inline in `crypto.c`; AAD = `[MyDatabaseId(4)\ |\ relid(4)\ |\ gen(8)]` LE |
+| Updated `tde_gcm_encrypt_tuple()` / `tde_gcm_decrypt_tuple()` to pass AAD | ✅ Done | `TDE_V3_VERSION_BYTE = 0x03`; `EVP_EncryptUpdate(NULL,...)` before data; `OidIsValid(relid)` guard for InvalidOid fallback |
+| Backward compatible: v1/v2-no-AAD tuples skip AAD check (trial-decryption path) | ✅ Done | `is_v3` flag; v2 and v1 paths unchanged; prev_dek fallback also applies AAD for v3 tuples |
 | Tests 68–69: cross-table paste attack rejected; same-table decrypt succeeds | Medium | |
 
 ---
@@ -549,7 +548,7 @@ HIPAA §164.312(b) require logging of all access to encrypted data.
 ### 4. Physical Backup Key Sealing (Medium — Backup Security)
 
 **Problem**: `pg_basebackup` copies encrypted pages but the KMS credentials must be
-available at restore time. We need to "trasparently manged this
+available at restore time. We need to trasparently manged this
 
 | Sub-feature | Priority | Notes |
 |-------------|----------|-------|

@@ -40,9 +40,12 @@ void pg_vault_tde_tam_init(void);
  * The WAL sender reads raw encrypted tuples from WAL; the output
  * plugin calls this to produce plaintext before emitting changes.
  *
+ * relid: the OID of the source relation (used for per-table DEK lookup).
+ *        Pass InvalidOid to fall back to the v1.4 global DEK.
+ *
  * Returns a palloc'd HeapTuple (caller must pfree after use).
  * Raises ERROR on GCM authentication failure.
  */
-HeapTuple tde_decrypt_heap_tuple(HeapTuple enc);
+HeapTuple tde_decrypt_heap_tuple(HeapTuple enc, Oid relid);
 
 #endif /* PG_VAULT_TDE_TAM_H */

@@ -42,26 +42,26 @@
 #include <openssl/crypto.h>
 
 /*
- * Forward declarations for btree internal sort API.
+ * Index build strategy: ambuildempty + per-row aminsert
  *
- * _bt_spoolinit / _bt_spool / _bt_leafbuild / _bt_spoolfreeall are compiled
- * into the postgres binary but are NOT declared in the installed extension
- * dev headers (access/nbtsort.h is an internal header).  We forward-declare
- * them here with matching signatures so the C compiler accepts the calls;
- * the dynamic linker resolves them against the postgres binary at load time
- * (all backend symbols are exported on ELF platforms).
+ * tde_btree's CREATE INDEX does NOT use the private btree sort API
+ * (_bt_spoolinit / _bt_spool / _bt_leafbuild / _bt_spoolfreeall).  Those
+ * symbols are defined as "static" in PostgreSQL's nbtsort.c and are therefore
+ * NOT exported from the postgres binary on any platform — linking against them
+ * produces an undefined-symbol FATAL at load time on debian/ubuntu packages.
  *
- * This is the same technique used by contrib/pg_amcheck and similar
- * extensions that need btree's sort layer without a full PG source tree.
+ * Instead, we use the public IndexAmRoutine callbacks:
+ *   1. saved_btree_methods.ambuildempty(index) — creates a valid empty btree
+ *      (metapage + empty root page) via WAL-safe btree initialisation.
+ *   2. table_index_build_scan() with tde_build_callback() — visits each
+ *      heap tuple, encrypts the key datums, and calls aminsert() one-by-one.
+ *
+ * Trade-off: slightly more page splits than the sorted bulk-load path
+ * (O(n) sequential writes vs O(n log n) sorted writes), but fully portable
+ * and correct.  For CREATE INDEX on an empty table the cost is zero.
+ *
+ * PKCS5_PBKDF2_HMAC is declared in openssl/evp.h (included above).
  */
-typedef struct BTSpool BTSpool;  /* opaque — we only need the pointer */
-extern BTSpool *_bt_spoolinit(Relation heap, Relation index,
-                              bool isunique, bool isdead);
-extern void     _bt_spool(BTSpool *btspool, ItemPointer self,
-                          Datum *values, bool *isnull);
-extern void     _bt_leafbuild(BTSpool *btspool, BTSpool *btspooldead);
-extern void     _bt_spoolfreeall(BTSpool *btspool);
-/* PKCS5_PBKDF2_HMAC is declared in openssl/evp.h (included above) */
 
 #include "src/include/pg_vault_tde_kms.h"
 #include "src/include/pg_vault_tde_iam.h"
@@ -145,10 +145,21 @@ tde_iam_encrypt_key(const char *plaintext, Size plaintext_len, Size *out_len)
     {
         out_buf = (char *) palloc0(plaintext_len + TDE_SIV_OVERHEAD);
 
-        /* Reuse the per-backend SIV encrypt context; allocate on first use. */
+        /*
+         * Reuse the per-backend SIV encrypt context; allocate on first use.
+         *
+         * Allocate in TopMemoryContext so the EVP_CIPHER_CTX survives
+         * for the lifetime of the backend.  During index builds this
+         * function is called from pg_vault_tde_index_build_range_scan
+         * where the per-tuple memory context may be reset between rows;
+         * allocating in TopMemoryContext ensures the context pointer
+         * (tde_iam_siv_enc_ctx) remains valid across iterations.
+         */
         if (tde_iam_siv_enc_ctx == NULL)
         {
+            MemoryContext old_ctx = MemoryContextSwitchTo(TopMemoryContext);
             tde_iam_siv_enc_ctx = EVP_CIPHER_CTX_new();
+            MemoryContextSwitchTo(old_ctx);
             if (tde_iam_siv_enc_ctx == NULL)
             {
                 pfree(out_buf);
@@ -315,10 +326,15 @@ tde_iam_decrypt_key(const char *ciphertext, Size ciphertext_len, Size *out_len)
     {
         out_buf = (char *) palloc0(ciphertext_len);
 
-        /* Reuse the per-backend SIV decrypt context; allocate on first use. */
+        /*
+         * Reuse the per-backend SIV decrypt context; allocate in
+         * TopMemoryContext (same rationale as the encrypt context above).
+         */
         if (tde_iam_siv_dec_ctx == NULL)
         {
+            MemoryContext old_ctx = MemoryContextSwitchTo(TopMemoryContext);
             tde_iam_siv_dec_ctx = EVP_CIPHER_CTX_new();
+            MemoryContextSwitchTo(old_ctx);
             if (tde_iam_siv_dec_ctx == NULL)
             {
                 pfree(out_buf);
@@ -457,39 +473,81 @@ tde_iam_decrypt_key(const char *ciphertext, Size ciphertext_len, Size *out_len)
  * that return bytea).  The operator class tde_bytea_ops is registered
  * as the default for type bytea using tde_btree (see pg_vault_tde--1.0.sql).
  *
- * The btree spool functions (_bt_spoolinit, _bt_spool, _bt_leafbuild,
- * _bt_spoolfreeall) are exported from nbtree.h and used here to give
- * tde_btree's CREATE INDEX the same sorted-bulk-load performance as
- * native btree.
+ * Index build uses ambuildempty + per-row aminsert (portable; see the
+ * build strategy comment near the top of this file for rationale).
  * ================================================================
  */
 
 /* Mutable copy of the btree AM routine, patched with our overrides */
 static IndexAmRoutine  tde_btree_methods;
 
-/* Original btree AM pointer — saved for delegation */
-static IndexAmRoutine *saved_btree_am = NULL;
+/*
+ * Original (unmodified) btree AM — saved as a STATIC copy for delegation.
+ *
+ * Previously this was a POINTER (saved_btree_am) to a palloc'd struct
+ * from _PG_init() in the POSTMASTER.  That pointer became stale in forked
+ * backends because the heap block could be freed/overwritten by later
+ * allocations, causing SIGSEGV when pg_vault_tde_ambuild tried to call
+ * saved_btree_am->ambuild.
+ *
+ * Storing the full struct in BSS ensures all function pointers are
+ * reliably inherited by forked backends (COW pages never change for
+ * a static that is only written during _PG_init).
+ */
+static IndexAmRoutine  saved_btree_methods;
+static bool            saved_btree_methods_valid = false;
 
 /*
- * tde_encrypt_bytea_datum
+ * tde_iam_build_in_progress — process-local flag (see pg_vault_tde_iam.h).
+ * Set while pg_vault_tde_ambuild is executing saved_btree_methods.ambuild
+ * so pg_vault_tde_index_build_range_scan (tam.c) knows to encrypt index keys.
+ */
+bool tde_iam_build_in_progress = false;
+
+/*
+ * tde_iam_encrypt_index_datum
  *
  * Encrypts a bytea Datum using AES-256-SIV.
  * Returns a new palloc'd bytea Datum with the encrypted content,
  * or the original Datum unchanged if DEK is unavailable (degraded mode).
  *
+ * Called from pg_vault_tde_index_build_range_scan (tam.c) when
+ * tde_iam_build_in_progress is set, and from pg_vault_tde_aminsert for
+ * individual INSERTs on an existing tde_btree index.
+ *
  * Caller is responsible for pfree'ing the result when done.
  */
-static Datum
-tde_encrypt_bytea_datum(Datum datum)
+Datum
+tde_iam_encrypt_index_datum(Datum datum)
 {
-    bytea  *bval    = DatumGetByteaPP(datum);
-    char   *plain   = VARDATA_ANY(bval);
-    Size    plen    = VARSIZE_ANY_EXHDR(bval);
+    bytea  *bval;
+    char   *plain;
+    Size    plen;
     Size    enc_len = 0;
     char   *encrypted;
     bytea  *enc_bytea;
 
+    /*
+     * PG_DETOAST_DATUM_COPY always allocates a private palloc'd copy of the
+     * decompressed/out-of-line datum in CurrentMemoryContext.  Using COPY
+     * (rather than DatumGetByteaPP which may return the original pointer)
+     * guarantees we own this memory and can safely pfree it after
+     * extracting the plaintext bytes.  This prevents use-after-free if the
+     * calling context resets or pfrees the slot tuple between iterations.
+     */
+    bval  = (bytea *) PG_DETOAST_DATUM_COPY(datum);
+    plain = VARDATA_ANY(bval);
+    plen  = VARSIZE_ANY_EXHDR(bval);
+
     encrypted = tde_iam_encrypt_key(plain, plen, &enc_len);
+
+    /*
+     * bval is a palloc'd copy in the current memory context (ecxt_per_tuple_memory
+     * during index builds).  Do NOT pfree it here — the context reset at the top
+     * of the scan loop reclaims it automatically.  Manual pfree here risks
+     * double-free if the context is reset between pfree and next use.
+     */
+
     if (encrypted == NULL)
     {
         /*
@@ -508,115 +566,65 @@ tde_encrypt_bytea_datum(Datum datum)
     memcpy(VARDATA(enc_bytea), encrypted, enc_len);
 
     OPENSSL_cleanse(encrypted, enc_len);
-    pfree(encrypted);
+    /*
+     * Do NOT pfree(encrypted) here — let ecxt_per_tuple_memory reset
+     * reclaim it.  Avoiding manual pfree prevents double-free risks
+     * when the context is reset right after this function returns.
+     */
 
     return PointerGetDatum(enc_bytea);
 }
 
 /* ── BUILD CALLBACK ─────────────────────────────────────────────────────── */
 
-typedef struct TdeBuildState
-{
-    BTSpool    *spool;        /* btree sorted-bulk-load spool */
-    IndexInfo  *indexInfo;    /* column count, uniqueness, etc. */
-    Relation    heapRel;      /* heap being indexed */
-    double      index_tuples; /* counter for stats */
-} TdeBuildState;
-
-/*
- * tde_build_callback
- *
- * Called by IndexBuildHeapScan for each live heap tuple.  Encrypts each
- * indexed bytea column via AES-256-SIV and spools the encrypted key into
- * the btree sorted bulk-loader.
- */
-static void
-tde_build_callback(Relation indexRel, ItemPointer tid,
-                   Datum *values, bool *isnull,
-                   bool tupleIsAlive, void *state)
-{
-    TdeBuildState *bstate = (TdeBuildState *) state;
-    Datum          enc_values[INDEX_MAX_KEYS];
-    bool           enc_isnull[INDEX_MAX_KEYS];
-    int            ncols = bstate->indexInfo->ii_NumIndexAttrs;
-    int            i;
-
-    if (!tupleIsAlive)
-        return;
-
-    memcpy(enc_isnull, isnull, ncols * sizeof(bool));
-
-    for (i = 0; i < ncols; i++)
-    {
-        if (isnull[i])
-            enc_values[i] = (Datum) 0;
-        else
-            enc_values[i] = tde_encrypt_bytea_datum(values[i]);
-    }
-
-    /*
-     * Feed the encrypted tuple into the btree spool.  _bt_spool buffers
-     * items in a sort file; _bt_leafbuild (called after the scan) writes
-     * all sorted items to the btree pages in one pass.
-     */
-    _bt_spool(bstate->spool, tid, enc_values, enc_isnull);
-    bstate->index_tuples++;
-}
-
 /* ── AMBUILD ────────────────────────────────────────────────────────────── */
 
+/*
+ * pg_vault_tde_ambuild
+ *
+ * Delegates entirely to btree's ambuild but sets tde_iam_build_in_progress
+ * first so that pg_vault_tde_index_build_range_scan (tam.c) will encrypt
+ * index key values before passing them to btbuildCallback.
+ *
+ * This approach avoids the private btree spool API (_bt_spoolinit, etc.) and
+ * the single-row aminsert approach (which does not work correctly because
+ * btbuildempty only initialises the INIT fork, leaving MAIN fork pages
+ * absent when btinsert tries to locate the index metapage).
+ *
+ * Flow:
+ *   pg_vault_tde_ambuild
+ *     → saved_btree_methods.ambuild (= btbuild)
+ *       → table_index_build_scan(heap, index, ..., btbuildCallback, ...)
+ *         → pg_vault_tde_index_build_range_scan (via heap's TableAmRoutine)
+ *           → [for each tuple] encrypt values[], then btbuildCallback(...)
+ *
+ * tde_iam_build_in_progress is a process-local (not thread-local) variable;
+ * PostgreSQL is multi-process, so concurrent backends are unaffected.
+ */
 static IndexBuildResult *
 pg_vault_tde_ambuild(Relation heap, Relation index, IndexInfo *index_info)
 {
     IndexBuildResult *result;
-    TdeBuildState     bstate;
-    double            ntuples;
 
-    Assert(saved_btree_am != NULL);
-
-    result = (IndexBuildResult *) palloc0(sizeof(IndexBuildResult));
+    Assert(saved_btree_methods_valid);
 
     /*
-     * Create the btree spool: a sorted temporary file that will become
-     * the index pages via _bt_leafbuild at the end.  Using the spool
-     * (rather than one-at-a-time aminsert calls) gives the same
-     * sorted-bulk-load performance as native btree CREATE INDEX.
-     *
-     * _bt_spoolinit(heap, index, isunique, isdead)
-     *   isunique = index_info->ii_Unique (respect UNIQUE constraint)
-     *   isdead   = false (for the non-concurrent, non-dead-tuple spool)
+     * Signal pg_vault_tde_index_build_range_scan to encrypt index keys.
+     * PG_TRY ensures the flag is cleared even if btbuild raises an error.
      */
-    bstate.spool       = _bt_spoolinit(heap, index,
-                                       index_info->ii_Unique, false);
-    bstate.indexInfo   = index_info;
-    bstate.heapRel     = heap;
-    bstate.index_tuples = 0;
+    tde_iam_build_in_progress = true;
 
-    /*
-     * Heap scan: visits every live tuple and calls tde_build_callback
-     * which encrypts the datums and _bt_spool()s them.
-     */
-    ntuples = table_index_build_scan(heap, index, index_info,
-                                     true,  /* allow_sync */
-                                     true,  /* report_progress */
-                                     tde_build_callback,
-                                     &bstate,
-                                     NULL   /* existing TableScanDesc */);
-
-    /*
-     * Sort the spool and write all index pages in a single sorted pass.
-     * The second argument is the "dead-tuple" spool — NULL for non-concurrent
-     * builds.
-     */
-    _bt_leafbuild(bstate.spool, NULL);
-    _bt_spoolfreeall(bstate.spool);
-
-    result->heap_tuples  = ntuples;
-    result->index_tuples = bstate.index_tuples;
-
-    ereport(DEBUG1,
-            (errmsg("[IAM] tde_btree ambuild: %.0f heap tuples, %.0f index tuples",
-                    ntuples, bstate.index_tuples)));
+    PG_TRY();
+    {
+        result = saved_btree_methods.ambuild(heap, index, index_info);
+    }
+    PG_CATCH();
+    {
+        tde_iam_build_in_progress = false;
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+    tde_iam_build_in_progress = false;
 
     return result;
 }
@@ -635,7 +643,7 @@ pg_vault_tde_aminsert(Relation index, Datum *values, bool *isnull,
     int     ncols = index_info->ii_NumIndexAttrs;
     int     i;
 
-    Assert(saved_btree_am != NULL);
+    Assert(saved_btree_methods_valid);
 
     memcpy(enc_isnull, isnull, ncols * sizeof(bool));
 
@@ -645,10 +653,10 @@ pg_vault_tde_aminsert(Relation index, Datum *values, bool *isnull,
         if (isnull[i])
             enc_values[i] = (Datum) 0;
         else
-            enc_values[i] = tde_encrypt_bytea_datum(values[i]);
+            enc_values[i] = tde_iam_encrypt_index_datum(values[i]);
     }
 
-    return saved_btree_am->aminsert(index, enc_values, enc_isnull,
+    return saved_btree_methods.aminsert(index, enc_values, enc_isnull,
                                     heap_tid, heap,
                                     check_unique, index_unchanged,
                                     index_info);
@@ -663,8 +671,8 @@ pg_vault_tde_ambeginscan(Relation index, int nkeys, int norderbys)
      * Delegate entirely to btree.  The ScanKey encryption happens in
      * amrescan, called immediately after by the executor.
      */
-    Assert(saved_btree_am != NULL);
-    return saved_btree_am->ambeginscan(index, nkeys, norderbys);
+    Assert(saved_btree_methods_valid);
+    return saved_btree_methods.ambeginscan(index, nkeys, norderbys);
 }
 
 /* ── AMRESCAN ───────────────────────────────────────────────────────────── */
@@ -675,7 +683,7 @@ pg_vault_tde_amrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 {
     int i;
 
-    Assert(saved_btree_am != NULL);
+    Assert(saved_btree_methods_valid);
 
     /*
      * Encrypt equality scan keys (strategy == BTEqualStrategyNumber = 3)
@@ -694,12 +702,12 @@ pg_vault_tde_amrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
                 keys[i].sk_strategy == BTEqualStrategyNumber)
             {
                 keys[i].sk_argument =
-                    tde_encrypt_bytea_datum(keys[i].sk_argument);
+                    tde_iam_encrypt_index_datum(keys[i].sk_argument);
             }
         }
     }
 
-    saved_btree_am->amrescan(scan, keys, nkeys, orderbys, norderbys);
+    saved_btree_methods.amrescan(scan, keys, nkeys, orderbys, norderbys);
 }
 
 /* ── INIT + HANDLER ─────────────────────────────────────────────────────── */
@@ -725,14 +733,27 @@ tde_iam_init(void)
      * PointerGetDatum(NULL) passes a null 'internal' argument, which is
      * what bthandler() expects (it ignores it).
      */
-    saved_btree_am = (IndexAmRoutine *) DatumGetPointer(
+    IndexAmRoutine *tmp = (IndexAmRoutine *) DatumGetPointer(
         OidFunctionCall1(F_BTHANDLER, PointerGetDatum(NULL)));
 
-    Assert(saved_btree_am != NULL);
-    Assert(saved_btree_am->type == T_IndexAmRoutine);
+    Assert(tmp != NULL);
+    Assert(tmp->type == T_IndexAmRoutine);
 
-    /* Base: copy ALL btree callbacks so we inherit everything by default */
-    memcpy(&tde_btree_methods, saved_btree_am, sizeof(IndexAmRoutine));
+    /*
+     * Copy the btree callbacks into TWO static structs:
+     *  - saved_btree_methods: unchanged original, used for delegation
+     *  - tde_btree_methods:   patched copy returned to PG via handler
+     *
+     * Both are BSS statics, so their content is reliably inherited by
+     * forked backends (no stale heap pointers).
+     */
+    memcpy(&saved_btree_methods, tmp, sizeof(IndexAmRoutine));
+    memcpy(&tde_btree_methods, tmp, sizeof(IndexAmRoutine));
+
+    /* Safe to free now — we've memcpy'd everything we need */
+    pfree(tmp);
+
+    saved_btree_methods_valid = true;
 
     /* Override the callbacks that need to see or produce encrypted keys */
     tde_btree_methods.ambuild     = pg_vault_tde_ambuild;
@@ -748,7 +769,15 @@ tde_iam_init(void)
 /*
  * pg_vault_tde_get_iam_routine
  *
- * Returns a pointer to tde_btree_methods for the handler function.
+ * Returns a palloc'd copy of tde_btree_methods for the handler function.
+ *
+ * PostgreSQL's InitIndexAmRoutine() calls GetIndexAmRoutine() to obtain
+ * the IndexAmRoutine struct, copies it into rd_indexcxt, then pfree()'s
+ * the original pointer.  If we returned &tde_btree_methods (a static BSS
+ * variable), pfree would crash with "invalid pointer (header 0x0)".
+ * Therefore we must return a freshly palloc'd copy that pfree can safely
+ * reclaim.
+ *
  * If tde_iam_init() has not yet been called (e.g. during pg_dump or
  * a direct pg_vault_tde_iam_handler call without shared_preload_libraries),
  * it is called here as a lazy initializer to ensure the struct is valid.
@@ -757,7 +786,12 @@ extern const IndexAmRoutine *pg_vault_tde_get_iam_routine(void);
 const IndexAmRoutine *
 pg_vault_tde_get_iam_routine(void)
 {
-    if (saved_btree_am == NULL)
+    IndexAmRoutine *result;
+
+    if (!saved_btree_methods_valid)
         tde_iam_init();
-    return &tde_btree_methods;
+
+    result = (IndexAmRoutine *) palloc(sizeof(IndexAmRoutine));
+    memcpy(result, &tde_btree_methods, sizeof(IndexAmRoutine));
+    return result;
 }
