@@ -1,16 +1,23 @@
 #!/usr/bin/make -f
 # Debian rules for pg_vault_tde
-# Uses debhelper 13 with PGXS build system
+# Uses debhelper 13 with manual PGXS overrides
+#
+# PG_MAJOR is set by build_deb.sh (default: 18).
+# The variable is passed via environment and used in all pg_config paths.
+
+# Allow the calling script to override the PostgreSQL major version.
+PG_MAJOR ?= 18
+PKG_NAME  = postgresql-$(PG_MAJOR)-pg-vault-tde
 
 %:
-	dh $@ --with pgxs
+	dh $@
 
 override_dh_auto_build:
-	$(MAKE) PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
+	$(MAKE) PG_CONFIG=/usr/lib/postgresql/$(PG_MAJOR)/bin/pg_config
 
 override_dh_auto_install:
-	$(MAKE) PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config install \
-		DESTDIR=$(CURDIR)/debian/postgresql-18-pg-vault-tde
+	$(MAKE) PG_CONFIG=/usr/lib/postgresql/$(PG_MAJOR)/bin/pg_config install \
+		DESTDIR=$(CURDIR)/debian/$(PKG_NAME)
 
 override_dh_auto_test:
 	# Tests require a running PostgreSQL server; skip in package build

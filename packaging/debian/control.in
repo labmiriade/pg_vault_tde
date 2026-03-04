@@ -1,0 +1,40 @@
+Source: postgresql-pg-vault-tde
+Section: database
+Priority: optional
+Maintainer: Miriade Srl <info@miriade.it>
+Build-Depends:
+ debhelper-compat (= 13),
+ postgresql-server-dev-PGMAJOR,
+ libssl-dev,
+ libcurl4-openssl-dev,
+ pkg-config
+Standards-Version: 4.6.2
+Homepage: https://github.com/miriade/pg_vault_tde
+Rules-Requires-Root: no
+
+Package: postgresql-PGMAJOR-pg-vault-tde
+Architecture: any
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+ postgresql-PGMAJOR,
+ libssl3,
+ libcurl4
+Description: Transparent Data Encryption extension for PostgreSQL PGMAJOR
+ pg_vault_tde provides plug-and-play Transparent Data Encryption (TDE) for
+ PostgreSQL PGMAJOR via the Table Access Method (TAM) and Index Access Method
+ (IAM) APIs.
+ .
+ All user data in encrypted_heap tables is encrypted at rest using
+ AES-256-GCM (AEAD). Encryption keys are managed via HashiCorp Vault,
+ OpenBao, or a local PKCS#12 wallet, and cached in shared memory with
+ generation-based rotation.
+ .
+ Features:
+  - AES-256-GCM per-tuple encryption with authenticated integrity
+  - Hardware-accelerated (AES-NI) via OpenSSL 3.x EVP dispatch
+  - Zero-config key rotation with lazy generation-epoch detection
+  - Compatible with MVCC, HOT chains, VACUUM, ANALYZE, COPY, pg_dump
+  - Compatible with page-level checksums (initdb --data-checksums)
+  - Local PKCS#12 wallet KMS provider (v1.6, no external service)
+  - Zero core PostgreSQL modifications required

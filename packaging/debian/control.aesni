@@ -1,6 +1,6 @@
-Package: postgresql-18-pg-vault-tde-aesni
+Package: postgresql-PGMAJOR-pg-vault-tde-aesni
 Architecture: amd64
-Depends: postgresql-18-pg-vault-tde (= ${binary:Version}), ${misc:Depends}
+Depends: postgresql-PGMAJOR-pg-vault-tde (= ${binary:Version}), ${misc:Depends}
 Description: pg_vault_tde AES-NI optimized build for x86_64
  Recompiled with -maes -mpclmul -mvaes flags for Intel/AMD CPUs with
  AES New Instructions (AES-NI) hardware support.

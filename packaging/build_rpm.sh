@@ -4,37 +4,55 @@
 # Prerequisites on the build host (RHEL/Rocky/Fedora):
 #   dnf install -y rpm-build postgresql18-devel openssl-devel libcurl-devel \
 #                  pkgconfig gcc make
+#   # or postgresql17-devel for PG17
 #
-# Usage: bash packaging/build_rpm.sh
+# Usage:
+#   bash packaging/build_rpm.sh [--pg-version 17|18]
 #
-# Output: ~/rpmbuild/RPMS/x86_64/postgresql18-pg_vault_tde-1.0-1.*.rpm
+# Output: ~/rpmbuild/RPMS/x86_64/postgresql{17,18}-pg_vault_tde-1.6-1.*.rpm
 #
 # Copyright (c) 2026 Miriade Srl — PostgreSQL License
 
 set -e
 cd "$(dirname "$0")/.."  # move to project root
 
-VERSION="1.0"
+VERSION="1.6"
 RELEASE="1"
+PG_MAJOR="18"  # default; override with --pg-version
 SPEC="packaging/rpm/pg_vault_tde.spec"
 TARBALL="pg_vault_tde-${VERSION}.tar.gz"
 
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --pg-version)
+            PG_MAJOR="$2"
+            shift 2
+            ;;
+        *)
+            echo "ERROR: Unknown argument '$1'"
+            echo "Usage: $0 [--pg-version 17|18]"
+            exit 1
+            ;;
+    esac
+done
+
 echo "========================================================"
-echo "  Building RPM package: postgresql18-pg_vault_tde-${VERSION}-${RELEASE}"
+echo "  Building RPM package: postgresql${PG_MAJOR}-pg_vault_tde-${VERSION}-${RELEASE}"
 echo "========================================================"
 
 # Verify build dependencies
 for dep in rpmbuild pg_config; do
     if ! command -v "$dep" &>/dev/null; then
         echo "ERROR: '$dep' not found."
-        echo "Install: dnf install rpm-build postgresql18-devel"
+        echo "Install: dnf install rpm-build postgresql${PG_MAJOR}-devel"
         exit 1
     fi
 done
 
-PG_VERSION=$(pg_config --version | grep -oP '\d+' | head -1)
-if [ "$PG_VERSION" != "18" ]; then
-    echo "WARNING: pg_config reports PostgreSQL $PG_VERSION, expected 18"
+PG_DETECTED=$(pg_config --version | grep -oP '\d+' | head -1)
+if [ "$PG_DETECTED" != "$PG_MAJOR" ]; then
+    echo "WARNING: pg_config reports PostgreSQL $PG_DETECTED but --pg-version ${PG_MAJOR} was requested"
 fi
 
 # Set up rpmbuild tree
@@ -56,18 +74,19 @@ echo "  -> ~/rpmbuild/SOURCES/$TARBALL"
 cp "$SPEC" ~/rpmbuild/SPECS/pg_vault_tde.spec
 
 # Build RPM
-echo "Building RPM..."
+echo "Building RPM for PG${PG_MAJOR}..."
 rpmbuild -ba \
-    --define "pgmajorversion 18" \
+    --define "pgmajorversion ${PG_MAJOR}" \
+    --define "pgpackageversion ${PG_MAJOR}" \
     ~/rpmbuild/SPECS/pg_vault_tde.spec
 
 echo ""
 echo "RPM build complete. Packages in ~/rpmbuild/RPMS/"
-ls -la ~/rpmbuild/RPMS/*/postgresql18-pg_vault_tde* 2>/dev/null || true
+ls -la ~/rpmbuild/RPMS/*/postgresql${PG_MAJOR}-pg_vault_tde* 2>/dev/null || true
 
 echo ""
 echo "Install with:"
-echo "  dnf install ~/rpmbuild/RPMS/x86_64/postgresql18-pg_vault_tde-${VERSION}-${RELEASE}.*.rpm"
+echo "  dnf install ~/rpmbuild/RPMS/x86_64/postgresql${PG_MAJOR}-pg_vault_tde-${VERSION}-${RELEASE}.*.rpm"
 echo ""
 echo "Then configure postgresql.conf:"
 echo "  shared_preload_libraries = 'pg_vault_tde'"

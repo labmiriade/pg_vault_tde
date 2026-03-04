@@ -1,9 +1,13 @@
-%global pgmajorversion 18
-%global pgpackageversion 18
+# Default PG major version; override at build time with:
+#   rpmbuild --define 'pgmajorversion 17' -ba pg_vault_tde.spec
+# or via build_rpm.sh --pg-version 17
+%{!?pgmajorversion: %global pgmajorversion 18}
+%global pgpackageversion %{pgmajorversion}
 %global sname pg_vault_tde
+%global pginstdir /usr/pgsql-%{pgmajorversion}
 
 Name:           postgresql%{pgmajorversion}-%{sname}
-Version:        1.0
+Version:        1.6
 Release:        1%{?dist}
 Summary:        Transparent Data Encryption (TDE) extension for PostgreSQL %{pgmajorversion}
 License:        BSD
@@ -43,14 +47,14 @@ Features:
 %setup -q -n %{sname}-%{version}
 
 %build
-PG_CONFIG=/usr/pgsql-%{pgmajorversion}/bin/pg_config
+PG_CONFIG=%{pginstdir}/bin/pg_config
 export PG_CONFIG
 %{__make} PG_CONFIG="$PG_CONFIG" \
     CFLAGS="%{optflags} -fno-lto" \
     %{?_smp_mflags}
 
 %install
-PG_CONFIG=/usr/pgsql-%{pgmajorversion}/bin/pg_config
+PG_CONFIG=%{pginstdir}/bin/pg_config
 export PG_CONFIG
 %{__make} PG_CONFIG="$PG_CONFIG" \
     DESTDIR=%{buildroot} \
@@ -59,11 +63,20 @@ export PG_CONFIG
 %files
 %license LICENSE
 %doc doc/pg_vault_tde.md README.md
-%{_libdir}/pgsql/%{sname}.so
-%{_datadir}/pgsql/extension/%{sname}.control
-%{_datadir}/pgsql/extension/%{sname}--*.sql
+%{pginstdir}/lib/%{sname}.so
+%{pginstdir}/share/extension/%{sname}.control
+%{pginstdir}/share/extension/%{sname}--*.sql
+%{pginstdir}/lib/bitcode/%{sname}*
 
 %changelog
+* Wed Mar 04 2026 Miriade Srl <info@miriade.it> - 1.6-1
+- v1.6: Local PKCS#12 wallet KMS provider (offline, no external service)
+- Flexible passphrase sources: env, file, command, dev_mode
+- wallet_unlock/lock/rotate_kek/export_bundle/import_bundle SQL functions
+- Online Vault-to-wallet migration function
+- Support for PostgreSQL 17 and 18
+- 72 regression tests passing
+
 * Fri Feb 27 2026 Miriade Srl <info@miriade.it> - 1.0-1
 - Initial RPM release for PostgreSQL 17-18
 - AES-256-GCM transparent encryption via TAM

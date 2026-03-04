@@ -63,8 +63,10 @@ CREATE EXTENSION pg_vault_tde;
 
 ### 3. Configure Key Access
 
-Set GUC parameters in `postgresql.conf` (or `ALTER SYSTEM`) to point at your
-Vault / OpenBao instance:
+
+#### a) HashiCorp Vault / OpenBao (default)
+
+Set GUC parameters in `postgresql.conf` (or `ALTER SYSTEM`) to point at your Vault / OpenBao instance:
 
 ```ini
 pg_vault_tde.vault_url            = 'https://vault.example.com:8200'
@@ -77,7 +79,48 @@ pg_vault_tde.vault_timeout_ms     = 5000
 pg_vault_tde.enabled              = on          # set off to benchmark overhead
 ```
 
-For development and testing (no Vault required):
+#### b) Local Wallet (keypass locale, v1.6+)
+
+To use a local PKCS#12 wallet (no external KMS, suitable for offline/air-gapped/standalone):
+
+1. Set the following in `postgresql.conf`:
+
+```ini
+pg_vault_tde.kms_provider          = 'local'
+pg_vault_tde.wallet_path           = '/var/lib/postgresql/data/pg_vault_tde/wallet.p12'
+pg_vault_tde.wallet_passphrase_env = 'TDE_WALLET_PASSPHRASE'   # env var name only
+pg_vault_tde.wallet_auto_open      = on
+pg_vault_tde.enabled               = on
+```
+
+2. Set the passphrase in the environment before starting PostgreSQL:
+
+```bash
+export TDE_WALLET_PASSPHRASE='my-strong-wallet-passphrase'
+```
+
+3. Initialize the wallet (first time only, as superuser):
+
+```sql
+SELECT pg_vault_tde_wallet_init(current_setting('TDE_WALLET_PASSPHRASE'));
+```
+
+4. Check wallet status:
+
+```sql
+SELECT * FROM pg_vault_tde_wallet_status();
+```
+
+5. Unlock/lock wallet interactively (no restart needed):
+
+```sql
+SELECT pg_vault_tde_wallet_unlock('my-strong-wallet-passphrase');
+SELECT pg_vault_tde_wallet_lock();
+```
+
+> **Tip:** You can also use `wallet_passphrase_file` or `wallet_passphrase_command` instead of an environment variable. See the [GUC Parameters](#guc-parameters) section for details.
+
+For development and testing (no Vault or wallet required):
 
 ```sql
 -- Inject a random ephemeral DEK (test/dev only — lost on restart)
@@ -483,6 +526,21 @@ Hardware dispatch is via OpenSSL 3.x provider; the `TDE_TARGET_ARCH` flag
 enables the matching compiler intrinsics to ensure the provider is available.
 
 ### Packages
+
+The easiest way — no local build toolchain required (only `podman` or `docker`):
+
+```bash
+# Build all four packages (deb+rpm × pg17+pg18) into ./dist/
+bash packaging/build_in_container.sh --all
+
+# Single package
+bash packaging/build_in_container.sh                          # DEB PG18 (default)
+bash packaging/build_in_container.sh --format rpm             # RPM PG18
+bash packaging/build_in_container.sh --pg-version 17          # DEB PG17
+bash packaging/build_in_container.sh --format rpm --pg-version 17  # RPM PG17
+```
+
+If you have a local build environment, invoke the underlying scripts directly:
 
 ```bash
 # Debian / Ubuntu

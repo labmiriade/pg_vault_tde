@@ -1,3 +1,14 @@
+postgresql-pg-vault-tde (1.6-1) unstable; urgency=medium
+
+  * v1.6: Local PKCS#12 wallet KMS provider (offline/air-gapped support).
+  * Flexible passphrase sources: env var, file, command, dev_mode.
+  * wallet_unlock/lock/rotate_kek/export_bundle/import_bundle SQL functions.
+  * Online Vault-to-wallet migration (pg_vault_tde_migrate_vault_to_wallet).
+  * Support for PostgreSQL 17 and 18 from a single source package.
+  * 72 regression tests passing.
+
+ -- Miriade Srl <info@miriade.it>  Tue, 04 Mar 2026 00:00:00 +0100
+
 postgresql-pg-vault-tde (1.0-1) unstable; urgency=medium
 
   * Initial release.
