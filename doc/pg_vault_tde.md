@@ -1,6 +1,6 @@
 # pg_vault_tde Technical Reference
 
-**Version**: 1.4  
+**Version**: 1.6  
 **PostgreSQL**: 17.x, 18.x (19.x planned)  
 **License**: BSD (PostgreSQL License)  
 **Copyright**: © 2026 Miriade S.r.l.
@@ -531,14 +531,14 @@ CREATE OPERATOR CLASS tde_bytea_ops DEFAULT FOR TYPE bytea USING tde_btree AS
     FUNCTION 1 byteacmp(bytea, bytea);
 ```
 
-### IAM Limitations (v1.5)
+### IAM Limitations (v1.6)
 
 `tde_btree` now supports native operator classes for `text`, `int4`, `int8`, `uuid`,
 `numeric`, `date`, `timestamptz` (added v1.5). **Caveat**: varlena types (`text`,
 `bytea`, `numeric`) have their index key encrypted with AES-256-SIV. Fixed-size
 pass-by-value types (`int4`, `uuid`, `date`, `timestamptz`) store the **index key in
 plaintext** — the heap tuple remains fully encrypted but the btree page entry is not.
-This requires a custom btree page format to fix; planned for v1.6.
+This requires a custom btree page format to fix; planned for v1.7.
 
 Range scans on `tde_btree` columns return empty results by design (ordering not
 preserved by AES-SIV, regardless of type).
@@ -547,18 +547,17 @@ preserved by AES-SIV, regardless of type).
 
 ## Known Limitations
 
-### Current Limitations (v1.5)
+### Current Limitations (v1.6)
 
 | # | Limitation | Fix Version |
 |---|-----------|-------------|
-| 1 | **TOAST chunk-level storage encryption** — large values (> ~2 kB) round-trip correctly via heap TAM coverage, but `pg_toast_NNNNN` pages are not encrypted at the chunk-storage layer | v1.6 |
-| 2 | **Local Wallet KMS not operative** — `kms_provider = 'local'` GUC and SQL stubs exist; full PKCS#12/AES-256-WRAP implementation pending | v1.6 |
-| 3 | **tde_btree fixed-size types plaintext index keys** — `int4`, `int8`, `uuid`, `date`, `timestamptz` btree index entries are plaintext (heap fully encrypted); only varlena types have encrypted index keys | v1.6 |
-| 4 | **Logical replication TOAST gap** — tables with externally-TOAST'd columns not supported for logical decoding | v1.6 |
-| 5 | **WAL unencrypted** — requires `XLogInsert()` hook unavailable in extension API | Permanently deferred |
-| 6 | **All-or-nothing table encryption** — no per-column granularity | v1.6 |
-| 7 | **Range scans on tde_btree** — `WHERE col > x` returns empty (AES-SIV not order-preserving) | By design, permanent |
-| 8 | **BRIN on encrypted columns** — min/max of AES-SIV ciphertexts is meaningless | By design, permanent |
+| 1 | **TOAST chunk-level storage encryption** — large values (> ~2 kB) round-trip correctly via heap TAM coverage, but `pg_toast_NNNNN` pages are not encrypted at the chunk-storage layer | v1.7 |
+| 2 | **tde_btree fixed-size types plaintext index keys** — `int4`, `int8`, `uuid`, `date`, `timestamptz` btree index entries are plaintext (heap fully encrypted); only varlena types have encrypted index keys | v1.7 |
+| 3 | **Logical replication TOAST gap** — tables with externally-TOAST'd columns not supported for logical decoding | v1.7 |
+| 4 | **WAL unencrypted** — requires `XLogInsert()` hook unavailable in extension API | Permanently deferred |
+| 5 | **All-or-nothing table encryption** — no per-column granularity | v1.8 |
+| 6 | **Range scans on tde_btree** — `WHERE col > x` returns empty (AES-SIV not order-preserving) | By design, permanent |
+| 7 | **BRIN on encrypted columns** — min/max of AES-SIV ciphertexts is meaningless | By design, permanent |
 
 ### Historical Limitations (v1.0) — Many Resolved Since
 
@@ -795,7 +794,7 @@ dynamic LWLock tranche.
 
 ### Regression Tests (`sql/regression_test.sql`)
 
-52 SQL-level tests covering:
+72 SQL-level tests covering:
 
 | Range | Area |
 |---|---|
@@ -907,91 +906,35 @@ generic build. See `packaging/rpm/pg_vault_tde-arm.spec`.
 
 | pg_vault_tde | PostgreSQL | OpenSSL | Status |
 |---|---|---|---|
-| 1.0.x | 18.x | 3.x | ✅ Current |
-| 1.1.x | 18.x | 3.x | 🚧 In development |
-| 2.0.x | 18.x / 19.x | 3.x | 📋 Planned |
+| 1.6.x | 17.x, 18.x | 3.x | ✅ Current |
+| 1.7.x | 17.x, 18.x, 19.x | 3.x | 📋 Planned |
+| 1.8.x | 17.x, 18.x, 19.x | 3.x | 📋 Planned |
 
 ---
 
 ## Roadmap
 
-This roadmap is maintained by the Lead Architect. Priority is assigned by
-security impact, feature completeness, and upstream PostgreSQL schedule.
+See [ROADMAP.md](ROADMAP.md) for the full release roadmap.
 
-### Release 1.1 — "Production KMS" (Q3 2026)
+| Version | Theme | Status | Tests |
+|---------|-------|--------|-------|
+| **v1.1** | KMS/Vault + Key Rotation + HW Accel | ✅ Completed | 41 |
+| **v1.2** | Logical Decoding | ✅ Completed | — |
+| **v1.3** | Vault KEK + multi_insert + BGW | ✅ Completed | 48 |
+| **v1.4** | CI/CD + tde_btree + Wire Format v2 | ✅ Completed | 52 |
+| **v1.5** | Per-Table DEK + Online Rotation + AAD | ✅ Completed | 72 |
+| **v1.6** | Local Wallet KMS (production-ready) | ✅ Completed | 72 |
+| **v1.7** | TOAST Chunks + HSM + Audit | 📋 Q4 2027 | ~100 |
+| **v1.8** | KMIP + Column-Level + HA | 📋 Q2 2028 | ~130 |
 
-**Focus**: Complete Vault HTTP connector; TOAST encryption; COPY throughput.
+### Permanent Deferrals
 
-GUC infrastructure (`vault_url`, `vault_token`, etc.) is already wired
-in v1.0. The 1.1 release completes the libcurl request loop and adds
-AppRole / Kubernetes JWT auth.
-
-| Ticket | Feature | Complexity | Notes |
-|---|---|---|---|
-| #3 | **Vault HTTP connector** | High | Complete `pg_vault_tde_kms_request_async()` via libcurl; token refresh; `pg_vault_tde_kms_status()` SQL function |
-| #3b | AppRole / Kubernetes JWT auth | Medium | OIDC token path for cloud-native deployments |
-| #1 | **TOAST encryption (per-chunk)** | High | Wire `tde_toast_encrypt_chunk` / `tde_toast_decrypt_chunk`; switch TOAST override from `HEAP_TABLE_AM_OID` to `encrypted_heap` after index build fix |
-| #4 | **multi_insert batching** | Medium | Batch-encrypt slots; call `heap_multi_insert` once per batch |
-| — | `pg_vault_tde.dek_cache_ttl` | Low | Expire local DEK copy after N seconds independently of rotation |
-
-**Mandatory gates for 1.1**:
-- All 24 existing regression tests pass (no regressions).
-- New tests for Vault mock (TAP `tap/03_vault.t`) and TOAST roundtrip.
-- Zero compiler warnings on `gcc -Wall -Wextra` and `clang -Wall -Wextra`.
-
----
-
-### Release 1.2 — "Data Lifecycle" (Q4 2026)
-
-**Focus**: Row re-encryption; logical replication; monitoring.
-
-| Ticket | Feature | Complexity | Notes |
-|---|---|---|---|
-| #2 | **Row re-encryption utility** (`pg_vault_tde_reencrypt_table(regclass)`) | High | Cursor-based scan: read plaintext via TAM → write-encrypted in explicit transaction batches (configurable batch size); idempotent; safe to interrupt and resume; logs progress via `ereport(NOTICE)` |
-| #5 | **Logical replication plugin** | High | `pgoutput`-compatible decoding plugin; decrypts tuples in WAL sender context; new read path that bypasses query executor slot machinery |
-| — | `pg_vault_tde_encrypted_size(regclass)` | Low | Report encrypted overhead per table (total rows × `TDE_GCM_OVERHEAD`) |
-| — | `pg_vault_tde_verify_integrity(regclass)` | Medium | Full-table GCM tag verification without returning data (integrity audit tool) |
-
-**Key architectural constraints for #2**:
-- Must use explicit transaction batches (`BEGIN` / `COMMIT` per N rows) to
-  prevent XID wraparound and bloat.
-- Must hold `ShareRowExclusiveLock` on the table during each batch to prevent
-  concurrent writes on rows being re-encrypted.
-- Must handle the case where Vault returns a new DEK mid-scan (generation bump
-  during re-encryption): abort and restart from last committed batch.
-
-**Key architectural constraints for #5**:
-- `pg_vault_tde_decode_slot` cannot be called from WAL sender context — it
-  depends on `ExecForceStoreHeapTuple` which requires an executor slot.
-- The logical decoding plugin must call `tde_decrypt_heap_tuple()` directly
-  on the raw `HeapTuple` from the change record.
-- Must expose a GUC `pg_vault_tde.logical_decrypt = on|off` so subscribers
-  can opt out of decryption for encrypted replicas.
-
----
-
-### Release 2.0 — "Advanced Encryption" (H1 2027)
-
-**Focus**: Column-level encryption; key hierarchy; PG19 compatibility.
-
-| Feature | Complexity | Notes |
-|---|---|---|
-| **Column-level DEK** | Very High | Separate DEK per column, or per column group; requires tuple format change (per-column IV + tag); breaks wire format compatibility with 1.x |
-| **Key hierarchy (KEK/DEK)** | High | Vault stores KEK; DEK is wrapped (encrypted) by KEK; only wrapped DEK persists in shmem; unwrapped DEK lives only in per-backend stack frame during crypto calls |
-| **PostgreSQL 19 compatibility audit** | Medium | Track upstream TAM API changes; `scan_bitmap_next_tuple` signature changed between PG17→18; audit all callbacks at PG19 branch cut; follow PG N+1 Checklist in `copilot-instructions.md` § 0.5 |
-| **CockroachDB-compatible wire format** | Low | Document wire format version byte for future cross-version compatibility |
-| **Audit logging** | Medium | `pg_vault_tde_audit` table: log DEK access (generation, backend PID, timestamp) for compliance; configurable via GUC |
-
----
-
-### Deferred / Under Evaluation
-
-| Feature | Blocker |
-|---|---|
-| Range scans on `tde_btree` | Requires order-preserving encryption (OPE/ORE); these schemes have known security weaknesses; not scheduled |
-| Transparent WAL encryption | Requires PostgreSQL core WAL writer hook (not available in extension API) |
-| Tablespace-level key isolation | Requires per-tablespace DEK; shmem layout change |
-| SELinux / AppArmor profile | Packaging concern; deferred to distribution maintainers |
+| Gap | Reason |
+|-----|--------|
+| WAL encryption | Requires PG core hook (`XLogInsert()`) — not extension API |
+| BRIN on encrypted columns | min/max of ciphertexts is meaningless |
+| General GiST (range, geometric) | Penalty/picksplit requires ordering |
+| Full-text phrase search | Positional ordering destroyed by AES-SIV |
 
 ---
 
@@ -1001,7 +944,7 @@ This extension follows PostgreSQL's BSD-derived coding style and
 `pgindent` formatting conventions. All contributions must:
 
 - Pass `make` with `-Wall -Wextra` and zero warnings
-- Pass the full 52-test regression suite (`make ci-regress`)
+- Pass the full 72-test regression suite (`make ci-regress`)
 - Pass the page checksum compatibility test (`make ci-checksums`)
 - Use `palloc` / `pfree` exclusively (never `malloc` / `free`)
 - Use `ereport` / `elog` exclusively (never `printf` / `exit`)

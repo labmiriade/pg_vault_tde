@@ -5,10 +5,11 @@ zero core modifications.
 
 pg_vault_tde encrypts every tuple with **AES-256-GCM** at the Table Access
 Method layer. Data is encrypted before it reaches the storage manager and
-decrypted after it leaves. Encryption keys live in **HashiCorp Vault** /
-**OpenBao** and are cached in shared memory with automatic rotation.
+decrypted after it leaves. Encryption keys are managed by **HashiCorp Vault** /
+**OpenBao** or a **local PKCS#12 wallet** and cached in shared memory with
+automatic rotation.
 
-**Current release: v1.5** — 72 regression tests, zero compiler warnings on PG 17 + PG 18.
+**Current release: v1.6** — 72 regression tests, zero compiler warnings on PG 17 + PG 18.
 
 ### PostgreSQL Version Compatibility
 
@@ -109,12 +110,12 @@ SELECT email, ssn FROM users WHERE id = 1;
 | Tuple user data | ✅ **Yes** — AES-256-GCM | All column values in `encrypted_heap` tables |
 | HeapTupleHeader | ✗ No | xmin, xmax, ctid, infomask — required for MVCC |
 | Index keys (B-Tree) | ⚠️ Optional — `tde_btree` | AES-256-SIV — equality only; `bytea` only in v1.4; native types in v1.5 |
-| Index keys (GIN, Hash) | 🔜 v1.6 | GIN for jsonb/arrays; Hash for equality hashing |
+| Index keys (GIN, Hash) | 🔜 v1.8 | GIN for jsonb/arrays; Hash for equality hashing |
 | Index keys (GiST equality) | 🔜 v1.8 | Equality-only GiST (`inet_ops`); range/geometric GiST permanently deferred |
-| TOAST values | 🔜 v1.5 | Large column values (> ~2 kB) — chunk-level AES-GCM planned |
-| Column-level granularity | 🔜 v1.6 | Per-column `ENABLE COLUMN ENCRYPTION` DDL |
+| TOAST values | ⚠️ Partial v1.5 | Heap-level round-trips functional; per-chunk storage encryption → v1.7 |
+| Column-level granularity | 🔜 v1.8 | Per-column `ENABLE COLUMN ENCRYPTION` DDL |
 | WAL / redo log | ✗ Permanently deferred | Requires core hook in `XLogInsert()` — not possible as extension |
-| pg_statistic | 🔜 v1.6 | Statistics stored plaintext; MCVs/histograms expose value distribution |
+| pg_statistic | 🔜 v1.8 | Statistics stored plaintext; MCVs/histograms expose value distribution |
 
 > **Column-level**: Only tables created with `USING encrypted_heap` are
 > encrypted. Regular `heap` tables are unaffected.
@@ -190,12 +191,12 @@ pg_vault_tde supports multiple KMS backends via a provider abstraction layer
 
 ```ini
 pg_vault_tde.kms_provider = 'vault'   # HashiCorp Vault / OpenBao (default)
-# pg_vault_tde.kms_provider = 'local'  # Local wallet (PKCS#12, no external service)
+# pg_vault_tde.kms_provider = 'local'  # Local wallet (PKCS#12, no external service) (v1.6)
 # pg_vault_tde.kms_provider = 'pkcs11' # HSM via PKCS#11 (v1.7)
 # pg_vault_tde.kms_provider = 'kmip'   # KMIP 1.2 (v1.8)
 ```
 
-### Local Wallet Provider (v1.5 — Offline, No External Service)
+### Local Wallet Provider (v1.6 — Offline, No External Service)
 
 A PKCS#12-based encrypted file at
 `$PGDATA/pg_vault_tde/wallet.p12` protects the KEK. No network dependency.
@@ -211,8 +212,16 @@ pg_vault_tde.wallet_auto_open      = on
 ```sql
 -- First-time wallet setup:
 SELECT pg_vault_tde_wallet_init(current_setting('TDE_WALLET_PASSPHRASE'));
--- Check status:
+-- Check status (6-column SRF):
 SELECT * FROM pg_vault_tde_wallet_status();
+-- Interactive unlock (without PG restart):
+SELECT pg_vault_tde_wallet_unlock('my_passphrase');
+-- Lock wallet (evict DEKs from shmem):
+SELECT pg_vault_tde_wallet_lock();
+-- Rotate KEK (re-wrap all DEKs):
+SELECT pg_vault_tde_wallet_rotate_kek();
+-- Export wallet backup bundle:
+SELECT pg_vault_tde_wallet_export_bundle('/backup/wallet_bundle.bin', 'daily-backup');
 ```
 
 ### Production (HashiCorp Vault / OpenBao)
@@ -272,9 +281,13 @@ All parameters are in the `pg_vault_tde` namespace.
 
 | Parameter | Type | Default | Context | Description |
 |---|---|---|---|---|
-| `kms_provider` | string | `vault` | postmaster | Active KMS backend: `vault`, `local` (v1.5), `pkcs11` (v1.7), `kmip` (v1.8) |
+| `kms_provider` | string | `vault` | postmaster | Active KMS backend: `vault`, `local` (v1.6), `pkcs11` (v1.7), `kmip` (v1.8) |
 | `wallet_path` | string | `$PGDATA/pg_vault_tde/wallet.p12` | postmaster | Local wallet PKCS#12 file path (`kms_provider = 'local'`) |
 | `wallet_passphrase_env` | string | `''` | postmaster | Env var name holding wallet passphrase — env var NAME only, never the value |
+| `wallet_passphrase_file` | string | `''` | postmaster | File path containing wallet passphrase (trimmed; `0400` permission enforced) **(v1.6)** |
+| `wallet_passphrase_command` | string | `''` | postmaster | Shell command to retrieve passphrase (analogous to PG's `ssl_passphrase_command`) **(v1.6)** |
+| `wallet_dev_mode_passphrase` | string | `''` | userset | Convenience passphrase for dev/CI (only honoured when `dev_mode = on`) **(v1.6)** |
+| `dev_mode` | boolean | `off` | postmaster | Enable development mode features (wallet_dev_mode_passphrase) **(v1.6)** |
 | `wallet_auto_open` | boolean | `on` | postmaster | Auto-open wallet on startup if passphrase env var is set |
 | `max_encrypted_relations` | integer | `1024` | postmaster | Maximum number of per-table DEK entries in shmem (64–65536) |
 | `toast_encryption` | boolean | `on` | postmaster | Encrypt TOAST chunks with the parent relation's DEK (v1.5) |
@@ -309,7 +322,7 @@ All parameters are in the `pg_vault_tde` namespace.
 |---|---|---|---|---|
 | `enabled` | boolean | `on` | superuser | Master switch — set `off` to measure TAM overhead without crypto |
 | `dump_plaintext_warning` | boolean | `on` | sighup | Emit WARNING when `pg_dump`/`COPY TO` reads from an encrypted table (v1.7) |
-| `encrypt_statistics` | boolean | `off` | sighup | Encrypt `pg_statistic` MCVs/histograms for encrypted columns (v1.6) |
+| `encrypt_statistics` | boolean | `off` | sighup | Encrypt `pg_statistic` MCVs/histograms for encrypted columns (v1.8) |
 | `audit_enabled` | boolean | `on` | sighup | Enable audit event logging to `pg_vault_tde_audit_log` (v1.7) |
 
 ---
@@ -330,8 +343,14 @@ All parameters are in the `pg_vault_tde` namespace.
 | `pg_vault_tde_rotate_online(regclass, int)` | void | BGW-based online rotation, no exclusive lock **(v1.5)** |
 | `pg_vault_tde_rotation_status(regclass)` | composite | Online rotation progress **(v1.5)** |
 | `pg_vault_tde_wallet_init(text)` | void | Create local wallet and generate KEK **(v1.5)** |
-| `pg_vault_tde_wallet_change_passphrase(text, text)` | void | Re-protect wallet with new passphrase **(v1.5)** |
-| `pg_vault_tde_wallet_status()` | composite | Wallet existence, open state, algorithm **(v1.5)** |
+| `pg_vault_tde_wallet_change_passphrase(text, text)` | void | Re-protect wallet with new passphrase **(v1.6)** |
+| `pg_vault_tde_wallet_status()` | composite | Wallet existence, open state, algorithm, DEK count, last opened, file perms (6 cols) **(v1.6)** |
+| `pg_vault_tde_wallet_unlock(text)` | void | Interactive wallet unlock without PG restart **(v1.6)** |
+| `pg_vault_tde_wallet_lock()` | void | Evict all DEKs from shmem, mark wallet closed **(v1.6)** |
+| `pg_vault_tde_wallet_rotate_kek()` | void | Generate new KEK, re-wrap all DEKs atomically **(v1.6)** |
+| `pg_vault_tde_wallet_export_bundle(text, text)` | void | Export HMAC-signed wallet backup bundle **(v1.6)** |
+| `pg_vault_tde_wallet_import_bundle(text, text)` | void | Import and verify wallet backup bundle **(v1.6)** |
+| `pg_vault_tde_migrate_vault_to_wallet(text)` | void | Online Vault→local wallet migration **(v1.6)** |
 | `pg_vault_tde_kms_health_check()` | composite | Active provider connectivity and key access test **(v1.5)** |
 
 ---
@@ -372,10 +391,10 @@ CREATE INDEX ON secrets USING tde_btree (id);
 | Streaming replication | ✅ Full | WAL ships encrypted bytes; standby decrypts at TAM layer |
 | Page checksums | ✅ Full | Checksums over encrypted content (complementary to GCM) |
 | Logical replication (non-TOAST) | ✅ Full (v1.2) | `pg_vault_tde_pgoutput` plugin decrypts tuples before streaming |
-| TOAST (large values > ≈2 kB) | ⚠️ Partial v1.5 | Heap-level round-trips functional; per-chunk storage encryption → v1.6 |
-| Logical replication (TOAST columns) | 🔜 v1.6 | TOAST decrypt in `change_cb` before `ReorderBufferToastReplace()` |
+| TOAST (large values > ≈2 kB) | ⚠️ Partial v1.5 | Heap-level round-trips functional; per-chunk storage encryption → v1.7 |
+| Logical replication (TOAST columns) | 🔜 v1.7 | TOAST decrypt in `change_cb` before `ReorderBufferToastReplace()` |
 | Range scans on TDE indexes | ⚠️ By design | `tde_btree`/`tde_gin`/`tde_hash` use AES-SIV — equality only; ranges return empty |
-| Column-level encryption | 🔜 v1.6 | Per-column `ENABLE COLUMN ENCRYPTION` DDL |
+| Column-level encryption | 🔜 v1.8 | Per-column `ENABLE COLUMN ENCRYPTION` DDL |
 
 ---
 
@@ -479,38 +498,32 @@ rpmbuild -ba packaging/rpm/pg_vault_tde-arm.spec        # ARM CE optimised
 
 ---
 
-## Limitations (v1.5)
+## Limitations (v1.6)
 
 See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
 
-1. **TOAST chunk-level storage encryption** (→ v1.6): Large column values (> ~2 kB) are
-   stored in a TOAST table. In v1.5, TOAST round-trips are fully functional (heap TAM
+1. **TOAST chunk-level storage encryption** (→ v1.7): Large column values (> ~2 kB) are
+   stored in a TOAST table. In v1.6, TOAST round-trips are fully functional (heap TAM
    coverage), but individual TOAST chunks in `pg_toast_NNNNN` pages are **not encrypted
-   at the storage layer**. Per-chunk AES-256-GCM is planned for v1.6.
+   at the storage layer**. Per-chunk AES-256-GCM is planned for v1.7.
 
-2. **Local Wallet KMS provider not functional** (→ v1.6): SQL stubs and GUCs are
-   registered but `kms_provider = 'local'` is not operative. Full PKCS#12/AES-256-WRAP
-   implementation is planned for v1.6.
-
-3. **tde_btree fixed-size type index key encryption** (→ v1.6): `int4`, `int8`, `uuid`,
+2. **tde_btree fixed-size type index key encryption** (→ v1.7): `int4`, `int8`, `uuid`,
    `date`, `timestamptz` columns using `tde_btree` store the **index key in plaintext**.
    Only varlena types (`text`, `bytea`, `numeric`) have encrypted index keys. The heap
-   tuple is fully encrypted regardless. This limitation requires a custom btree page
-   format to fix (v1.6).
+   tuple is fully encrypted regardless.
 
-4. **Range scans on TDE indexes** (by design — permanent): The `tde_btree` AM uses
+3. **Range scans on TDE indexes** (by design — permanent): The `tde_btree` AM uses
    AES-256-SIV (equality-preserving, NOT order-preserving). `WHERE col > 'x'` on a
    `tde_btree` index returns empty results. Use sequential scans for range predicates.
 
-5. **Logical replication TOAST gap** (→ v1.6): Tables with externally-TOASTed columns
-   are not supported for logical decoding. `ReorderBufferToastReplace()` runs before
-   the output plugin.
+4. **Logical replication TOAST gap** (→ v1.7): Tables with externally-TOASTed columns
+   are not supported for logical decoding.
+
+5. **All-or-nothing table encryption** (→ v1.8): All columns in an `encrypted_heap`
+   table are encrypted. Per-column `ENABLE COLUMN ENCRYPTION` DDL is planned for v1.8.
 
 6. **WAL unencrypted** (permanently deferred): Full WAL encryption requires a hook in
    `XLogInsert()` / `XLogWrite()` — not achievable as a PostgreSQL extension.
-
-7. **All-or-nothing table encryption** (→ v1.6): All columns in an `encrypted_heap`
-   table are encrypted. Per-column `ENABLE COLUMN ENCRYPTION` DDL is planned for v1.6.
 
 ---
 

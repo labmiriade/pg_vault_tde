@@ -636,11 +636,11 @@ enc_copy = heap_copytuple(bslot->base.tuple);
 | DEK shared-memory cache + provider dispatch | `src/kms/pg_vault_tde_kms.c` | Shared memory + LWLock only; calls active KMS provider vtable |
 | KMS provider interface (vtable) | `src/kms/pg_vault_tde_kms_provider.h` | Function-pointer table `{init, wrap_dek, unwrap_dek, generate_dek, rewrap_dek, delete_key, health_check, shutdown}` |
 | Vault / OpenBao HTTP connector | `src/kms/pg_vault_tde_kms_vault.c` | libcurl, async/non-blocking; implements TdeKmsProvider vtable |
-| Local wallet KMS provider (v1.5) | `src/kms/pg_vault_tde_kms_local.c` | PKCS#12 via OpenSSL `PKCS12_*` API; AES-256-WRAP for DEK; implements TdeKmsProvider vtable |
+| Local wallet KMS provider (v1.6) | `src/kms/pg_vault_tde_kms_local.c` | PKCS#12 via OpenSSL `PKCS12_*` API; AES-256-WRAP for DEK; implements TdeKmsProvider vtable |
 | PKCS#11 / HSM provider (v1.7) | `src/kms/pg_vault_tde_kms_pkcs11.c` | OpenSSL 3.x PKCS#11 provider; `C_WrapKey`/`C_UnwrapKey`; implements TdeKmsProvider vtable |
 | KMIP 1.2 provider (v1.8) | `src/kms/pg_vault_tde_kms_kmip.c` | KMIP 1.2 over mTLS; implements TdeKmsProvider vtable |
 | AES-SIV index encryption (B-Tree, Hash) | `src/iam/pg_vault_tde_iam.c` | No GCM; equality-preserving only |
-| GIN index encryption (v1.6) | `src/iam/pg_vault_tde_gin.c` | Per-entry AES-SIV; equality only; no phrase search |
+| GIN index encryption (v1.8) | `src/iam/pg_vault_tde_gin.c` | Per-entry AES-SIV; equality only; no phrase search |
 | GiST equality index encryption (v1.8) | `src/iam/pg_vault_tde_gist.c` | Equality-only operator classes; `amvalidate` rejects range strategies |
 | Audit event log (v1.7) | `src/audit/pg_vault_tde_audit.c` | `tde_audit_log_event()` called from all key lifecycle paths |
 | Extension init / hooks + provider selection | `src/pg_vault_tde.c` | Hook registration + `tde_active_kms_provider` assignment from GUC |
@@ -705,83 +705,69 @@ New releases: bump both `packaging/debian/changelog` and the `Version:` field in
 
 ## 9. Roadmap Awareness
 
-When implementing new features, verify they do not conflict with the v1.5–v1.8 roadmap.
+When implementing new features, verify they do not conflict with the v1.7–v1.8 roadmap.
 Before any new code, read `doc/ROADMAP.md` for the current target version.
 
-### v1.5 Features (Q4 2026) — In Scope Now
+### Completed Features (v1.1–v1.6)
 
-1. **Local Wallet KMS provider** — `src/kms/pg_vault_tde_kms_local.c`; PKCS#12-based,
-   no external service. Requires KMS provider vtable first.
-   GUC `pg_vault_tde.kms_provider = 'local'`. Passphrase from env var ONLY.
+All features from v1.1 through v1.6 are **shipped and verified**. Key milestones:
 
-2. **KMS provider abstraction layer** — `src/kms/pg_vault_tde_kms_provider.h`; function-pointer
-   vtable. Refactor existing Vault code to `pg_vault_tde_kms_vault.c`. All future KMS backends
-   implement this interface. MUST NOT change `pg_vault_tde_kms_get_rel_dek()` call site API.
+- **v1.1**: Vault HTTP connector, AppRole + K8s JWT auth, `prev_dek` rotation fallback, HW accel
+- **v1.2**: `pg_vault_tde_pgoutput` logical decoding plugin
+- **v1.3**: Vault Transit KEK, `multi_insert` batching, token renewal BGW, `health_check()`
+- **v1.4**: CI/CD pipeline, `tde_btree` full wiring, wire format v2, OpenBao 3-node Raft
+- **v1.5**: Per-table DEK catalog, KMS provider vtable, native type ops, wire format v3 AAD, online rotation BGW
+- **v1.6**: Local Wallet KMS (PKCS#12, AES-256-WRAP), flexible passphrase (env/file/command/dev_mode), wallet unlock/lock/rotate_kek, export/import bundle ceremony, Vault→wallet migration
 
-3. **Per-table DEK isolation** — replace `TdeKmsSharedState.dek[32]` with `TdeRelDekCache`
-   (shmem array keyed by `Oid`). New catalog table `pg_vault_tde_catalog`. Backward
-   compat: v1.4 single-DEK tables use `relid = 0` sentinel.
+### v1.7 Features (Q4 2027) — Next
 
-4. **TOAST chunk encryption** — `pg_vault_tde_toast_am()` returns `encrypted_heap` OID;
-   chunk-level AES-256-GCM; `pg_vault_tde_detoast_datum()` wrapper. Closes the
-   "TOAST chunks unencrypted" known limitation. GUC `pg_vault_tde.toast_encryption = on`.
+1. **TOAST chunk-level storage encryption** — per-chunk AES-256-GCM at `pg_toast_NNNNN` layer.
+   `pg_vault_tde_detoast_datum()` wrapper decrypts chunks before reassembly.
 
-5. **tde_btree native type support** — type serializers via `type_send()`; operator
-   classes for `text`, `int4`, `int8`, `numeric`, `uuid`, `date`, `timestamptz`.
-   `amvalidate` MUST reject non-equality strategies.
+2. **Proper KEK/DEK wrapping hierarchy** — provider-agnostic `wrap_dek`/`unwrap_dek` API;
+   `pg_vault_tde_catalog.wrapped_dek` authoritative; Vault Transit as key protector.
 
-6. **Wire format v2 AEAD AAD** — AAD = `[database_oid(4) | relfilenode(4) | generation(8)]`;
-   passed to `EVP_EncryptUpdate` before data; never stored (zero wire overhead);
-   backward-compatible.
+3. **tde_btree fixed-size type encryption** — custom btree key serialisation; new
+   `tde_*_enc_ops` operator classes; deprecation path from v1.5 plaintext ops.
 
-7. **Online key rotation BGW** — `pg_vault_tde_rotate_online(regclass, batch_size)`;
-   cursor-based, no `AccessExclusiveLock`; `pg_vault_tde_rotation_progress` catalog.
+4. **Logical replication TOAST decrypt** — `change_cb` TOAST chunk decryption.
 
-8. **PG19 compatibility audit** — full PG N+1 checklist; `TDE_PG_MAX = 19`.
+5. **PKCS#11 / HSM provider** — `src/kms/pg_vault_tde_kms_pkcs11.c`; OpenSSL 3.x
+   PKCS#11 provider; CI with SoftHSM2.
 
-### v1.6 Features (Q2 2027) — Future
+6. **Audit trail** — `src/audit/pg_vault_tde_audit.c`; 10 event types;
+   `pg_vault_tde_audit_log` encrypted table with dedicated audit DEK.
 
-9. **Full KEK/DEK wrapping hierarchy** — formal `wrap_dek`/`unwrap_dek` provider API;
-   `pg_vault_tde_catalog.wrapped_dek` authoritative; Vault Transit never stores raw DEK.
+7. **pg_dump plaintext warning** — `ProcessUtility_hook` intercepts `COPY TO` on
+   encrypted tables; GUC `pg_vault_tde.dump_plaintext_warning`.
 
-10. **Column-level encryption** — `pg_vault_tde_columns` catalog; `ProcessUtility_hook`
-    intercepts `ALTER TABLE ... ENABLE/DISABLE COLUMN ENCRYPTION`; per-column Datum
-    serialization in `src/tam/pg_vault_tde_column.c`.
-
-11. **GIN index encryption** — `src/iam/pg_vault_tde_gin.c`; per-entry AES-SIV;
-    `amvalidate` rejects phrase/proximity operators. Equality only.
-
-12. **Hash index encryption** — `src/iam/pg_vault_tde_hash.c`; same SIV pattern as
-    `tde_btree`; reuse type serializers from v1.5.
-
-13. **pg_statistic encryption** — post-`ANALYZE` hook; encrypt `stavalues` for encrypted
-    relations; GUC `pg_vault_tde.encrypt_statistics`.
-
-### v1.7 Features (Q4 2027) — Future
-
-14. **PKCS#11 / HSM provider** — `src/kms/pg_vault_tde_kms_pkcs11.c`; OpenSSL 3.x
-    PKCS#11 provider; CI with SoftHSM2.
-
-15. **Audit trail** — `src/audit/pg_vault_tde_audit.c`; 10 event types;
-    `pg_vault_tde_audit_log` encrypted table with dedicated audit DEK.
-
-16. **pg_dump plaintext warning** — `ProcessUtility_hook` intercepts `COPY TO` on
-    encrypted tables; GUC `pg_vault_tde.dump_plaintext_warning`.
-
-17. **Physical backup key sealing** — `pg_vault_tde_backup_prepare()` / `restore()`;
-    HMAC-signed bundle of all `wrapped_dek` entries.
+8. **Physical backup key sealing** — `pg_vault_tde_backup_prepare()` / `restore()`;
+   HMAC-signed bundle of all `wrapped_dek` entries.
 
 ### v1.8 Features (Q2 2028) — Future
 
-18. **KMIP 1.2 provider** — `src/kms/pg_vault_tde_kms_kmip.c`; mTLS; CI with PyKMIP.
+9. **Column-level encryption** — `pg_vault_tde_columns` catalog; `ProcessUtility_hook`
+    intercepts `ALTER TABLE ... ENABLE/DISABLE COLUMN ENCRYPTION`; per-column Datum
+    serialization in `src/tam/pg_vault_tde_column.c`.
 
-19. **GiST equality-only encryption** — `src/iam/pg_vault_tde_gist.c`; `amvalidate`
+10. **GIN index encryption** — `src/iam/pg_vault_tde_gin.c`; per-entry AES-SIV;
+    `amvalidate` rejects phrase/proximity operators. Equality only.
+
+11. **Hash index encryption** — `src/iam/pg_vault_tde_hash.c`; same SIV pattern as
+    `tde_btree`; reuse type serializers from v1.5.
+
+12. **pg_statistic encryption** — post-`ANALYZE` hook; encrypt `stavalues` for encrypted
+    relations; GUC `pg_vault_tde.encrypt_statistics`.
+
+13. **KMIP 1.2 provider** — `src/kms/pg_vault_tde_kms_kmip.c`; mTLS; CI with PyKMIP.
+
+14. **GiST equality-only encryption** — `src/iam/pg_vault_tde_gist.c`; `amvalidate`
     MUST reject range/geometric strategies.
 
-20. **Streaming replication HA** — `pg_vault_tde_replica_setup()` for read-only KMS
+15. **Streaming replication HA** — `pg_vault_tde_replica_setup()` for read-only KMS
     credentials; HA documentation for all four KMS providers.
 
-21. **Dual-control / M-of-N** — `pg_vault_tde_key_custody_info()`; Vault Shamir +
+16. **Dual-control / M-of-N** — `pg_vault_tde_key_custody_info()`; Vault Shamir +
     PKCS#11 PIN-split ceremony documentation.
 
 ### Permanently Deferred (Cannot Be Implemented as Extension)
