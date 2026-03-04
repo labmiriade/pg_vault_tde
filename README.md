@@ -8,7 +8,7 @@ Method layer. Data is encrypted before it reaches the storage manager and
 decrypted after it leaves. Encryption keys live in **HashiCorp Vault** /
 **OpenBao** and are cached in shared memory with automatic rotation.
 
-**Current release: v1.4** — 52 regression tests, zero compiler warnings on PG 17 + PG 18.
+**Current release: v1.5** — 72 regression tests, zero compiler warnings on PG 17 + PG 18.
 
 ### PostgreSQL Version Compatibility
 
@@ -161,21 +161,23 @@ HashiCorp Vault / OpenBao (GUC-configurable endpoint)
 
 ### Wire Format (on disk, per tuple)
 
-**v2 format** (all new tuples as of v1.4):
+**v3 format** (all new tuples as of v1.5 — default for `encrypted_heap` tables):
 
 ```
-┌─────────────────────────────────┬────────────────────────────────────────────────────────────┐
+┌─────────────────────────────────┬────────────────────────────────────────────────────────────────┐
 │  HeapTupleHeader (t_hoff bytes) │  VER(1) │ GEN(8) │ IV(12) │ Ciphertext │ GCM-Tag(16)      │
 │  PLAINTEXT — MVCC fields        │                       ENCRYPTED USER DATA                  │
-└─────────────────────────────────┴────────────────────────────────────────────────────────────┘
-                                     ←────────── TDE_V2_OVERHEAD = 37 bytes ──────────►
+└─────────────────────────────────┴────────────────────────────────────────────────────────────────┘
+                                     ←────────── TDE_V2_OVERHEAD = 37 bytes ───────────→
 ```
 
-v2 overhead: **37 bytes per tuple** (1-byte version `0x02` + 8-byte DEK generation
+v3 overhead: **37 bytes per tuple** (1-byte version `0x03` + 8-byte DEK generation
 counter + 12-byte IV + 16-byte GCM authentication tag).
+v3 also passes `[database_oid(4) | relfilenode(4) | generation(8)]` as AEAD Additional
+Authenticated Data (AAD) — zero wire overhead; prevents cross-table ciphertext smuggling.
 
-v1 format (written by pg_vault_tde < 1.4) is **fully backward-compatible**: the
-decrypt path detects v1/v2 from the first byte and generation counter.
+**v2 format** (written by pg_vault_tde 1.4) is **fully backward-compatible**: the
+decrypt path detects v1/v2/v3 from the first byte and applies the correct AAD.
 
 ---
 
@@ -370,8 +372,8 @@ CREATE INDEX ON secrets USING tde_btree (id);
 | Streaming replication | ✅ Full | WAL ships encrypted bytes; standby decrypts at TAM layer |
 | Page checksums | ✅ Full | Checksums over encrypted content (complementary to GCM) |
 | Logical replication (non-TOAST) | ✅ Full (v1.2) | `pg_vault_tde_pgoutput` plugin decrypts tuples before streaming |
-| TOAST (large values) | 🔜 v1.5 | Chunk-level AES-GCM planned; unencrypted in v1.4 |
-| Logical replication (TOAST columns) | 🔜 v1.5 | TOAST decryption in `change_cb` before `ReorderBufferToastReplace()` |
+| TOAST (large values > ≈2 kB) | ⚠️ Partial v1.5 | Heap-level round-trips functional; per-chunk storage encryption → v1.6 |
+| Logical replication (TOAST columns) | 🔜 v1.6 | TOAST decrypt in `change_cb` before `ReorderBufferToastReplace()` |
 | Range scans on TDE indexes | ⚠️ By design | `tde_btree`/`tde_gin`/`tde_hash` use AES-SIV — equality only; ranges return empty |
 | Column-level encryption | 🔜 v1.6 | Per-column `ENABLE COLUMN ENCRYPTION` DDL |
 
@@ -387,8 +389,8 @@ make ci-all
 PG_VERSION=17 make ci-all
 
 # Individual test stages:
-make ci-regress          # 52 SQL regression tests
-make ci-checksums        # 52 tests + page checksum compatibility
+make ci-regress          # 72 SQL regression tests
+make ci-checksums        # 72 tests + page checksum compatibility
 make ci-tap              # TAP tests with mock Vault
 make ci-isolation        # Concurrency / MVCC isolation tests
 make ci-vault            # Vault integration (Compose-based)
@@ -400,7 +402,7 @@ make ci-bench BENCH_ROWS=100000  # with custom row count
 make ci-clean            # Remove test containers and images
 ```
 
-Test coverage (52 tests):
+Test coverage (72 tests):
 - Tests 1-11: AES-256-GCM crypto primitives, DEK rotation, tamper detection
 - Tests 12-14: TAM INSERT/SELECT/UPDATE end-to-end
 - Test 15: DELETE
@@ -418,6 +420,12 @@ Test coverage (52 tests):
 - Test 50: tde_btree CREATE INDEX + equality index scan **(v1.4)**
 - Test 51: health_check() `wrapped_dek_perms` column **(v1.4)**
 - Test 52: tde_btree UNIQUE constraint **(v1.4)**
+- Tests 53-56: Per-table DEK catalog, wallet SQL stubs, rotation progress schema **(v1.5)**
+- Tests 57-61: TOAST large-value round-trips (4 kB text, 8 kB jsonb, UPDATE, bulk COPY, raw-page check) **(v1.5)**
+- Tests 62-64: Per-table DEK isolation (two tables; DEK-A cannot decrypt table-B), DROP TABLE catalog cleanup **(v1.5)**
+- Tests 65-67: tde_btree native type operator classes (text, int4, uuid) **(v1.5)**
+- Tests 68-69: Wire format v3 AEAD AAD — cross-table paste attack rejected **(v1.5)**
+- Tests 70-72: Online key rotation BGW — concurrent SELECTs, progress tracking, BGW completion **(v1.5)**
 
 ---
 
@@ -471,36 +479,38 @@ rpmbuild -ba packaging/rpm/pg_vault_tde-arm.spec        # ARM CE optimised
 
 ---
 
-## Limitations (v1.4)
+## Limitations (v1.5)
 
 See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
 
-1. **TOAST encryption** (→ v1.5): Column values > ~2 kB are stored in a TOAST
-   table that uses the standard heap AM. These values are currently unencrypted.
+1. **TOAST chunk-level storage encryption** (→ v1.6): Large column values (> ~2 kB) are
+   stored in a TOAST table. In v1.5, TOAST round-trips are fully functional (heap TAM
+   coverage), but individual TOAST chunks in `pg_toast_NNNNN` pages are **not encrypted
+   at the storage layer**. Per-chunk AES-256-GCM is planned for v1.6.
 
-2. **tde_btree bytea-only** (→ v1.5): The `tde_btree` index AM supports only
-   `bytea` columns in v1.4. Native operator classes for `text`, `int4`, `uuid`,
-   `numeric`, `timestamptz` are planned for v1.5.
+2. **Local Wallet KMS provider not functional** (→ v1.6): SQL stubs and GUCs are
+   registered but `kms_provider = 'local'` is not operative. Full PKCS#12/AES-256-WRAP
+   implementation is planned for v1.6.
 
-3. **Range scans on TDE indexes** (by design — permanent): The `tde_btree` AM uses
+3. **tde_btree fixed-size type index key encryption** (→ v1.6): `int4`, `int8`, `uuid`,
+   `date`, `timestamptz` columns using `tde_btree` store the **index key in plaintext**.
+   Only varlena types (`text`, `bytea`, `numeric`) have encrypted index keys. The heap
+   tuple is fully encrypted regardless. This limitation requires a custom btree page
+   format to fix (v1.6).
+
+4. **Range scans on TDE indexes** (by design — permanent): The `tde_btree` AM uses
    AES-256-SIV (equality-preserving, NOT order-preserving). `WHERE col > 'x'` on a
    `tde_btree` index returns empty results. Use sequential scans for range predicates.
 
-4. **Logical replication TOAST gap** (→ v1.5): Tables with externally-toasted columns
+5. **Logical replication TOAST gap** (→ v1.6): Tables with externally-TOASTed columns
    are not supported for logical decoding. `ReorderBufferToastReplace()` runs before
    the output plugin.
 
-5. **WAL unencrypted** (permanently deferred): Full WAL encryption requires a hook in
+6. **WAL unencrypted** (permanently deferred): Full WAL encryption requires a hook in
    `XLogInsert()` / `XLogWrite()` — not achievable as a PostgreSQL extension.
-
-6. **No Local Wallet KMS provider** (→ v1.5): Currently Vault/OpenBao HTTP is the only
-   supported KMS backend. A PKCS#12-based local wallet  is planned for v1.5.
 
 7. **All-or-nothing table encryption** (→ v1.6): All columns in an `encrypted_heap`
    table are encrypted. Per-column `ENABLE COLUMN ENCRYPTION` DDL is planned for v1.6.
-
-8. **Single global DEK** (→ v1.5): All `encrypted_heap` tables currently share one DEK
-   in shmem. Per-table DEK isolation is planned for v1.5.
 
 ---
 

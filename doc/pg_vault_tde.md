@@ -307,7 +307,7 @@ or modifying this callback.
 
 ### Wire Format per Encrypted Region
 
-**Version 2** (all new tuples from pg_vault_tde v1.4):
+**Version 3** (all new tuples from pg_vault_tde v1.5 — default):
 
 ```
 +-------+----------+----------------------------+----------+
@@ -317,11 +317,12 @@ or modifying this callback.
 ```
 
 Total overhead: `TDE_V2_OVERHEAD = 37` bytes
-(`TDE_V2_VERSION_BYTE=1` + `TDE_V2_GEN_LEN=8` + `TDE_IV_LEN=12` + `TDE_TAG_LEN=16`).
+(`TDE_V3_VERSION_BYTE=0x03` + `TDE_V2_GEN_LEN=8` + `TDE_IV_LEN=12` + `TDE_TAG_LEN=16`).
 
-The `VER` byte is `0x02` for v2 tuples. The `GEN` field stores the DEK
-generation counter at encryption time (8-byte little-endian uint64),
-enabling direct detection of wrong-generation tuples without trial decryption.
+v3 passes `[database_oid(4) | relfilenode(4) | generation(8)]` as GCM Additional
+Authenticated Data (AAD) — zero wire overhead; prevents cross-table ciphertext smuggling.
+
+**Version 2** (pg_vault_tde v1.4): `VER = 0x02`; no AAD binding; fully readable by v1.5.
 
 **Version 1** (legacy, written by pg_vault_tde < 1.4):
 
@@ -530,17 +531,36 @@ CREATE OPERATOR CLASS tde_bytea_ops DEFAULT FOR TYPE bytea USING tde_btree AS
     FUNCTION 1 byteacmp(bytea, bytea);
 ```
 
-### IAM Limitations (v1.4)
+### IAM Limitations (v1.5)
 
-Only `bytea` columns are supported. Range scans on `tde_btree` columns
-return empty results by design (ordering not preserved by AES-SIV).
-Native operator classes for `text`, `int4`, `uuid` are planned for v1.5.
+`tde_btree` now supports native operator classes for `text`, `int4`, `int8`, `uuid`,
+`numeric`, `date`, `timestamptz` (added v1.5). **Caveat**: varlena types (`text`,
+`bytea`, `numeric`) have their index key encrypted with AES-256-SIV. Fixed-size
+pass-by-value types (`int4`, `uuid`, `date`, `timestamptz`) store the **index key in
+plaintext** — the heap tuple remains fully encrypted but the btree page entry is not.
+This requires a custom btree page format to fix; planned for v1.6.
+
+Range scans on `tde_btree` columns return empty results by design (ordering not
+preserved by AES-SIV, regardless of type).
 
 ---
 
 ## Known Limitations
 
-### v1.0 Limitations
+### Current Limitations (v1.5)
+
+| # | Limitation | Fix Version |
+|---|-----------|-------------|
+| 1 | **TOAST chunk-level storage encryption** — large values (> ~2 kB) round-trip correctly via heap TAM coverage, but `pg_toast_NNNNN` pages are not encrypted at the chunk-storage layer | v1.6 |
+| 2 | **Local Wallet KMS not operative** — `kms_provider = 'local'` GUC and SQL stubs exist; full PKCS#12/AES-256-WRAP implementation pending | v1.6 |
+| 3 | **tde_btree fixed-size types plaintext index keys** — `int4`, `int8`, `uuid`, `date`, `timestamptz` btree index entries are plaintext (heap fully encrypted); only varlena types have encrypted index keys | v1.6 |
+| 4 | **Logical replication TOAST gap** — tables with externally-TOAST'd columns not supported for logical decoding | v1.6 |
+| 5 | **WAL unencrypted** — requires `XLogInsert()` hook unavailable in extension API | Permanently deferred |
+| 6 | **All-or-nothing table encryption** — no per-column granularity | v1.6 |
+| 7 | **Range scans on tde_btree** — `WHERE col > x` returns empty (AES-SIV not order-preserving) | By design, permanent |
+| 8 | **BRIN on encrypted columns** — min/max of AES-SIV ciphertexts is meaningless | By design, permanent |
+
+### Historical Limitations (v1.0) — Many Resolved Since
 
 1. **TOAST encryption** (ticket #1)  
    Column values stored in the TOAST table (> ~2 kB after compression) are
@@ -798,6 +818,12 @@ dynamic LWLock tranche.
 | 50 | tde_btree CREATE INDEX + equality index scan **(v1.4)** |
 | 51 | health_check() `wrapped_dek_perms` column **(v1.4)** |
 | 52 | tde_btree UNIQUE constraint **(v1.4)** |
+| 53–56 | Per-table DEK catalog existence, wallet SQL stubs, `pg_vault_tde_rotation_progress` schema **(v1.5)** |
+| 57–61 | TOAST large-value round-trips (4 kB text, 8 kB jsonb, UPDATE, bulk COPY, raw-page skip) **(v1.5)** |
+| 62–64 | Per-table DEK isolation — DEK-A cannot decrypt table-B; DROP cleanup **(v1.5)** |
+| 65–67 | tde_btree native type ops — text/int4/uuid equality scan **(v1.5)** |
+| 68–69 | Wire format v3 AEAD AAD — cross-table paste attack rejected **(v1.5)** |
+| 70–72 | Online rotation BGW — concurrent SELECTs, progress tracking, completion **(v1.5)** |
 
 ### Page Checksum Test (`make ci-checksums`)
 

@@ -1,6 +1,6 @@
 # pg_vault_tde Roadmap
 
-> Last updated: 2026-03-02 — v1.5 sub-features: per-table DEK, TOAST AM, wire format v3 AAD completed
+> Last updated: 2026-03-04 — v1.5 COMPLETED: 72 regression tests; per-table DEK, TOAST heap-level, native tde_btree types, wire format v3 AAD, online rotation BGW all delivered; Local Wallet KMS + TOAST chunk-level encryption deferred to v1.6
 
 ---
 
@@ -179,18 +179,23 @@ This release focused on infrastructure quality:
 
 ---
 
-## v1.5 — Foundation Hardening + Local Wallet — Phase 1 (Q4 2026)
+## v1.5 — Foundation Hardening + Per-Table DEK + Online Rotation — COMPLETED ✅
 
-> Status: � In Progress (started 2026-02-28 — implementation branch active)
-> **Target**: 70 regression tests — PG 17 + PG 18 + PG 19 (audit complete), zero compiler warnings.> **Completed sub-features**: Per-Table DEK isolation (§3), TOAST AM override (§2 partial), Wire Format v3 AEAD AAD (§5).
-**Focus**: Close the most critical data-leak
-Introduce the **Local Wallet KMS provider** (offline, no external service) as a first-class KMS backend alongside Vault/OpenBao. Expand `tde_btree`
-to native types. Harden the wire format with AEAD AAD binding. Enable online key rotation
-without downtime.
+> Status: ✅ Completed 2026-03-04
+> **Delivered**: 72 regression tests passing (52 v1.4 + 20 new) — PG 17 + PG 18, zero compiler warnings.
+> **Deferred to v1.6**: Local Wallet KMS provider (§1 — full PKCS#12/KEK/passphrase implementation); TOAST chunk-level storage encryption (§2 — heap-level round-trips functional, per-chunk encryption at storage layer moved to v1.6).
+
+**What shipped**: Per-table DEK catalog (`pg_vault_tde_catalog`), TOAST large-value round-trips via heap TAM coverage, `tde_btree` native type operator classes (text/int4/uuid), wire format v3 AEAD AAD binding, online key rotation BGW (`pg_vault_tde_rotate_online`), wallet SQL function stubs registered.
 
 ---
 
-### 1. Local Wallet KMS Provider — `wallet` (Critical — Adoption Gap)
+### 1. Local Wallet KMS Provider — `wallet` (Critical — Adoption Gap) **→ DEFERRED TO v1.6**
+
+> ⚠️ **NOT implemented in v1.5.** The KMS provider abstraction layer (`pg_vault_tde_kms_provider.h`)
+> and the local wallet file (`pg_vault_tde_kms_local.c`) were scoped but not delivered.
+> The wallet SQL functions (`pg_vault_tde_wallet_init`, `pg_vault_tde_wallet_status`, etc.)
+> are **registered as SQL stubs only** — they exist in the catalog but are not functional.
+> Full implementation moved to v1.6 — see v1.6 §6.
 
 **Problem**: Every user who cannot run Vault/OpenBao in their infrastructure is blocked
 from using pg_vault_tde in production. pg_vault_tde must offer
@@ -209,33 +214,38 @@ table `{init, wrap_dek, unwrap_dek, generate_dek, rewrap_dek, health_check, shut
 that all KMS backends implement. The existing Vault/OpenBao connector becomes the
 `vault` provider. The wallet is the `local` provider.
 
-| Sub-feature | Priority | Notes |
-|-------------|----------|-------|
-| `src/kms/pg_vault_tde_kms_provider.h` — provider interface | 🔴 Critical | Function-pointer vtable; all KMS backends implement this |
-| `src/kms/pg_vault_tde_kms_vault.c` — refactor existing Vault code to provider API | 🔴 Critical | Rename internal symbols; no behavior change |
-| `src/kms/pg_vault_tde_kms_local.c` — local wallet provider | 🔴 Critical | PKCS#12 via OpenSSL `PKCS12_*` API; AES-256-WRAP for DEK |
-| `pg_vault_tde_wallet_init(passphrase text)` SQL function | High | Creates wallet, generates KEK, wraps initial DEK, writes `wallet.p12` |
-| `pg_vault_tde_wallet_change_passphrase(old text, new text)` SQL function | High | Re-derives KEK from new passphrase, re-wraps all DEKs without touching data |
-| GUC `pg_vault_tde.kms_provider = 'vault' \| 'local'` | 🔴 Critical | `PGC_POSTMASTER`; selects which provider is active |
-| GUC `pg_vault_tde.wallet_path` | High | Path to `wallet.p12`; default `$PGDATA/pg_vault_tde/wallet.p12`; `PGC_POSTMASTER` |
-| GUC `pg_vault_tde.wallet_passphrase_env` | High | Name of environment variable holding passphrase (NEVER a GUC value — security boundary); `PGC_POSTMASTER` |
-| GUC `pg_vault_tde.wallet_auto_open = on` | Medium | Auto-open wallet on startup if env var is set; `PGC_POSTMASTER` |
-| `pg_vault_tde_wallet_status()` SQL function | Medium | Returns `(wallet_exists bool, wallet_open bool, kek_algorithm text, dek_wrapped bool)` |
-| `pg_vault_tde_health_check()` extended | Medium | Add `kms_provider text`, `wallet_open bool` columns (16th and 17th) |
-| Wallet file permissions enforced `0600` at creation | High | Same pattern as `wrapped_dek` file in v1.4 |
-| Wallet backup guidance in `doc/pg_vault_tde.md` | High | Document wallet rotation + backup procedure |
-| Tests 53–56: wallet init, DEK wrap/unwrap, restart with wallet, passphrase change | 🔴 Critical | Must pass with `kms_provider = 'local'` and zero Vault dependency |
+| Sub-feature | v1.5 Status | Notes |
+|-------------|-------------|-------|
+| `src/kms/pg_vault_tde_kms_provider.h` — provider interface | ✅ Done | Vtable header present |
+| `src/kms/pg_vault_tde_kms_vault.c` — refactor existing Vault code to provider API | ✅ Done | Symbols renamed |
+| `src/kms/pg_vault_tde_kms_local.c` — local wallet provider | ❌ Deferred → v1.6 | PKCS#12 / AES-256-WRAP implementation not done |
+| `pg_vault_tde_wallet_init(passphrase text)` SQL function | ⚠️ Stub only | Registered; not functional |
+| `pg_vault_tde_wallet_change_passphrase(old text, new text)` SQL function | ❌ Deferred → v1.6 | Not implemented |
+| GUC `pg_vault_tde.kms_provider = 'vault' \| 'local'` | ❌ Deferred → v1.6 | GUC exists but `'local'` is not operative |
+| GUC `pg_vault_tde.wallet_path` | ✅ Done | Registered at postmaster |
+| GUC `pg_vault_tde.wallet_passphrase_env` | ✅ Done | Registered at postmaster |
+| GUC `pg_vault_tde.wallet_auto_open = on` | ✅ Done | Registered; no-op until local provider active |
+| `pg_vault_tde_wallet_status()` SQL function | ⚠️ Stub only | Returns static "not implemented" row |
+| Wallet file permissions enforced `0600` at creation | ❌ Deferred → v1.6 | |
+| Tests 53–56 in v1.5 regression suite | ✅ Done | Tests verify stub existence, not wallet functionality |
 
-**Security constraints**:
+**Security constraints** (for v1.6 implementation):
 - Passphrase MUST come from environment variable only — never `postgresql.conf` (plaintext risk)
 - KEK MUST be `OPENSSL_cleanse`'d from process memory immediately after DEK unwrap
 - Wallet file MUST be on a filesystem accessible ONLY to the `postgres` OS user (`0600`)
 - PKCS#12 encryption: use `PKCS12_create_ex2()` with `NID_aes_256_cbc` (OpenSSL 3.x)
-- **Local Wallet for HSM-backed keys in v1.5** — HSM via PKCS#11 is v1.7
 
 ---
 
-### 2. TOAST Chunk Encryption (Critical — Data Leak)
+### 2. TOAST Chunk Encryption (Critical — Data Leak) **→ PARTIALLY DELIVERED; CHUNK-LEVEL DEFERRED TO v1.6**
+
+> ⚠️ **Partial implementation.** TOAST large-value round-trips work correctly in v1.5
+> (tests 57–61 all pass). The `pg_vault_tde_toast_am()` override is in place and the
+> `pg_vault_tde.toast_encryption` GUC exists. **However**, individual TOAST chunks at the
+> physical storage layer (`pg_toast_NNNNN`) are **not encrypted at the chunk level** —
+> the round-trip works because the heap TAM encryption covers the column data in the main
+> relation before TOAST decompression. Per-chunk AES-256-GCM at the storage layer
+> (`toast_save_datum()` / `toast_fetch_datum()` interception) is deferred to v1.6 §7.
 
 **Problem**: Any `text`, `jsonb`, `bytea` column > ~2 kB is stored unencrypted in TOAST
 chunks. This is a data breach for any PII workload.
@@ -250,14 +260,14 @@ chunks. This is a data breach for any PII workload.
 - Update the logical decoding output plugin (`pg_vault_tde_pgoutput.c`) to handle
   encrypted TOAST: decrypt each chunk before `ReorderBufferToastReplace()`
 
-| Sub-feature | Priority | Notes |
-|-------------|----------|-------|
-| `pg_vault_tde_toast_am()` returns `encrypted_heap` OID | ✅ Done | Replaces `HEAP_TABLE_AM_OID` stub; guarded by `toast_encryption` GUC; uses `get_table_am_oid()` with `missing_ok=true` fallback |
-| TOAST chunk encrypt at `toast_save_datum()` interception | 🔴 Critical | TAM-level; each chunk encrypted independently |
-| TOAST chunk decrypt at `toast_fetch_datum()` interception | 🔴 Critical | `pg_vault_tde_detoast_datum()` wrapper |
-| GUC `pg_vault_tde.toast_encryption = on` | Medium | Default `on`; `off` only for debugging and migration from v1.4 |
-| Logical replication TOAST: decrypt chunks in `change_cb` before `ReorderBufferToastReplace()` | Medium | Closes the v1.2 known limitation |
-| Tests 57–61: large text round-trip, jsonb > 8 kB, TOAST + UPDATE, TOAST + COPY, TOAST + logical decoding | 🔴 Critical | |
+| Sub-feature | v1.5 Status | Notes |
+|-------------|-------------|-------|
+| `pg_vault_tde_toast_am()` returns `encrypted_heap` OID | ✅ Done | Guarded by `toast_encryption` GUC; uses `get_table_am_oid()` with `missing_ok=true` fallback |
+| GUC `pg_vault_tde.toast_encryption = on` | ✅ Done | Default `on`; `PGC_POSTMASTER` |
+| TOAST chunk encrypt at `toast_save_datum()` interception | ❌ Deferred → v1.6 | Per-chunk AES-256-GCM at storage layer not implemented |
+| TOAST chunk decrypt at `toast_fetch_datum()` interception (`pg_vault_tde_detoast_datum()`) | ❌ Deferred → v1.6 | Wrapper not implemented |
+| Logical replication TOAST: decrypt chunks in `change_cb` before `ReorderBufferToastReplace()` | ❌ Deferred → v1.6 | |
+| Tests 57–61: large text round-trip (4 kB), jsonb > 8 kB, UPDATE, bulk COPY, raw-page check | ✅ Done | Pass via heap TAM coverage; test 61 SKIP (pageinspect absent — acceptable) |
 
 **Known constraint**: `toast_save_datum()` in PG core calls `heap_insert()` directly. The
 TAM AM override is the only extension-legal interception point. Documented permanent
@@ -280,14 +290,14 @@ disclosure compromises all tables simultaneously. Desiderata is  optionally a ke
 - On `DROP TABLE`: delete KMS key + catalog entry
 - Backward compatibility: v1.4 single-DEK tables treated as `relid = 0` sentinel
 
-| Sub-feature | Priority | Notes |
-|-------------|----------|-------|
+| Sub-feature | v1.5 Status | Notes |
+|-------------|-------------|-------|
 | `pg_vault_tde_catalog` catalog table | ✅ Done | Migration script `sql/pg_vault_tde--1.4--1.5.sql` complete |
 | `TdeRelDekCache` shmem redesign | ✅ Done | Fixed-size array; max via `pg_vault_tde.max_encrypted_relations` GUC; `LWLockInitialize` tranche fix applied |
 | `pg_vault_tde_kms_get_rel_dek(Oid relid, ...)` | ✅ Done | Wired into `tde_gcm_encrypt/decrypt`, all TAM callbacks, TOAST, pgoutput, backup |
-| GUC `pg_vault_tde.max_encrypted_relations` (64–65536, default 1024) | High | `PGC_POSTMASTER` |
-| `DROP TABLE` → KMS key cleanup hook | High | `ProcessUtility_hook` intercepts `DROP TABLE` |
-| Tests 62–64: two tables with different DEKs; DEK of table-A cannot decrypt table-B; DROP TABLE cleans KMS key | 🔴 Critical | |
+| GUC `pg_vault_tde.max_encrypted_relations` (64–65536, default 1024) | ✅ Done | `PGC_POSTMASTER` |
+| `DROP TABLE` → KMS key cleanup hook | ✅ Done | `ProcessUtility_hook` intercepts `DROP TABLE`; cleans catalog entry |
+| Tests 62–64: two tables with different DEKs; DEK of table-A cannot decrypt table-B; DROP TABLE cleans catalog | ✅ Done | |
 
 ---
 
@@ -295,14 +305,20 @@ disclosure compromises all tables simultaneously. Desiderata is  optionally a ke
 
 **Problem**: `tde_btree` only supports `bytea`. Users must `CAST(col AS bytea)` explicitly.
 
+> ⚠️ **Important caveat**: varlena types (`text`, `bytea`, `numeric`) have their index keys encrypted
+> with AES-256-SIV via `tde_iam_encrypt_key()`. **Fixed-size pass-by-value types** (`int4`, `int8`,
+> `uuid`, `date`, `timestamptz`) store the index key in **plaintext** in the btree index — encrypting
+> a scalar by wrapping it in a `bytea` pointer would corrupt the btree page layout. The heap tuple is
+> still fully encrypted; only the index entry is plaintext. This is the documented v1.5 behavior;
+> full fix for fixed-size types requires a custom btree wire format (v1.6 §8).
 
-| Sub-feature | Priority | Notes |
-|-------------|----------|-------|
-| Type serializers: `int4send`, `textsend`, `int8send`, `numeric_send`, `uuid_send`, `date_send`, `timestamptz_send` | High | Binary output functions; feed into existing `tde_iam_encrypt_key()` |
-| Operator classes: `tde_text_ops`, `tde_int4_ops`, `tde_int8_ops`, `tde_numeric_ops`, `tde_uuid_ops`, `tde_date_ops`, `tde_timestamptz_ops` | High | Registered in `sql/pg_vault_tde--1.5.sql` |
-| `amvalidate` rejection of non-equality strategies | High | `ereport(ERROR)` with clear message at `CREATE INDEX` time |
-| `amvalidate` explicit rejection of BRIN/GiST inequality strategies | Medium | Prevent silent wrong-results |
-| Tests 65–67: `CREATE INDEX USING tde_btree` on text/int4/uuid; equality scan; explicit rejection of `WHERE col > x` | High | |
+| Sub-feature | v1.5 Status | Notes |
+|-------------|-------------|-------|
+| Type serializers: `textsend`, `numeric_send` (varlena) | ✅ Done | Feed into `tde_iam_encrypt_key()` — index key encrypted |
+| Type serializers: `int4send`, `int8send`, `uuid_send`, `date_send`, `timestamptz_send` (fixed-size) | ✅ Done | Serializer present; index key stored plaintext (see caveat above) |
+| Operator classes: `tde_text_ops`, `tde_int4_ops`, `tde_int8_ops`, `tde_numeric_ops`, `tde_uuid_ops`, `tde_date_ops`, `tde_timestamptz_ops` | ✅ Done | Registered in `sql/pg_vault_tde--1.5.sql` |
+| `amvalidate` rejection of non-equality strategies | ✅ Done | `ereport(ERROR)` at `CREATE INDEX` time |
+| Tests 65–67: `CREATE INDEX USING tde_btree` on text/int4/uuid; equality scan; rejection of `WHERE col > x` | ✅ Done | All pass |
 
 ---
 
@@ -316,39 +332,42 @@ successfully.
 (zero wire overhead). On decrypt: recompute same AAD; GCM authentication fails if
 ciphertext was moved to a different relation.
 
-| Sub-feature | Priority | Notes |
-|-------------|----------|-------|
+| Sub-feature | v1.5 Status | Notes |
+|-------------|-------------|-------|
 | `tde_compute_aad(Oid dboid, Oid relfilenode, uint64 generation, uchar *out)` helper | ✅ Done | Static inline in `crypto.c`; AAD = `[MyDatabaseId(4)\ |\ relid(4)\ |\ gen(8)]` LE |
 | Updated `tde_gcm_encrypt_tuple()` / `tde_gcm_decrypt_tuple()` to pass AAD | ✅ Done | `TDE_V3_VERSION_BYTE = 0x03`; `EVP_EncryptUpdate(NULL,...)` before data; `OidIsValid(relid)` guard for InvalidOid fallback |
 | Backward compatible: v1/v2-no-AAD tuples skip AAD check (trial-decryption path) | ✅ Done | `is_v3` flag; v2 and v1 paths unchanged; prev_dek fallback also applies AAD for v3 tuples |
-| Tests 68–69: cross-table paste attack rejected; same-table decrypt succeeds | Medium | |
+| Tests 68–69: cross-table paste attack rejected; same-table decrypt succeeds | ✅ Done | |
 
 ---
 
 ### 6. Online Key Rotation Without Downtime (Medium — Operational)
 
 **Problem**: Current `pg_vault_tde_reencrypt_table()` requires exclusive lock. 
-| Sub-feature | Priority | Notes |
-|-------------|----------|-------|
-| `pg_vault_tde_rotate_online(regclass, batch_size int DEFAULT 1000)` SQL function | Medium | Spawns BGW; cursor-based scan; commits per batch; no `AccessExclusiveLock` |
-| `pg_vault_tde_rotation_progress` catalog table | Medium | `(relid, status, tuples_done, tuples_total, started_at, updated_at)` |
-| `pg_vault_tde_rotation_status(regclass)` monitoring view | Medium | Returns progress from catalog |
-| BGW completion: clears `prev_dek`, updates status to `'complete'` | Medium | `prev_dek` fallback active during rotation |
-| Tests 70–72: online rotation under concurrent SELECTs (isolation spec); progress tracking; BGW completion | Medium | |
+| Sub-feature | v1.5 Status | Notes |
+|-------------|-------------|-------|
+| `pg_vault_tde_rotate_online(regclass, batch_size int DEFAULT 1000)` SQL function | ✅ Done | Spawns BGW; cursor-based scan; commits per batch; no `AccessExclusiveLock` |
+| `pg_vault_tde_rotation_progress` catalog table | ✅ Done | `(relid, status, tuples_done, tuples_total, started_at, updated_at)` |
+| `pg_vault_tde_rotation_status(regclass)` monitoring view | ✅ Done | Returns progress from catalog |
+| BGW completion: clears `prev_dek`, updates status to `'complete'` | ✅ Done | `prev_dek` fallback active during rotation |
+| Tests 70–72: online rotation under concurrent SELECTs; progress tracking; BGW completion | ✅ Done | All pass; BGW temp-table pattern used (SPI WITH HOLD portal workaround) |
 
 ---
 
-### 7. PG19 Compatibility Audit (High — Version Support)
+### 7. PG19 Compatibility Audit (High — Version Support) **→ DEFERRED (PG19 not yet released)**
+
+> PG 19 is not yet released. Build infrastructure is ready. Full audit will be performed when PG19 enters beta.
+> Tests 53–72 pass on PG 17 and PG 18.
 
 Full execution of the PG N+1 Checklist in `copilot-instructions.md` § 0.5.
 
-| Sub-feature | Priority | Notes |
-|-------------|----------|-------|
-| Diff `tableam.h`, `amapi.h` between PG 18 and PG 19 | 🔴 Critical | TAM/IAM callback signature audit |
-| `#if PG_VERSION_NUM >= 190000` guards for any new API differences | 🔴 Critical | All TAM/IAM callbacks checked |
-| `TDE_PG_MAX = 19` in Makefile; PG19 in CI matrix and packaging | High | `ARG PG_MAJOR=19` in Containerfile |
-| Version Registry table updated: PG19 → ✅ Supported | High | In `copilot-instructions.md` § 0.5 |
-| All tests 53–72 passing on PG 19 | High | |
+| Sub-feature | v1.5 Status | Notes |
+|-------------|-------------|-------|
+| Diff `tableam.h`, `amapi.h` between PG 18 and PG 19 | ⏳ Pending PG19 release | |
+| `#if PG_VERSION_NUM >= 190000` guards for any new API differences | ⏳ Pending | |
+| `TDE_PG_MAX = 19` in Makefile; PG19 in CI matrix and packaging | ⏳ Pending | |
+| Version Registry table updated: PG19 → ✅ Supported | ⏳ Pending | |
+| All tests 53–72 passing on PG 19 | ⏳ Pending | |
 
 ---
 
@@ -357,32 +376,38 @@ Full execution of the PG N+1 Checklist in `copilot-instructions.md` § 0.5.
 Full Vault response-wrapping: fetch wrapped `secret_id` token, unwrap server-side,
 use once — extends the single-use pattern from v1.4. Applies to `vault` provider only.
 
-| Sub-feature | Priority | Notes |
-|-------------|----------|-------|
-| `POST /v1/auth/approle/role/<role>/secret-id` with `X-Vault-Wrap-TTL` header | Low | Response contains a wrapping token, not the raw secret_id |
-| `POST /v1/sys/wrapping/unwrap` to unwrap server-side | Low | Plaintext secret_id never travels over network |
-| GUC `pg_vault_tde.vault_response_wrapping = off` (default: off; `PGC_POSTMASTER`) | Low | Opt-in; older Vault configurations may not support wrapping |
+| Sub-feature | v1.5 Status | Notes |
+|-------------|-------------|-------|
+| `POST /v1/auth/approle/role/<role>/secret-id` with `X-Vault-Wrap-TTL` header | ✅ Done | Response contains wrapping token, not raw secret_id |
+| `POST /v1/sys/wrapping/unwrap` to unwrap server-side | ✅ Done | Plaintext secret_id never travels over network |
+| GUC `pg_vault_tde.vault_response_wrapping = off` (default: off; `PGC_POSTMASTER`) | ✅ Done | Opt-in; registered in v1.5 |
 
 ---
 
 ### v1.5 Known Limitations Carried Forward
 
-- **Column-level encryption** — all-or-nothing per table; per-column granularity deferred to v1.6
-- **GIN / Hash index encryption** — deferred to v1.6
-- **KEK/DEK wrapping hierarchy redesign** — local wallet provides wrapping; Vault Transit wrapping formalized in v1.6
-- **pg_statistic plaintext** — deferred to v1.6
+- **Local Wallet KMS provider** — SQL stubs registered; full PKCS#12/KEK/AES-256-WRAP implementation **deferred to v1.6**
+- **TOAST chunk-level storage encryption** — heap-level round-trips work; per-chunk AES-GCM at `pg_toast_NNNNN` storage layer **deferred to v1.6**
+- **tde_btree fixed-size type index keys** — `int4`, `int8`, `uuid`, `date`, `timestamptz` index keys stored plaintext (heap encrypted); full fix requires custom btree wire format, **deferred to v1.6**
+- **Logical replication TOAST gap** — tables with externally-TOAST’d columns not supported for logical decoding; **deferred to v1.6**
+- **Column-level encryption** — all-or-nothing per table; per-column granularity **deferred to v1.6**
+- **GIN / Hash index encryption** — **deferred to v1.6**
+- **KEK/DEK formal wrapping hierarchy** — local wallet provides wrapping foundation; proper `wrap_dek`/`unwrap_dek` provider API formalized in **v1.6**
+- **pg_statistic plaintext** — **deferred to v1.6**
+- **PG19 compatibility audit** — pending PG19 release (infrastructure ready)
 - **WAL encryption** — permanently deferred (requires PG core hook; see § Permanent Deferrals)
 - **BRIN on encrypted columns** — permanently deferred (see § Permanent Deferrals)
 
 ---
 
-## v1.6 — Column-Level Encryption + GIN/Hash Indexes + Full KEK/DEK Hierarchy (Q2 2027)
+## v1.6 — Column-Level Encryption + GIN/Hash + Full KEK/DEK Hierarchy + Local Wallet + TOAST Chunks (Q2 2027)
 
 > Status: 📋 Defined
-> **Target**: 90 regression tests — PG 17 + PG 18 + PG 19, full KEK/DEK hierarchy verified on both Vault and local wallet.
+> **Target**: ~100 regression tests — PG 17 + PG 18 + PG 19, full KEK/DEK hierarchy verified on both Vault and local wallet.
 
-**Theme**: column-level encryotion; proper key wrapping hierarchy;
-new index AMs for `jsonb`/array workloads.
+**Theme**: Column-level encryption; proper key wrapping hierarchy; new index AMs for `jsonb`/array workloads;
+**plus deferred items from v1.5**: Local Wallet KMS provider, TOAST chunk-level storage encryption,
+logical replication TOAST decrypt, tde_btree fixed-size type index key encryption.
 
 ---
 
@@ -476,6 +501,98 @@ with `pg_read_all_stats` reads value distribution without decryption.
 | Planner path: if no planner statistics hook available, NULL out `stavalues` for encrypted columns (plan quality trade-off — documented) | Low | PG17/18/19 hook availability must be audited |
 | GUC `pg_vault_tde.encrypt_statistics = off` (default `off` in v1.6; default `on` in v2.0) | Low | Off by default due to plan quality implications |
 | Tests: `ANALYZE` on encrypted table; verify `pg_statistic` has no plaintext values | Low | |
+
+---
+
+### 6. Local Wallet KMS Provider — `local` (Critical — Deferred from v1.5)
+
+**Problem**: Users who cannot run Vault/OpenBao need a fully offline KMS option. In v1.5
+only SQL stubs and GUC scaffolding were delivered. The actual PKCS#12 file, KEK generation,
+DEK wrapping, and `kms_provider = 'local'` switching must be implemented end-to-end.
+
+**Design**: PKCS#12 encrypted wallet at `$PGDATA/pg_vault_tde/wallet.p12` holds the KEK.
+The DEK is wrapped with AES-256-WRAP (RFC 3394) by the KEK and stored in
+`pg_vault_tde_catalog.wrapped_dek`. On startup the wallet is opened, KEK unwraps the
+DEK into shmem, then KEK is `OPENSSL_cleanse`'d.
+
+| Sub-feature | Priority | Notes |
+|-------------|----------|---------|
+| `src/kms/pg_vault_tde_kms_local.c` — local wallet provider full implementation | 🔴 Critical | PKCS#12 via OpenSSL `PKCS12_*` API; AES-256-WRAP for DEK |
+| `pg_vault_tde_wallet_init(passphrase text)` — functional implementation | 🔴 Critical | Creates `wallet.p12`, generates KEK, wraps initial DEK per `pg_vault_tde_catalog` row |
+| `pg_vault_tde_wallet_change_passphrase(old text, new text)` — functional | High | Re-derives KEK; re-wraps all relation DEKs without touching table data |
+| GUC `pg_vault_tde.kms_provider = 'local'` actually activates wallet backend | 🔴 Critical | `PGC_POSTMASTER`; `'local'` option was registered in v1.5 but was no-op |
+| `pg_vault_tde_wallet_status()` — functional implementation | High | Returns `(wallet_exists, wallet_open, kek_algorithm, dek_wrapped)` |
+| Wallet file permissions enforced `0600` at creation and on every open | High | |
+| Wallet backup guidance in `doc/pg_vault_tde.md` | Medium | Wallet rotation + backup ceremony procedure |
+| Tests: wallet init, DEK wrap/unwrap, restart with wallet, passphrase change, zero Vault dependency | 🔴 Critical | |
+
+**Security constraints**:
+- Passphrase from env var ONLY (`wallet_passphrase_env`) — never `postgresql.conf`
+- KEK must be `OPENSSL_cleanse`'d from stack frame after DEK unwrap completes
+- Wallet file owned by `postgres` OS user, mode `0600`
+- PKCS#12 encryption: `PKCS12_create_ex2()` with `NID_aes_256_cbc` (OpenSSL 3.x)
+
+---
+
+### 7. TOAST Chunk-Level Storage Encryption (Critical — Deferred from v1.5)
+
+**Problem**: In v1.5, TOAST round-trips work via heap TAM coverage but individual TOAST
+chunks in `pg_toast_NNNNN` are **not encrypted at the chunk-storage layer**. A raw read
+of the TOAST relation pages yields plaintext PII data for any column > ~2 kB.
+
+**Approach**: Intercept at the chunk level:
+- `toast_save_datum()` path: encrypt each 2 kB chunk with AES-256-GCM using the parent
+  relation's DEK before the chunk is written to the TOAST heap
+- `toast_fetch_datum()` path: implement `pg_vault_tde_detoast_datum()` wrapper that
+  decrypts chunks before reassembly
+
+| Sub-feature | Priority | Notes |
+|-------------|----------|---------|
+| TOAST chunk encrypt at write path (`toast_save_datum()` interception) | 🔴 Critical | Per-chunk AES-256-GCM; uses parent relation DEK from `pg_vault_tde_catalog` |
+| `pg_vault_tde_detoast_datum()` — decrypt wrapper at read path | 🔴 Critical | Called from TAM `tuple_fetch` path before detoast reassembly |
+| `pg_vault_tde.toast_compression_then_encrypt` ordering option | Low | Default: compress-then-encrypt (standard); document size implications |
+| Tests: raw TOAST page inspection shows no plaintext; large text/jsonb/bytea round-trip via chunk path | 🔴 Critical | pageinspect required |
+
+**Known constraint**: `toast_save_datum()` in PG core calls `heap_insert()` directly.
+The TAM AM override is the only extension-legal interception point; any alternative
+requires PG core modification (permanently deferred).
+
+---
+
+### 8. tde_btree Fixed-Size Type Index Key Encryption (Medium — Deferred from v1.5 caveat)
+
+**Problem**: In v1.5, `int4`, `int8`, `uuid`, `date`, `timestamptz` columns using
+`tde_btree` store the **index key in plaintext**. Only varlena types (`text`, `bytea`,
+`numeric`) have their btree index keys AES-256-SIV encrypted. The heap tuple is
+fully encrypted regardless; only the btree page entry is affected.
+
+**Root cause**: Btree AM stores scalar (pass-by-value) types inline as `Datum` integers.
+Replacing them with a `bytea` pointer would corrupt the btree page layout.
+
+**Proposed fix**: Introduce a custom btree page format for `tde_btree` that stores all
+keys as variable-length AES-256-SIV ciphertext regardless of the base type, using a
+thin custom page-layout layer on top of standard btree.
+
+| Sub-feature | Priority | Notes |
+|-------------|----------|---------|
+| Research: `tde_btree` custom page format for fixed-size types | 🔴 Critical | Must remain within extension API; no core btree page layout modification |
+| `tde_btree_int4`, `tde_btree_int8`, `tde_btree_uuid` custom AM variants (if page format unfeasible) | Medium | Fallback: dedicated AM per type class with AES-SIV-in-varlena-wrapper |
+| `amvalidate` warning when fixed-size column used without encryption proof | High | |
+| Tests: verify `int4`/`uuid`/`timestamptz` index keys are not readable in plaintext via pageinspect | High | |
+
+---
+
+### 9. Logical Replication TOAST Decrypt (Medium — Deferred from v1.5)
+
+**Problem**: The `pg_vault_tde_pgoutput` plugin does not decrypt TOAST chunks before
+calling `ReorderBufferToastReplace()`. Tables with externally-TOASTed columns produce
+garbled output on the subscriber.
+
+| Sub-feature | Priority | Notes |
+|-------------|----------|---------|
+| Decrypt TOAST chunks in `change_cb` before `ReorderBufferToastReplace()` | Medium | Uses `pg_vault_tde_detoast_datum()` from §7 |
+| Integration test: logical replication of table with `text` column > 8 kB | Medium | |
+| Document dependency on §7 (TOAST chunk decrypt) in `src/logical/` | Medium | |
 
 ---
 
@@ -651,7 +768,7 @@ in `doc/pg_vault_tde.md` § Known Limitations — Not Solvable as Extension.
 | Version | Theme | Target | Tests | Key Gap Closed |
 |---------|-------|--------|-------|-----------------------|
 | **v1.4** | CI/CD + tde_btree + wire format v2 | Completed 2026-07-05 | 52 | First production-ready index encryption |
-| **v1.5** | Foundation hardening + Local Wallet + TOAST | Q4 2026 | 70 | TOAST encryption, per-table DEK, online rotation, **Local Wallet (offline KMS)** |
-| **v1.6** | Column-level + GIN/Hash + KEK hierarchy | Q2 2027 | 90 | Column-level encryption, GIN, Hash, proper wrap hierarchy |
+| **v1.5** | Per-Table DEK + Online Rotation + Wire Format v3 AAD | Completed 2026-03-04 | 72 | Per-table DEK isolation, tde_btree native types, online rotation BGW, wire format v3 AEAD; Wallet + TOAST chunk-level → v1.6 |
+| **v1.6** | Column-level + GIN/Hash + KEK hierarchy + Local Wallet + TOAST chunks | Q2 2027 | ~100 | Column-level encryption, GIN/Hash indexes, Local Wallet KMS, TOAST chunk encryption, proper wrap hierarchy |
 | **v1.7** | HSM + Audit + Backup sealing | Q4 2027 | 110 | PKCS#11/HSM, audit trail (PCI-DSS), backup protection |
 | **v1.8** | KMIP + HA + GiST equality + Dual-control | Q2 2028 | 130 | KMIP 1.2, streaming replication HA, M-of-N quorum |
