@@ -87,7 +87,8 @@ To use a local PKCS#12 wallet (no external KMS, suitable for offline/air-gapped/
 
 ```ini
 pg_vault_tde.kms_provider          = 'local'
-pg_vault_tde.wallet_path           = '/var/lib/postgresql/data/pg_vault_tde/wallet.p12'
+# wallet_path defaults to $PGDATA/pg_vault_tde/wallet.p12 — omit unless overriding:
+# pg_vault_tde.wallet_path         = '/custom/path/to/wallet.p12'
 pg_vault_tde.wallet_passphrase_env = 'TDE_WALLET_PASSPHRASE'   # env var name only
 pg_vault_tde.wallet_auto_open      = on
 pg_vault_tde.enabled               = on
@@ -102,7 +103,10 @@ export TDE_WALLET_PASSPHRASE='my-strong-wallet-passphrase'
 3. Initialize the wallet (first time only, as superuser):
 
 ```sql
-SELECT pg_vault_tde_wallet_init(current_setting('TDE_WALLET_PASSPHRASE'));
+-- In psql: \set reads the shell variable without exposing the value in
+-- pg_stat_activity or server logs (note: backslash-set is a psql meta-command)
+\set PASSPHRASE `echo $TDE_WALLET_PASSPHRASE`
+SELECT pg_vault_tde_wallet_init(:'PASSPHRASE');
 ```
 
 4. Check wallet status:
@@ -247,14 +251,16 @@ Suitable for single-server deployments, air-gapped environments, and development
 
 ```ini
 pg_vault_tde.kms_provider          = 'local'
-pg_vault_tde.wallet_path           = '/var/lib/postgresql/data/pg_vault_tde/wallet.p12'
+# wallet_path defaults to $PGDATA/pg_vault_tde/wallet.p12 — omit unless overriding:
+# pg_vault_tde.wallet_path         = '/custom/path/to/wallet.p12'
 pg_vault_tde.wallet_passphrase_env = 'TDE_WALLET_PASSPHRASE'   # env var, never postgresql.conf
 pg_vault_tde.wallet_auto_open      = on
 ```
 
 ```sql
--- First-time wallet setup:
-SELECT pg_vault_tde_wallet_init(current_setting('TDE_WALLET_PASSPHRASE'));
+-- First-time wallet setup (\set reads the shell var without exposing it in logs):
+\set PASSPHRASE `echo $TDE_WALLET_PASSPHRASE`
+SELECT pg_vault_tde_wallet_init(:'PASSPHRASE');
 -- Check status (6-column SRF):
 SELECT * FROM pg_vault_tde_wallet_status();
 -- Interactive unlock (without PG restart):

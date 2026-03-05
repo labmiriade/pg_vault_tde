@@ -917,53 +917,88 @@ pg_vault_tde_wallet_init_sql(PG_FUNCTION_ARGS)
                        "rotate the passphrase, or remove the file manually "
                        "to re-initialize", path));
 
-    /* Ensure parent directory exists */
+    /*
+     * Ensure the wallet parent directory exists.
+     *
+     * We derive the parent dir from the configured wallet path, NOT from
+     * DataDir + "/pg_vault_tde".  The GUC pg_vault_tde.wallet_path may
+     * point anywhere (e.g. a separate filesystem); using DataDir here
+     * would create the directory in the wrong location and then fail when
+     * opening the file at the GUC path.
+     *
+     * We create exactly one directory level.  If the parent's own parent
+     * does not exist, mkdir returns ENOENT and the admin must create it.
+     */
     {
-        char dir[MAXPGPATH];
-        snprintf(dir, sizeof(dir), "%s/pg_vault_tde", DataDir);
+        char    dir[MAXPGPATH];
+        const char *slash = strrchr(path, '/');
+
+        if (slash && slash > path)
+        {
+            size_t  dlen = (size_t) (slash - path);
+
+            if (dlen >= sizeof(dir))
+            {
+                OPENSSL_cleanse(passphrase, strlen(passphrase));
+                pfree(passphrase);
+                ereport(ERROR,
+                        errmsg("pg_vault_tde: wallet path too long"));
+            }
+            memcpy(dir, path, dlen);
+            dir[dlen] = '\0';
+        }
+        else
+            strlcpy(dir, ".", sizeof(dir));
+
         if (mkdir(dir, 0700) != 0 && errno != EEXIST)
+        {
+            OPENSSL_cleanse(passphrase, strlen(passphrase));
+            pfree(passphrase);
             ereport(ERROR,
                     errmsg("pg_vault_tde: could not create directory \"%s\": %m",
                            dir));
+        }
     }
 
     /*
-     * Create a PKCS#12 structure with AES-256-CBC encryption.
-     * NID_pbe_WithSHA1AndRC2_CBC is the PKCS12_create default old cipher;
-     * we override it with NID_aes_256_cbc for OpenSSL 3.x compliance.
+     * Build a passphrase-authenticated PKCS#12 structure.
      *
-     * PKCS12_create_ex2 signature (OpenSSL 3.x):
-     *   PKCS12_create_ex2(pass, name, pkey, cert, ca,
-     *                     nid_key, nid_cert, iter, maciter, keytype,
-     *                     libctx, propq, cb, cbarg)
+     * PKCS12_create_ex(pkey=NULL, cert=NULL, ca=NULL) is rejected on
+     * OpenSSL 3.0.x (Ubuntu 22.04 ships 3.0.2) with
+     * PKCS12_R_INVALID_NULL_ARGUMENT — the 3.0.x code requires at least
+     * one of pkey/cert/ca to be non-NULL.  This was relaxed in 3.3+.
      *
-     * We pass NULL for pkey/cert/ca — passphrase-only bag.
+     * We use the lower-level API instead:
+     *   PKCS12_init(NID_pkcs7_data) — allocate an empty AuthSafe
+     *   PKCS12_set_mac(...)         — attach a passphrase-based MAC
+     *
+     * The wallet file is used solely for passphrase verification.
+     * Actual DEKs are wrapped with AES-256-WRAP and stored in
+     * pg_vault_tde_catalog — they are never inside this file.
      */
-    /*
-     * PKCS12_create_ex2 was introduced in OpenSSL 3.3+.  We use
-     * PKCS12_create_ex which is available in OpenSSL 3.0+ and provides
-     * the same functionality (libctx / propq parameters, no callback).
-     */
-    p12 = PKCS12_create_ex(passphrase,
-                            "pg_vault_tde wallet",
-                            NULL,      /* no private key */
-                            NULL,      /* no certificate */
-                            NULL,      /* no CA chain */
-                            NID_aes_256_cbc,       /* nid_key */
-                            NID_aes_256_cbc,       /* nid_cert */
-                            PKCS12_DEFAULT_ITER,   /* iter */
-                            PKCS12_DEFAULT_ITER,   /* maciter */
-                            0,                     /* default keytype */
-                            NULL,                  /* libctx */
-                            NULL                   /* propq */
-                            );
-
+    p12 = PKCS12_init(NID_pkcs7_data);
     if (!p12)
     {
         OPENSSL_cleanse(passphrase, strlen(passphrase));
         pfree(passphrase);
         ereport(ERROR,
-                errmsg("pg_vault_tde: PKCS12_create_ex failed: %s",
+                errmsg("pg_vault_tde: PKCS12_init failed: %s",
+                       ERR_reason_error_string(ERR_get_error())));
+    }
+    /*
+     * salt=NULL tells OpenSSL to generate a random 8-byte salt internally.
+     * iter=PKCS12_DEFAULT_ITER (2048), md=SHA-256.
+     */
+    if (PKCS12_set_mac(p12, passphrase, -1,
+                       NULL, 0,                 /* salt: random */
+                       PKCS12_DEFAULT_ITER,
+                       EVP_sha256()) != 1)
+    {
+        PKCS12_free(p12);
+        OPENSSL_cleanse(passphrase, strlen(passphrase));
+        pfree(passphrase);
+        ereport(ERROR,
+                errmsg("pg_vault_tde: PKCS12_set_mac failed: %s",
                        ERR_reason_error_string(ERR_get_error())));
     }
 
@@ -1032,16 +1067,25 @@ local_create_wallet_file(const char *dest_path, const char *passphrase)
 
     snprintf(tmp_path, sizeof(tmp_path), "%s.new", dest_path);
 
-    p12 = PKCS12_create_ex(passphrase,
-                            "pg_vault_tde wallet",
-                            NULL, NULL, NULL,
-                            NID_aes_256_cbc, NID_aes_256_cbc,
-                            PKCS12_DEFAULT_ITER, PKCS12_DEFAULT_ITER,
-                            0, NULL, NULL);
+    /*
+     * Build a MAC-only PKCS#12 (see wallet_init_sql for full rationale).
+     * PKCS12_create_ex rejects pkey=cert=ca=NULL on OpenSSL 3.0.x.
+     */
+    p12 = PKCS12_init(NID_pkcs7_data);
     if (!p12)
         ereport(ERROR,
-                errmsg("pg_vault_tde: PKCS12_create_ex failed: %s",
+                errmsg("pg_vault_tde: PKCS12_init failed: %s",
                        ERR_reason_error_string(ERR_get_error())));
+    if (PKCS12_set_mac(p12, passphrase, -1,
+                       NULL, 0,              /* salt: random */
+                       PKCS12_DEFAULT_ITER,
+                       EVP_sha256()) != 1)
+    {
+        PKCS12_free(p12);
+        ereport(ERROR,
+                errmsg("pg_vault_tde: PKCS12_set_mac failed: %s",
+                       ERR_reason_error_string(ERR_get_error())));
+    }
 
     fd = open(tmp_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
     if (fd < 0)
