@@ -1,7 +1,7 @@
 #!/bin/bash
 # packaging/build_in_container.sh — Build pg_vault_tde packages inside a container
 #
-# Builds .deb (Ubuntu 22.04 + PGDG) or .rpm (Rocky Linux 9 + PGDG) packages
+# Builds .deb (Ubuntu/Debian + PGDG) or .rpm (Rocky Linux/AlmaLinux + PGDG) packages
 # without requiring any local build toolchain.  Output packages land in ./dist/.
 #
 # Requires: podman or docker
@@ -10,12 +10,24 @@
 #   bash packaging/build_in_container.sh [OPTIONS]
 #
 # Options:
-#   --format deb|rpm      Package format  (default: deb)
-#   --pg-version 17|18    PostgreSQL major version  (default: 18)
-#   --all                 Build all combinations: deb+rpm × pg17+pg18
-#   --output-dir DIR      Where to copy finished packages  (default: ./dist)
-#   --no-cache            Pass --no-cache to the container runtime
-#   -h, --help            Show this help
+#   --format deb|rpm          Package format  (default: deb)
+#   --pg-version 17|18        PostgreSQL major version  (default: 18)
+#   --os-version VERSION      OS base image for the build container:
+#                               DEB:  ubuntu:22.04 (default), ubuntu:24.04,
+#                                     debian:12, debian:11
+#                               RPM:  rockylinux:9 (default), rockylinux:8,
+#                                     almalinux:9, almalinux:8
+#   --arch-variant VARIANT    Hardware acceleration variant:
+#                               generic (default) — portable, no special flags
+#                               aesni   — Intel/AMD AES-NI + PCLMUL (Core 2010+, Bulldozer+)
+#                               vaes    — AMD VAES + AVX2 (Zen 4+, Intel Ice Lake+)
+#                               armce   — ARM Crypto Extensions (ARMv8-A, Graviton 2/3)
+#                               sve2    — ARM SVE2 (ARMv9-A, Neoverse V2, Grace)
+#   --all                     Build all combinations: deb+rpm × pg17+pg18
+#                             (uses default OS versions, generic arch variant)
+#   --output-dir DIR          Where to copy finished packages  (default: ./dist)
+#   --no-cache                Pass --no-cache to the container runtime
+#   -h, --help                Show this help
 #
 # Examples:
 #   bash packaging/build_in_container.sh
@@ -24,8 +36,20 @@
 #   bash packaging/build_in_container.sh --format rpm --pg-version 17
 #       → ./dist/postgresql17-pg_vault_tde-1.6-1.el9.x86_64.rpm
 #
+#   bash packaging/build_in_container.sh --os-version ubuntu:24.04
+#       → DEB PG18 built on Ubuntu 24.04 Noble
+#
+#   bash packaging/build_in_container.sh --format rpm --os-version rockylinux:8 --pg-version 17
+#       → RPM PG17 built on Rocky Linux 8 (EL8)
+#
+#   bash packaging/build_in_container.sh --arch-variant aesni
+#       → ./dist/postgresql-18-pg-vault-tde-aesni_1.6-1_amd64.deb
+#
+#   bash packaging/build_in_container.sh --format rpm --arch-variant vaes --os-version almalinux:9
+#       → RPM AES-VAES on AlmaLinux 9
+#
 #   bash packaging/build_in_container.sh --all
-#       → dist/ with all four packages
+#       → dist/ with all four generic packages (deb+rpm × pg17+pg18)
 #
 # Copyright (c) 2026 Miriade Srl — PostgreSQL License
 
@@ -42,6 +66,8 @@ PG_MAJOR="18"
 BUILD_ALL=0
 OUTPUT_DIR="./dist"
 NO_CACHE=""
+ARCH_VARIANT=""          # empty = generic
+OS_VERSION_ARG=""        # empty = use format-specific default
 
 # ---------------------------------------------------------------------------
 # Parse arguments
@@ -54,6 +80,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --pg-version)
             PG_MAJOR="$2"
+            shift 2
+            ;;
+        --os-version)
+            OS_VERSION_ARG="$2"
+            shift 2
+            ;;
+        --arch-variant)
+            ARCH_VARIANT="${2,,}"   # lowercase
             shift 2
             ;;
         --all)
@@ -69,7 +103,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            sed -n '2,28p' "$0" | sed 's/^# \?//'
+            sed -n '2,58p' "$0" | sed 's/^# \?//'
             exit 0
             ;;
         *)
@@ -81,16 +115,100 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ---------------------------------------------------------------------------
-# Validate
+# Validate --format
 # ---------------------------------------------------------------------------
 if [[ "$FORMAT" != "deb" && "$FORMAT" != "rpm" ]]; then
     echo "ERROR: --format must be 'deb' or 'rpm', got '$FORMAT'"
     exit 1
 fi
+
+# ---------------------------------------------------------------------------
+# Validate --pg-version
+# ---------------------------------------------------------------------------
 if [[ "$PG_MAJOR" != "17" && "$PG_MAJOR" != "18" ]]; then
     echo "ERROR: --pg-version must be 17 or 18, got '$PG_MAJOR'"
     exit 1
 fi
+
+# ---------------------------------------------------------------------------
+# OS version validation and defaults
+# ---------------------------------------------------------------------------
+VALID_DEB_OS=("ubuntu:22.04" "ubuntu:24.04" "debian:12" "debian:11")
+VALID_RPM_OS=("rockylinux:9" "rockylinux:8" "almalinux:9" "almalinux:8")
+
+# Set format defaults
+DEB_OS_IMAGE="ubuntu:22.04"
+RPM_OS_IMAGE="rockylinux:9"
+
+if [[ -n "$OS_VERSION_ARG" ]]; then
+    case "$FORMAT" in
+        deb)
+            valid=0
+            for v in "${VALID_DEB_OS[@]}"; do
+                [[ "$OS_VERSION_ARG" == "$v" ]] && valid=1 && break
+            done
+            if [[ "$valid" -eq 0 ]]; then
+                echo "ERROR: --os-version '$OS_VERSION_ARG' is not valid for --format deb."
+                echo "       Valid values: ${VALID_DEB_OS[*]}"
+                exit 1
+            fi
+            DEB_OS_IMAGE="$OS_VERSION_ARG"
+            ;;
+        rpm)
+            valid=0
+            for v in "${VALID_RPM_OS[@]}"; do
+                [[ "$OS_VERSION_ARG" == "$v" ]] && valid=1 && break
+            done
+            if [[ "$valid" -eq 0 ]]; then
+                echo "ERROR: --os-version '$OS_VERSION_ARG' is not valid for --format rpm."
+                echo "       Valid values: ${VALID_RPM_OS[*]}"
+                exit 1
+            fi
+            RPM_OS_IMAGE="$OS_VERSION_ARG"
+            ;;
+    esac
+fi
+
+# ---------------------------------------------------------------------------
+# Validate and resolve --arch-variant
+# ---------------------------------------------------------------------------
+VALID_ARCH_VARIANTS=("" "generic" "aesni" "vaes" "armce" "sve2")
+valid=0
+for v in "${VALID_ARCH_VARIANTS[@]}"; do
+    [[ "$ARCH_VARIANT" == "$v" ]] && valid=1 && break
+done
+if [[ "$valid" -eq 0 ]]; then
+    echo "ERROR: --arch-variant '$ARCH_VARIANT' is not valid."
+    echo "       Valid values: generic, aesni, vaes, armce, sve2"
+    exit 1
+fi
+
+#
+# Map variant → compiler flags string passed to build_deb.sh / build_rpm.sh
+# via the --arch-variant argument (mirrored from the upstream spec/rules).
+#
+case "$ARCH_VARIANT" in
+    ""|generic)
+        PKG_VARIANT_FLAG=""           # no --arch-variant flag → generic build
+        ARCH_LABEL="generic"
+        ;;
+    aesni)
+        PKG_VARIANT_FLAG="--arch-variant aesni"
+        ARCH_LABEL="aesni"
+        ;;
+    vaes)
+        PKG_VARIANT_FLAG="--arch-variant vaes"
+        ARCH_LABEL="vaes"
+        ;;
+    armce)
+        PKG_VARIANT_FLAG="--arch-variant armce"
+        ARCH_LABEL="armce"
+        ;;
+    sve2)
+        PKG_VARIANT_FLAG="--arch-variant sve2"
+        ARCH_LABEL="sve2"
+        ;;
+esac
 
 # ---------------------------------------------------------------------------
 # Detect container runtime
@@ -115,20 +233,37 @@ mkdir -p "$OUTPUT_DIR"
 OUTPUT_DIR="$(realpath "$OUTPUT_DIR")"
 
 # ---------------------------------------------------------------------------
+# Helper: derive the EL version number from an RPM OS image name.
+# Used to construct the correct PGDG repo URL (EL-8 vs EL-9).
+# ---------------------------------------------------------------------------
+_el_version_from_image() {
+    local img="$1"
+    case "$img" in
+        rockylinux:9|almalinux:9) echo "9" ;;
+        rockylinux:8|almalinux:8) echo "8" ;;
+        *) echo "9" ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
 # Build functions
 # ---------------------------------------------------------------------------
 
 build_deb() {
     local pg="$1"
+    local os_image="$2"
+    local arch_label="$3"
+    local pkg_variant_flag="$4"
+
     echo ""
     echo "════════════════════════════════════════════════════════"
-    echo "  DEB build  |  PG${pg}  |  Ubuntu 22.04 / PGDG"
+    echo "  DEB build  |  PG${pg}  |  ${os_image}  |  arch=${arch_label}"
     echo "════════════════════════════════════════════════════════"
 
     $RUNTIME run --rm $NO_CACHE \
         -v "$(pwd)":/src:ro \
         -v "$OUTPUT_DIR":/dist \
-        docker.io/library/ubuntu:22.04 bash -c "
+        "docker.io/library/${os_image}" bash -c "
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
@@ -151,10 +286,10 @@ apt-get install -y -q \\
 # ── Build ─────────────────────────────────────────────────────────────────
 cp -r /src /build && cd /build
 export PG_MAJOR=${pg}
-bash packaging/build_deb.sh --no-sign --pg-version ${pg}
+bash packaging/build_deb.sh --no-sign --pg-version ${pg} ${pkg_variant_flag}
 
 # ── Copy output ───────────────────────────────────────────────────────────
-pkg=\$(ls /build/../postgresql-${pg}-pg-vault-tde_*.deb 2>/dev/null | head -1)
+pkg=\$(ls /build/../postgresql-${pg}-pg-vault-tde*.deb 2>/dev/null | head -1)
 if [[ -z \"\$pkg\" ]]; then
     echo 'ERROR: .deb not found after build'
     exit 1
@@ -162,27 +297,36 @@ fi
 cp \"\$pkg\" /dist/
 echo \"Copied: \$(basename \$pkg) → /dist/\"
 "
-    echo "  ✓ DEB PG${pg} complete"
+    echo "  ✓ DEB PG${pg} (${os_image}, arch=${arch_label}) complete"
 }
 
 
 build_rpm() {
     local pg="$1"
+    local os_image="$2"
+    local arch_label="$3"
+    # arch-variant for RPM: separate spec files per variant; not wired through
+    # build_rpm.sh flags yet — the EL spec names carry the variant suffix.
+
+    local el_ver
+    el_ver="$(_el_version_from_image "$os_image")"
+
     echo ""
     echo "════════════════════════════════════════════════════════"
-    echo "  RPM build  |  PG${pg}  |  Rocky Linux 9 / PGDG"
+    echo "  RPM build  |  PG${pg}  |  ${os_image} (EL${el_ver})  |  arch=${arch_label}"
     echo "════════════════════════════════════════════════════════"
 
     $RUNTIME run --rm $NO_CACHE \
         -v "$(pwd)":/src:ro \
         -v "$OUTPUT_DIR":/dist \
-        docker.io/library/rockylinux:9 bash -c "
+        "docker.io/library/${os_image}" bash -c "
 set -euo pipefail
 
 # ── PGDG + EPEL + CRB repositories ───────────────────────────────────────
 dnf install -y -q epel-release
-dnf config-manager --set-enabled crb
-dnf install -y -q https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-x86_64/pgdg-redhat-repo-latest.noarch.rpm
+dnf config-manager --set-enabled crb 2>/dev/null || \
+    dnf config-manager --enable crb 2>/dev/null || true
+dnf install -y -q https://download.postgresql.org/pub/repos/yum/reporpms/EL-${el_ver}-x86_64/pgdg-redhat-repo-latest.noarch.rpm
 dnf -y module disable postgresql 2>/dev/null || true
 
 # ── Build dependencies ────────────────────────────────────────────────────
@@ -194,10 +338,10 @@ dnf install -y -q \\
 # ── Build ─────────────────────────────────────────────────────────────────
 export PATH=\"/usr/pgsql-${pg}/bin:\$PATH\"
 cp -r /src /build && cd /build
-bash packaging/build_rpm.sh --pg-version ${pg}
+bash packaging/build_rpm.sh --pg-version ${pg} ${PKG_VARIANT_FLAG}
 
 # ── Copy output ───────────────────────────────────────────────────────────
-pkg=\$(find ~/rpmbuild/RPMS -name \"postgresql${pg}-pg_vault_tde-*.rpm\" \\
+pkg=\$(find ~/rpmbuild/RPMS -name \"postgresql${pg}-pg_vault_tde*.rpm\" \\
            ! -name '*debuginfo*' ! -name '*debugsource*' | head -1)
 if [[ -z \"\$pkg\" ]]; then
     echo 'ERROR: .rpm not found after build'
@@ -206,21 +350,23 @@ fi
 cp \"\$pkg\" /dist/
 echo \"Copied: \$(basename \$pkg) → /dist/\"
 "
-    echo "  ✓ RPM PG${pg} complete"
+    echo "  ✓ RPM PG${pg} (${os_image}, arch=${arch_label}) complete"
 }
 
 # ---------------------------------------------------------------------------
 # Run builds
 # ---------------------------------------------------------------------------
 if [[ "$BUILD_ALL" -eq 1 ]]; then
-    build_deb 17
-    build_deb 18
-    build_rpm 17
-    build_rpm 18
+    # --all targets all PG × format combinations with the default OS images
+    # and the generic (portable) arch variant.
+    build_deb 17 "$DEB_OS_IMAGE" "generic" ""
+    build_deb 18 "$DEB_OS_IMAGE" "generic" ""
+    build_rpm 17 "$RPM_OS_IMAGE" "generic"
+    build_rpm 18 "$RPM_OS_IMAGE" "generic"
 elif [[ "$FORMAT" == "deb" ]]; then
-    build_deb "$PG_MAJOR"
+    build_deb "$PG_MAJOR" "$DEB_OS_IMAGE" "$ARCH_LABEL" "$PKG_VARIANT_FLAG"
 else
-    build_rpm "$PG_MAJOR"
+    build_rpm "$PG_MAJOR" "$RPM_OS_IMAGE" "$ARCH_LABEL"
 fi
 
 # ---------------------------------------------------------------------------
