@@ -31,6 +31,7 @@ source "$SCRIPT_DIR/lib.sh"
 # ---------------------------------------------------------------------------
 SKIP_BENCH=0
 SKIP_OPENBAO=0
+SKIP_INSTALL_TEST=0
 ONLY_STAGES=()
 
 while [[ $# -gt 0 ]]; do
@@ -43,6 +44,10 @@ while [[ $# -gt 0 ]]; do
             SKIP_OPENBAO=1
             shift
             ;;
+        --skip-install-test)
+            SKIP_INSTALL_TEST=1
+            shift
+            ;;
         --only)
             shift
             while [[ $# -gt 0 && ! "$1" =~ ^-- ]]; do
@@ -51,9 +56,9 @@ while [[ $# -gt 0 ]]; do
             done
             ;;
         --help|-h)
-            echo "Usage: $0 [--skip-bench] [--skip-openbao] [--only stage1 stage2 ...]"
+            echo "Usage: $0 [--skip-bench] [--skip-openbao] [--skip-install-test] [--only stage1 stage2 ...]"
             echo ""
-            echo "Stages: regress checksums tap isolation vault openbao bench"
+            echo "Stages: regress checksums tap isolation vault openbao install-test bench"
             exit 0
             ;;
         *)
@@ -66,7 +71,7 @@ done
 # ---------------------------------------------------------------------------
 # Stage definitions
 # ---------------------------------------------------------------------------
-ALL_STAGES=(regress checksums tap isolation vault openbao bench)
+ALL_STAGES=(regress checksums tap isolation vault openbao install-test bench)
 
 should_run() {
     local stage="$1"
@@ -80,6 +85,9 @@ should_run() {
         return 1
     fi
     if [[ "$stage" == "openbao" && "$SKIP_OPENBAO" == "1" ]]; then
+        return 1
+    fi
+    if [[ "$stage" == "install-test" && "$SKIP_INSTALL_TEST" == "1" ]]; then
         return 1
     fi
     return 0
