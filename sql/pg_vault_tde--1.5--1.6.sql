@@ -17,7 +17,12 @@
 -- Copyright (c) 2026 Miriade S.r.l., Licensed under the PostgreSQL License.
 
 -- Guard: this script is idempotent for the DROP below, but must only run once.
-SET search_path TO pg_catalog;
+--
+-- NOTE: do NOT set search_path to pg_catalog here.  The functions created by
+-- this script live in the extension schema (public).  Narrowing search_path
+-- to pg_catalog causes COMMENT ON FUNCTION / REVOKE / GRANT to fail to
+-- resolve unqualified names, and CREATE FUNCTION would land in the wrong
+-- schema.  Let the extension mechanism control the search_path.
 
 -- ============================================================================
 -- 1. Replace wallet_status() with extended 6-column version
@@ -48,10 +53,18 @@ COMMENT ON FUNCTION pg_vault_tde_wallet_status() IS
 'number of cached per-table DEKs, last-unlock timestamp, and file permissions.';
 
 -- ============================================================================
--- 2. wallet_change_passphrase() — already declared in 1.5, now fully implemented
+-- 2. wallet_change_passphrase() — create-or-replace in case 1.4→1.5 ran as a
+--    stub, or the upgrade chain starts here on a fresh install.
 -- ============================================================================
--- No DDL change needed; the C implementation replaces the stub at dynamic
--- link time when the new .so is loaded.
+CREATE OR REPLACE FUNCTION pg_vault_tde_wallet_change_passphrase(
+        old_passphrase text,
+        new_passphrase text
+    )
+    RETURNS void
+    LANGUAGE C STRICT SECURITY DEFINER
+    AS 'MODULE_PATHNAME', 'pg_vault_tde_wallet_change_passphrase_sql';
+
+REVOKE ALL ON FUNCTION pg_vault_tde_wallet_change_passphrase(text, text) FROM PUBLIC;
 
 COMMENT ON FUNCTION pg_vault_tde_wallet_change_passphrase(text, text) IS
 'Re-protect the wallet and all per-table DEKs under a new passphrase. '
