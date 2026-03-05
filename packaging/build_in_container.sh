@@ -65,7 +65,7 @@ FORMAT="deb"
 PG_MAJOR="18"
 BUILD_ALL=0
 OUTPUT_DIR="./dist"
-NO_CACHE=""
+NO_CACHE=""              # --pull=always when --no-cache is passed
 ARCH_VARIANT=""          # empty = generic
 OS_VERSION_ARG=""        # empty = use format-specific default
 
@@ -99,7 +99,9 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --no-cache)
-            NO_CACHE="--no-cache"
+            # --no-cache is a 'build' flag; for 'run' the equivalent is
+            # --pull=always which forces a fresh pull of the base image.
+            NO_CACHE="--pull=always"
             shift
             ;;
         -h|--help)
