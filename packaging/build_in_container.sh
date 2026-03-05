@@ -65,7 +65,7 @@ FORMAT="deb"
 PG_MAJOR="18"
 BUILD_ALL=0
 OUTPUT_DIR="./dist"
-NO_CACHE=""              # --pull=always when --no-cache is passed
+PULL_FLAG=""             # set to --pull=always by --no-cache
 ARCH_VARIANT=""          # empty = generic
 OS_VERSION_ARG=""        # empty = use format-specific default
 
@@ -100,8 +100,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-cache)
             # --no-cache is a 'build' flag; for 'run' the equivalent is
-            # --pull=always which forces a fresh pull of the base image.
-            NO_CACHE="--pull=always"
+            # --pull=always which forces a fresh pull of the base OS image
+            # from the registry, preventing a stale cached image from
+            # delivering an outdated build toolchain or compiled binary.
+            PULL_FLAG="--pull=always"
             shift
             ;;
         -h|--help)
@@ -226,7 +228,8 @@ if [[ -z "$RUNTIME" ]]; then
     echo "ERROR: Neither 'podman' nor 'docker' found. Install one and retry."
     exit 1
 fi
-echo "Container runtime: $RUNTIME"
+echo "Container runtime : $RUNTIME"
+echo "Pull flag         : ${PULL_FLAG:-'(use local cache)'}"
 
 # ---------------------------------------------------------------------------
 # Ensure output directory exists
@@ -262,12 +265,29 @@ build_deb() {
     echo "  DEB build  |  PG${pg}  |  ${os_image}  |  arch=${arch_label}"
     echo "════════════════════════════════════════════════════════"
 
-    $RUNTIME run --rm $NO_CACHE \
+    # $PULL_FLAG is intentionally unquoted: either empty or "--pull=always".
+    # Quoting an empty string would pass a literal "" argument to the runtime.
+    # shellcheck disable=SC2086
+    $RUNTIME run --rm $PULL_FLAG \
         -v "$(pwd)":/src:ro \
         -v "$OUTPUT_DIR":/dist \
         "docker.io/library/${os_image}" bash -c "
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
+
+# ── Verify the buffer pin fix is present in the mounted source ────────────
+# The bug was ExecClearTuple(slot) called inside pg_vault_tde_decode_slot(),
+# releasing the buffer pin prematurely (O(rows) hits instead of O(pages)).
+# A legitimate ExecClearTuple(slot) also exists in tde_index_build_range_scan
+# so we must scope the check to decode_slot's function body only.
+if awk '/^pg_vault_tde_decode_slot/,/^}/' /src/src/tam/pg_vault_tde_tam.c \
+       | grep -q 'ExecClearTuple(slot)'; then
+    echo 'BUILD ERROR: ExecClearTuple(slot) found inside pg_vault_tde_decode_slot'
+    echo '             Buffer pin fix is MISSING. Check the source tree.'
+    exit 1
+fi
+echo '── Source OK: buffer pin fix confirmed in decode_slot ──'
+md5sum /src/src/tam/pg_vault_tde_tam.c
 
 # ── PGDG apt repository ───────────────────────────────────────────────────
 apt-get update  -qq
@@ -298,8 +318,13 @@ if [[ -z \"\$pkg\" ]]; then
 fi
 cp \"\$pkg\" /dist/
 echo \"Copied: \$(basename \$pkg) → /dist/\"
+md5sum /dist/\$(basename \$pkg)
 "
     echo "  ✓ DEB PG${pg} (${os_image}, arch=${arch_label}) complete"
+    echo ""
+    echo "  To install and activate:"
+    echo "    sudo dpkg -i ${OUTPUT_DIR}/postgresql-${pg}-pg-vault-tde*.deb"
+    echo "    sudo systemctl restart postgresql"
 }
 
 
@@ -318,11 +343,22 @@ build_rpm() {
     echo "  RPM build  |  PG${pg}  |  ${os_image} (EL${el_ver})  |  arch=${arch_label}"
     echo "════════════════════════════════════════════════════════"
 
-    $RUNTIME run --rm $NO_CACHE \
+    # shellcheck disable=SC2086
+    $RUNTIME run --rm $PULL_FLAG \
         -v "$(pwd)":/src:ro \
         -v "$OUTPUT_DIR":/dist \
         "docker.io/library/${os_image}" bash -c "
 set -euo pipefail
+
+# ── Verify the buffer pin fix is present in the mounted source ────────────
+if awk '/^pg_vault_tde_decode_slot/,/^}/' /src/src/tam/pg_vault_tde_tam.c \
+       | grep -q 'ExecClearTuple(slot)'; then
+    echo 'BUILD ERROR: ExecClearTuple(slot) found inside pg_vault_tde_decode_slot'
+    echo '             Buffer pin fix is MISSING. Check the source tree.'
+    exit 1
+fi
+echo '── Source OK: buffer pin fix confirmed in decode_slot ──'
+md5sum /src/src/tam/pg_vault_tde_tam.c
 
 # ── PGDG + EPEL + CRB repositories ───────────────────────────────────────
 dnf install -y -q epel-release
@@ -351,8 +387,13 @@ if [[ -z \"\$pkg\" ]]; then
 fi
 cp \"\$pkg\" /dist/
 echo \"Copied: \$(basename \$pkg) → /dist/\"
+md5sum /dist/\$(basename \$pkg)
 "
     echo "  ✓ RPM PG${pg} (${os_image}, arch=${arch_label}) complete"
+    echo ""
+    echo "  To install and activate:"
+    echo "    sudo dnf install ${OUTPUT_DIR}/postgresql${pg}-pg_vault_tde*.rpm"
+    echo "    sudo systemctl restart postgresql"
 }
 
 # ---------------------------------------------------------------------------
@@ -363,8 +404,8 @@ if [[ "$BUILD_ALL" -eq 1 ]]; then
     # and the generic (portable) arch variant.
     build_deb 17 "$DEB_OS_IMAGE" "generic" ""
     build_deb 18 "$DEB_OS_IMAGE" "generic" ""
-    build_rpm 17 "$RPM_OS_IMAGE" "generic"
-    build_rpm 18 "$RPM_OS_IMAGE" "generic"
+    build_rpm 17 "$RPM_OS_IMAGE" "generic" ""
+    build_rpm 18 "$RPM_OS_IMAGE" "generic" ""
 elif [[ "$FORMAT" == "deb" ]]; then
     build_deb "$PG_MAJOR" "$DEB_OS_IMAGE" "$ARCH_LABEL" "$PKG_VARIANT_FLAG"
 else
