@@ -2,18 +2,20 @@
 # ci/scripts/run-all.sh — Master orchestrator for the local CI pipeline
 #
 # Runs all test stages in sequence:
-#   1. regress     — 48-test SQL regression suite
+#   1. regress     — 80-test SQL regression suite (52 v1.4 + 20 v1.5 + 8 v1.6)
 #   2. checksums   — Page checksum compatibility
 #   3. tap         — Perl TAP tests (extension load, backup hooks)
 #   4. isolation   — Concurrency/MVCC isolation specs
 #   5. vault       — Vault mock integration (via Compose)
 #   6. openbao     — OpenBao 3-node Raft integration (AppRole, KEK, BGW)
-#   7. bench       — Performance benchmark (informational, non-blocking)
+#   7. wallet      — Local wallet full regression (kms_provider=local, tests 74-80)
+#   8. bench       — Performance benchmark (informational, non-blocking)
 #
 # Usage:
 #   bash ci/scripts/run-all.sh                    # run all stages
 #   bash ci/scripts/run-all.sh --skip-bench       # skip benchmark
 #   bash ci/scripts/run-all.sh --skip-openbao     # skip OpenBao stage
+#   bash ci/scripts/run-all.sh --skip-wallet      # skip local wallet stage
 #   bash ci/scripts/run-all.sh --only regress tap # run specific stages
 #
 # Exit code: 0 if all stages pass, otherwise the first non-zero exit code.
@@ -31,6 +33,7 @@ source "$SCRIPT_DIR/lib.sh"
 # ---------------------------------------------------------------------------
 SKIP_BENCH=0
 SKIP_OPENBAO=0
+SKIP_WALLET=0
 SKIP_INSTALL_TEST=0
 ONLY_STAGES=()
 
@@ -42,6 +45,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --skip-openbao)
             SKIP_OPENBAO=1
+            shift
+            ;;
+        --skip-wallet)
+            SKIP_WALLET=1
             shift
             ;;
         --skip-install-test)
@@ -56,9 +63,9 @@ while [[ $# -gt 0 ]]; do
             done
             ;;
         --help|-h)
-            echo "Usage: $0 [--skip-bench] [--skip-openbao] [--skip-install-test] [--only stage1 stage2 ...]"
+            echo "Usage: $0 [--skip-bench] [--skip-openbao] [--skip-wallet] [--skip-install-test] [--only stage1 stage2 ...]"
             echo ""
-            echo "Stages: regress checksums tap isolation vault openbao install-test bench"
+            echo "Stages: regress checksums tap isolation vault openbao wallet install-test bench"
             exit 0
             ;;
         *)
@@ -71,7 +78,7 @@ done
 # ---------------------------------------------------------------------------
 # Stage definitions
 # ---------------------------------------------------------------------------
-ALL_STAGES=(regress checksums tap isolation vault openbao install-test bench)
+ALL_STAGES=(regress checksums tap isolation vault openbao wallet install-test bench)
 
 should_run() {
     local stage="$1"
@@ -85,6 +92,9 @@ should_run() {
         return 1
     fi
     if [[ "$stage" == "openbao" && "$SKIP_OPENBAO" == "1" ]]; then
+        return 1
+    fi
+    if [[ "$stage" == "wallet" && "$SKIP_WALLET" == "1" ]]; then
         return 1
     fi
     if [[ "$stage" == "install-test" && "$SKIP_INSTALL_TEST" == "1" ]]; then
