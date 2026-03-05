@@ -105,9 +105,10 @@ typedef struct LocalWalletState
 {
     char        *wallet_path;   /* absolute path to wallet.p12 */
     bool         wallet_open;   /* true iff wallet was successfully opened */
-    bool         kek_loaded;    /* true only transiently during wrap/unwrap */
+    bool         kek_loaded;    /* true while wallet is open (unlock caches KEK here);
+                                 * cleared by wallet_lock() or backend exit */
     TimestampTz  last_opened;   /* last successful open timestamp; 0 = never */
-    /* per-backend KEK buffer — wiped immediately after use */
+    /* per-backend KEK buffer — held while wallet is open, cleared on lock */
     unsigned char kek[TDE_DEK_LEN];
 } LocalWalletState;
 
@@ -143,6 +144,13 @@ static bool local_unwrap_dek_with_pass(const unsigned char *wrapped,
                                        unsigned char *dek_out, int dek_len,
                                        const char *passphrase,
                                        const char *wallet_path);
+static bool local_wrap_dek_with_kek(const unsigned char *dek, int dek_len,
+                                    unsigned char *wrapped_out, int *out_len,
+                                    const unsigned char *kek);
+static bool local_unwrap_dek_with_kek(const unsigned char *wrapped,
+                                      int wrapped_len,
+                                      unsigned char *dek_out, int dek_len,
+                                      const unsigned char *kek);
 static const char *local_get_wallet_path(void);
 static bool local_get_passphrase(char *pass_out, Size pass_max);
 static bool local_passphrase_from_env(char *pass_out, Size pass_max);
@@ -394,37 +402,140 @@ local_unwrap_dek_with_pass(const unsigned char *wrapped, int wrapped_len,
 }
 
 /* -------------------------------------------------------------------------
- * local_wrap_dek — vtable callback: read passphrase from GUC source, wrap
+ * local_wrap_dek_with_kek — AES-256-WRAP using a raw in-memory KEK.
+ *
+ * Used by the vtable callbacks when the wallet was opened interactively via
+ * wallet_unlock() and the KEK is cached in local_wallet_state.  Avoids an
+ * expensive PBKDF2 re-derivation and passphrase re-read on every call.
+ *
+ * kek MUST point to TDE_DEK_LEN bytes.  Caller retains ownership.
+ * -------------------------------------------------------------------------*/
+static bool
+local_wrap_dek_with_kek(const unsigned char *dek, int dek_len,
+                        unsigned char *wrapped_out, int *out_len,
+                        const unsigned char *kek)
+{
+    EVP_CIPHER_CTX *ctx;
+    int             update_len = 0;
+    int             final_len  = 0;
+    bool            ok         = false;
+
+    Assert(dek != NULL && dek_len == TDE_DEK_LEN);
+    Assert(wrapped_out != NULL && out_len != NULL);
+    Assert(kek != NULL);
+
+    ctx = EVP_CIPHER_CTX_new();
+    if (!ctx)
+    {
+        ereport(WARNING, errmsg("pg_vault_tde: EVP_CIPHER_CTX_new failed"));
+        return false;
+    }
+
+    if (EVP_EncryptInit_ex2(ctx, EVP_aes_256_wrap(), kek, NULL, NULL) == 1 &&
+        EVP_EncryptUpdate(ctx, wrapped_out, &update_len, dek, dek_len) == 1 &&
+        EVP_EncryptFinal_ex(ctx, wrapped_out + update_len, &final_len) == 1)
+    {
+        *out_len = update_len + final_len;
+        ok = true;
+    }
+    else
+        ereport(WARNING,
+                errmsg("pg_vault_tde: AES-256-WRAP (cached KEK) failed: %s",
+                       ERR_reason_error_string(ERR_get_error())));
+
+    EVP_CIPHER_CTX_free(ctx);
+    return ok;
+}
+
+/* -------------------------------------------------------------------------
+ * local_unwrap_dek_with_kek — AES-256-UNWRAP using a raw in-memory KEK.
+ *
+ * Symmetric inverse of local_wrap_dek_with_kek.
+ * -------------------------------------------------------------------------*/
+static bool
+local_unwrap_dek_with_kek(const unsigned char *wrapped, int wrapped_len,
+                          unsigned char *dek_out, int dek_len,
+                          const unsigned char *kek)
+{
+    EVP_CIPHER_CTX *ctx;
+    int             update_len = 0;
+    int             final_len  = 0;
+    bool            ok         = false;
+
+    Assert(wrapped != NULL && wrapped_len == LOCAL_WRAPPED_DEK_LEN);
+    Assert(dek_out != NULL && dek_len == TDE_DEK_LEN);
+    Assert(kek != NULL);
+
+    ctx = EVP_CIPHER_CTX_new();
+    if (!ctx)
+    {
+        ereport(WARNING, errmsg("pg_vault_tde: EVP_CIPHER_CTX_new failed"));
+        return false;
+    }
+
+    if (EVP_DecryptInit_ex2(ctx, EVP_aes_256_wrap(), kek, NULL, NULL) == 1 &&
+        EVP_DecryptUpdate(ctx, dek_out, &update_len, wrapped, wrapped_len) == 1 &&
+        EVP_DecryptFinal_ex(ctx, dek_out + update_len, &final_len) == 1)
+        ok = true;
+    else
+        ereport(WARNING,
+                errmsg("pg_vault_tde: AES-256-UNWRAP (cached KEK) failed: %s",
+                       ERR_reason_error_string(ERR_get_error())));
+
+    EVP_CIPHER_CTX_free(ctx);
+    return ok;
+}
+
+/* -------------------------------------------------------------------------
+ * local_wrap_dek — vtable callback: wrap a DEK under the wallet KEK.
+ *
+ * Fast path: wallet was opened via wallet_unlock() in this backend — the KEK
+ * is cached in local_wallet_state.  Use it directly without PBKDF2.
+ * Slow path: re-derive the passphrase from the configured GUC source each
+ * call (env var / file / command) and open the wallet.
  * -------------------------------------------------------------------------*/
 static bool
 local_wrap_dek(const unsigned char *dek, int dek_len,
                unsigned char *wrapped_out, int *out_len)
 {
-    char        pass[1024];
     const char *path;
-    bool        ok;
 
     Assert(dek != NULL);
     Assert(dek_len == TDE_DEK_LEN);
     Assert(wrapped_out != NULL);
     Assert(out_len != NULL);
 
-    /* Re-derive passphrase each call — never cache it between requests. */
-    if (!local_get_passphrase(pass, sizeof(pass)))
+    /*
+     * Fast path: KEK is cached because wallet_unlock() was called in this
+     * backend.  No passphrase re-read or PBKDF2 re-derivation needed.
+     */
+    if (local_wallet_state && local_wallet_state->kek_loaded)
+        return local_wrap_dek_with_kek(dek, dek_len, wrapped_out, out_len,
+                                       local_wallet_state->kek);
+
+    /* Slow path: re-derive passphrase from GUC source on every call. */
     {
-        ereport(WARNING,
-                errmsg("pg_vault_tde: local wrap_dek: passphrase unavailable"));
-        return false;
+        char pass[1024];
+        bool ok;
+
+        if (!local_get_passphrase(pass, sizeof(pass)))
+        {
+            ereport(WARNING,
+                    errmsg("pg_vault_tde: local wrap_dek: passphrase unavailable "
+                           "— call pg_vault_tde_wallet_unlock() or configure "
+                           "pg_vault_tde.wallet_passphrase_env"));
+            return false;
+        }
+
+        path = (local_wallet_state && local_wallet_state->wallet_path[0])
+               ? local_wallet_state->wallet_path
+               : local_get_wallet_path();
+
+        ok = local_wrap_dek_with_pass(dek, dek_len, wrapped_out, out_len,
+                                      pass, path);
+        OPENSSL_cleanse(pass, sizeof(pass));
+        return ok;
     }
-
-    path = (local_wallet_state && local_wallet_state->wallet_path[0])
-           ? local_wallet_state->wallet_path
-           : local_get_wallet_path();
-
-    ok = local_wrap_dek_with_pass(dek, dek_len, wrapped_out, out_len,
-                                  pass, path);
-    OPENSSL_cleanse(pass, sizeof(pass));
-    return ok;
 }
 
 /* -------------------------------------------------------------------------
@@ -443,10 +554,18 @@ local_unwrap_dek(const unsigned char *wrapped, int wrapped_len,
     Assert(dek_out != NULL);
     Assert(dek_len == TDE_DEK_LEN);
 
+    /* Fast path: cached KEK from wallet_unlock(). */
+    if (local_wallet_state && local_wallet_state->kek_loaded)
+        return local_unwrap_dek_with_kek(wrapped, wrapped_len, dek_out, dek_len,
+                                         local_wallet_state->kek);
+
+    /* Slow path: re-derive passphrase from GUC source. */
     if (!local_get_passphrase(pass, sizeof(pass)))
     {
         ereport(WARNING,
-                errmsg("pg_vault_tde: local unwrap_dek: passphrase unavailable"));
+                errmsg("pg_vault_tde: local unwrap_dek: passphrase unavailable "
+                       "— call pg_vault_tde_wallet_unlock() or configure "
+                       "pg_vault_tde.wallet_passphrase_env"));
         return false;
     }
 
@@ -1433,21 +1552,38 @@ pg_vault_tde_wallet_unlock_sql(PG_FUNCTION_ARGS)
                 errmsg("pg_vault_tde: wallet_unlock: wrong passphrase or "
                        "wallet not found at \"%s\"", path));
     }
-    OPENSSL_cleanse(kek_test, TDE_DEK_LEN);
+
     OPENSSL_cleanse(passphrase, strlen(passphrase));
     pfree(passphrase);
 
     /*
-     * Evict shmem so every backend reloads DEKs through the full
-     * unwrap path (which will succeed now that the wallet is accessible).
+     * Cache the derived KEK in per-backend state so that subsequent
+     * wrap_dek / unwrap_dek calls in this backend can use it directly
+     * without re-reading the passphrase from a GUC source.
+     *
+     * This is the only safe mechanism for the interactive unlock path
+     * where no passphrase env var / file / command is configured:
+     *   SELECT pg_vault_tde_wallet_unlock('pass');
+     *   CREATE TABLE t (...) USING encrypted_heap;  ← needs wrap_dek
+     *
+     * kek_loaded is cleared by wallet_lock() and local_shutdown().
      */
-    pg_vault_tde_catalog_evict_all();
-
     if (local_wallet_state)
     {
+        memcpy(local_wallet_state->kek, kek_test, TDE_DEK_LEN);
+        local_wallet_state->kek_loaded  = true;
         local_wallet_state->wallet_open = true;
         local_wallet_state->last_opened = GetCurrentTimestamp();
     }
+    OPENSSL_cleanse(kek_test, TDE_DEK_LEN);
+
+    /*
+     * Evict shmem so every backend reloads DEKs through the full
+     * unwrap path.  Other backends that lack the cached KEK will use
+     * the GUC passphrase source; if that is also absent they must call
+     * wallet_unlock() themselves.
+     */
+    pg_vault_tde_catalog_evict_all();
 
     ereport(LOG, errmsg("pg_vault_tde: wallet unlocked by superuser"));
 
@@ -1475,9 +1611,19 @@ pg_vault_tde_wallet_lock_sql(PG_FUNCTION_ARGS)
     pg_vault_tde_catalog_evict_all();
 
     if (local_wallet_state)
+    {
+        /*
+         * Evict the cached KEK so that this backend can no longer
+         * wrap or unwrap DEKs without a fresh wallet_unlock() or a
+         * configured passphrase GUC source.
+         */
+        if (local_wallet_state->kek_loaded)
+            OPENSSL_cleanse(local_wallet_state->kek, TDE_DEK_LEN);
+        local_wallet_state->kek_loaded  = false;
         local_wallet_state->wallet_open = false;
+    }
 
-    ereport(LOG, errmsg("pg_vault_tde: wallet locked; all DEKs cleared from shmem"));
+    ereport(LOG, errmsg("pg_vault_tde: wallet locked; KEK and all DEKs cleared from shmem"));
 
     PG_RETURN_VOID();
 }

@@ -239,8 +239,6 @@ tde_process_utility_hook(PlannedStmt *pstmt,
     {
         CreateStmt *stmt   = (CreateStmt *) parsetree;
         Oid         relid;
-        char        sql[512];
-        int         rc;
         Oid         public_ns;
 
         relid = RangeVarGetRelid(stmt->relation, NoLock, true /* missing_ok */);
@@ -272,29 +270,13 @@ tde_process_utility_hook(PlannedStmt *pstmt,
             return;
         }
 
-        SPI_connect();
-
-        snprintf(sql, sizeof(sql),
-                 "INSERT INTO pg_vault_tde_catalog "
-                 "  (relid, vault_key_name, kms_provider) "
-                 "VALUES (%u, %s, %s) "
-                 "ON CONFLICT (relid) DO NOTHING",
-                 relid,
-                 pg_vault_tde_vault_key_name ?
-                     quote_literal_cstr(pg_vault_tde_vault_key_name) :
-                     quote_literal_cstr("pg-tde-dek"),
-                 pg_vault_tde_kms_provider ?
-                     quote_literal_cstr(pg_vault_tde_kms_provider) :
-                     quote_literal_cstr("vault"));
-
-        rc = SPI_execute(sql, false, 0);
-        if (rc < 0)
-            ereport(WARNING,
-                    (errmsg("pg_vault_tde: could not register encrypted "
-                            "relation %u in catalog (SPI rc=%d)",
-                            relid, rc)));
-
-        SPI_finish();
+        /*
+         * Generate a fresh per-table DEK, wrap it under the active KMS
+         * provider's KEK, and store the wrapped bytes in pg_vault_tde_catalog.
+         * pg_vault_tde_catalog_register_rel() manages its own SPI connection
+         * and calls OPENSSL_cleanse() on the plaintext DEK after wrapping.
+         */
+        pg_vault_tde_catalog_register_rel(relid, pg_vault_tde_vault_key_name);
 
         ereport(DEBUG1,
                 (errmsg("pg_vault_tde: registered relid=%u in DEK catalog",
