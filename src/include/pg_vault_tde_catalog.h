@@ -43,6 +43,7 @@
  */
 #define TDE_REL_DEK_CACHE_DEFAULT  1024
 
+
 /*
  * TdeRelDekEntry — one slot in the per-table DEK cache.
  *
@@ -122,16 +123,27 @@ bool pg_vault_tde_kms_get_rel_prev_dek(Oid relid,
 
 /*
  * pg_vault_tde_catalog_register_rel:
- *   Called from the ProcessUtility_hook on CREATE TABLE USING encrypted_heap.
- *   1. Asks the active KMS provider to generate + wrap a new DEK.
- *   2. Inserts a row into pg_vault_tde_catalog via SPI.
- *   3. Loads the DEK into the shmem cache.
+ *   Called from the ProcessUtility_hook on CREATE TABLE USING encrypted_heap
+ *   and from the object_access_hook during CTAS.
+ *   Idempotent: if a catalog entry for relid already exists, returns immediately
+ *   without generating a new DEK (the existing key remains valid).
  *
  *   vault_key_name: for Vault provider, the named Transit key (e.g.
  *   "pg-tde-rel-<relfilenode>"). For local wallet, the slot label.
  *   May be NULL — provider generates a name from the relfilenode.
  */
 void pg_vault_tde_catalog_register_rel(Oid relid, const char *vault_key_name);
+
+/*
+ * pg_vault_tde_catalog_update_rel_dek:
+ *   Called by the online rotation BGW to replace the wrapped DEK of an
+ *   existing catalog entry.  Generates a fresh DEK, wraps it, and performs
+ *   a CatalogTupleUpdate on the existing row.  The caller must have already
+ *   zeroed the shmem cache entry (pg_vault_tde_catalog_zero_rel_dek) so that
+ *   concurrent readers re-fetch the new key from the catalog.
+ *   Raises ERROR if no catalog entry exists for relid.
+ */
+void pg_vault_tde_catalog_update_rel_dek(Oid relid, const char *vault_key_name);
 
 /*
  * pg_vault_tde_catalog_deregister_rel:
@@ -169,5 +181,7 @@ void pg_vault_tde_catalog_evict_all(void);
  *   Acquires LW_SHARED; safe to call from any backend at any time.
  */
 int  pg_vault_tde_catalog_get_dek_count(void);
+
+void pg_vault_tde_catalog_zero_rel_dek(Oid relid);
 
 #endif /* PG_VAULT_TDE_CATALOG_H */

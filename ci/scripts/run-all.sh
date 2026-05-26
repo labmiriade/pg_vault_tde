@@ -9,13 +9,15 @@
 #   5. vault       — Vault mock integration (via Compose)
 #   6. openbao     — OpenBao 3-node Raft integration (AppRole, KEK, BGW)
 #   7. wallet      — Local wallet full regression (kms_provider=local, tests 74-80)
-#   8. bench       — Performance benchmark (informational, non-blocking)
+#   8. schema      — Multi-database and multi-schema isolation (SCHEMA-1..20)
+#   9. bench       — Performance benchmark (informational, non-blocking)
 #
 # Usage:
 #   bash ci/scripts/run-all.sh                    # run all stages
 #   bash ci/scripts/run-all.sh --skip-bench       # skip benchmark
 #   bash ci/scripts/run-all.sh --skip-openbao     # skip OpenBao stage
 #   bash ci/scripts/run-all.sh --skip-wallet      # skip local wallet stage
+#   bash ci/scripts/run-all.sh --skip-schema      # skip schema isolation stage
 #   bash ci/scripts/run-all.sh --only regress tap # run specific stages
 #
 # Exit code: 0 if all stages pass, otherwise the first non-zero exit code.
@@ -34,6 +36,7 @@ source "$SCRIPT_DIR/lib.sh"
 SKIP_BENCH=0
 SKIP_OPENBAO=0
 SKIP_WALLET=0
+SKIP_SCHEMA=0
 SKIP_INSTALL_TEST=0
 ONLY_STAGES=()
 
@@ -51,6 +54,10 @@ while [[ $# -gt 0 ]]; do
             SKIP_WALLET=1
             shift
             ;;
+        --skip-schema)
+            SKIP_SCHEMA=1
+            shift
+            ;;
         --skip-install-test)
             SKIP_INSTALL_TEST=1
             shift
@@ -65,7 +72,7 @@ while [[ $# -gt 0 ]]; do
         --help|-h)
             echo "Usage: $0 [--skip-bench] [--skip-openbao] [--skip-wallet] [--skip-install-test] [--only stage1 stage2 ...]"
             echo ""
-            echo "Stages: regress checksums tap isolation vault openbao wallet install-test bench"
+            echo "Stages: regress checksums tap isolation vault openbao wallet schema install-test bench"
             exit 0
             ;;
         *)
@@ -78,7 +85,7 @@ done
 # ---------------------------------------------------------------------------
 # Stage definitions
 # ---------------------------------------------------------------------------
-ALL_STAGES=(regress checksums tap isolation vault openbao wallet install-test bench)
+ALL_STAGES=(regress checksums tap isolation vault openbao wallet schema install-test bench)
 
 should_run() {
     local stage="$1"
@@ -95,6 +102,9 @@ should_run() {
         return 1
     fi
     if [[ "$stage" == "wallet" && "$SKIP_WALLET" == "1" ]]; then
+        return 1
+    fi
+    if [[ "$stage" == "schema" && "$SKIP_SCHEMA" == "1" ]]; then
         return 1
     fi
     if [[ "$stage" == "install-test" && "$SKIP_INSTALL_TEST" == "1" ]]; then

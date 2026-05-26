@@ -6,13 +6,13 @@
 # Build:  podman build -f ci/containers/vault-mock.Containerfile -t vault-mock ci/vault-mock/
 # Run:    podman run --rm -p 8200:8200 -e VAULT_MOCK_TOKEN=test-token vault-mock
 
-FROM golang:1.21-bookworm AS builder
+FROM docker.io/library/golang:1.21-bookworm AS builder
 
 WORKDIR /src
-COPY go.mod vault_mock.go ./
+COPY ci/vault-mock/go.mod ci/vault-mock/vault_mock.go ./
 RUN go build -ldflags="-s -w" -o /vault-mock .
 
-FROM debian:bookworm-slim
+FROM docker.io/library/debian:bookworm-slim
 
 # Non-root user for security
 RUN groupadd -r vault && useradd -r -g vault vault

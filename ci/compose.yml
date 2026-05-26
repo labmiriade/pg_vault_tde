@@ -50,6 +50,7 @@ services:
     command: >
       postgres
         -c shared_preload_libraries=pg_vault_tde
+        -c pg_vault_tde.dev_mode=on
         -c log_min_messages=warning
     ports:
       - "${PG_TEST_PORT:-15432}:5432"
@@ -78,6 +79,7 @@ services:
     command: >
       postgres
         -c shared_preload_libraries=pg_vault_tde
+        -c pg_vault_tde.dev_mode=on
         -c log_min_messages=warning
     ports:
       - "${PG_CHECKSUMS_PORT:-15433}:5432"
@@ -106,6 +108,7 @@ services:
     command: >
       postgres
         -c shared_preload_libraries=pg_vault_tde
+        -c pg_vault_tde.dev_mode=on
         -c pg_vault_tde.vault_url=http://vault-mock:8200
         -c pg_vault_tde.vault_token=test-token
         -c pg_vault_tde.vault_mount=transit

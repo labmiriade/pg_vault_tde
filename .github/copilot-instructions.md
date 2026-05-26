@@ -131,7 +131,7 @@ The Makefile validates the detected PG version at build time:
 
 ```makefile
 TDE_PG_MIN := 17
-TDE_PG_MAX := 18
+TDE_PG_MAX := 19
 
 TDE_PG_MAJOR := $(shell $(PG_CONFIG) --version | sed 's/PostgreSQL //' | cut -d. -f1)
 $(if $(shell [ $(TDE_PG_MAJOR) -lt $(TDE_PG_MIN) ] && echo fail), \
@@ -380,6 +380,25 @@ void pg_vault_tde_tam_init(void) {
 }
 ```
 
+### Write Path Contract
+
+Every write callback (`tuple_insert`, `tuple_insert_speculative`,
+`multi_insert`, `tuple_update`) MUST follow this sequence inside a single
+`PG_TRY` block:
+
+1. Swap `rel->rd_rel->reltoastrelid` to redirect TOAST writes to standard heap
+2. Materialize slot → plaintext `HeapTuple`
+3. Call `heap_toast_insert_or_update()` (TOAST under standard heap AM)
+4. Call `tde_encrypt_heap_tuple()` → encrypted `HeapTuple`
+5. Call `heap_insert` / `heap_update` with the encrypted tuple
+6. Copy physical TID back to the slot
+7. In `PG_CATCH`: restore `reltoastrelid` **and** `OPENSSL_cleanse` any
+   in-flight plaintext before `PG_RE_THROW`
+
+**Why the full pipeline must be in one `PG_TRY`**: an error after
+`tde_encrypt_heap_tuple()` but before `heap_insert()` would leak the swapped
+`reltoastrelid` in the relcache and leave un-cleansed plaintext intermediates.
+
 ### ALL Read Paths Must Decrypt
 
 Every TAM callback that causes heapam to fill a `TupleTableSlot` with a buffer-backed
@@ -395,6 +414,16 @@ hole through which ciphertext reaches the query executor.
 | `scan_sample_next_tuple` | TABLESAMPLE | ✅ Override |
 | `tuple_fetch_row_version` | TidScan, UPDATE recheck | ✅ Override |
 | `tuple_lock` | SELECT FOR UPDATE/SHARE | ✅ Override |
+
+### Rewrite Path: relation_copy_for_cluster
+
+`VACUUM FULL` and `CLUSTER` trigger `relation_copy_for_cluster`. This callback reads
+every tuple via `heap_getnext` (with `rd_tableam` impersonation), decrypts it, then
+re-encrypts it into the new heap via `rewrite_heap_tuple`. The encrypted copy has
+`HEAP_HASEXTERNAL` cleared before writing (to pass `rewrite_heap_tuple`'s assertion);
+subsequent DELETE calls must therefore use `tde_tuple_has_external_slow` — a per-attribute
+varlena scan on the decrypted tuple — to detect and clean TOAST chunks regardless of the
+infomask flag.
 
 ### decode_slot Implementation Rules
 
@@ -461,13 +490,25 @@ When adding new heapam-delegated callbacks, check whether they contain the ident
 
 ### TOAST AM Override
 ```c
-static Oid pg_vault_tde_toast_am(Relation rel) {
-    return HEAP_TABLE_AM_OID;  /* TOAST tables must always use standard heap */
+static Oid
+pg_vault_tde_toast_am(Relation rel)
+{
+    (void) rel;
+    if (pg_vault_tde_toast_encryption)
+    {
+        Oid encheap_oid = get_table_am_oid("encrypted_heap", true);
+        if (OidIsValid(encheap_oid))
+            return encheap_oid;
+    }
+    return HEAP_TABLE_AM_OID;
 }
 ```
-Without this, PG18 creates TOAST tables with `encrypted_heap` AM, then `heap_getnext` inside
-the TOAST index build rejects them. Side effect: large column values (> ~2 kB after TOAST
-compression) are stored unencrypted. This is a documented v1 limitation.
+When `pg_vault_tde.toast_encryption = on` (default), TOAST tables are created with the
+`encrypted_heap` AM so every TOAST chunk is encrypted with the parent relation's DEK.
+The `rd_tableam` impersonation workaround must be applied in `index_build_range_scan`
+to satisfy the `heap_getnext` identity assertion on PG 18 during TOAST index build.
+When `toast_encryption = off`, the fallback to `HEAP_TABLE_AM_OID` restores the v1.0
+behaviour (large values stored unencrypted).
 
 ### PG18-Specific API Change: scan_bitmap_next_tuple
 ```
@@ -543,18 +584,29 @@ Assert(key_len <= INDEX_MAX_KEYS * sizeof(Datum));
 ### Mandatory Gates — ALL Must Pass
 
 ```bash
-make ci-regress                 # 24 regression tests (base correctness)
-make ci-checksums               # 24 tests + page checksum compatibility (initdb -k)
+make ci-regress                 # 110 regression tests (vault provider, base correctness)
+make ci-wallet                  # 110 regression tests (local/wallet kms_provider)
+make ci-checksums               # 110 tests + page checksum compatibility (initdb -k)
 ```
 
-Zero compiler warnings with `-Wall -Wextra` is also required.
+Verify zero compiler warnings:
+```bash
+make PG_CONFIG=$(which pg_config) 2>&1 | grep -c "warning:" | grep "^0$"
+```
+
+Run a single regression file manually (no container):
+```bash
+psql -f sql/regression_test.sql        # 70 tests (52 v1.4 + 18 v1.7 TAM/TOAST)
+psql -f sql/regression_test_v15.sql    # v1.5 tests (20 tests)
+psql -f sql/regression_test_v16.sql    # v1.6 tests (38 tests)
+```
 
 Full local pipeline (all stages including Vault integration and benchmark):
 ```bash
 make ci-all
 ```
 
-### 24-Test Suite Coverage Map
+### 110-Test Suite Coverage Map (70 in regression_test.sql + 20 v1.5 + 38 v1.6 + 2 v1.6 skip-guarded)
 
 | Tests | What | Why |
 |---|---|---|
@@ -572,6 +624,21 @@ make ci-all
 | 22 | SELECT FOR UPDATE | `tuple_lock` path |
 | 23 | BitmapHeapScan | `scan_bitmap_next_tuple` via forced bitmap scan |
 | 24 | TABLESAMPLE | `scan_sample_next_tuple` via SYSTEM(100) |
+| 25–52 | UPSERT, MERGE, TRUNCATE, REINDEX, ALTER, JOINs, CTEs, HW accel, Vault, logical decoding | v1.1–v1.3 coverage |
+| 53–58 | TOAST large-value round-trips (4 kB text, 8 kB jsonb, UPDATE, bulk COPY, inline/EXTERNAL storage paths) | v1.7 TAM/TOAST additions |
+| 59 | VACUUM dead tuple collection | `pg_stat_force_next_flush` + `n_dead_tup` counter |
+| 60 | VACUUM FULL + `tde_tuple_has_external_slow` | `relation_copy_for_cluster`; DELETE after VACUUM FULL locates TOAST chunks even when `HEAP_HASEXTERNAL` was cleared on the rewritten tuple |
+| 61 | CLUSTER | Same `relation_copy_for_cluster` path driven by `CLUSTER ON index`; full round-trip on re-clustered relation |
+| 62–65 | TOAST + all seven read paths | TOAST + index scan, BitmapHeapScan, SELECT FOR UPDATE, TABLESAMPLE |
+| 66 | TOAST + ANALYZE | `scan_analyze_next_tuple` with large-value column |
+| 67 | TOAST + multi_insert | Bulk COPY with large-value column; `multi_insert` + TOAST |
+| 68 | Multi-column TOAST | Two large-value columns; both decoded correctly |
+| 69 | UPDATE `old_has_external` branch | large→large, large→small, small→large transitions in `tuple_update` |
+| 70 | `toast_am` GUC | `pg_vault_tde_toast_am` returns correct AM OID based on `toast_encryption` GUC |
+| 53–72 | Per-table DEK catalog, TOAST large-value, DEK isolation, tde_btree native ops, wire format v3 AAD, online rotation BGW | v1.5 coverage (`regression_test_v15.sql`) |
+| 73–110 | Wallet init/unlock/lock, wallet passphrase, rotate_kek, bundle export/import, TOAST storage paths (EXTERNAL/EXTENDED), VACUUM FULL + TOAST, CLUSTER, all seven read paths with TOAST, ANALYZE, multi_insert, UPDATE old_has_external, ALTER TABLE AM switch, online rotation, CREATE TABLE AS, WITH HOLD cursor plaintext spill | v1.6 coverage (`regression_test_v16.sql`) |
+
+**Skip semantics**: Tests 74–80 SKIP under `make ci-regress` if `kms_provider != local`; tests 84–85 SKIP if `pg_vault_tde.dev_mode != on`; test 103 SKIP if `pg_vault_tde.toast_encryption != on`. See `sql/testing.instructions.md` for full skip matrix.
 
 ### New Feature Test Template
 
@@ -590,6 +657,8 @@ When adding a new override (e.g., a new scan type), add a test that:
 - **DO NOT** assume `slot->tts_tid` is valid after `ExecFetchSlotHeapTuple(slot, false, ...)`
 - **DO NOT** call `pg_vault_tde_decode_slot` on a potentially already-decoded slot without the
   double-decode guard (`bslot->buffer == InvalidBuffer`)
+- **DO NOT** use `VACUUM FULL` in rotation tests — it rewrites tuples, re-encrypting them with
+  the current DEK and masking the rotation test result
 
 ---
 

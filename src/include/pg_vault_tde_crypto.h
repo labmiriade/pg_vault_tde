@@ -56,8 +56,9 @@
 
 /*
  * Encrypt plaintext_len bytes using the DEK for the given relation.
- * relid == InvalidOid selects the v1.4 global DEK (backward compat).
- * Returns palloc'd [VERSION|GEN|IV|CT|TAG] buffer (v2 wire format).
+ * relid == InvalidOid selects an unscoped path (v2 compatibility mode);
+ * valid relid emits v3 with AAD binding.
+ * Returns palloc'd [VERSION|GEN|IV|CT|TAG] buffer.
  * Caller MUST: OPENSSL_cleanse(buf, out_len); pfree(buf);
  */
 char *tde_gcm_encrypt(Oid relid, const char *plaintext, Size plaintext_len,
@@ -65,7 +66,8 @@ char *tde_gcm_encrypt(Oid relid, const char *plaintext, Size plaintext_len,
 
 /*
  * Decrypt a buffer produced by tde_gcm_encrypt. Verifies GCM tag.
- * relid == InvalidOid selects the v1.4 global DEK (backward compat).
+ * Supports legacy v1/v2 tuples and current v3 tuples.
+ * relid == InvalidOid selects an unscoped compatibility path.
  * Returns palloc'd plaintext. Caller MUST: OPENSSL_cleanse + pfree.
  */
 char *tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len,

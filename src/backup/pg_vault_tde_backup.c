@@ -57,10 +57,10 @@
 #include "src/include/pg_vault_tde_kms.h"
 #include "src/include/pg_vault_tde_backup.h"
 
-/* Current backup format version \u2014 increment on breaking changes. */
+/* Current backup format version — increment on breaking changes. */
 #define TDE_BACKUP_FORMAT_VERSION 1
 #define TDE_BACKUP_MAGIC          "PGVAULTTDE"
-#define TDE_BACKUP_MAGIC_LEN      10
+/* TDE_BACKUP_MAGIC_LEN is defined in pg_vault_tde_backup.h */
 #define TDE_BACKUP_BLOCK_SIZE     (64 * 1024) /* 64KB streaming blocks */
 
 /*

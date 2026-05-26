@@ -21,6 +21,10 @@
 #     Build with TDE_TARGET_ARCH=aarch64-ce TDE_OPTIMIZE=max.
 #     Package name: postgresql-PG-pg-vault-tde-armce
 #
+#   bash packaging/build_deb.sh --arch-variant vaes [--no-sign]
+#     Build with TDE_TARGET_ARCH=x86_64-vaes TDE_OPTIMIZE=max.
+#     Package name: postgresql-PG-pg-vault-tde-vaes
+#
 # Output: ../postgresql-PG-pg-vault-tde[_variant]_1.6-1_<arch>.deb
 #
 # Copyright (c) 2026 Miriade Srl — PostgreSQL License
@@ -55,7 +59,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "ERROR: Unknown argument '$1'"
-            echo "Usage: $0 [--pg-version 17|18] [--arch-variant aesni|armce] [--no-sign]"
+            echo "Usage: $0 [--pg-version 17|18] [--arch-variant aesni|armce|vaes] [--no-sign]"
             exit 1
             ;;
     esac
@@ -77,6 +81,12 @@ case "$ARCH_VARIANT" in
         PKG_SUFFIX="-armce"
         CONTROL_EXTRA="packaging/debian/control.arm"
         ;;
+    vaes)
+        TDE_TARGET_ARCH="x86_64-vaes"
+        TDE_OPTIMIZE="max"
+        PKG_SUFFIX="-vaes"
+        CONTROL_EXTRA="packaging/debian/control.vaes"
+        ;;
     "")
         TDE_TARGET_ARCH="generic"
         TDE_OPTIMIZE="standard"
@@ -84,7 +94,7 @@ case "$ARCH_VARIANT" in
         CONTROL_EXTRA=""
         ;;
     *)
-        echo "ERROR: Unknown --arch-variant '$ARCH_VARIANT'. Supported: aesni, armce"
+        echo "ERROR: Unknown --arch-variant '$ARCH_VARIANT'. Supported: aesni, armce, vaes"
         exit 1
         ;;
 esac
