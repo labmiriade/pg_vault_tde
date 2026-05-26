@@ -108,7 +108,7 @@ extern char       *pg_vault_tde_kms_provider;
 /*
  * Local wallet path (PGC_POSTMASTER).
  * Absolute path to the PKCS#12 wallet file.
- * Default: $PGDATA/pg_vault_tde/wallet.p12 (resolved at runtime).
+ * Default: $PGDATA/base/<DB_OID>/pg_vault_tde/wallet.p12 (resolved at runtime).
  * Used only when kms_provider = 'local'.
  */
 extern char       *pg_vault_tde_wallet_path;
@@ -181,5 +181,7 @@ extern char       *pg_vault_tde_wallet_dev_mode_passphrase;
  * When true, ereport(WARNING) is emitted on every dev-mode passphrase use.
  */
 extern bool        pg_vault_tde_dev_mode;
+
+extern char*       pg_vault_tde_extension_name;
 
 #endif /* PG_VAULT_TDE_GUC_H */

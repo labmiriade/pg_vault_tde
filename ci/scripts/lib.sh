@@ -154,7 +154,8 @@ start_pg_container() {
         "${PG_TEST_IMAGE:-pg-tde-test}:latest" \
         postgres \
         -c "shared_preload_libraries=pg_vault_tde" \
-        -c "log_min_messages=warning"
+        -c "pg_vault_tde.dev_mode=on" \
+        -c "log_min_messages=warning" \
 
     wait_pg_ready "$name"
 }

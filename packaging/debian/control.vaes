@@ -1,0 +1,7 @@
+# control.aes - Debian control file for AES-optimized builds
+
+Package: postgresql-PG-pg-vault-tde-vaes
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}, postgresql-server-dev-PG, libssl-dev, libcurl4-openssl-dev
+Description: Transparent Data Encryption (TDE) extension for PostgreSQL
+ This package provides an AES-optimized build of the pg_vault_tde extension for PostgreSQL.

@@ -54,6 +54,7 @@ $RT run --rm -d \
     "${PG_TEST_IMAGE:-pg-tde-test}:latest" \
     postgres \
     -c "shared_preload_libraries=pg_vault_tde" \
+    -c "pg_vault_tde.dev_mode=on" \
     -c "log_min_messages=warning"
 
 wait_pg_ready "$CONTAINER"
@@ -65,7 +66,7 @@ run_sql() {
 
 # Setup: extension + DEK
 run_sql -c "CREATE EXTENSION IF NOT EXISTS pg_vault_tde;"
-run_sql -c "SELECT pg_vault_tde_set_test_dek(decode('${DEK_HEX}', 'hex'));"
+run_sql -c "SELECT pg_vault_tde_wallet_init('tde_bench_test');"
 
 # Create bench tables
 run_sql -c "
@@ -200,6 +201,7 @@ if [[ "$SKIP_PASSTHROUGH" != "1" ]]; then
 
     pt_insert=$(avg_insert_ms bench_enc "$ROWS")
     run_sql -c "
+        TRUNCATE bench_enc;
         INSERT INTO bench_enc SELECT g, md5(g::text) FROM generate_series(1,${ROWS}) g;
         ANALYZE bench_enc;
     " > /dev/null

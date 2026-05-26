@@ -221,6 +221,7 @@ services:
 
         exec docker-entrypoint.sh postgres \
           -c shared_preload_libraries=pg_vault_tde \
+          -c pg_vault_tde.dev_mode=on \
           -c pg_vault_tde.vault_url=http://bao-1:8200 \
           -c pg_vault_tde.auth_method=approle \
           -c "pg_vault_tde.approle_role_id=$$ROLE_ID" \

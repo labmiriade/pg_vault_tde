@@ -183,6 +183,101 @@ typedef struct TdeKmsProvider {
 extern const TdeKmsProvider *tde_active_kms_provider;
 ```
 
+### `wrap_dek(out, &out_len)` Contract — MUST READ (v1.6 patch)
+
+`*wrapped_len` is **bidirectional**:
+
+- **Input**: caller MUST initialize `*wrapped_len` to the **capacity in bytes**
+  of the `wrapped_out` buffer (i.e. `sizeof(buffer)` for stack arrays).
+- **Output**: provider sets `*wrapped_len` to the number of bytes actually
+  written.
+
+**Anti-pattern** (silently broke `CREATE TABLE ... USING encrypted_heap`
+under the Vault provider in pre-patch v1.6):
+
+```c
+unsigned char wrapped[TDE_WRAPPED_DEK_MAX];
+int wrapped_len = 0;                           /* WRONG — capacity is 0 */
+provider->wrap_dek(relid, dek, 32, wrapped, &wrapped_len);
+/* Vault provider's wrap_dek interprets *out_len as input capacity:
+ * a 0 capacity makes it refuse to write any bytes and return false. */
+```
+
+**Correct**:
+
+```c
+unsigned char wrapped[TDE_WRAPPED_DEK_MAX];
+int wrapped_len = sizeof(wrapped);             /* OK — capacity in bytes */
+if (!provider->wrap_dek(relid, dek, 32, wrapped, &wrapped_len))
+    ereport(ERROR, ...);
+/* On success, wrapped_len now contains bytes-written. */
+```
+
+Two other historical occurrences of the same bug were fixed in
+`src/kms/pg_vault_tde_kms_local.c` (lines ~1413 in `change_passphrase` and
+~1706 in `rotate_kek` — both used `int new_len = sizeof(new_wrapped);`).
+
+### `change_passphrase` / `rotate_kek` SPI re-wrap contract (v1.6 patch)
+
+Both functions iterate over `pg_vault_tde_catalog` and re-wrap each DEK.
+The naive pattern below is **broken**:
+
+```c
+spi_ret = SPI_execute("SELECT relid, wrapped_dek FROM ...", true, 0);
+for (i = 0; i < SPI_processed; i++) {
+    HeapTuple tup = SPI_tuptable->vals[i];   /* invalidated on iter 2+ */
+    /* ... derive new_wrapped ... */
+    SPI_execute_with_args("UPDATE ...", ...); /* ← OVERWRITES SPI_tuptable */
+}
+```
+
+`SPI_execute_with_args` resets `SPI_tuptable` and `SPI_processed` to the
+UPDATE's empty tuptable, so on the second iteration `SPI_tuptable->vals[i]`
+dereferences freed memory and SEGV-s the backend.
+
+The required pattern is **two-phase**: snapshot the SELECT into caller-
+owned arrays in `TopTransactionContext` BEFORE issuing any UPDATE, then
+iterate the local arrays.
+
+### `change_passphrase` KEK derivation (v1.6 patch)
+
+`local_open_wallet(path, NEW_pass, kek)` runs `PKCS12_verify_mac`, which
+fails on a wallet file still authenticated under the OLD passphrase.  The
+correct sequence is:
+
+1. `local_open_wallet(path, OLD_pass, old_kek)` — verifies on-disk MAC.
+2. `local_derive_kek_from_pass(NEW_pass, new_kek)` — PBKDF2-only with the
+   fixed `"pg_vault_tde_kek_v1"` salt; no file I/O, no MAC check.
+3. Re-wrap each DEK with `local_wrap_dek_with_kek(...new_kek)`.
+4. Rewrite the wallet file under `NEW_pass` via `local_create_wallet_file`.
+
+`local_derive_kek_from_pass()` is the helper that decouples KEK
+derivation from MAC verification.  Use it instead of
+`local_wrap_dek_with_pass()` whenever the wallet file's MAC does not yet
+match the target passphrase.
+
+### `rotate_kek` / `export_bundle` dual-source KEK (v1.6 patch)
+
+For `pg_vault_tde_wallet_rotate_kek(new_pass)`: the function now prefers
+`local_wallet_state->kek` (set by a prior `wallet_unlock`) over
+`local_get_passphrase()`.  This means tests that already called
+`wallet_unlock` no longer need to configure
+`pg_vault_tde.wallet_passphrase_env` to call `rotate_kek`.
+
+`pg_vault_tde_wallet_export_bundle()` deliberately keeps the
+GUC-passphrase requirement: the bundle's HMAC key is derived via PBKDF2
+from the passphrase string itself, and `import_bundle` must regenerate
+the same key from the user-supplied passphrase.  Switching to the cached
+KEK would yield a different HMAC key and break the import path.
+
+This contract applies symmetrically to `unwrap_dek(wrapped, wrapped_len, dek_out, dek_len)`:
+`dek_len` here is **input-only capacity** because the unwrapped output is
+always exactly `TDE_DEK_LEN`. Providers MAY assert `dek_len >= TDE_DEK_LEN`.
+
+When implementing a new provider, call sites that allocate with
+`palloc(TDE_WRAPPED_DEK_MAX)` MUST still set `*out_len = TDE_WRAPPED_DEK_MAX`
+before the call — the same bidirectional contract holds for heap buffers.
+
 ### Provider Registration
 
 ```c
@@ -202,13 +297,14 @@ else if (strcmp(guc_kms_provider, "kmip") == 0)
 | File | Provider | Available Since |
 |------|----------|-----------------|
 | `src/kms/pg_vault_tde_kms_vault.c` | `vault` | v1.0 (refactored in v1.5) |
-| `src/kms/pg_vault_tde_kms_local.c` | `local` | v1.5 |
+| `src/kms/pg_vault_tde_kms_local.c` | `local` | v1.5 (v1.6 patch: wrap_dek capacity-init bug fixed in `change_passphrase` + `rotate_kek`) |
+| `src/kms/pg_vault_tde_catalog.c` | dispatch / catalog access | v1.5 (v1.6 patch: wrap_dek capacity-init bug fixed at line 488 — was blocking `CREATE TABLE` under Vault provider) |
 | `src/kms/pg_vault_tde_kms_pkcs11.c` | `pkcs11` | v1.7 |
 | `src/kms/pg_vault_tde_kms_kmip.c` | `kmip` | v1.8 |
 
 ### Local Wallet Provider Rules (`local`)
 
-- Wallet file: `$PGDATA/pg_vault_tde/wallet.p12` (default; GUC `pg_vault_tde.wallet_path`)
+- Wallet file: `$PGDATA/base/<DB_OID>/pg_vault_tde/wallet.p12` (default; GUC `pg_vault_tde.wallet_path`)
 - Format: PKCS#12 with `NID_aes_256_cbc` encryption (OpenSSL 3.x `PKCS12_create_ex2()`)
 - Passphrase: from environment variable ONLY — GUC `pg_vault_tde.wallet_passphrase_env`
   holds the env var NAME, never the value. Never read from `postgresql.conf`.

@@ -34,6 +34,13 @@ const TableAmRoutine *pg_vault_tde_get_tableam_routine(void);
 void pg_vault_tde_tam_init(void);
 
 /*
+ * tde_encrypt_heap_tuple - encrypt a HeapTuple payload for on-disk storage.
+ *
+ * Exported for TOAST chunk write path in pg_vault_tde_toast.c.
+ * relid is used for per-table DEK lookup.
+ */
+HeapTuple tde_encrypt_heap_tuple(HeapTuple plain, Oid relid);
+/*
  * tde_decrypt_heap_tuple — decrypt an on-disk encrypted HeapTuple.
  *
  * Exported for use by the logical decoding output plugin (v1.2).
@@ -47,5 +54,7 @@ void pg_vault_tde_tam_init(void);
  * Raises ERROR on GCM authentication failure.
  */
 HeapTuple tde_decrypt_heap_tuple(HeapTuple enc, Oid relid);
+
+int64 pg_vault_tde_reencrypt_table(Oid relid);
 
 #endif /* PG_VAULT_TDE_TAM_H */

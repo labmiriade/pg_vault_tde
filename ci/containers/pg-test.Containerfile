@@ -85,7 +85,7 @@ COPY --from=builder /usr/share/postgresql/${PG_MAJOR}/extension/pg_vault_tde* \
 COPY sql/regression_test.sql  /test/regression_test.sql
 COPY sql/pg_vault_tde_init.sql /docker-entrypoint-initdb.d/pg_vault_tde_init.sql
 COPY tap/                     /test/tap/
-COPY isolation/               /test/isolation/
+COPY test/isolation/               /test/isolation/
 COPY bench_tde.sh            /test/bench_tde.sh
 
 # Ensure test files are readable

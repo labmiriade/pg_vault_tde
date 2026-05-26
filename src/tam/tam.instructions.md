@@ -21,6 +21,108 @@ Every write callback MUST follow this sequence:
 4. Copy physical TID back to the slot
 5. `OPENSSL_cleanse` + `pfree` the plaintext copy
 
+### Write Path PG_TRY Contract (v1.6 patch — fix #1)
+
+All four write callbacks (`pg_vault_tde_tuple_insert`,
+`pg_vault_tde_tuple_insert_speculative`, `pg_vault_tde_multi_insert`,
+`pg_vault_tde_tuple_update`) MUST wrap the **entire** pre-TOAST → encrypt →
+heap_insert pipeline inside a single `PG_TRY` block.
+
+**Why**: prior to the patch, `PG_TRY` started AFTER
+`heap_toast_insert_or_update()` and `tde_encrypt_heap_tuple()`. An error in
+either of those two stages would:
+
+1. Leak the swapped `reltoastrelid` (the relation cache stayed pointing at
+   the wrong TOAST OID until the next relcache invalidation).
+2. Leak `palloc`'d plaintext / pre-TOAST intermediates without
+   `OPENSSL_cleanse`.
+
+**Pattern** (canonical):
+
+```c
+Oid     saved_toastrelid    = rel->rd_rel->reltoastrelid;
+bool    toastrelid_swapped  = false;
+HeapTuple plain_inflight    = NULL;   /* pre-TOAST intermediate */
+HeapTuple toasted_inflight  = NULL;   /* post-TOAST, pre-encrypt */
+HeapTuple ct_tuple          = NULL;   /* post-encrypt */
+
+PG_TRY();
+{
+    /* 1. swap toastrelid so heap_toast_insert_or_update writes into
+     *    pg_toast_NNNNN under heap AM, not encrypted_heap. */
+    rel->rd_rel->reltoastrelid = pg_vault_tde_get_toast_relid(rel);
+    toastrelid_swapped = true;
+
+    /* 2. pre-TOAST + encrypt + heap_insert — ALL inside PG_TRY */
+    plain_inflight   = ExecCopySlotHeapTuple(slot);
+    toasted_inflight = heap_toast_insert_or_update(rel, plain_inflight, ...);
+    ct_tuple         = tde_encrypt_heap_tuple(rel, toasted_inflight);
+    heap_insert(rel, ct_tuple, cid, options, bistate);
+
+    /* 3. restore */
+    rel->rd_rel->reltoastrelid = saved_toastrelid;
+    toastrelid_swapped = false;
+}
+PG_CATCH();
+{
+    if (toastrelid_swapped)
+        rel->rd_rel->reltoastrelid = saved_toastrelid;
+    if (plain_inflight)    { OPENSSL_cleanse(plain_inflight->t_data, plain_inflight->t_len); pfree(plain_inflight); }
+    if (toasted_inflight && toasted_inflight != plain_inflight)
+                           { OPENSSL_cleanse(...); pfree(toasted_inflight); }
+    if (ct_tuple)          { pfree(ct_tuple); }
+    PG_RE_THROW();
+}
+PG_END_TRY();
+```
+
+For `multi_insert`, the equivalent loop allocates **arrays**
+(`plain_inflight[]`, `toasted_inflight[]`) sized at `ntuples`, and the
+`PG_CATCH` walks the partially-populated arrays freeing/cleansing the slots
+that were already produced before the error.
+
+**TOAST chunk rollback**: TOAST chunks already committed by
+`heap_toast_insert_or_update()` before the error are rolled back by the
+surrounding subtransaction — DO NOT attempt manual cleanup of TOAST chunks
+in `PG_CATCH`.
+
+Tests **81** (catalog registration), **83** (transactional rollback after
+pre-TOAST + encrypt), and **84** (per-table DEK isolation across parent + TOAST)
+exercise this contract.
+
+### TOAST RELKIND_TOASTVALUE bypass (v1.0–v1.6) → Transparent Encryption (v1.7)
+
+**v1.0–v1.6 behavior**: `pg_vault_tde.toast_encryption=on` made the auto-created
+TOAST relation inherit the `encrypted_heap` AM, but PG's `toast_save_datum()`
+writes chunks via `heap_insert(toastrel, …)` directly — bypassing the TAM
+dispatch — so chunks landed **plaintext** on disk (documented v1 limitation).
+
+**v1.7 behavior**: TOAST chunks are now encrypted at the TAM level.
+- **Write path**: `pg_vault_tde_tuple_insert()` now detects `RELKIND_TOASTVALUE`
+  and encrypts each chunk using the **parent table's DEK** via
+  `tde_encrypt_heap_tuple(chunk, parent_relid)`.
+- **Read path**: All 7 read callbacks automatically route TOAST relid to parent
+  DEK lookup via `pg_vault_tde_kms_get_rel_dek()` (see Phase 1 KMS routing).
+  No explicit `RELKIND_TOASTVALUE` bypass needed anymore; TOAST chunks are
+  decrypted transparently just like parent table tuples.
+
+**Architecture**:
+```
+TOAST chunk INSERT:     chunk → encrypt(parent_relid) → heap_insert
+TOAST chunk SELECT:     heap_fetch → decrypt(TOAST_relid) 
+                           ↓ (pg_vault_tde_kms_get_rel_dek routes TOAST_relid → parent_relid)
+                        plaintext chunk
+```
+
+**TOAST table DEK assignment**:
+- Each TOAST table **inherits the parent table's DEK** (no separate entry in catalog).
+- Parent-child DEK linkage is implicit: TOAST relid is passed to
+  `pg_vault_tde_kms_get_rel_dek()`, which calls `pg_vault_tde_get_parent_relid()`
+  (Phase 1, KMS layer) to find the parent and loads the parent's wrapped DEK.
+
+**Test coverage**: Test #53 validates v1.7 TOAST round-trip (10 KB payload →
+external storage → multiple chunks → encrypt + decrypt → round-trip check).
+
 ### Read Path Contract
 
 Every read callback that populates a `TupleTableSlot` with buffer-backed
@@ -100,9 +202,10 @@ When adding support for PostgreSQL N+1, audit every TAM callback:
 
 ### Known Version Differences (TAM)
 
-| Callback | PG 17 | PG 18 | Guard |
-|----------|-------|-------|-------|
+| Callback / Function | PG 17 | PG 18 | Guard |
+|---------------------|-------|-------|-------|
 | `scan_bitmap_next_tuple` | 3 args | 5 args (+lossy, exact) | `PG_VERSION_NUM >= 180000` |
+| `heap_beginscan` flags in `relation_copy_for_cluster` | `SO_ALLOW_STRAT\|SO_ALLOW_SYNC` sufficient | Must also include `SO_TYPE_SEQSCAN`; `heapgettup` calls `heap_fetch_next_buffer` which asserts `scan->rs_read_stream != NULL`, and the read stream is only initialized when `SO_TYPE_SEQSCAN` is set | `PG_VERSION_NUM >= 180000` |
 
 **Add rows** here when PG 19+ introduces new TAM changes.
 
@@ -143,6 +246,7 @@ to its expected error conditions and the correct `ereport` level:
 | `tuple_update` | old tuple GCM mismatch | ERROR | "GCM authentication failed on UPDATE source tuple" |
 | `index_fetch_tuple` | rd_tableam restore failed | PANIC | "pg_vault_tde: failed to restore rd_tableam — relation cache corrupted" |
 | `multi_insert` | any single tuple encrypt fail | ERROR | "pg_vault_tde: bulk insert encryption failed at tuple %d of %d" |
+| `tuple_insert*` / `tuple_update` / `multi_insert` | pre-TOAST or encrypt fail mid-pipeline | ERROR (re-thrown via PG_RE_THROW) | Original heapam/encrypt errmsg; `PG_CATCH` restores `reltoastrelid` and cleanses plaintext intermediates (v1.6 patch — fix #1) |
 
 ## Callback × Test Coverage Matrix
 
@@ -159,5 +263,8 @@ to its expected error conditions and the correct `ereport` level:
 | `scan_sample_next_tuple` | 24 | `TABLESAMPLE` | ✅ |
 | `tuple_fetch_row_version` | — | `SELECT ... WHERE ctid = '(0,1)'` | via UPDATE recheck |
 | `tuple_lock` | 22 | `SELECT FOR UPDATE` | ✅ |
+| `tuple_insert` PG_TRY widening | 81, 82, 83 | DDL hook + 64 KB compressible + ROLLBACK | ✅ (v1.6 patch — fix #1) |
+| `multi_insert` PG_TRY widening | 18, 84 | `COPY FROM` + per-table DEK isolation | ✅ (v1.6 patch — fix #1) |
+| `tuple_update` PG_TRY widening | 14, 83 | UPDATE + transactional rollback | ✅ (v1.6 patch — fix #1) |
 
-**Action item for @QA**: All TAM callbacks now have test coverage (tests 1-24).
+**Action item for @QA**: All TAM callbacks now have test coverage (tests 1-84).

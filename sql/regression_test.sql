@@ -1415,11 +1415,14 @@ END;
 $$;
 
 -- ================================================================
--- TEST 44: health_check() returns valid 14-column composite (v1.3)
+-- TEST 44: health_check() returns valid 7-column composite (v1.5+)
 --
--- Validates the unified diagnostic function that aggregates DEK state,
--- Vault connectivity, authentication, OpenSSL, and hardware acceleration
--- into a single composite row.
+-- v1.5 redefined pg_vault_tde_health_check() with the schema:
+--   (version text, enabled bool, kms_provider text, dek_available bool,
+--    aad_binding bool, wallet_open bool, checked_at timestamptz)
+--
+-- Validates each column's presence and basic invariants after a fresh
+-- pg_vault_tde_set_test_dek() injection.
 -- ================================================================
 DO $$
 DECLARE
@@ -1429,35 +1432,27 @@ BEGIN
 
     SELECT * INTO r FROM pg_vault_tde_health_check();
 
-    -- Verify all 14 columns are present and have expected types/values
-    IF r.overall_status IS NULL THEN
-        RAISE EXCEPTION 'TEST 44 FAILED: overall_status is NULL';
+    IF r.version IS NULL OR r.version = '' THEN
+        RAISE EXCEPTION 'TEST 44 FAILED: version is NULL/empty';
     END IF;
-    IF r.dek_valid != true THEN
-        RAISE EXCEPTION 'TEST 44 FAILED: dek_valid should be true after set_test_dek';
+    IF r.kms_provider IS NULL THEN
+        RAISE EXCEPTION 'TEST 44 FAILED: kms_provider is NULL';
     END IF;
-    IF r.generation < 1 THEN
-        RAISE EXCEPTION 'TEST 44 FAILED: generation should be >= 1';
+    IF r.dek_available IS DISTINCT FROM true THEN
+        RAISE EXCEPTION 'TEST 44 FAILED: dek_available should be true after set_test_dek (got %)', r.dek_available;
     END IF;
-    IF r.encryption_enabled != true THEN
-        RAISE EXCEPTION 'TEST 44 FAILED: encryption_enabled should be true';
+    IF r.aad_binding IS DISTINCT FROM true THEN
+        RAISE EXCEPTION 'TEST 44 FAILED: aad_binding should be true (got %)', r.aad_binding;
     END IF;
-    IF r.openssl_version IS NULL OR r.openssl_version = '' THEN
-        RAISE EXCEPTION 'TEST 44 FAILED: openssl_version is empty';
+    IF r.checked_at IS NULL THEN
+        RAISE EXCEPTION 'TEST 44 FAILED: checked_at is NULL';
     END IF;
-    IF r.crypto_provider IS NULL THEN
-        RAISE EXCEPTION 'TEST 44 FAILED: crypto_provider is NULL';
-    END IF;
-    IF r.auth_method IS NULL THEN
-        RAISE EXCEPTION 'TEST 44 FAILED: auth_method is NULL';
+    IF r.checked_at < now() - interval '60 seconds' THEN
+        RAISE EXCEPTION 'TEST 44 FAILED: checked_at=% is more than 60s in the past', r.checked_at;
     END IF;
 
-    -- Without Vault configured, overall_status should reflect DEK state
-    IF r.dek_valid AND r.overall_status NOT IN ('healthy', 'degraded') THEN
-        RAISE EXCEPTION 'TEST 44 FAILED: unexpected overall_status: %', r.overall_status;
-    END IF;
-
-    RAISE NOTICE 'TEST 44 PASSED: health_check() returns valid 14-column composite';
+    RAISE NOTICE 'TEST 44 PASSED: health_check() v1.5 schema OK (version=%, kms_provider=%, dek_available=%, aad_binding=%, wallet_open=%)',
+        r.version, r.kms_provider, r.dek_available, r.aad_binding, r.wallet_open;
 END;
 $$;
 
@@ -1567,11 +1562,15 @@ END;
 $$;
 
 -- ================================================================
--- TEST 47: health_check() status transitions (v1.3)
+-- TEST 47: health_check() DEK-state transitions (v1.5+ schema)
 --
--- Tests that health_check() correctly reports DEK state changes:
--- (a) after rotate_key() → dek_valid=false, overall_status=error
--- (b) after setting new DEK → dek_valid=true, overall_status=healthy
+-- v1.5 dropped overall_status / prev_dek_available from
+-- pg_vault_tde_health_check() and replaced them with dek_available.
+-- This test exercises the same scenarios using the v1.5 columns:
+--   (a) initial state: dek_available=true
+--   (b) after rotate_key()                : dek_available=false (no current DEK)
+--   (c) after set_test_dek()              : dek_available=true again
+--   (d) after clear_prev_dek()            : still dek_available=true
 -- ================================================================
 DO $$
 DECLARE
@@ -1579,42 +1578,39 @@ DECLARE
 BEGIN
     PERFORM pg_vault_tde_set_test_dek();
 
-    -- Initial state: healthy
+    -- (a) Initial: a DEK has been injected.
     SELECT * INTO r FROM pg_vault_tde_health_check();
-    IF r.overall_status != 'healthy' THEN
-        RAISE EXCEPTION 'TEST 47 FAILED: expected healthy, got %', r.overall_status;
+    IF r.dek_available IS DISTINCT FROM true THEN
+        RAISE EXCEPTION 'TEST 47 FAILED: dek_available should be true after set_test_dek (got %)',
+            r.dek_available;
     END IF;
 
-    -- Rotate key (wipes DEK)
+    -- (b) Rotate the key — the current DEK is wiped, no replacement was set.
     PERFORM pg_vault_tde_rotate_key();
-
-    -- After rotation: error (no DEK)
     SELECT * INTO r FROM pg_vault_tde_health_check();
-    IF r.overall_status != 'error' THEN
-        RAISE EXCEPTION 'TEST 47 FAILED: expected error after rotation, got %', r.overall_status;
-    END IF;
-    IF r.dek_valid != false THEN
-        RAISE EXCEPTION 'TEST 47 FAILED: dek_valid should be false after rotation';
-    END IF;
-    IF r.prev_dek_available != true THEN
-        RAISE EXCEPTION 'TEST 47 FAILED: prev_dek should be available after rotation';
+    IF r.dek_available IS DISTINCT FROM false THEN
+        RAISE EXCEPTION 'TEST 47 FAILED: dek_available should be false after rotate_key '
+                        '(got %)', r.dek_available;
     END IF;
 
-    -- Set new DEK → healthy again
+    -- (c) Inject a new DEK — back to available.
     PERFORM pg_vault_tde_set_test_dek();
     SELECT * INTO r FROM pg_vault_tde_health_check();
-    IF r.overall_status != 'healthy' THEN
-        RAISE EXCEPTION 'TEST 47 FAILED: expected healthy after new DEK, got %', r.overall_status;
+    IF r.dek_available IS DISTINCT FROM true THEN
+        RAISE EXCEPTION 'TEST 47 FAILED: dek_available should be true after new DEK '
+                        '(got %)', r.dek_available;
     END IF;
 
-    -- Clear prev DEK
+    -- (d) Clearing the previous-DEK slot must NOT affect the current DEK.
     PERFORM pg_vault_tde_clear_prev_dek();
     SELECT * INTO r FROM pg_vault_tde_health_check();
-    IF r.prev_dek_available != false THEN
-        RAISE EXCEPTION 'TEST 47 FAILED: prev_dek should be false after clear';
+    IF r.dek_available IS DISTINCT FROM true THEN
+        RAISE EXCEPTION 'TEST 47 FAILED: clear_prev_dek must not invalidate current DEK '
+                        '(got dek_available=%)', r.dek_available;
     END IF;
 
-    RAISE NOTICE 'TEST 47 PASSED: health_check() status transitions OK';
+    RAISE NOTICE 'TEST 47 PASSED: health_check() DEK-state transitions OK '
+                 '(rotate → unavailable → set → available)';
 END;
 $$;
 
@@ -1751,33 +1747,41 @@ END;
 $$;
 
 -- ================================================================
--- TEST 51: health_check() wrapped_dek_perms column (v1.4)
+-- TEST 51: health_check() reflects the active KMS provider (v1.5+)
 --
--- Verifies that pg_vault_tde_health_check() now returns a 15th
--- column reporting the filesystem permissions of the persisted
--- wrapped DEK file ($PGDATA/pg_vault_tde/wrapped_dek).
--- In CI (no Vault), the file does not exist → NULL is expected.
+-- v1.5 moved persisted DEKs from a single $PGDATA/pg_vault_tde/wrapped_dek
+-- file into pg_vault_tde_catalog and dropped the wrapped_dek_perms column.
+-- Instead the v1.5 schema exposes kms_provider, which must match the
+-- pg_vault_tde.kms_provider GUC (vault | local).  This test enforces that
+-- consistency so health_check() can never silently disagree with the GUC.
 -- ================================================================
 DO $$
 DECLARE
-    r record;
+    r        record;
+    v_guc    text;
 BEGIN
     PERFORM pg_vault_tde_set_test_dek();
 
     SELECT * INTO r FROM pg_vault_tde_health_check();
+    v_guc := current_setting('pg_vault_tde.kms_provider', true);
 
-    -- The column must exist; NULL is acceptable (file not present in CI)
-    IF r.wrapped_dek_perms IS NULL THEN
-        RAISE NOTICE
-            'TEST 51 PASSED: wrapped_dek_perms column exists (NULL = no file in CI)';
-    ELSE
-        IF r.wrapped_dek_perms NOT IN ('0600', 'other', 'missing') THEN
-            RAISE EXCEPTION
-                'TEST 51 FAILED: unexpected wrapped_dek_perms value: %',
-                r.wrapped_dek_perms;
-        END IF;
-        RAISE NOTICE 'TEST 51 PASSED: wrapped_dek_perms = %', r.wrapped_dek_perms;
+    IF r.kms_provider IS NULL THEN
+        RAISE EXCEPTION 'TEST 51 FAILED: kms_provider column is NULL';
     END IF;
+
+    IF r.kms_provider IS DISTINCT FROM v_guc THEN
+        RAISE EXCEPTION 'TEST 51 FAILED: health_check.kms_provider=% '
+                        'does not match GUC pg_vault_tde.kms_provider=%',
+            r.kms_provider, COALESCE(v_guc, '(unset)');
+    END IF;
+
+    IF r.kms_provider NOT IN ('vault', 'local') THEN
+        RAISE EXCEPTION 'TEST 51 FAILED: unexpected kms_provider value "%"',
+            r.kms_provider;
+    END IF;
+
+    RAISE NOTICE 'TEST 51 PASSED: health_check.kms_provider="%" matches GUC',
+        r.kms_provider;
 END;
 $$;
 
@@ -1818,6 +1822,7 @@ BEGIN
 END;
 $$;
 
+
 -- ================================================================
 -- FINAL SUMMARY
 -- ================================================================
@@ -1840,7 +1845,7 @@ BEGIN
     RAISE NOTICE '   v1.1: fetch_dek, re-encrypt . tests 37-38';
     RAISE NOTICE '   v1.1: verify, enc_size, IAM . tests 39-41';
     RAISE NOTICE '   v1.1: HW accel info, round  . tests 42-43';
-    RAISE NOTICE '   v1.3: health_check, batch .. . tests 44-47';
+    RAISE NOTICE '   v1.3: health_check, batch ... tests 44-47';
     RAISE NOTICE '   v1.2: logical decoding ...... test  48';
     RAISE NOTICE '   v1.4: wire fmt v2, tde_btree  tests 49-52';
     RAISE NOTICE '====================================================';

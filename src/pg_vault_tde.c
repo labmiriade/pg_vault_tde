@@ -6,9 +6,15 @@
  */
 #include "postgres.h"
 #include "fmgr.h"
+#include "access/htup_details.h" /* GETSTRUCT, HeapTupleIsValid */
 #include "access/relation.h"    /* try_relation_open / relation_close */
 #include "access/tableam.h"
+#include "catalog/indexing.h"   /* systable_beginscan / SysScanDesc */
 #include "catalog/namespace.h"
+#include "catalog/objectaccess.h" /* object_access_hook, OAT_POST_CREATE */
+#include "catalog/pg_class.h"     /* RelationRelationId, Form_pg_class, ClassOidIndexId */
+#include "utils/fmgroids.h"     /* F_OIDEQ */
+#include "utils/snapmgr.h"      /* SnapshotSelf */
 #include "commands/defrem.h"
 #include "executor/spi.h"
 #include "miscadmin.h"
@@ -21,6 +27,8 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/builtins.h"
+#include "access/table.h"
+#include "commands/extension.h"
 
 #include "src/include/pg_vault_tde_kms.h"
 #include "src/include/pg_vault_tde_tam.h"
@@ -57,6 +65,7 @@ char *pg_vault_tde_vault_k8s_mount      = NULL;
 char *pg_vault_tde_crypto_provider      = NULL;
 bool        pg_vault_tde_bgw_enabled              = false;
 int         pg_vault_tde_token_renewal_interval   = 3600;
+char *pg_vault_tde_extension_name       = "pg_vault_tde";
 
 /* -----------------------------------------------------------------------
  * v1.5 GUC definitions
@@ -87,7 +96,7 @@ const TdeKmsProvider *tde_active_kms_provider = NULL;
 static shmem_request_hook_type    prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type    prev_shmem_startup_hook = NULL;
 static ProcessUtility_hook_type   prev_process_utility_hook = NULL;
-
+static object_access_hook_type    prev_object_access_hook = NULL;
 /*
  * tde_backend_cleanup -- on_proc_exit callback.
  *
@@ -138,10 +147,106 @@ tde_get_tableam_name_for_create(CreateStmt *create_stmt)
 }
 
 /*
- * tde_process_utility_hook
+ * tde_object_access_hook — register per-table DEK immediately on table creation.
  *
- * ProcessUtility hook that intercepts DDL statements to maintain the per-
- * table DEK catalog:
+ * PostgreSQL fires this hook inside the same command as the CREATE TABLE (or
+ * CTAS), AFTER the pg_class row is inserted but BEFORE any data is inserted
+ * into the new relation.  This timing is critical for CTAS:
+ *
+ *   CREATE TABLE t USING encrypted_heap AS SELECT ...
+ *
+ * The ProcessUtility post-processing registers the DEK AFTER
+ * standard_ProcessUtility returns, which is too late for CTAS — the TAM
+ * tuple_insert callbacks have already run and need the DEK.  By hooking
+ * here we guarantee the DEK is in pg_vault_tde_catalog before the first INSERT.
+ *
+ * IMPORTANT: during OAT_POST_CREATE, CommandCounterIncrement has NOT yet been
+ * called, so the new pg_class tuple is not yet visible in the syscache or via
+ * try_relation_open().  We must use SnapshotSelf (which sees tuples inserted
+ * by the current command regardless of CommandCounterIncrement) with a direct
+ * heap scan of pg_class to determine the AM of the new relation.
+ *
+ * catalog_register_rel is idempotent (skips if entry already exists), so it
+ * is safe to call here even though the ProcessUtility post-processing may
+ * call it again afterwards for regular CREATE TABLE.
+ */
+static void
+tde_object_access_hook(ObjectAccessType access, Oid classId, Oid objectId,
+                       int subId, void *arg)
+{
+    char           *amname;
+    Relation        rel;
+    Oid             relam  = InvalidOid;
+    char            relkind = '\0';
+
+    /* Chain to any previously registered hook first. */
+    if (prev_object_access_hook)
+        prev_object_access_hook(access, classId, objectId, subId, arg);
+
+    /* We only care about newly created plain relations. */
+    if (access != OAT_POST_CREATE)
+        return;
+    if (classId != RelationRelationId)
+        return;
+    if (subId != 0)             /* subId != 0 means a column, not the relation */
+        return;
+
+    /*
+     * We call CCI here because the OAT_POST_CREATE doesn't do it,
+     * so we are not able to open relation created by the same
+     * transaction.
+     * From a testability point of view, it's not very good:
+     * (https://www.postgresql.org/message-id/flat/CAHoZxqvN2eoic_CvjsAvpryyLyA2xG8JmsyMtKFFJz_1oFhfOg@mail.gmail.com)
+     *
+     * Alternative: scan pg_class with SnapshotSelf (less efficient)
+     */
+    CommandCounterIncrement();
+
+    rel = try_relation_open(objectId, NoLock);
+    if(!rel) ereport(ERROR, errmsg("pg_vault_tde: unable to open relation %u", objectId));
+
+    /*
+     * Skip rewrite targets created by VACUUM FULL / ALTER TABLE / CLUSTER.
+     * pg_class.relrewrite is set on the transient new heap and is only visible
+     * after CommandCounterIncrement() above — which is why we cannot check it
+     * via SearchSysCache before the CCI (it would return InvalidOid and the
+     * guard would incorrectly pass, registering the temp relation).
+     */
+    if (OidIsValid(rel->rd_rel->relrewrite))
+    {
+        table_close(rel, NoLock);
+        return;
+    }
+
+    relkind = rel->rd_rel->relkind;
+    relam = rel->rd_rel->relam;
+
+    table_close(rel, NoLock);
+
+    /* Only handle plain heap tables; skip TOAST, indexes, sequences, etc. */
+    if (relkind != RELKIND_RELATION || !OidIsValid(relam))
+        return;
+
+    amname = get_am_name(relam);
+    if (amname == NULL || strcmp(amname, "encrypted_heap") != 0)
+        return;
+
+    /*
+     * Register a fresh per-table DEK now, while we are still inside the
+     * CREATE command and before any row is inserted.  catalog_register_rel
+     * is idempotent: if the entry already exists it returns immediately
+     * without overwriting the existing DEK.
+     */
+    pg_vault_tde_catalog_register_rel(objectId, pg_vault_tde_vault_key_name);
+
+    ereport(DEBUG1,
+            errmsg("pg_vault_tde: [object_access] registered DEK for new "
+                   "encrypted_heap relation %u", objectId));
+}
+
+
+/*
+ * tde_process_utility_hook
  *
  *   CREATE TABLE ... USING encrypted_heap → register in pg_vault_tde_catalog
  *   DROP TABLE ... (if relation used encrypted_heap)  → deregister from catalog
@@ -165,7 +270,10 @@ tde_process_utility_hook(PlannedStmt *pstmt,
 {
     Node       *parsetree = pstmt->utilityStmt;
     bool        is_create_encrypted = false;
+    bool        alter_tam_away = false; /* converting FROM encrypted_heap TO another TAM */
+    bool        alter_tam_into = false; /* converting TO encrypted_heap FROM another TAM */
     List       *drop_encrypted_oids = NIL;  /* OIDs of encrypted tables being dropped */
+    List       *evict_only_oids     = NIL;  /* OIDs to evict from shmem only (no catalog row) */
 
     /*
      * Pre-processing: determine if this is a CREATE TABLE USING encrypted_heap.
@@ -209,12 +317,95 @@ tde_process_utility_hook(PlannedStmt *pstmt,
                         if (OidIsValid(rel->rd_rel->relam) &&
                             strcmp(get_am_name(rel->rd_rel->relam),
                                    "encrypted_heap") == 0)
+                        {
                             drop_encrypted_oids = lappend_oid(drop_encrypted_oids, rid);
+
+                            /*
+                             * Also capture the TOAST relation OID to evict its
+                             * shmem DEK cache slot.  TOAST tables share the
+                             * parent's DEK and are never registered with a
+                             * separate row in pg_vault_tde_catalog, so we add
+                             * them to evict_only_oids (shmem eviction only) and
+                             * NOT to drop_encrypted_oids (which triggers a
+                             * catalog DELETE that would produce a spurious
+                             * WARNING when no row is found).
+                             */
+                            if (OidIsValid(rel->rd_rel->reltoastrelid))
+                                evict_only_oids = lappend_oid(
+                                        evict_only_oids,
+                                        rel->rd_rel->reltoastrelid);
+                        }
                         relation_close(rel, NoLock);
                     }
                 }
             }
         }
+    }
+    else if (IsA(parsetree, AlterTableStmt))
+    {
+        AlterTableStmt* stmt = (AlterTableStmt*) parsetree;
+
+        ListCell* lc;
+        
+        if(stmt->objtype == OBJECT_TABLE) {
+            foreach(lc, stmt->cmds) {
+                AlterTableCmd* cmd = lfirst_node(AlterTableCmd, lc);
+
+                if(cmd->subtype == AT_SetAccessMethod) {   
+                    if(strcmp(cmd->name, "encrypted_heap") == 0) {
+                        alter_tam_into = true;
+                        break;
+                    }
+                    else {
+                        alter_tam_away = true;
+                        break;  
+                    }     
+                }
+            }
+        }
+    }
+
+
+    /*
+     * We register the tuple table BEFORE utility_hook execution
+     * because it's going to rewrite the table with encrypted_heap's
+     * methods (insert, multi-insert ecc.) and we MUST have a DEK 
+     * before that.
+     */
+    if(alter_tam_into)
+    {
+        AlterTableStmt *stmt = (AlterTableStmt *) parsetree;
+        Oid         relid;
+        Oid         ext_ns;
+
+        relid = RangeVarGetRelid(stmt->relation, NoLock, true /* missing_ok */);
+        if (!OidIsValid(relid))
+        {
+            ereport(WARNING,
+                    (errmsg("pg_vault_tde: could not find "
+                            "heap relation '%s' for catalog "
+                            "registration",
+                            stmt->relation->relname)));
+            return;
+        }
+
+        ext_ns = get_extension_schema(get_extension_oid(pg_vault_tde_extension_name, true));
+        if (!OidIsValid(ext_ns) ||
+            !OidIsValid(get_relname_relid("pg_vault_tde_catalog", ext_ns)))
+        {
+            ereport(DEBUG1,
+                    (errmsg("pg_vault_tde: skipping per-table DEKeregistration "
+                            "for relid=%u (pg_vault_tde_catalog not found; "
+                            "upgrade to v1.5 to enable per-table DEK isolation)",
+                            relid)));
+            return;
+        }
+
+        pg_vault_tde_catalog_register_rel(relid, pg_vault_tde_vault_key_name);
+
+        ereport(DEBUG1,
+                (errmsg("pg_vault_tde: registered relid=%u in DEK catalog",
+                        relid)));
     }
 
     /* Run the actual DDL statement through the hook chain */
@@ -239,7 +430,7 @@ tde_process_utility_hook(PlannedStmt *pstmt,
     {
         CreateStmt *stmt   = (CreateStmt *) parsetree;
         Oid         relid;
-        Oid         public_ns;
+        Oid         ext_ns;
 
         relid = RangeVarGetRelid(stmt->relation, NoLock, true /* missing_ok */);
         if (!OidIsValid(relid))
@@ -251,16 +442,15 @@ tde_process_utility_hook(PlannedStmt *pstmt,
                             stmt->relation->relname)));
             return;
         }
-
         /*
          * Guard: pg_vault_tde_catalog is created by the v1.5 upgrade script
          * (pg_vault_tde--1.4--1.5.sql).  On a v1.0 deployment that has not
          * yet been upgraded, the table does not exist and we skip the INSERT
          * gracefully.  Encrypted tables still work using the global DEK.
          */
-        public_ns = get_namespace_oid("public", true /* missing_ok */);
-        if (!OidIsValid(public_ns) ||
-            !OidIsValid(get_relname_relid("pg_vault_tde_catalog", public_ns)))
+        ext_ns = get_extension_schema(get_extension_oid(pg_vault_tde_extension_name, true));
+        if (!OidIsValid(ext_ns) ||
+            !OidIsValid(get_relname_relid("pg_vault_tde_catalog", ext_ns)))
         {
             ereport(DEBUG1,
                     (errmsg("pg_vault_tde: skipping per-table DEK registration "
@@ -291,7 +481,7 @@ tde_process_utility_hook(PlannedStmt *pstmt,
     if (drop_encrypted_oids != NIL)
     {
         ListCell *lc;
-        Oid       public_ns;
+        Oid       ext_ns;
         bool      catalog_exists;
 
         /*
@@ -299,44 +489,92 @@ tde_process_utility_hook(PlannedStmt *pstmt,
          * On pre-v1.5 deployments the table is absent and we skip the DELETE,
          * but still evict the shmem DEK cache entries.
          */
-        public_ns      = get_namespace_oid("public", true);
-        catalog_exists = OidIsValid(public_ns) &&
+        ext_ns      = get_extension_schema(get_extension_oid(pg_vault_tde_extension_name, true));
+        catalog_exists = OidIsValid(ext_ns) &&
                          OidIsValid(get_relname_relid("pg_vault_tde_catalog",
-                                                      public_ns));
-
-        if (catalog_exists)
-            SPI_connect();
-
+                                                      ext_ns));
+        
         foreach(lc, drop_encrypted_oids)
         {
             Oid         relid = lfirst_oid(lc);
-            char        sql[256];
-            int         rc;
 
             if (catalog_exists)
             {
-                snprintf(sql, sizeof(sql),
-                         "DELETE FROM pg_vault_tde_catalog WHERE relid = %u",
-                         relid);
-                rc = SPI_execute(sql, false, 0);
-                if (rc < 0)
-                    ereport(WARNING,
-                            (errmsg("pg_vault_tde: could not remove catalog "
-                                    "entry for dropped relation %u (SPI rc=%d)",
-                                    relid, rc)));
+                pg_vault_tde_catalog_deregister_rel(relid);
             }
-
-            /* Evict shmem slot — this holds the LWLock briefly */
-            pg_vault_tde_catalog_evict_rel(relid);
+            else
+            {
+                /*
+                 * Pre-v1.5 deployment: no catalog row to delete, but we must
+                 * still evict the shmem DEK cache entry to prevent stale DEK
+                 * reuse if the OID is recycled by a future CREATE TABLE.
+                 */
+                pg_vault_tde_catalog_evict_rel(relid);
+            }
 
             ereport(DEBUG1,
                     (errmsg("pg_vault_tde: deregistered relid=%u from "
                             "DEK catalog", relid)));
         }
-
-        if (catalog_exists)
-            SPI_finish();
         list_free(drop_encrypted_oids);
+    }
+
+    /*
+     * Evict TOAST table OIDs from the shmem DEK cache.  TOAST tables share
+     * the parent's DEK and have no row in pg_vault_tde_catalog, so only a
+     * cache eviction is needed here.
+     */
+    if (evict_only_oids != NIL)
+    {
+        ListCell *lc;
+
+        foreach(lc, evict_only_oids)
+        {
+            Oid relid = lfirst_oid(lc);
+
+            pg_vault_tde_catalog_evict_rel(relid);
+
+            ereport(DEBUG1,
+                    (errmsg("pg_vault_tde: evicted TOAST relid=%u from "
+                            "shmem DEK cache", relid)));
+        }
+        list_free(evict_only_oids);
+    }
+
+    if(alter_tam_away)
+    {
+        AlterTableStmt *stmt   = (AlterTableStmt *) parsetree;
+        Oid         relid;
+        Oid         ext_ns;
+
+        relid = RangeVarGetRelid(stmt->relation, NoLock, true /* missing_ok */);
+        if (!OidIsValid(relid))
+        {
+            ereport(WARNING,
+                    (errmsg("pg_vault_tde: could not find "
+                            "encrypted_heap relation '%s' for catalog "
+                            "deregistration",
+                            stmt->relation->relname)));
+            return;
+        }
+
+        ext_ns = get_extension_schema(get_extension_oid(pg_vault_tde_extension_name, true));
+        if (!OidIsValid(ext_ns) ||
+            !OidIsValid(get_relname_relid("pg_vault_tde_catalog", ext_ns)))
+        {
+            ereport(DEBUG1,
+                    (errmsg("pg_vault_tde: skipping per-table DEK deregistration "
+                            "for relid=%u (pg_vault_tde_catalog not found; "
+                            "upgrade to v1.5 to enable per-table DEK isolation)",
+                            relid)));
+            return;
+        }
+
+        pg_vault_tde_catalog_deregister_rel(relid);
+
+        ereport(DEBUG1,
+                (errmsg("pg_vault_tde: deregistered relid=%u in DEK catalog",
+                        relid)));
     }
 }
 
@@ -562,7 +800,7 @@ _PG_init(void)
     DefineCustomStringVariable("pg_vault_tde.wallet_path",
         "Absolute path to the PKCS#12 local wallet file",
         "Used only when pg_vault_tde.kms_provider = 'local'.  "
-        "Default: $PGDATA/pg_vault_tde/wallet.p12",
+        "Default: $PGDATA/base/<DB_OID>/pg_vault_tde/wallet.p12",
         &pg_vault_tde_wallet_path, "", PGC_POSTMASTER,
         0, NULL, NULL, NULL);
 
@@ -675,6 +913,14 @@ _PG_init(void)
      */
     prev_process_utility_hook = ProcessUtility_hook;
     ProcessUtility_hook = tde_process_utility_hook;
+
+    /*
+     * Object access hook: register the DEK for newly created encrypted_heap
+     * tables BEFORE any data is inserted (critical for CTAS).  Fires after
+     * the pg_class row is committed but before the SELECT data is populated.
+     */
+    prev_object_access_hook = object_access_hook;
+    object_access_hook = tde_object_access_hook;
 
     /*
      * Wire the mutable tde_methods copy: copy heapam's TableAmRoutine and

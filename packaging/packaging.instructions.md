@@ -14,7 +14,8 @@
 | Job | Purpose | PG Versions | Dependencies |
 |-----|---------|-------------|-------------|
 | `build` | Compile with `-Wall -Wextra`, zero warnings required | 17, 18 | None |
-| `regress` | Run 24 `pg_regress` SQL tests | 17, 18 | `build` |
+| `regress` | Run 84 `pg_regress` SQL tests (vault provider) | 17, 18 | `build` |
+| `wallet` | Run 84 `pg_regress` SQL tests (local wallet provider) | 17, 18 | `build` |
 | `tap` | Run TAP tests with mock Vault | 17, 18 | `build` |
 | `isolation` | Run isolation tests (concurrency / MVCC) | 17, 18 | `build` |
 | `memcheck` | Valgrind + AddressSanitizer | 17, 18 | `build` |
@@ -93,7 +94,8 @@ The pipeline auto-detects `podman` or `docker` and uses a mock Vault for integra
 
 | Command | What It Tests |
 |---------|---------------|
-| `make ci-regress` | 24-test SQL regression suite |
+| `make ci-regress` | 84-test SQL regression suite (vault provider) |
+| `make ci-wallet` | 84-test SQL regression suite (local wallet provider) |
 | `make ci-checksums` | Same + page checksums (`initdb -k`) |
 | `make ci-tap` | TAP tests (extension load, backup hooks) |
 | `make ci-isolation` | MVCC / DEK rotation concurrency |
@@ -126,6 +128,6 @@ When PostgreSQL N+1 becomes GA:
 5. **CI matrix**: Add PG N+1 to GitHub Actions matrix and Bitbucket steps
 6. **`ci/.env`**: Add N+1 to `PG_SUPPORTED_VERSIONS`
 7. **Makefile**: Update `TDE_PG_MAX` to N+1
-8. **Test**: Run `PG_VERSION=N+1 make ci-all` — all 24 tests must pass
+8. **Test**: Run `PG_VERSION=N+1 make ci-all` — all 84 tests must pass
 9. **`build_deb.sh` / `build_rpm.sh`**: Verify scripts work with new PG version
 10. **Tag release**: Include "Added PG N+1 support" in release notes

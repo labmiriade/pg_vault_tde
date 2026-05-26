@@ -149,7 +149,6 @@ typedef struct TdeKmsProvider
      * Wipes sensitive material (e.g. PKCS#12 passphrase buffer, curl handle).
      */
     void (*shutdown)(void);
-
 } TdeKmsProvider;
 
 /*

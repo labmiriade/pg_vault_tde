@@ -164,3 +164,61 @@ COMMENT ON FUNCTION pg_vault_tde_migrate_vault_to_wallet(text) IS
 'provider under a new local PKCS#12 wallet with new_passphrase.  Updates '
 'kms_provider = ''local'' for each migrated row.  The local wallet must '
 'already exist (call pg_vault_tde_wallet_init() first).';
+
+-- ============================================================================
+-- 9. Mark tde_btree operator classes as DEFAULT
+-- ============================================================================
+-- v1.5 created these operator classes without the DEFAULT keyword, so
+-- CREATE INDEX ... USING tde_btree (col) required an explicit opclass name.
+-- PostgreSQL has no ALTER OPERATOR CLASS ... SET DEFAULT DDL; update the
+-- catalog directly.
+DO $$
+DECLARE
+    am_oid oid;
+BEGIN
+    SELECT oid INTO am_oid FROM pg_catalog.pg_am WHERE amname = 'tde_btree';
+    IF am_oid IS NULL THEN
+        RETURN;
+    END IF;
+
+    UPDATE pg_catalog.pg_opclass
+       SET opcdefault = true
+     WHERE opcmethod = am_oid
+       AND opcname IN (
+           'tde_text_ops',
+           'tde_int4_ops',
+           'tde_int8_ops',
+           'tde_uuid_ops',
+           'tde_numeric_ops',
+           'tde_date_ops',
+           'tde_timestamptz_ops',
+           'tde_bytea_ops'
+       );
+END;
+$$;
+
+-- ============================================================================
+-- 9. Migrate reencrypt_table function, C function name changed
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION pg_vault_tde_reencrypt_table(
+    rel regclass,
+    batch_size integer DEFAULT 1000
+)
+    RETURNS void
+    LANGUAGE C
+    AS 'MODULE_PATHNAME', 'pg_vault_tde_reencrypt_table_sql';
+
+CREATE OR REPLACE FUNCTION pg_vault_tde_reencrypt_table(
+        rel         text,
+        batch_size  int DEFAULT 1000
+    )
+    RETURNS void
+    LANGUAGE SQL SECURITY DEFINER AS $$
+        SELECT pg_vault_tde_reencrypt_table(rel::regclass, batch_size);
+$$;
+
+REVOKE ALL   ON FUNCTION pg_vault_tde_reencrypt_table(text, int) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION pg_vault_tde_reencrypt_table(text, int) TO pg_monitor;
+
+

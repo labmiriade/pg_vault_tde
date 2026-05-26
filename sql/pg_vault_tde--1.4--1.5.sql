@@ -162,7 +162,7 @@ CREATE FUNCTION pg_vault_tde_rotate_online(
 -- wrong results on SIV ciphertext and are rejected by amvalidate.
 
 -- text
-CREATE OPERATOR CLASS tde_text_ops FOR TYPE text USING tde_btree AS
+CREATE OPERATOR CLASS tde_text_ops DEFAULT FOR TYPE text USING tde_btree AS
     OPERATOR 1 <  (text, text),
     OPERATOR 2 <= (text, text),
     OPERATOR 3 =  (text, text),
@@ -171,7 +171,7 @@ CREATE OPERATOR CLASS tde_text_ops FOR TYPE text USING tde_btree AS
     FUNCTION 1 bttextcmp(text, text);
 
 -- int4 (integer)
-CREATE OPERATOR CLASS tde_int4_ops FOR TYPE int4 USING tde_btree AS
+CREATE OPERATOR CLASS tde_int4_ops DEFAULT FOR TYPE int4 USING tde_btree AS
     OPERATOR 1 <  (int4, int4),
     OPERATOR 2 <= (int4, int4),
     OPERATOR 3 =  (int4, int4),
@@ -180,7 +180,7 @@ CREATE OPERATOR CLASS tde_int4_ops FOR TYPE int4 USING tde_btree AS
     FUNCTION 1 btint4cmp(int4, int4);
 
 -- int8 (bigint)
-CREATE OPERATOR CLASS tde_int8_ops FOR TYPE int8 USING tde_btree AS
+CREATE OPERATOR CLASS tde_int8_ops DEFAULT FOR TYPE int8 USING tde_btree AS
     OPERATOR 1 <  (int8, int8),
     OPERATOR 2 <= (int8, int8),
     OPERATOR 3 =  (int8, int8),
@@ -189,7 +189,7 @@ CREATE OPERATOR CLASS tde_int8_ops FOR TYPE int8 USING tde_btree AS
     FUNCTION 1 btint8cmp(int8, int8);
 
 -- uuid
-CREATE OPERATOR CLASS tde_uuid_ops FOR TYPE uuid USING tde_btree AS
+CREATE OPERATOR CLASS tde_uuid_ops DEFAULT FOR TYPE uuid USING tde_btree AS
     OPERATOR 1 <  (uuid, uuid),
     OPERATOR 2 <= (uuid, uuid),
     OPERATOR 3 =  (uuid, uuid),
@@ -198,7 +198,7 @@ CREATE OPERATOR CLASS tde_uuid_ops FOR TYPE uuid USING tde_btree AS
     FUNCTION 1 uuid_cmp(uuid, uuid);
 
 -- numeric
-CREATE OPERATOR CLASS tde_numeric_ops FOR TYPE numeric USING tde_btree AS
+CREATE OPERATOR CLASS tde_numeric_ops DEFAULT FOR TYPE numeric USING tde_btree AS
     OPERATOR 1 <  (numeric, numeric),
     OPERATOR 2 <= (numeric, numeric),
     OPERATOR 3 =  (numeric, numeric),
@@ -207,7 +207,7 @@ CREATE OPERATOR CLASS tde_numeric_ops FOR TYPE numeric USING tde_btree AS
     FUNCTION 1 numeric_cmp(numeric, numeric);
 
 -- date
-CREATE OPERATOR CLASS tde_date_ops FOR TYPE date USING tde_btree AS
+CREATE OPERATOR CLASS tde_date_ops DEFAULT FOR TYPE date USING tde_btree AS
     OPERATOR 1 <  (date, date),
     OPERATOR 2 <= (date, date),
     OPERATOR 3 =  (date, date),
@@ -216,7 +216,7 @@ CREATE OPERATOR CLASS tde_date_ops FOR TYPE date USING tde_btree AS
     FUNCTION 1 date_cmp(date, date);
 
 -- timestamptz
-CREATE OPERATOR CLASS tde_timestamptz_ops FOR TYPE timestamptz USING tde_btree AS
+CREATE OPERATOR CLASS tde_timestamptz_ops DEFAULT FOR TYPE timestamptz USING tde_btree AS
     OPERATOR 1 <  (timestamptz, timestamptz),
     OPERATOR 2 <= (timestamptz, timestamptz),
     OPERATOR 3 =  (timestamptz, timestamptz),

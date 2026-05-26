@@ -142,8 +142,8 @@ void pg_vault_tde_tam_init(void) {
 ```
 
 All structural operations (VACUUM, HOT, CLUSTER, index build, truncate, scan
-state management) delegate to heapam unchanged. Only the four write paths and
-seven read paths are overridden.
+state management) delegate to heapam unchanged. Only the four write paths,
+seven read paths, and one rewrite path are overridden.
 
 ### Overridden Callbacks
 
@@ -177,6 +177,12 @@ buffer-backed `HeapTuple` MUST call `pg_vault_tde_decode_slot()`.
 | `scan_sample_next_tuple` | TABLESAMPLE | ✅ Override |
 | `tuple_fetch_row_version` | TidScan, UPDATE recheck | ✅ Override |
 | `tuple_lock` | SELECT FOR UPDATE/SHARE | ✅ Override |
+
+#### Rewrite Paths (decrypt → process → re-encrypt)
+
+| Callback | Trigger | Notes |
+|---|---|---|
+| `relation_copy_for_cluster` | `VACUUM FULL`, `CLUSTER` | Reads each tuple via `heap_getnext` (with `rd_tableam` impersonation), decrypts, re-encrypts into the new heap via `rewrite_heap_tuple`. Clears `HEAP_HASEXTERNAL` on the encrypted copy before writing; `tde_tuple_has_external_slow` (per-attribute varlena scan) is used on subsequent DELETE to locate TOAST chunks regardless of the infomask flag. |
 
 ### pg_vault_tde_decode_slot
 
@@ -261,15 +267,30 @@ restore in a single-threaded backend.
 ### TOAST Table Override
 
 ```c
-static Oid pg_vault_tde_toast_am(Relation rel) {
-    return HEAP_TABLE_AM_OID;  /* TOAST tables must always use standard heap */
+static Oid pg_vault_tde_toast_am(Relation rel)
+{
+    (void) rel;
+    if (pg_vault_tde_toast_encryption)
+    {
+        Oid encheap_oid = get_table_am_oid("encrypted_heap", true);
+        if (OidIsValid(encheap_oid))
+            return encheap_oid;
+    }
+    return HEAP_TABLE_AM_OID;
 }
 ```
 
-Without this, PG18 creates TOAST tables with `encrypted_heap` AM, causing
-`heap_getnext` inside the TOAST index build to reject them. **Side effect**:
-large column values (> ~2 kB after TOAST compression) are stored unencrypted.
-This is a documented v1 limitation (see [Known Limitations](#known-limitations)).
+When `pg_vault_tde.toast_encryption = on` (the default), TOAST tables are
+created with the `encrypted_heap` AM so that every TOAST chunk is encrypted
+individually using the parent relation's DEK.  On PG 18 the `heap_getnext`
+identity assertion inside the TOAST index build would reject `encrypted_heap`;
+the `rd_tableam` impersonation workaround is applied during
+`index_build_range_scan` to satisfy this assertion.
+
+When `pg_vault_tde.toast_encryption = off`, TOAST tables fall back to standard
+`heap` AM, leaving large column values stored unencrypted — a configuration
+intentionally supported for performance-sensitive workloads where only the
+tuple body (not TOAST chunks) needs confidentiality protection.
 
 ### PG18-Specific API Notes
 
@@ -547,11 +568,11 @@ preserved by AES-SIV, regardless of type).
 
 ## Known Limitations
 
-### Current Limitations (v1.6)
+### Current Limitations (v1.7)
 
 | # | Limitation | Fix Version |
 |---|-----------|-------------|
-| 1 | **TOAST chunk-level storage encryption** — large values (> ~2 kB) round-trip correctly via heap TAM coverage, but `pg_toast_NNNNN` pages are not encrypted at the chunk-storage layer | v1.7 |
+| 1 | **TOAST chunk-level storage encryption** — ✅ **Resolved in v1.6**: large values round-trip fully encrypted via `pg_vault_tde_toast_am` returning `encrypted_heap` AM. Disable with `pg_vault_tde.toast_encryption = off` for legacy behaviour. | v1.6 ✅ |
 | 2 | **tde_btree fixed-size types plaintext index keys** — `int4`, `int8`, `uuid`, `date`, `timestamptz` btree index entries are plaintext (heap fully encrypted); only varlena types have encrypted index keys | v1.7 |
 | 3 | **Logical replication TOAST gap** — tables with externally-TOAST'd columns not supported for logical decoding | v1.7 |
 | 4 | **WAL unencrypted** — requires `XLogInsert()` hook unavailable in extension API | Permanently deferred |
@@ -561,12 +582,11 @@ preserved by AES-SIV, regardless of type).
 
 ### Historical Limitations (v1.0) — Many Resolved Since
 
-1. **TOAST encryption** (ticket #1)  
-   Column values stored in the TOAST table (> ~2 kB after compression) are
-   **NOT encrypted**. The TOAST table is forced to use `HEAP_TABLE_AM_OID`
-   (standard heap) to avoid a `heap_getnext` identity check failure during
-   TOAST index build. Headers for `pg_vault_tde_toast.h` are scaffolded;
-   the chunk-level encryption path is not yet connected.
+1. **TOAST encryption** (ticket #1) — ✅ **Resolved in 6**  
+   `pg_vault_tde_toast_am` now returns `encrypted_heap` AM when
+   `pg_vault_tde.toast_encryption = on` (default). Every TOAST chunk is
+   encrypted individually using the parent relation's DEK.  The v1.0 behaviour
+   (forced `HEAP_TABLE_AM_OID`) is available via `toast_encryption = off`.
 
 2. **Row re-encryption after rotation** (ticket #2)  
    Existing rows encrypted with DEK generation N become **permanently
@@ -794,7 +814,9 @@ dynamic LWLock tranche.
 
 ### Regression Tests (`sql/regression_test.sql`)
 
-72 SQL-level tests covering:
+`sql/regression_test.sql` contains **70 tests**: the original 52 v1.4 baseline
+TAM/TOAST additions (tests 53–70). Combined with the v1.5 and v1.6 supplement files the
+full `make ci-regress` suite runs **105 tests**.
 
 | Range | Area |
 |---|---|
@@ -815,15 +837,8 @@ dynamic LWLock tranche.
 | 25–48 | UPSERT, MERGE, TRUNCATE, REINDEX, ALTER, JOINs, CTEs, HW accel, Vault, logical decoding |
 | 49 | Wire format v2 round-trip (version byte + generation counter) **(v1.4)** |
 | 50 | tde_btree CREATE INDEX + equality index scan **(v1.4)** |
-| 51 | health_check() `wrapped_dek_perms` column **(v1.4)** |
+| 51 | health_check() `kms_provider` GUC coherence **(v1.4)** |
 | 52 | tde_btree UNIQUE constraint **(v1.4)** |
-| 53–56 | Per-table DEK catalog existence, wallet SQL stubs, `pg_vault_tde_rotation_progress` schema **(v1.5)** |
-| 57–61 | TOAST large-value round-trips (4 kB text, 8 kB jsonb, UPDATE, bulk COPY, raw-page skip) **(v1.5)** |
-| 62–64 | Per-table DEK isolation — DEK-A cannot decrypt table-B; DROP cleanup **(v1.5)** |
-| 65–67 | tde_btree native type ops — text/int4/uuid equality scan **(v1.5)** |
-| 68–69 | Wire format v3 AEAD AAD — cross-table paste attack rejected **(v1.5)** |
-| 70–72 | Online rotation BGW — concurrent SELECTs, progress tracking, completion **(v1.5)** |
-
 ### Page Checksum Test (`make ci-checksums`)
 
 Starts PostgreSQL with `initdb -k` (`--data-checksums`). Verifies that:

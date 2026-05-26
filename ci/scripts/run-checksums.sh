@@ -31,6 +31,7 @@ $RT run --rm -d \
     "${PG_TEST_IMAGE:-pg-tde-test}:latest" \
     postgres \
     -c "shared_preload_libraries=pg_vault_tde" \
+    -c "pg_vault_tde.dev_mode=on" \
     -c "log_min_messages=warning"
 
 wait_pg_ready "$CONTAINER"

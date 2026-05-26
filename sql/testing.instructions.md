@@ -10,8 +10,11 @@
 ALL gates must pass before any change is considered complete:
 
 ```bash
-# Gate 1: Full regression (24 tests)
+# Gate 1: Full regression (110 tests: 70 baseline + 20 v1.5 + 38 v1.6 + 2 skip-guarded, vault provider)
 make ci-regress
+
+# Gate 1b: Wallet provider regression (110 tests, kms_provider=local)
+make ci-wallet
 
 # Gate 2: Page checksum compatibility
 make ci-checksums
@@ -34,24 +37,65 @@ make ci-all
 
 ---
 
-## Test Suite Map (24 Regression Tests)
+## Test Suite Map
 
-| Test # | Category | What It Validates |
-|--------|----------|-------------------|
-| 1–11 | Crypto primitives | GCM encrypt/decrypt, IV uniqueness, tamper detection, rotation |
-| 12 | TAM INSERT+SELECT | Basic round-trip on `encrypted_heap` table |
-| 13 | On-disk absence | Raw file scan confirms no plaintext on disk |
-| 14 | TAM UPDATE | ctid preservation, tuple refetch, HOT chains |
-| 15 | DELETE | Row removal without crash |
-| 16 | All-NULL row | `user_len == 0` edge case (no Assert crash) |
-| 17 | Index scan | `index_fetch_tuple` + `rd_tableam` impersonation |
-| 18 | COPY/bulk | `multi_insert` path via `COPY FROM` |
-| 19 | Multi-column | int, text, bool, numeric, timestamptz types |
-| 20 | Key rotation | DEK-A rows rejected after rotating to DEK-B |
-| 21 | ANALYZE | Statistics computed on decrypted data |
-| 22 | SELECT FOR UPDATE | `tuple_lock` path |
-| 23 | BitmapHeapScan | `scan_bitmap_next_tuple` via forced bitmap scan |
-| 24 | TABLESAMPLE | `scan_sample_next_tuple` via SYSTEM(100) |
+`sql/regression_test.sql` contains **70 tests** (52 v1.4 baseline + 18 v1.7
+TAM/TOAST additions in tests 53–70).  The v1.5 and v1.6 supplement files each
+carry their own internal numbering.  All three files together make up the
+**110-test** suite run by `make ci-regress` / `make ci-wallet`.
+
+| Test # | Category | What It Validates | File |
+|--------|----------|-------------------|------|
+| 1–11 | Crypto primitives | GCM encrypt/decrypt, IV uniqueness, tamper detection, rotation | `regression_test.sql` |
+| 12 | TAM INSERT+SELECT | Basic round-trip on `encrypted_heap` table | `regression_test.sql` |
+| 13 | On-disk absence | Raw file scan confirms no plaintext on disk | `regression_test.sql` |
+| 14 | TAM UPDATE | ctid preservation, tuple refetch, HOT chains | `regression_test.sql` |
+| 15 | DELETE | Row removal without crash | `regression_test.sql` |
+| 16 | All-NULL row | `user_len == 0` edge case (no Assert crash) | `regression_test.sql` |
+| 17 | Index scan | `index_fetch_tuple` + `rd_tableam` impersonation | `regression_test.sql` |
+| 18 | COPY/bulk | `multi_insert` path via `COPY FROM` | `regression_test.sql` |
+| 19 | Multi-column | int, text, bool, numeric, timestamptz types | `regression_test.sql` |
+| 20 | Key rotation | DEK-A rows rejected after rotating to DEK-B | `regression_test.sql` |
+| 21 | ANALYZE | Statistics computed on decrypted data | `regression_test.sql` |
+| 22 | SELECT FOR UPDATE | `tuple_lock` path | `regression_test.sql` |
+| 23 | BitmapHeapScan | `scan_bitmap_next_tuple` via forced bitmap scan | `regression_test.sql` |
+| 24 | TABLESAMPLE | `scan_sample_next_tuple` via SYSTEM(100) | `regression_test.sql` |
+| 25–43 | UPSERT, MERGE, TRUNCATE, REINDEX, ALTER, JOINs, CTEs, HW accel, Vault, logical decoding | v1.1–v1.3 coverage | `regression_test.sql` |
+| 44 | `health_check()` 7-col v1.5+ schema | Realigned to (`version`, `enabled`, `kms_provider`, `dek_available`, `aad_binding`, `wallet_open`, `checked_at`) | `regression_test.sql` |
+| 45–46 | BGW token renewal, multi_insert batch | v1.3 coverage | `regression_test.sql` |
+| 47 | `health_check()` state transitions | Uses `dek_available` only | `regression_test.sql` |
+| 48 | Logical decoding (skipped if `wal_level != logical`) | v1.2 | `regression_test.sql` |
+| 49 | Wire format v2 round-trip | v1.4 | `regression_test.sql` |
+| 50 | `tde_btree` CREATE INDEX + equality | v1.4 | `regression_test.sql` |
+| 51 | `health_check.kms_provider` GUC coherence | Replaces v1.4 `wrapped_dek_perms` test | `regression_test.sql` |
+| 52 | `tde_btree` UNIQUE constraint | v1.4 | `regression_test.sql` |
+| 53–58 | TOAST large-value round-trips (4 kB text, 8 kB jsonb, UPDATE, bulk COPY, inline/EXTERNAL storage paths) | v1.7 TAM/TOAST additions | `regression_test.sql` |
+| 59 | VACUUM dead tuples | `VACUUM` + `pg_stat_force_next_flush`; dead tuple counter matches delete count | `regression_test.sql` |
+| 60 | VACUUM FULL + `tde_tuple_has_external_slow` | `pg_vault_tde_relation_copy_for_cluster`; DELETE after VACUUM FULL finds TOAST chunks even if `HEAP_HASEXTERNAL` was cleared on the rewritten tuple | `regression_test.sql` |
+| 61 | CLUSTER | Same `relation_copy_for_cluster` path driven by `CLUSTER ON index`; full round-trip on re-clustered relation | `regression_test.sql` |
+| 62 | TOAST + index scan | Large-value column + `index_fetch_tuple`; verifies decrypt survives detoast across index lookup | `regression_test.sql` |
+| 63 | TOAST + BitmapHeapScan | Large-value column + `scan_bitmap_next_tuple`; forced bitmap scan | `regression_test.sql` |
+| 64 | TOAST + SELECT FOR UPDATE | Large-value column + `tuple_lock`; verifies TOAST-bearing rows handled by tuple_lock | `regression_test.sql` |
+| 65 | TOAST + TABLESAMPLE | Large-value column + `scan_sample_next_tuple`; SYSTEM(100) | `regression_test.sql` |
+| 66 | TOAST + ANALYZE | Large-value column + `scan_analyze_next_tuple`; verifies stats computed on decrypted text | `regression_test.sql` |
+| 67 | TOAST + multi_insert | Bulk COPY with large-value column; `multi_insert` + TOAST round-trip | `regression_test.sql` |
+| 68 | Multi-column TOAST | Table with two large-value columns; both columns decoded correctly after TOAST | `regression_test.sql` |
+| 69 | UPDATE large↔large / large↔small | `old_has_external` branch in `tuple_update`; UPDATE large→large, large→small, small→large | `regression_test.sql` |
+| 70 | `toast_am` GUC | `pg_vault_tde_toast_am` returns correct AM OID based on `toast_encryption` GUC; TOAST table AM matches expectation | `regression_test.sql` |
+| 53–72 | Per-table DEK catalog, TOAST large-value, DEK isolation, tde_btree native ops, wire format v3 AAD, online rotation BGW | v1.5 coverage | `regression_test_v15.sql` |
+| 73–110 | Wallet init/unlock/lock, wallet passphrase, rotate_kek, bundle export/import, TOAST storage paths (EXTERNAL/EXTENDED), VACUUM FULL + TOAST, CLUSTER, all seven read paths with TOAST, ANALYZE, multi_insert, UPDATE old_has_external, ALTER TABLE AM switch, online rotation, CREATE TABLE AS, WITH HOLD cursor plaintext spill | v1.6 coverage | `regression_test_v16.sql` |
+
+> **Skip semantics under `make ci-regress` (vault provider):**
+> Test 48 SKIP if `wal_level != logical`; Test 61 (v15) SKIP if the `pageinspect`
+> contrib extension is not available; Tests 74–80 SKIP if `kms_provider != local`;
+> tests 84–85 SKIP if `pg_vault_tde.dev_mode != on`; test 103 SKIP if
+> `pg_vault_tde.toast_encryption != on`.
+> Net result: 110/110 PASS with the corresponding skips.
+>
+> **Under `make ci-wallet` (`kms_provider=local`):**
+> Tests 73–79 PASS; test 80 SKIPS unless `wallet_passphrase_env` is wired
+> up; tests 81–110 also PASS (the v1.6 patch resolved the change_passphrase
+> SPI invalidation crash and the rotate_kek MAC mismatch).
 
 ---
 
@@ -201,16 +245,18 @@ A callback with no test is a **gap** that MUST be filled before release.
 | Callback | Test(s) | Gap? |
 |----------|---------|------|
 | `tuple_insert` | 12 | No |
-| `tuple_update` | 14 | No |
-| `tuple_delete` | 15 | No |
-| `multi_insert` | 18 | No |
+| `tuple_update` | 14, 69 | No |
+| `tuple_delete` | 15, 60 | No |
+| `multi_insert` | 18, 67 | No |
 | `scan_getnextslot` | 12, 14, 16, 19 | No |
-| `index_fetch_tuple` | 17 | No |
-| `scan_bitmap_next_tuple` | 23 | No |
-| `scan_analyze_next_tuple` | 21 | No |
-| `scan_sample_next_tuple` | 24 | No |
-| `tuple_fetch_row_version` | (implicit via 14) | Borderline |
-| `tuple_lock` | 22 | No |
+| `index_fetch_tuple` | 17, 62 | No |
+| `scan_bitmap_next_tuple` | 23, 63 | No |
+| `scan_analyze_next_tuple` | 21, 66 | No |
+| `scan_sample_next_tuple` | 24, 65 | No |
+| `tuple_fetch_row_version` | 14, 64 | No |
+| `tuple_lock` | 22, 64 | No |
+| `relation_copy_for_cluster` | 60, 61 | No |
+| `tde_tuple_has_external_slow` (DELETE after VACUUM FULL) | 60 | No |
 | `ambuild` (IAM) | 17 | No |
 | `aminsert` (IAM) | 17 | No |
 
@@ -222,8 +268,12 @@ Every regression test MUST have a corresponding expected output file:
 sql/regression_test.sql  →  expected/pg_vault_tde_init.out
 ```
 
-When adding Tests 23-24:
+When adding new tests (current numbering in `regression_test.sql` goes up to 70):
 1. Run the test manually: `psql -f sql/regression_test.sql > expected/pg_vault_tde_init.out 2>&1`
 2. Review the output for correctness
 3. Commit the `.out` file alongside the `.sql` file
 4. NEVER hand-edit `.out` files — always regenerate
+5. v1.6 tests (73–110) live in `sql/regression_test_v16.sql`; v1.5 tests (53–72)
+   live in `sql/regression_test_v15.sql`. The baseline file `sql/regression_test.sql`
+   now contains tests 1–70: the original 52 v1.4 tests plus tests 53–70 added as
+   v1.7 TAM/TOAST coverage.
