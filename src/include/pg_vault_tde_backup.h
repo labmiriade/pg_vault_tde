@@ -18,6 +18,15 @@
  * for the wrapped_dek field regardless of the wrapping algorithm.
  */
 #define TDE_BACKUP_WRAPPED_LEN  512
+#define TDE_BACKUP_BLOCK_SIZE         (64 * 1024) /* 64KB streaming blocks */
+
+/*
+ * Per-block AES-256-GCM overhead: 12-byte IV + 16-byte authentication tag.
+ * Out-buffers passed to tde_backup_encrypt_block() must be at least
+ * (block_len + TDE_BACKUP_ENCRYPT_OVERHEAD) bytes.
+ */
+#define TDE_BACKUP_ENCRYPT_OVERHEAD   (TDE_GCM_IV_LEN + TDE_GCM_TAG_LEN)
+
 
 /*
  * tde_backup_header
@@ -36,9 +45,9 @@ typedef struct tde_backup_header
 } tde_backup_header;
 
 bool tde_backup_header_init(tde_backup_header *hdr);
-void tde_backup_encrypt_block(const char *block_data, Size block_len,
-                               uint64 block_seq,
-                               char *out_buf, Size *out_len);
+void tde_backup_encrypt_block(const unsigned char* wrapped_dek, int wrapped_len,
+                         const char *block_data, Size block_len,
+                         uint64 block_seq, char *out_buf, Size *out_len);
 
 /* SQL-callable status function */
 extern Datum pg_vault_tde_backup_status(PG_FUNCTION_ARGS);

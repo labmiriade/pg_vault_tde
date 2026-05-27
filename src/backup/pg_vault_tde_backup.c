@@ -55,13 +55,13 @@
 
 #include "src/include/pg_vault_tde_crypto.h"
 #include "src/include/pg_vault_tde_kms.h"
+#include "src/kms/pg_vault_tde_kms_provider.h"
 #include "src/include/pg_vault_tde_backup.h"
 
 /* Current backup format version — increment on breaking changes. */
 #define TDE_BACKUP_FORMAT_VERSION 1
 #define TDE_BACKUP_MAGIC          "PGVAULTTDE"
 /* TDE_BACKUP_MAGIC_LEN is defined in pg_vault_tde_backup.h */
-#define TDE_BACKUP_BLOCK_SIZE     (64 * 1024) /* 64KB streaming blocks */
 
 /*
  * tde_backup_header_init
@@ -81,50 +81,57 @@
 bool
 tde_backup_header_init(tde_backup_header *hdr)
 {
-    char dek[TDE_DEK_LEN];
+    unsigned char backup_dek[TDE_DEK_LEN];
+    unsigned char wrapped_dek[TDE_BACKUP_WRAPPED_LEN]; 
+
+    int new_len = sizeof(wrapped_dek);
 
     Assert(hdr != NULL);
 
     memcpy(hdr->magic, TDE_BACKUP_MAGIC, TDE_BACKUP_MAGIC_LEN);
     hdr->format_version = TDE_BACKUP_FORMAT_VERSION;
 
-    /* Fetch live DEK from the shared memory cache */
-    if (!pg_vault_tde_kms_get_dek(dek, TDE_DEK_LEN))
-    {
-        ereport(WARNING,
-                (errmsg("[BACKUP] DEK unavailable; cannot initialise "
-                        "backup header")));
-        return false;
-    }
-
     /*
-     * Generate a fresh IV for the backup stream.  Each backup gets its own
-     * IV even when using the same DEK, so two dumps of identical data
-     * produce different encrypted files (prevents chosen-plaintext attacks
-     * on the backup archive).
+     * We can't use the DEK of the shmem or table's DEK, we 
+     * need to generate a fresh DEK to wrap with the 
+     * provider's KEK
      */
-    if (!pg_strong_random(hdr->stream_iv, TDE_GCM_IV_LEN))
+
+    PG_TRY();
     {
-        OPENSSL_cleanse(dek, TDE_DEK_LEN);
-        ereport(ERROR,
-                (errmsg("[BACKUP] Failed to generate backup stream IV")));
+        if(!tde_active_kms_provider->generate_dek(backup_dek, TDE_DEK_LEN))
+        {
+            ereport(ERROR,
+                    (errmsg("[BACKUP] Failed to generate backup DEK")));
+        }
+
+        if(!tde_active_kms_provider->wrap_dek(backup_dek, TDE_DEK_LEN, 
+                                                wrapped_dek, &new_len))
+        {
+            ereport(ERROR, 
+                    errmsg("[BACKUP] Failed to wrap backup dek"));
+        }
+
+        if (!pg_strong_random(hdr->stream_iv, TDE_GCM_IV_LEN))
+        {
+            ereport(ERROR,
+                    (errmsg("[BACKUP] Failed to generate backup stream IV")));
+        }
+
+        memcpy(hdr->wrapped_dek, wrapped_dek, new_len);
+        hdr->wrapped_dek_len = new_len;
     }
+    PG_CATCH();
+    {
+        OPENSSL_cleanse(backup_dek, TDE_DEK_LEN);
+        OPENSSL_cleanse(wrapped_dek, TDE_DEK_LEN);
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
 
-    /*
-     * TODO: wrap the DEK with RSA-4096 OAEP-SHA256 using the KEK public key
-     * fetched from Vault.  Store the wrapped blob in hdr->wrapped_dek and
-     * its length in hdr->wrapped_dek_len.
-     *
-     * RSA_public_encrypt(TDE_DEK_LEN, dek, hdr->wrapped_dek,
-     *                    rsa_pub_key, RSA_PKCS1_OAEP_PADDING);
-     *
-     * For now, store a zeroed placeholder; the TAP test will verify this
-     * field is non-zero once the KMS RSA integration is complete.
-     */
-    OPENSSL_cleanse(hdr->wrapped_dek, sizeof(hdr->wrapped_dek));
-    hdr->wrapped_dek_len = 0; /* placeholder */
-
-    OPENSSL_cleanse(dek, TDE_DEK_LEN);
+    OPENSSL_cleanse(backup_dek, TDE_DEK_LEN);
+    OPENSSL_cleanse(wrapped_dek, TDE_DEK_LEN);
+     
     return true;
 }
 
@@ -148,24 +155,27 @@ tde_backup_header_init(tde_backup_header *hdr)
  * @param out_len       set to encrypted output length
  */
 void
-tde_backup_encrypt_block(const char *block_data, Size block_len,
-                         uint64 block_seq,
-                         char *out_buf, Size *out_len)
+tde_backup_encrypt_block(const unsigned char* wrapped_dek, int wrapped_len,
+                         const char *block_data, Size block_len,
+                         uint64 block_seq, char *out_buf, Size *out_len)
 {
-    char   *encrypted;
-    Size    enc_len;
+    char            *encrypted;
+    Size             enc_len;
+    unsigned char   dek[TDE_DEK_LEN];
 
     Assert(block_data != NULL && out_buf != NULL && out_len != NULL);
     Assert(block_len > 0 && block_len <= TDE_BACKUP_BLOCK_SIZE);
 
-    /*
-     * Backup blocks are not table-scoped, so we use InvalidOid which selects
-     * the v1.4 global DEK.  A per-table backup DEK (v1.7) will pass the
-     * correct relid once the backup bundle format is redesigned.
-     * TODO: pass block_seq as GCM AAD via EVP_EncryptUpdate with a NULL
-     * output pointer (standard GCM AAD pattern) before encrypting payload.
-     */
-    encrypted = tde_gcm_encrypt(InvalidOid, block_data, block_len, &enc_len);
+    if(!tde_active_kms_provider->unwrap_dek(wrapped_dek, wrapped_len, 
+                                            dek, TDE_DEK_LEN))
+    {
+        OPENSSL_cleanse(dek, TDE_DEK_LEN);
+        ereport(ERROR, 
+                errmsg("[BACKUP] Can't unwrap the DEK for encryption"));
+    }
+
+    encrypted = tde_gcm_encrypt_with_dek(dek, TDE_DEK_LEN, 
+                                         block_data, block_len, &enc_len);
 
     memcpy(out_buf, encrypted, enc_len);
     *out_len = enc_len;

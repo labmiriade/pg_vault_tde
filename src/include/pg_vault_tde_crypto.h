@@ -79,4 +79,8 @@ char *tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len,
  */
 void tde_crypto_ctx_cleanup(void);
 
+char * 
+tde_gcm_encrypt_with_dek(const unsigned char* dek, int dek_len, 
+                         const char* plaintext, Size plaintext_size, Size* out_len);
+
 #endif /* PG_VAULT_TDE_CRYPTO_H */

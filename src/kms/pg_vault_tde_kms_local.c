@@ -520,7 +520,7 @@ local_derive_kek_from_pass(const char *passphrase, unsigned char *kek_out)
 
     if (PKCS5_PBKDF2_HMAC(passphrase, -1,
                           (const unsigned char *) "pg_vault_tde_kek_v1",
-                          19,                       /* salt length */
+                          19,                                 /* salt length */
                           LOCAL_PBKDF2_ITERS,
                           EVP_sha256(),
                           TDE_DEK_LEN, kek_out) != 1)
@@ -1879,7 +1879,7 @@ pg_vault_tde_wallet_rotate_kek_sql(PG_FUNCTION_ARGS)
         OPENSSL_cleanse(new_pass, strlen(new_pass));
         OPENSSL_cleanse(old_kek, TDE_DEK_LEN);
         OPENSSL_cleanse(new_kek, TDE_DEK_LEN);
-        pfree(old_pass); pfree(new_pass);
+        pfree(new_pass);
         ereport(ERROR, errmsg("pg_vault_tde: catalog table pg_vault_tde_catalog absent"));
     }
 

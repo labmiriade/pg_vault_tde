@@ -173,3 +173,62 @@ ci-clean:
 # Full pipeline alias
 .PHONY: ci-full
 ci-full: ci-all
+
+# ---------------------------------------------------------------------------
+# pg_dump_tde: standalone backup encryption wrapper for pg_dump
+#
+# This binary is NOT a PostgreSQL extension module (.so).  It is a standalone
+# C tool that forks pg_dump, intercepts its stdout through a pipe, and
+# re-encrypts each 64 KB block with AES-256-GCM before writing to disk.
+#
+# Build:    make pg_dump_tde
+# Install:  make install-pg-dump-tde
+# Clean:    make clean-pg-dump-tde
+#
+# The object files use a _bin.o suffix to avoid collisions with the _bin.o
+# objects already compiled as -fPIC for the extension .so.
+# ---------------------------------------------------------------------------
+PG_DUMP_TDE_SRCS = \
+	src/backup/pg_dump_tde.c \
+	src/backup/pg_vault_tde_backup.c
+
+PG_DUMP_TDE_OBJS = $(PG_DUMP_TDE_SRCS:.c=_bin.o)
+
+PG_DUMP_TDE_CFLAGS = \
+	$(TDE_OPT_CFLAGS) \
+	$(TDE_ARCH_CFLAGS) \
+	-Wall -Wextra -std=c99 \
+	-Wno-unused-parameter \
+	-I$(shell $(PG_CONFIG) --includedir-server) \
+	-Isrc \
+	-Isrc/include \
+	$(shell pkg-config --cflags openssl)
+
+PG_DUMP_TDE_LDFLAGS = \
+	$(shell pkg-config --libs openssl) \
+	$(shell $(PG_CONFIG) --libs)
+
+# Pattern rule for _bin.o objects (standalone compilation, no -fPIC).
+# Must be declared before include $(PGXS) would shadow it, but we define
+# it after so PGXS %.o rules are not confused.
+%_bin.o: %.c
+	$(CC) $(PG_DUMP_TDE_CFLAGS) -c -o $@ $<
+
+pg_dump_tde: $(PG_DUMP_TDE_OBJS)
+	$(CC) -o $@ $^ $(PG_DUMP_TDE_LDFLAGS)
+
+# Hook into the standard PGXS targets so pg_dump_tde is always built,
+# installed, and cleaned together with the extension.
+all: pg_dump_tde
+
+.PHONY: install-pg-dump-tde
+install-pg-dump-tde: pg_dump_tde
+	install -m 755 pg_dump_tde $(shell $(PG_CONFIG) --bindir)/pg_dump_tde
+
+install: install-pg-dump-tde
+
+.PHONY: clean-pg-dump-tde
+clean-pg-dump-tde:
+	rm -f pg_dump_tde $(PG_DUMP_TDE_OBJS)
+
+clean: clean-pg-dump-tde
