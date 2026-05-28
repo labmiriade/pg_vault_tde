@@ -725,8 +725,6 @@ SELECT pg_vault_tde_set_test_dek();     -- inject random ephemeral DEK (DEV/TEST
 SELECT pg_vault_tde_rotate_key();       -- wipe DEK from shmem, bump generation
 SELECT pg_vault_tde_key_generation();   -- → bigint: current epoch counter
 
--- Operations / monitoring
-SELECT pg_vault_tde_backup_status();    -- → text: backup encryption status
 
 -- Test / diagnostic (require DEK set; never use in production)
 SELECT pg_vault_tde_encrypt_test('text');   -- → bytea: [IV(12)|CT|TAG(16)]
@@ -851,7 +849,7 @@ Starts PostgreSQL with `initdb -k` (`--data-checksums`). Verifies that:
 | File | Coverage |
 |---|---|
 | `tap/01_load.t` | Extension load, AM registration, basic SQL round-trip |
-| `tap/02_backup.t` | `pg_basebackup` + `pg_vault_tde_backup_status()` |
+| `tap/02_backup.t` | `pg_basebackup` |
 
 ### Isolation Tests (`isolation/dek_rotation.spec`)
 

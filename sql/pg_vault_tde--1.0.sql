@@ -47,12 +47,6 @@ CREATE OPERATOR CLASS tde_bytea_ops DEFAULT FOR TYPE bytea USING tde_btree AS
     OPERATOR 5 >  (bytea, bytea),
     FUNCTION 1 byteacmp(bytea, bytea);
 
--- Expose backup status to monitoring tools
-CREATE FUNCTION pg_vault_tde_backup_status()
-    RETURNS text
-    LANGUAGE C STRICT
-    AS 'MODULE_PATHNAME', 'pg_vault_tde_backup_status';
-
 -- Expose DEK rotation trigger (called by DBA or automation)
 CREATE FUNCTION pg_vault_tde_rotate_key()
     RETURNS void

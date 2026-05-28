@@ -13,7 +13,7 @@ ENV CFLAGS="-O2 -fno-lto"
 
 # Install build dependencies
 RUN apt-get update && \
-    apt-get install -y build-essential postgresql-server-dev-${PG_MAJOR} libssl-dev libcurl4-openssl-dev && \
+    apt-get install -y build-essential postgresql-server-dev-${PG_MAJOR} libssl-dev libcurl4-openssl-dev libpq-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # Set workdir

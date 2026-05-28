@@ -7,8 +7,21 @@
 #ifndef PG_VAULT_TDE_BACKUP_H
 #define PG_VAULT_TDE_BACKUP_H
 
-#include "postgres.h"
-#include "src/include/pg_vault_tde_crypto.h"
+#ifdef FRONTEND
+/*
+ * In frontend builds, pg_vault_tde_kms.h and pg_vault_tde_crypto.h pull in
+ * lwlock.h / postgres.h which cannot be included here.  Mirror the constants
+ * only; authoritative definitions live in the respective backend headers.
+ */
+#define TDE_DEK_LEN      32
+#define TDE_GCM_IV_LEN   12
+#define TDE_GCM_TAG_LEN  16
+#define TDE_V2_GEN_LEN    8
+#define TDE_V2_OVERHEAD  (1 + TDE_V2_GEN_LEN + TDE_GCM_IV_LEN + TDE_GCM_TAG_LEN)
+#else
+#include "pg_vault_tde_kms.h"     /* TDE_DEK_LEN */
+#include "pg_vault_tde_crypto.h"  /* TDE_GCM_IV_LEN, TDE_GCM_TAG_LEN, TDE_V2_OVERHEAD */
+#endif
 
 #define TDE_BACKUP_MAGIC_LEN     10  /* strlen("PGVAULTTDE") */
 
@@ -19,6 +32,12 @@
  */
 #define TDE_BACKUP_WRAPPED_LEN  512
 #define TDE_BACKUP_BLOCK_SIZE         (64 * 1024) /* 64KB streaming blocks */
+
+/* Current backup format version — increment on breaking changes. */
+#define TDE_BACKUP_FORMAT_VERSION 1
+#define TDE_BACKUP_MAGIC          "PGVAULTTDE"
+#define VAULT_PROVIDER            "vault"
+#define LOCAL_PROVIDER            "local"
 
 /*
  * Per-block AES-256-GCM overhead: 12-byte IV + 16-byte authentication tag.
@@ -39,17 +58,21 @@ typedef struct tde_backup_header
 {
     char     magic[TDE_BACKUP_MAGIC_LEN]; /* "PGVAULTTDE" */
     uint32   format_version;              /* TDE_BACKUP_FORMAT_VERSION */
-    uint8    stream_iv[TDE_GCM_IV_LEN];   /* per-backup stream IV */
     uint16   wrapped_dek_len;             /* actual length of wrapped_dek */
     uint8    wrapped_dek[TDE_BACKUP_WRAPPED_LEN]; /* DEK wrapped by KEK */
 } tde_backup_header;
 
-bool tde_backup_header_init(tde_backup_header *hdr);
-void tde_backup_encrypt_block(const unsigned char* wrapped_dek, int wrapped_len,
-                         const char *block_data, Size block_len,
-                         uint64 block_seq, char *out_buf, Size *out_len);
+typedef struct TdeBackupContext
+{
+    unsigned char dek[TDE_DEK_LEN];
+    int dek_len;
+} TdeBackupContext;
 
-/* SQL-callable status function */
-extern Datum pg_vault_tde_backup_status(PG_FUNCTION_ARGS);
+bool tde_backup_header_init(tde_backup_header *hdr, TdeBackupContext* ctx);
+char *tde_backup_encrypt_block(const TdeBackupContext* ctx,
+                         const char *block_data, Size block_len,
+                         uint64 block_seq, Size *out_len);
+
+bool tde_backup_init(ConnParams* params);
 
 #endif /* PG_VAULT_TDE_BACKUP_H */

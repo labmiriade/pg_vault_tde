@@ -69,7 +69,6 @@ OBJS = \
 	src/tam/pg_vault_tde_tam.o \
 	src/tam/pg_vault_tde_toast.o \
 	src/iam/pg_vault_tde_iam.o \
-	src/backup/pg_vault_tde_backup.o \
 	src/logical/pg_vault_tde_pgoutput.o
 
 # SQL scripts installed as part of the extension
@@ -190,23 +189,45 @@ ci-full: ci-all
 # ---------------------------------------------------------------------------
 PG_DUMP_TDE_SRCS = \
 	src/backup/pg_dump_tde.c \
-	src/backup/pg_vault_tde_backup.c
+	src/backup/pg_vault_tde_backup.c \
+	src/backup/pg_dump_tde_kms_vault.c
 
 PG_DUMP_TDE_OBJS = $(PG_DUMP_TDE_SRCS:.c=_bin.o)
+
+# pkg-config fallback: if not available, use well-known paths.
+HAS_PKG_CONFIG := $(shell command -v pkg-config 2>/dev/null)
+
+ifdef HAS_PKG_CONFIG
+  OPENSSL_CFLAGS  := $(shell pkg-config --cflags openssl)
+  OPENSSL_LIBS    := $(shell pkg-config --libs openssl)
+  LIBCURL_CFLAGS  := $(shell pkg-config --cflags libcurl)
+  LIBCURL_LIBS    := $(shell pkg-config --libs libcurl)
+else
+  OPENSSL_CFLAGS  :=
+  OPENSSL_LIBS    := -lssl -lcrypto
+  LIBCURL_CFLAGS  :=
+  LIBCURL_LIBS    := -lcurl
+endif
 
 PG_DUMP_TDE_CFLAGS = \
 	$(TDE_OPT_CFLAGS) \
 	$(TDE_ARCH_CFLAGS) \
 	-Wall -Wextra -std=c99 \
 	-Wno-unused-parameter \
+	-DFRONTEND \
+	-I$(shell $(PG_CONFIG) --includedir) \
 	-I$(shell $(PG_CONFIG) --includedir-server) \
 	-Isrc \
 	-Isrc/include \
-	$(shell pkg-config --cflags openssl)
+	$(OPENSSL_CFLAGS) \
+	$(LIBCURL_CFLAGS)
 
 PG_DUMP_TDE_LDFLAGS = \
-	$(shell pkg-config --libs openssl) \
-	$(shell $(PG_CONFIG) --libs)
+    -L$(shell $(PG_CONFIG) --libdir) \
+    -L$(shell $(PG_CONFIG) --pkglibdir) \
+    -lpq -lpgfeutils -lpgcommon -lpgport \
+    $(OPENSSL_LIBS) \
+    $(LIBCURL_LIBS)
 
 # Pattern rule for _bin.o objects (standalone compilation, no -fPIC).
 # Must be declared before include $(PGXS) would shadow it, but we define

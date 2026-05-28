@@ -867,7 +867,6 @@ v1.0 wire format has NO version byte. All future changes MUST:
 | `pg_vault_tde_set_test_dek()` | **Unstable** | May be removed in v2.0 |
 | `pg_vault_tde_rotate_key()` | **Stable** | Signature frozen |
 | `pg_vault_tde_key_generation()` | **Stable** | Return type frozen (`bigint`) |
-| `pg_vault_tde_backup_status()` | **Stable** | Return type frozen (`text`) |
 | `pg_vault_tde_encrypt_test(text)` | **Unstable** | Test-only, may change |
 | `pg_vault_tde_decrypt_test(bytea)` | **Unstable** | Test-only, may change |
 

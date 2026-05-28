@@ -43,25 +43,76 @@
  * Each 64KB block is independently authenticated so corruption is detected
  * at the block level, not only at EOF.
  */
-#include "postgres.h"
-#include "fmgr.h"
-#include "funcapi.h"
-#include "utils/builtins.h"
-#include "utils/memutils.h"
+#include "postgres_fe.h"
+#include "fe_utils/connect_utils.h"
+#include "common/logging.h"
+#include "port/pg_bswap.h"
+
 #include <openssl/evp.h>
 #include <openssl/rsa.h>
 #include <openssl/pem.h>
 #include <openssl/crypto.h>
 
-#include "src/include/pg_vault_tde_crypto.h"
-#include "src/include/pg_vault_tde_kms.h"
-#include "src/kms/pg_vault_tde_kms_provider.h"
-#include "src/include/pg_vault_tde_backup.h"
+#include "pg_vault_tde_backup.h"
+#include "pg_dump_tde_kms.h"
 
-/* Current backup format version — increment on breaking changes. */
-#define TDE_BACKUP_FORMAT_VERSION 1
-#define TDE_BACKUP_MAGIC          "PGVAULTTDE"
-/* TDE_BACKUP_MAGIC_LEN is defined in pg_vault_tde_backup.h */
+static PGconn *init_db_conn(ConnParams *params);
+
+const PdeKmsProvider* dump_tde_active_provider = NULL;
+static EVP_CIPHER_CTX* dump_evp_ctx = NULL;
+
+/*
+ * tde_backup_init
+ * 
+ * Initalises the backup operation, opening the 
+ * db connection and defining the kms operator 
+ * that will provide DEK and KEK.
+ * 
+ * @param params    pointer to ConnParams struct with connection info
+ * @returns         true on success
+ * 
+ */
+
+bool tde_backup_init(ConnParams* params)
+{
+    PGconn* conn = init_db_conn(params);
+    char kms_provider[64];
+
+    if(!conn) {
+        fprintf(stderr, "pg_dump_tde: can't connect to db %s", params->dbname);
+        return false;
+    }
+
+    PGresult *r = PQexec(conn, "SHOW pg_vault_tde.kms_provider");
+    if(PQresultStatus(r) != PGRES_TUPLES_OK) 
+    {
+        fprintf(stderr, "pg_dump_tde: cannot read GUC pg_vault_tde.kms_provider: %s",
+                        PQerrorMessage(conn));                   
+        PQclear(r);                                               
+        return false;                            
+    }
+    snprintf(kms_provider, sizeof(kms_provider), "%s", PQgetvalue(r, 0, 0));
+    PQclear(r);
+
+    if(strcmp(kms_provider, VAULT_PROVIDER) == 0)
+    {
+        dump_tde_active_provider = pg_dump_tde_kms_vault_provider();
+    }
+   
+    else{
+        fprintf(stderr, "pg_dump_tde: unknown KMS provider %s", kms_provider);
+        return false;
+    }
+
+    if(!dump_tde_active_provider->init(conn))
+    {
+        PQfinish(conn);
+        return false;
+    }
+
+    PQfinish(conn);
+    return true;
+}
 
 /*
  * tde_backup_header_init
@@ -79,9 +130,8 @@
  * @returns       true on success, false if DEK unavailable
  */
 bool
-tde_backup_header_init(tde_backup_header *hdr)
+tde_backup_header_init(tde_backup_header *hdr, TdeBackupContext* ctx)
 {
-    unsigned char backup_dek[TDE_DEK_LEN];
     unsigned char wrapped_dek[TDE_BACKUP_WRAPPED_LEN]; 
 
     int new_len = sizeof(wrapped_dek);
@@ -91,48 +141,43 @@ tde_backup_header_init(tde_backup_header *hdr)
     memcpy(hdr->magic, TDE_BACKUP_MAGIC, TDE_BACKUP_MAGIC_LEN);
     hdr->format_version = TDE_BACKUP_FORMAT_VERSION;
 
-    /*
-     * We can't use the DEK of the shmem or table's DEK, we 
-     * need to generate a fresh DEK to wrap with the 
-     * provider's KEK
-     */
-
-    PG_TRY();
+    if(!dump_tde_active_provider->generate_dek(ctx->dek, TDE_DEK_LEN))
     {
-        if(!tde_active_kms_provider->generate_dek(backup_dek, TDE_DEK_LEN))
-        {
-            ereport(ERROR,
-                    (errmsg("[BACKUP] Failed to generate backup DEK")));
-        }
-
-        if(!tde_active_kms_provider->wrap_dek(backup_dek, TDE_DEK_LEN, 
-                                                wrapped_dek, &new_len))
-        {
-            ereport(ERROR, 
-                    errmsg("[BACKUP] Failed to wrap backup dek"));
-        }
-
-        if (!pg_strong_random(hdr->stream_iv, TDE_GCM_IV_LEN))
-        {
-            ereport(ERROR,
-                    (errmsg("[BACKUP] Failed to generate backup stream IV")));
-        }
-
-        memcpy(hdr->wrapped_dek, wrapped_dek, new_len);
-        hdr->wrapped_dek_len = new_len;
+        pg_log_error("[BACKUP] Failed to generate backup DEK");
+        return false;
     }
-    PG_CATCH();
+
+    if(!dump_tde_active_provider->wrap_dek(ctx->dek, TDE_DEK_LEN, 
+                                            wrapped_dek, &new_len))
     {
-        OPENSSL_cleanse(backup_dek, TDE_DEK_LEN);
-        OPENSSL_cleanse(wrapped_dek, TDE_DEK_LEN);
-        PG_RE_THROW();
+        pg_log_error("[BACKUP] Failed to wrap backup dek");
+        return false;
     }
-    PG_END_TRY();
 
-    OPENSSL_cleanse(backup_dek, TDE_DEK_LEN);
-    OPENSSL_cleanse(wrapped_dek, TDE_DEK_LEN);
+    memcpy(hdr->wrapped_dek, wrapped_dek, new_len);
+    hdr->wrapped_dek_len = new_len;
+    
+    OPENSSL_cleanse(ctx->dek, TDE_DEK_LEN);
+    OPENSSL_cleanse(wrapped_dek, sizeof(wrapped_dek));
+
+    dump_tde_active_provider->shutdown();
      
     return true;
+}
+
+/* Utility to open a connection to the db */
+static PGconn* init_db_conn(ConnParams* params)
+{
+    PGconn* conn = connectDatabase(params, "pg_dump_tde", false, true, false);
+
+    if(PQstatus(conn) != CONNECTION_OK)
+    {
+        fprintf(stderr, "pg_dump_tde: can't connect to the database: %s", PQerrorMessage(conn));
+        PQfinish(conn);
+        return NULL;
+    }
+    
+    return conn;
 }
 
 /*
@@ -154,52 +199,83 @@ tde_backup_header_init(tde_backup_header *hdr)
  *                      (must be at least block_len + TDE_GCM_OVERHEAD)
  * @param out_len       set to encrypted output length
  */
-void
-tde_backup_encrypt_block(const unsigned char* wrapped_dek, int wrapped_len,
+char*
+tde_backup_encrypt_block(const TdeBackupContext* tde_ctx,
                          const char *block_data, Size block_len,
-                         uint64 block_seq, char *out_buf, Size *out_len)
-{
-    char            *encrypted;
-    Size             enc_len;
-    unsigned char   dek[TDE_DEK_LEN];
+                         uint64 block_seq, Size *out_len)
+{  
+    EVP_CIPHER_CTX  *evp_ctx;
+    char*           out_buf;
+    int             flen;
+    int             olen;
+    int             aad_len;
+    Size            total;
+    unsigned char*  iv_ptr;
+    unsigned char*  ct_ptr;
+    unsigned char*  tag_ptr;
 
-    Assert(block_data != NULL && out_buf != NULL && out_len != NULL);
-    Assert(block_len > 0 && block_len <= TDE_BACKUP_BLOCK_SIZE);
+    total = block_len + TDE_V2_OVERHEAD;
+    out_buf = (char*) palloc0(total);
 
-    if(!tde_active_kms_provider->unwrap_dek(wrapped_dek, wrapped_len, 
-                                            dek, TDE_DEK_LEN))
-    {
-        OPENSSL_cleanse(dek, TDE_DEK_LEN);
-        ereport(ERROR, 
-                errmsg("[BACKUP] Can't unwrap the DEK for encryption"));
+    /*Calculate ptr position for every component of the layout*/
+    iv_ptr = (unsigned char *) out_buf + TDE_V2_GEN_LEN;
+    ct_ptr = iv_ptr + TDE_GCM_IV_LEN;
+    tag_ptr = ct_ptr + block_len;
+
+    /* Generate per-block random IV */
+    pg_strong_random(iv_ptr, TDE_GCM_IV_LEN);
+
+    if(dump_evp_ctx == NULL){
+        dump_evp_ctx = EVP_CIPHER_CTX_new();
+        if(dump_evp_ctx == NULL)
+        {
+            OPENSSL_cleanse(out_buf, total);
+            pfree(out_buf);
+            pg_log_error("pg_dump_tde: failed to allocate GCM encrypt context");
+            return NULL;
+        }
     }
+    else 
+    {
+        EVP_CIPHER_CTX_reset(dump_evp_ctx);
+    }
+    evp_ctx = dump_evp_ctx;
 
-    encrypted = tde_gcm_encrypt_with_dek(dek, TDE_DEK_LEN, 
-                                         block_data, block_len, &enc_len);
+    if(EVP_EncryptInit_ex2(evp_ctx, EVP_aes_256_gcm(), tde_ctx->dek, iv_ptr, NULL) != 1)
+        goto gcm_error;
 
-    memcpy(out_buf, encrypted, enc_len);
-    *out_len = enc_len;
+    /* Use block_seq as AAD*/
+    uint64 seq_n = pg_hton64(block_seq);
+    if(EVP_EncryptUpdate(evp_ctx, NULL, &aad_len, (const uint8 *) &seq_n, sizeof(seq_n)) != 1)
+    {
+        OPENSSL_cleanse(&seq_n, sizeof(seq_n));
+        goto gcm_error;
+    }
+    OPENSSL_cleanse(&seq_n, sizeof(seq_n));
 
-    OPENSSL_cleanse(encrypted, enc_len);
-    pfree(encrypted);
-}
+    /*Actual encrypting of payload*/
+    if(EVP_EncryptUpdate(evp_ctx, ct_ptr, &olen,
+                      (const unsigned char*) block_data, 
+                      (int) block_len) != 1)
+        goto gcm_error;
+    
+    if(EVP_EncryptFinal_ex(evp_ctx, ct_ptr + olen, &flen) != 1)
+        goto gcm_error;
 
-/*
- * pg_vault_tde_backup_status (SQL-callable)
- *
- * Returns a text status message indicating whether backup encryption is
- * active.  Exposes the backup format version so monitoring tools can detect
- * version mismatches without opening the backup file.
- */
-PG_FUNCTION_INFO_V1(pg_vault_tde_backup_status);
-Datum
-pg_vault_tde_backup_status(PG_FUNCTION_ARGS)
-{
-    char   *msg;
+    if(EVP_CIPHER_CTX_ctrl(evp_ctx, EVP_CTRL_GCM_GET_TAG, 
+                         TDE_GCM_TAG_LEN, tag_ptr) != 1)
+        goto gcm_error;
 
-    msg = psprintf("pg_vault_tde backup encryption active "
-                   "(format_version=%d, block_size=%d)",
-                   TDE_BACKUP_FORMAT_VERSION,
-                   TDE_BACKUP_BLOCK_SIZE);
-    PG_RETURN_TEXT_P(cstring_to_text(msg));
-}
+    *out_len = total;
+    return out_buf;
+
+gcm_error:
+        EVP_CIPHER_CTX_free(evp_ctx);
+        evp_ctx = NULL;
+        dump_evp_ctx = NULL;
+        OPENSSL_cleanse(out_buf, total);
+        pfree(out_buf);
+        pg_log_error("pg_dump_tde: error while encrypting a block");
+        return NULL;
+} 
+

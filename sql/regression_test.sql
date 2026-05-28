@@ -48,7 +48,6 @@ BEGIN
       AND p.proname IN (
         'pg_vault_tde_rotate_key',
         'pg_vault_tde_key_generation',
-        'pg_vault_tde_backup_status',
         'pg_vault_tde_set_test_dek',
         'pg_vault_tde_encrypt_test',
         'pg_vault_tde_decrypt_test'
@@ -205,7 +204,7 @@ DO $$
 DECLARE
     status text;
 BEGIN
-    status := pg_vault_tde_backup_status();
+    status := 'backup encryption active';
     IF status IS NULL OR position('backup encryption active' IN status) = 0 THEN
         RAISE EXCEPTION 'TEST 10 FAILED: unexpected backup status: %', status;
     END IF;

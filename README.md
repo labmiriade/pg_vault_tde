@@ -376,7 +376,6 @@ All parameters are in the `pg_vault_tde` namespace.
 | `pg_vault_tde_set_test_dek()` | void | Inject a random ephemeral DEK (**dev/test only**) |
 |  `pg_vault_tde_rotate_key()` **deprecated** | void | Wipe DEK from shared cache, bump generation |
 | `pg_vault_tde_key_generation()` | bigint | Current generation counter |
-| `pg_vault_tde_backup_status()` | text | Backup encryption status string |
 | `pg_vault_tde_encrypt_test(text)` | bytea | Encrypt text via GCM (**test only**) |
 | `pg_vault_tde_decrypt_test(bytea)` | text | Decrypt bytea via GCM (**test only**) |
 | `pg_vault_tde_health_check()` | composite | KMS, DEK, crypto, and wallet status (15 columns) |
