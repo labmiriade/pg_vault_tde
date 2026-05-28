@@ -32,6 +32,7 @@ RUN apt-get update -qq && \
         postgresql-server-dev-${PG_MAJOR} \
         libssl-dev \
         libcurl4-openssl-dev \
+        libpq-dev \
         pkg-config && \
     rm -rf /var/lib/apt/lists/*
 

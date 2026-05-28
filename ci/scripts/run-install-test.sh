@@ -123,7 +123,6 @@ DECLARE
         -- v1.0 base
         '"'"'pg_vault_tde_tableam_handler(internal)'"'"',
         '"'"'pg_vault_tde_iam_handler(internal)'"'"',
-        '"'"'pg_vault_tde_backup_status()'"'"',
         '"'"'pg_vault_tde_rotate_key()'"'"',
         '"'"'pg_vault_tde_key_generation()'"'"',
         '"'"'pg_vault_tde_set_test_dek()'"'"',
