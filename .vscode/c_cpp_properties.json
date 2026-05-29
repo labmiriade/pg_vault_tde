@@ -4,6 +4,7 @@
             "name": "Linux",
             "includePath": [
                 "${workspaceFolder}/**",
+                "/usr/include/postgresql",
                 "/usr/include/postgresql/17/server"
             ],
             "defines": [],

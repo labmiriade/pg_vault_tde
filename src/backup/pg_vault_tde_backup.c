@@ -98,7 +98,10 @@ bool tde_backup_init(ConnParams* params)
     {
         dump_tde_active_provider = pg_dump_tde_kms_vault_provider();
     }
-   
+    else if(strcmp(kms_provider, LOCAL_PROVIDER) == 0)
+    {
+        dump_tde_active_provider = pg_dump_tde_kms_local_provider();
+    }
     else{
         fprintf(stderr, "pg_dump_tde: unknown KMS provider %s", kms_provider);
         return false;
@@ -157,7 +160,6 @@ tde_backup_header_init(tde_backup_header *hdr, TdeBackupContext* ctx)
     memcpy(hdr->wrapped_dek, wrapped_dek, new_len);
     hdr->wrapped_dek_len = new_len;
     
-    OPENSSL_cleanse(ctx->dek, TDE_DEK_LEN);
     OPENSSL_cleanse(wrapped_dek, sizeof(wrapped_dek));
 
     dump_tde_active_provider->shutdown();

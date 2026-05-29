@@ -35,3 +35,25 @@ const PdeKmsProvider *pg_dump_tde_kms_vault_provider(void);   /* vault */
 const PdeKmsProvider *pg_dump_tde_kms_local_provider(void);   /* local wallet */
 
 
+/*
+=======================
+Utility for load guc
+=======================
+*/
+#define LOAD_PARAM(field, guc)                                          \
+    do {                                                                \
+        PGresult *_r = PQexec(conn, "SHOW " guc);                      \
+        if (PQresultStatus(_r) != PGRES_TUPLES_OK)                     \
+        {                                                               \
+            pg_log_error("cannot read GUC %s: %s",                     \
+                         guc, PQerrorMessage(conn));                   \
+            PQclear(_r);                                               \
+            return false;                                               \
+        }                                                               \
+        snprintf(config->field, sizeof(config->field), "%s",          \
+                 PQgetvalue(_r, 0, 0));                                 \
+        PQclear(_r);                                                    \
+    } while (0)
+
+
+

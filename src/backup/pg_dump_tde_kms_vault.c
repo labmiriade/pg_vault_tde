@@ -1,5 +1,5 @@
 /*
- * pg_dump_tde_kms_vault.c — Vault/OpenBao KMS provider for pg_dump_tde.
+ * pg_dump_tde_kms_vault.c — Vault KMS provider for pg_dump_tde.
  *
  * Implements PdeKmsProvider for HashiCorp Vault / OpenBao Transit Engine.
  * Runs in a frontend (pg_dump) process — uses palloc/free, not palloc,
@@ -75,7 +75,7 @@ typedef struct
     size_t  alloc;
 } vault_resp_buf;
 
-static bool vault_init(PGconn * conn);
+static bool     vault_init(PGconn * conn);
 
 static bool     vault_generate_dek(unsigned char *out, int len);
 static bool     vault_wrap_dek(const unsigned char *dek, int dek_len,
@@ -423,26 +423,6 @@ vault_perform_login(const PdeVaultConfig *config)
 static bool
 vault_config_load(PGconn *conn, PdeVaultConfig *config)
 {
-    /*
-     * LOAD_PARAM executes SHOW <guc> and copies the result into
-     * config->field using strlcpy.  config fields are char arrays, so
-     * strlcpy + sizeof are safe (no pointer aliasing, no size == 8 trap).
-     */
-#define LOAD_PARAM(field, guc)                                          \
-    do {                                                                \
-        PGresult *_r = PQexec(conn, "SHOW " guc);                      \
-        if (PQresultStatus(_r) != PGRES_TUPLES_OK)                     \
-        {                                                               \
-            pg_log_error("cannot read GUC %s: %s",                     \
-                         guc, PQerrorMessage(conn));                   \
-            PQclear(_r);                                               \
-            return false;                                               \
-        }                                                               \
-        snprintf(config->field, sizeof(config->field), "%s",          \
-                 PQgetvalue(_r, 0, 0));                                 \
-        PQclear(_r);                                                    \
-    } while (0)
-
     LOAD_PARAM(vault_url,       "pg_vault_tde.vault_url");
     LOAD_PARAM(auth_method,     "pg_vault_tde.vault_auth_method");
     LOAD_PARAM(transit_mount,   "pg_vault_tde.vault_transit_mount");
@@ -455,8 +435,6 @@ vault_config_load(PGconn *conn, PdeVaultConfig *config)
     LOAD_PARAM(k8s_mount,       "pg_vault_tde.vault_k8s_mount");
     LOAD_PARAM(vault_namespace, "pg_vault_tde.vault_namespace");
     LOAD_PARAM(timeout_ms,      "pg_vault_tde.vault_timeout_ms");
-
-#undef LOAD_PARAM
 
     return true;
 }
@@ -573,10 +551,15 @@ vault_wrap_dek(const unsigned char *dek, int dek_len,
             if(ciphertext != NULL)
             {
                 size_t new_len = strlen(ciphertext);
-                memcpy(out, ciphertext, new_len);
-                *out_len = new_len;
+
+                if(new_len > (size_t)*out_len)
+                    pg_log_error("pg_dump_tde: Buffer Overflow on ciphertext");
+                else{
+                    memcpy(out, ciphertext, new_len);
+                    *out_len = new_len;
+                    success = true;
+                }
                 
-                success = true;
             }
         }
         else

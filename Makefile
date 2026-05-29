@@ -190,7 +190,8 @@ ci-full: ci-all
 PG_DUMP_TDE_SRCS = \
 	src/backup/pg_dump_tde.c \
 	src/backup/pg_vault_tde_backup.c \
-	src/backup/pg_dump_tde_kms_vault.c
+	src/backup/pg_dump_tde_kms_vault.c \
+	src/backup/pg_dump_tde_kms_local.c
 
 PG_DUMP_TDE_OBJS = $(PG_DUMP_TDE_SRCS:.c=_bin.o)
 
@@ -215,6 +216,7 @@ PG_DUMP_TDE_CFLAGS = \
 	-Wall -Wextra -std=c99 \
 	-Wno-unused-parameter \
 	-DFRONTEND \
+	-D_GNU_SOURCE \
 	-I$(shell $(PG_CONFIG) --includedir) \
 	-I$(shell $(PG_CONFIG) --includedir-server) \
 	-Isrc \

@@ -2,15 +2,17 @@
 #include "libpq-fe.h"
 #include "fe_utils/connect_utils.h"
 #include "common/fe_memutils.h"
+#include "getopt_long.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
-
+#include <openssl/crypto.h>
 #include <sys/wait.h>
+
 #include "pg_vault_tde_backup.h"
-#include "getopt_long.h"
+
 
 
 int main(int argc, char **argv) {
@@ -41,6 +43,7 @@ int main(int argc, char **argv) {
      * that streams a single byte sequence suitable for piping to the parent
      * process for block-level encryption.
      */
+    pg_dump_args[pg_dump_argc++] = "pg_dump";
     pg_dump_args[pg_dump_argc++] = "-Fc";
 
 
@@ -51,18 +54,22 @@ int main(int argc, char **argv) {
         {
         case 'h':
             cparams.pghost = optarg;  /*optarg is defined outside this file, contains the parameter*/
+            pg_dump_args[pg_dump_argc++] = "-h";
             pg_dump_args[pg_dump_argc++] = optarg;
             break;
         case 'p':
             cparams.pgport = optarg;
+            pg_dump_args[pg_dump_argc++] = "-p";
             pg_dump_args[pg_dump_argc++] = optarg;
             break;
         case 'U':
             cparams.pguser = optarg;
+            pg_dump_args[pg_dump_argc++] = "-U";
             pg_dump_args[pg_dump_argc++] = optarg;
             break;
         case 'd':
             cparams.dbname = optarg;    
+            pg_dump_args[pg_dump_argc++] = "-d";
             pg_dump_args[pg_dump_argc++] = optarg;
             break;
         case 'o':
@@ -70,13 +77,20 @@ int main(int argc, char **argv) {
             break;      
         case 'j':
             fprintf(stderr, "error: option j is not supported \n");
-            pfree(pg_dump_args);
-            exit(EXIT_FAILURE);
+            goto error_cleanup;
+        
+        case '?':
+            fprintf(stderr, "error: %c invalid option\n", c);
+            goto error_cleanup;
     
         default:
-            pg_dump_args[pg_dump_argc++] = optarg;
             break;
         }
+    }
+
+    for(int i=optind; i < argc; i++)
+    {
+        pg_dump_args[pg_dump_argc++] = argv[i];
     }
 
     pg_dump_args[pg_dump_argc] = NULL; /* execvp requires a NULL terminator */
@@ -84,45 +98,39 @@ int main(int argc, char **argv) {
     /* --output is mandatory: there is no default output path. */
     if (!output_file) {
         fprintf(stderr, "error: --output is required\n");
-        pfree(pg_dump_args);
-        exit(EXIT_FAILURE);
+        goto error_cleanup;
     }
 
     outfile = fopen(output_file, "wb");
     if (!outfile) {
         perror("error: could not open output file");
-        pfree(pg_dump_args);
-        exit(EXIT_FAILURE);
+        goto error_cleanup;
     }
 
     if(!tde_backup_init(&cparams))
     {
         fprintf(stderr, "fatal error: could not initialize TDE backup\n");
         fclose(outfile);
-        pfree(pg_dump_args);
-        exit(EXIT_FAILURE);
+        goto error_cleanup;
     }
     
 
     if (!tde_backup_header_init(&header, bkp_ctx)) {
         fprintf(stderr, "fatal error: could not initialize TDE backup header\n");
         fclose(outfile);
-        pfree(pg_dump_args);
-        exit(EXIT_FAILURE);
+        goto error_cleanup;
     }
 
     if (fwrite(&header, sizeof(tde_backup_header), 1, outfile) != 1) {
         perror("error: could not write backup header");
         fclose(outfile);
-        pfree(pg_dump_args);
-        exit(EXIT_FAILURE);
+        goto error_cleanup;
     }
 
     if (pipe(pipefd) == -1) {
         perror("error: could not create pipe");
         fclose(outfile);
-        pfree(pg_dump_args);
-        exit(EXIT_FAILURE);
+        goto error_cleanup;
     }
 
     pid = fork();
@@ -132,8 +140,7 @@ int main(int argc, char **argv) {
         close(pipefd[0]);
         close(pipefd[1]);
         fclose(outfile);
-        pfree(pg_dump_args);
-        exit(EXIT_FAILURE);
+        goto error_cleanup;
     }
 
     if (pid == 0) {
@@ -143,6 +150,7 @@ int main(int argc, char **argv) {
          * not write to the output file directly.
          */
         fclose(outfile);
+        OPENSSL_cleanse(bkp_ctx, sizeof(*bkp_ctx));
         pfree(bkp_ctx);
 
         close(pipefd[0]);
@@ -156,6 +164,7 @@ int main(int argc, char **argv) {
          * above so we cannot pfree it again here.
          */
         perror("error: could not execute pg_dump");
+        pfree(pg_dump_args);
         exit(EXIT_FAILURE);
 
     } else {
@@ -182,19 +191,25 @@ int main(int argc, char **argv) {
             if (out_buffer == NULL) {
                 close(pipefd[0]);
                 fclose(outfile);
-                exit(EXIT_FAILURE);
+                goto error_cleanup;
             }
 
             if (fwrite(out_buffer, 1, out_len, outfile) != out_len) {
                 perror("error: could not write encrypted block");
                 close(pipefd[0]);
                 fclose(outfile);
-                pfree(pg_dump_args);
-                exit(EXIT_FAILURE);
+                pfree(out_buffer);
+                
+                goto error_cleanup;
             }
             pfree(out_buffer);
             block_seq++;
+
+            OPENSSL_cleanse(in_buffer, sizeof(in_buffer));
         }
+
+        OPENSSL_cleanse(bkp_ctx, sizeof(*bkp_ctx));
+        pfree(bkp_ctx);
 
         if (bytes_read < 0)
             perror("warning: read error on pipe");
@@ -216,4 +231,11 @@ int main(int argc, char **argv) {
     }
 
     return 0;
+
+error_cleanup:
+    OPENSSL_cleanse(bkp_ctx, sizeof(*bkp_ctx));
+    pfree(bkp_ctx);
+    pfree(pg_dump_args);
+    exit(EXIT_FAILURE);
+
 }

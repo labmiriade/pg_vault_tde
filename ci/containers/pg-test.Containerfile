@@ -81,6 +81,9 @@ COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/lib/pg_vault_tde.so \
      /usr/lib/postgresql/${PG_MAJOR}/lib/
 COPY --from=builder /usr/share/postgresql/${PG_MAJOR}/extension/pg_vault_tde* \
      /usr/share/postgresql/${PG_MAJOR}/extension/
+#Copy the compiled pg_dump_tde from builder stage
+COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/bin/pg_dump_tde \ 
+     /usr/lib/postgresql/${PG_MAJOR}/bin/
 
 # Copy test assets into the image (for self-contained execution)
 COPY sql/regression_test.sql  /test/regression_test.sql
