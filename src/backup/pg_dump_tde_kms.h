@@ -19,8 +19,23 @@ typedef struct PdeKmsProvider {
 
     bool (*generate_dek)(unsigned char* out, int len);
     
-    bool (*wrap_dek)(const unsigned char* dek, int dek_len, 
+    /*
+     * wrap_dek — encrypt the plaintext DEK for storage in tde_backup_header.
+     *
+     * *out_len is BIDIRECTIONAL: caller sets it to the capacity of @out before
+     * the call; provider sets it to bytes written on success.  Mirrors the same
+     * contract as the backend TdeKmsProvider.wrap_dek (see kms.instructions.md).
+     */
+    bool (*wrap_dek)(const unsigned char* dek, int dek_len,
                      unsigned char* out, int* out_len);
+
+    /*
+     * unwrap_dek — recover the plaintext DEK from the wrapped blob read out of
+     * tde_backup_header.  @dek_len is input-only capacity; unwrapped output is
+     * always exactly TDE_DEK_LEN bytes.
+     */
+    bool (*unwrap_dek)(const unsigned char* wrapped_dek, int wrapped_len,
+                        unsigned char* dek_out, int dek_len);
 
     void (*shutdown)(void);
 } PdeKmsProvider;

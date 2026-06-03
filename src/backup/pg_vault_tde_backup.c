@@ -167,6 +167,36 @@ tde_backup_header_init(tde_backup_header *hdr, TdeBackupContext* ctx)
     return true;
 }
 
+
+/*
+ * tde_backup_header_validate
+ *
+ * takes a tde_backup_header and validates it.
+ * If it's valid returns true and contruct a PdeBackupContext with the unwrapped dek.
+ *
+ *
+ * @param hdr     pointer to caller-allocated tde_backup_header struct
+ * @para  ctx     pointer to caller-allocated PdeBackupContext to initalize
+ * @returns       true on success, false if header is invalid
+ */
+
+bool tde_backup_header_validate(tde_backup_header *hdr, TdeBackupContext* ctx)
+{
+
+    unsigned char* dek;
+    int dek_len;
+
+    Assert(hdr != NULL);
+    Assert(ctx != NULL);
+
+    if(strcmp(hdr->magic, TDE_BACKUP_MAGIC) != 0) return false;
+
+    if(!dump_tde_active_provider->unwrap_dek(hdr->wrapped_dek, hdr->wrapped_dek_len, 
+                                                dek, dek_len))
+}
+
+
+
 /* Utility to open a connection to the db */
 static PGconn* init_db_conn(ConnParams* params)
 {
@@ -186,7 +216,7 @@ static PGconn* init_db_conn(ConnParams* params)
  * tde_backup_encrypt_block
  *
  * Encrypts one TDE_BACKUP_BLOCK_SIZE block from an open pg_dump stream.
- * Produces an authenticated ciphertext block written to @out_buf.
+ * Produces an authenticated block_data block written to @out_buf.
  * Returns the number of encrypted bytes written (always
  * block_len + TDE_GCM_OVERHEAD).
  *
@@ -216,11 +246,14 @@ tde_backup_encrypt_block(const TdeBackupContext* tde_ctx,
     unsigned char*  ct_ptr;
     unsigned char*  tag_ptr;
 
-    total = block_len + TDE_V2_OVERHEAD;
+    total = block_len + TDE_BACKUP_ENCRYPT_OVERHEAD;
     out_buf = (char*) palloc0(total);
 
+    /*Write version byte*/
+    ((unsigned char*) out_buf)[0] = TDE_V2_VERSION_BYTE;
+
     /*Calculate ptr position for every component of the layout*/
-    iv_ptr = (unsigned char *) out_buf + TDE_V2_GEN_LEN;
+    iv_ptr = (unsigned char *) out_buf + 1;
     ct_ptr = iv_ptr + TDE_GCM_IV_LEN;
     tag_ptr = ct_ptr + block_len;
 
@@ -264,6 +297,9 @@ tde_backup_encrypt_block(const TdeBackupContext* tde_ctx,
     if(EVP_EncryptFinal_ex(evp_ctx, ct_ptr + olen, &flen) != 1)
         goto gcm_error;
 
+    if(flen != 0)
+        goto gcm_error;
+
     if(EVP_CIPHER_CTX_ctrl(evp_ctx, EVP_CTRL_GCM_GET_TAG, 
                          TDE_GCM_TAG_LEN, tag_ptr) != 1)
         goto gcm_error;
@@ -281,3 +317,99 @@ gcm_error:
         return NULL;
 } 
 
+
+char *tde_backup_decrypt_block(const TdeBackupContext* ctx, 
+                                const char* block_data, Size block_len,
+                                uint64 block_seq, Size* out_len)
+{
+    EVP_CIPHER_CTX  *evp_ctx;
+    const unsigned char* iv_ptr;
+    const unsigned char* ct_ptr;
+    const unsigned char* tag_ptr;   
+    char* out_buf;
+    Size pt_len;
+    int olen = 0;
+    int flen = 0;
+    int aad_len = 0;
+    uint64 seq_n;
+
+    Assert(block_data != NULL);
+    Assert(out_len != NULL);
+    Assert(ctx->dek != NULL);
+    Assert(ctx->dek_len == TDE_DEK_LEN);
+
+    if(block_len < (Size)(TDE_BACKUP_ENCRYPT_OVERHEAD)){
+        pg_log_error("pg_dump_tde: [CRYPTO] Ciphertext too short for AES-256-GCM");
+        return NULL;
+    }
+        
+    if((unsigned char) block_data[0] != TDE_V2_VERSION_BYTE)
+    {
+        pg_log_error("pg_dump_tde [CRYPTO]: error while decrypting");
+        return NULL;
+    }
+
+    pt_len = block_len - TDE_BACKUP_ENCRYPT_OVERHEAD;
+    iv_ptr = (const unsigned char* ) block_data + 1;
+    ct_ptr = iv_ptr + TDE_GCM_IV_LEN;
+    tag_ptr = ct_ptr + pt_len;
+
+    out_buf = (char*) palloc0(pt_len + 1);
+
+    if(dump_evp_ctx == NULL)
+    {
+        dump_evp_ctx = EVP_CIPHER_CTX_new();
+        if(dump_evp_ctx == NULL)
+        {
+            pfree(out_buf);
+            pg_log_error("pg_dump_tde [CRYPTO]: Failed to allocate GCM decrypt context");
+            return NULL;
+        }
+    }
+    else
+    {
+        EVP_CIPHER_CTX_reset(dump_evp_ctx);
+    }
+    evp_ctx = dump_evp_ctx;
+
+    if(EVP_DecryptInit_ex2(evp_ctx, EVP_aes_256_gcm(), ctx->dek, iv_ptr, NULL) != 1)
+        goto gcm_dec_error;
+        
+    /*Set the expected tah BEFORE calling Final*/
+    if(EVP_CIPHER_CTX_ctrl(evp_ctx, EVP_CTRL_GCM_SET_TAG, 
+                        TDE_GCM_TAG_LEN, (void*) tag_ptr) != 1)
+        goto gcm_dec_error;
+
+    /*Compute the AAD used during encryption*/
+    seq_n = pg_hton64(block_seq);
+    if(EVP_DecryptUpdate(evp_ctx, NULL, &aad_len, (const uint8 *)&seq_n, sizeof(seq_n)) != 1)
+    {
+        OPENSSL_cleanse(&seq_n, sizeof(seq_n));
+        goto gcm_dec_error;
+    }
+    OPENSSL_cleanse(&seq_n, sizeof(seq_n));
+
+    if(EVP_DecryptUpdate(evp_ctx, (unsigned char*)out_buf, &olen, 
+                         ct_ptr, (int)pt_len) != 1)
+        goto gcm_dec_error;
+    
+    if(EVP_DecryptFinal_ex(evp_ctx, (unsigned char*)out_buf + olen, &flen) != 1)
+        goto gcm_dec_error;
+    
+    
+    *out_len = pt_len;
+    return out_buf;
+
+gcm_dec_error:
+    /*
+     * Free and NULL-out the cached context — unknown state after an error.
+     */
+    EVP_CIPHER_CTX_free(dump_evp_ctx);
+    dump_evp_ctx = NULL;
+    evp_ctx = NULL;
+    OPENSSL_cleanse(out_buf, pt_len + 1);
+    pfree(out_buf);
+    pg_log_error("[CRYPTO] AES-256-GCM decryption setup failed");
+    return NULL; 
+
+}

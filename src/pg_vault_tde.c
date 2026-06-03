@@ -801,8 +801,8 @@ _PG_init(void)
         "Absolute path to the PKCS#12 local wallet file",
         "Used only when pg_vault_tde.kms_provider = 'local'.  "
         "Default: $PGDATA/base/<DB_OID>/pg_vault_tde/wallet.p12",
-        &pg_vault_tde_wallet_path, "", PGC_POSTMASTER,
-        0, NULL, NULL, NULL);
+        &pg_vault_tde_wallet_path, "", PGC_SUSET,
+        0, NULL, NULL, wallet_path_show_hook);
 
     /* Passphrase env var NAME — never the passphrase itself (v1.5) */
     DefineCustomStringVariable("pg_vault_tde.wallet_passphrase_env",

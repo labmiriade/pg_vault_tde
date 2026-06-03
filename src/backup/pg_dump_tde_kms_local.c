@@ -42,6 +42,8 @@ static bool     local_init(PGconn* conn);
 static bool     local_generate_dek(unsigned char* out, int len);
 static bool     local_wrap_dek(const unsigned char* dek, int dek_len,
                                 unsigned char* out, int* out_len);
+static bool     local_unwrap_dek(const unsigned char* wrapped_dek, int wrapped_len, 
+                                 unsigned char* dek_out, int dek_len);
 static bool     local_config_load(PGconn* conn, PdeLocalConfig* config);
 static bool     local_get_passphrase(char *pass_out, Size pass_max);
 static bool     local_passphrase_from_command(char *pass_out, Size pass_max);
@@ -52,7 +54,60 @@ static bool     local_open_wallet(const char* path, const char* passphrase,
 static bool     local_wrap_dek_with_pass(const unsigned char *dek, int dek_len,
                          unsigned char *wrapped_out, int *out_len,
                          const char *passphrase, const char *wallet_path);
+static bool     local_unwrap_dek_with_pass(const unsigned char* wrapped_dek, int wrapped_len, 
+                                            unsigned char* dek_out, int dek_len, 
+                                            const char* passphrase, const char* wallet_path);
 static void     local_shutdown(void);
+
+
+static bool local_unwrap_dek_with_pass(const unsigned char* wrapped_dek, int wrapped_len, 
+                                        unsigned char* dek_out, int dek_len, 
+                                        const char* passphrase, const char* wallet_path)
+{
+    unsigned char kek[TDE_DEK_LEN];
+
+    //TODO
+
+    Assert(wrapped_dek != NULL);
+    Assert(passphrase != NULL);
+    Assert(wallet_path != NULL);
+
+
+}
+
+static bool local_unwrap_dek(const unsigned char* wrapped_dek, int wrapped_len, 
+                                unsigned char* dek_out, int dek_len)
+{
+    const char* path;
+    char pass[1024];
+    bool ok;
+
+    Assert(dek != NULL);
+    Assert(dek_len == TDE_DEK_LEN);
+    Assert(out != NULL);
+    Assert(out_len != NULL);
+
+    if(!local_get_passphrase(pass, sizeof(pass)))
+    {
+        pg_log_error("pg_dump_tde: local unwrap_dek: passphrase unavailable");
+        return false;
+    }
+
+    path = config->wallet_path[0] ? config->wallet_path : NULL;
+
+    if(!path)
+    {
+        pg_log_error("pg_dump_tde: cannot find the wallet at \"%s\"", path);
+        return false;
+    } 
+
+
+    ok = 
+
+    OPENSSL_cleanse(pass, sizeof(pass));
+    return ok;
+}
+
 
 static void local_shutdown(void)
 {
@@ -81,6 +136,7 @@ static bool local_wrap_dek_with_pass(const unsigned char *dek, int dek_len,
     if(!local_open_wallet(wallet_path, passphrase, kek))
     {
         pg_log_error("pg_dump_tde: could not open wallet \"%s\"", wallet_path);
+        return false;
     }
 
     ctx = EVP_CIPHER_CTX_new();
@@ -225,15 +281,18 @@ local_passphrase_from_file(char *pass_out, Size pass_max)
         pg_log_error("pg_vault_tde: passphrase file \"%s\": %m", fpath);
         return false;
     }
-    if ((st.st_mode & 0777) & ~0600)
+    if ((st.st_mode & 0777) & ~0600){
         pg_log_error("pg_vault_tde: passphrase file \"%s\" is mode %04o; "
                        "expected 0400 or 0600 (owner-only)",
                        fpath, (unsigned)(st.st_mode & 0777));
+        return false;
+    }
     if ((st.st_mode & 0777) & 0044)  /* group/other readable */
     {
         pg_log_error("pg_vault_tde: passphrase file \"%s\" is group- or "
                        "world-readable (mode %04o); refusing to read passphrase",
                        fpath, (unsigned)(st.st_mode & 0777));
+        return false;
     }
 
     fp = fopen(fpath, "r");

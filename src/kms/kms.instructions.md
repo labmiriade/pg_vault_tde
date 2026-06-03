@@ -316,6 +316,30 @@ else if (strcmp(guc_kms_provider, "kmip") == 0)
 - Wallet file permissions MUST be `0600` — enforced at create time and in `health_check()`
 - PKCS#11 (HSM-backed keys) is a separate `pkcs11` provider — `local` is software-only
 
+#### GUC context and show_hook for `wallet_path` (v1.6 patch)
+
+`pg_vault_tde.wallet_path` was changed from `PGC_POSTMASTER` to `PGC_SUSET` so that
+`pg_vault_tde_wallet_init()` can update it via `SetConfigOption(..., PGC_SUSET,
+PGC_S_SESSION)` for the current session without requiring a server restart.
+
+A `show_hook` (`wallet_path_show_hook`, implemented in `pg_vault_tde_kms_local.c`) is
+registered so that `SHOW pg_vault_tde.wallet_path` returns the **computed** default path
+(`$PGDATA/base/<DB_OID>/pg_vault_tde/wallet.p12`) even when the GUC is not explicitly
+set in `postgresql.conf`.  Without the hook, `SHOW` returns the empty string stored in
+the GUC variable.
+
+`local_get_wallet_path()` guards against early calls (before `DataDir` is set or before
+the backend has connected to a database) by returning `""` when `DataDir == NULL` or
+`!OidIsValid(MyDatabaseId)`.
+
+#### `PKCS12_create` maciter parameter (v1.6 patch)
+
+The 8th argument to `PKCS12_create()` / `PKCS12_create_ex2()` (`maciter`) must be
+`PKCS12_DEFAULT_ITER` (2048), **not** `-1`.  In OpenSSL 3.x, `-1` disables the
+PKCS#12 MAC entirely, producing a wallet that `PKCS12_verify_mac` cannot authenticate
+— this causes `local_open_wallet` to fail with "wallet MAC verification failed" on
+the very first `wrap_dek` call after `wallet_init`.  Always use `PKCS12_DEFAULT_ITER`.
+
 ### Per-Table DEK Cache (v1.5+)
 
 ```c

@@ -324,7 +324,7 @@ All parameters are in the `pg_vault_tde` namespace.
 | Parameter | Type | Default | Context | Description |
 |---|---|---|---|---|
 | `kms_provider` | string | `vault` | postmaster | Active KMS backend: `vault`, `local` (v1.6), `pkcs11` (v1.7), `kmip` (v1.8) |
-| `wallet_path` | string | `$PGDATA/base/<DB_OID>/pg_vault_tde/wallet.p12` | postmaster | Local wallet PKCS#12 file path (`kms_provider = 'local'`) |
+| `wallet_path` | string | `$PGDATA/base/<DB_OID>/pg_vault_tde/wallet.p12` | suset | Local wallet PKCS#12 file path (`kms_provider = 'local'`). Default computed at runtime — `SHOW` returns the effective path even when not set in `postgresql.conf`. |
 | `wallet_passphrase_env` | string | `''` | postmaster | Env var name holding wallet passphrase — env var NAME only, never the value |
 | `wallet_passphrase_file` | string | `''` | postmaster | File path containing wallet passphrase (trimmed; `0400` permission enforced) **(v1.6)** |
 | `wallet_passphrase_command` | string | `''` | postmaster | Shell command to retrieve passphrase (analogous to PG's `ssl_passphrase_command`) **(v1.6)** |
@@ -428,7 +428,8 @@ CREATE INDEX ON secrets USING tde_btree (id);
 | DELETE | ✅ Full | No-op (heapam header-only delete, no column data touched) |
 | HOT chains | ✅ Full | Header plaintext → HOT chain pointers preserved |
 | VACUUM | ✅ Full | Inherited from heapam (dead-tuple header only) |
-| pg_dump / pg_restore | ✅ Full | pg_dump reads via scan_getnextslot → decrypted |
+| `pg_dump` (plain) | ⚠️ Dump is plaintext | pg_dump reads via scan_getnextslot → decrypted. Use `pg_dump_tde` to re-encrypt the output. |
+| `pg_dump_tde` / `pg_restore_tde` | ✅ / 🚧 In progress | Encrypted logical backup: dump wrapped with AES-256-GCM + DEK sealed in backup header. Restore tool skeleton committed. |
 | Streaming replication | ✅ Full | WAL ships encrypted bytes; standby decrypts at TAM layer |
 | Page checksums | ✅ Full | Checksums over encrypted content (complementary to GCM) |
 | Logical replication (non-TOAST) | ✅ Full (v1.2) | `pg_vault_tde_pgoutput` plugin decrypts tuples before streaming |
@@ -449,7 +450,7 @@ make ci-all
 PG_VERSION=17 make ci-all
 
 # Individual test stages:
-make ci-regress          # 109 SQL regression tests (vault provider)
+make ci-regress          # 109 SQL regression tests (vault provider) — tests 1-109 (test 110 deferred)
 make ci-wallet           # 109 SQL regression tests (local wallet provider)
 make ci-checksums        # 109 tests + page checksum compatibility
 make ci-tap              # TAP tests with mock Vault
@@ -521,8 +522,9 @@ Test coverage (109 tests = 52 v1.4 + 20 v1.5 + 37 v1.6):
 - Test 109: VACUUM FULL on table with STORAGE EXTERNAL columns **(v1.6)**
 
 > Test runner notes:
-> - `make ci-regress` (vault provider): 109/109 PASS, with conditional skips for `wal_level` (test 48), `pageinspect` (test 61) and wallet-only assertions (tests 74-80 when `kms_provider=local` is required).
-> - `make ci-wallet` (local provider): tests 73-79 PASS; test 80 SKIPS unless `wallet_passphrase_env` is wired up; tests 81-109 also PASS in wallet mode.
+> - `make ci-regress` (vault provider): 109/109 PASS, with conditional skips for `wal_level` (test 48), `pageinspect` (test 61) and wallet-only assertions (tests 74–80 when `kms_provider=local` is required).
+> - `make ci-wallet` (local provider): tests 73–79 PASS; test 80 SKIPS unless `wallet_passphrase_env` is wired up; tests 81–109 also PASS in wallet mode.
+> - Test 110 (WITH HOLD cursor plaintext spill) is permanently deferred — the executor's tuplestore layer bypasses the TAM write path, so pg_vault_tde cannot intercept it without core modifications. The test is commented out in `regression_test_v16.sql`.
 
 ---
 
@@ -646,6 +648,45 @@ bash packaging/build_rpm.sh                             # generic
 rpmbuild -ba packaging/rpm/pg_vault_tde-aesni.spec      # AES-NI optimised
 rpmbuild -ba packaging/rpm/pg_vault_tde-arm.spec        # ARM CE optimised
 ```
+
+---
+
+## Encrypted Backups (`pg_dump_tde` / `pg_restore_tde`)
+
+Plain `pg_dump` decrypts rows at read time (via the TAM), so the dump file is
+**plaintext**.  `pg_dump_tde` closes this gap by piping the dump through
+AES-256-GCM before touching disk:
+
+```bash
+# Encrypted dump
+pg_dump_tde -h localhost -U postgres -d mydb -o /backup/mydb.tde
+
+# Restore (pg_restore_tde — in progress, decrypt loop pending)
+# pg_restore_tde -h localhost -U postgres -d mydb -i /backup/mydb.tde
+```
+
+### How it works
+
+1. `pg_dump_tde` forks `pg_dump -Fc` with stdout redirected to a pipe.
+2. It connects to PostgreSQL to read `pg_vault_tde.kms_provider` from GUCs.
+3. Generates a fresh DEK, wraps it via the active KMS provider, writes a
+   `tde_backup_header` (magic + format_version + wrapped_dek) to the output file.
+4. Reads the `pg_dump` stream in 64 KB blocks; encrypts each block as:
+   `[ 0x02 (1) | IV (12) | Ciphertext | GCM-TAG (16) ]`
+   Block sequence number is bound as GCM AAD — reordering blocks is detectable.
+5. If `pg_dump` fails mid-stream the partial output file is deleted automatically.
+
+### Block wire format
+
+```
+[ tde_backup_header (fixed size) ]
+[ Block 0: 0x02 | IV(12) | CT(64 KB) | TAG(16) ]
+[ Block 1: 0x02 | IV(12) | CT(64 KB) | TAG(16) ]
+...
+```
+
+Each block is independently authenticated — corruption is detected at the block
+level, not only at EOF.
 
 ---
 

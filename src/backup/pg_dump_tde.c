@@ -2,6 +2,7 @@
 #include "libpq-fe.h"
 #include "fe_utils/connect_utils.h"
 #include "common/fe_memutils.h"
+#include "common/logging.h"
 #include "getopt_long.h"
 
 #include <stdio.h>
@@ -14,8 +15,8 @@
 #include "pg_vault_tde_backup.h"
 
 
-
 int main(int argc, char **argv) {
+    pg_logging_init(argv[0]);
     int pipefd[2];
     pid_t pid;
     FILE *outfile;
@@ -32,10 +33,17 @@ int main(int argc, char **argv) {
         {"username", required_argument, NULL, 'U'}, 
         {"dbname", required_argument, NULL, 'd'}, 
         {"output", required_argument, NULL, 'o'}, 
-        {"jobs", required_argument, NULL, 'j'}
+        {"jobs", required_argument, NULL, 'j'}, 
+
+        {NULL, 0, NULL, 0} /*Sentinel of EOA used by getopt_long*/
     };
     
-    char **pg_dump_args = palloc((argc + 5) * sizeof(char *));
+    /*
+     * Each pg_dump_tde CLI flag translates to two entries in pg_dump_args
+     * ("-X" + value), so argc * 2 is the worst-case upper bound.  The extra 5
+     * covers argv[0] ("pg_dump"), "-Fc", a trailing NULL, and two spares.
+     */
+    char **pg_dump_args = palloc((argc * 2 + 5) * sizeof(char *));
 
     bkp_ctx = palloc(sizeof(*bkp_ctx));
     /*
@@ -113,7 +121,6 @@ int main(int argc, char **argv) {
         fclose(outfile);
         goto error_cleanup;
     }
-    
 
     if (!tde_backup_header_init(&header, bkp_ctx)) {
         fprintf(stderr, "fatal error: could not initialize TDE backup header\n");
@@ -220,12 +227,14 @@ int main(int argc, char **argv) {
 
         if (waitpid(pid, &status, 0) == -1) {
             perror("error: waitpid failed");
+            unlink(output_file); /* partial file is unusable; remove to avoid confusion */
             exit(EXIT_FAILURE);
         }
 
         if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
             fprintf(stderr, "fatal error: pg_dump exited with status %d\n",
                     WEXITSTATUS(status));
+            unlink(output_file); /* pg_dump failed mid-stream; file is incomplete */
             exit(EXIT_FAILURE);
         }
     }

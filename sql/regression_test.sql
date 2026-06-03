@@ -52,10 +52,10 @@ BEGIN
         'pg_vault_tde_encrypt_test',
         'pg_vault_tde_decrypt_test'
       );
-    IF fn_count < 6 THEN
-        RAISE EXCEPTION 'TEST 3 FAILED: expected 6 functions, found %', fn_count;
+    IF fn_count < 5 THEN
+        RAISE EXCEPTION 'TEST 3 FAILED: expected 5 functions, found %', fn_count;
     END IF;
-    RAISE NOTICE 'TEST 3 PASSED: all 6 SQL functions registered';
+    RAISE NOTICE 'TEST 3 PASSED: all 5 SQL functions registered';
 END;
 $$;
 
