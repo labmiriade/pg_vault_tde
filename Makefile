@@ -187,13 +187,21 @@ ci-full: ci-all
 # The object files use a _bin.o suffix to avoid collisions with the _bin.o
 # objects already compiled as -fPIC for the extension .so.
 # ---------------------------------------------------------------------------
-PG_DUMP_TDE_SRCS = \
-	src/backup/pg_dump_tde.c \
+PG_DUMP_TDE_SHARED = \
 	src/backup/pg_vault_tde_backup.c \
 	src/backup/pg_dump_tde_kms_vault.c \
-	src/backup/pg_dump_tde_kms_local.c
+	src/backup/pg_dump_tde_kms_local.c 
+
+PG_DUMP_TDE_SRCS = \
+	$(PG_DUMP_TDE_SHARED) \
+	src/backup/pg_dump_tde.c 
+
+PG_RESTORE_TDE_SRCS = \
+	$(PG_DUMP_TDE_SHARED) \
+	src/backup/pg_restore_tde.c 
 
 PG_DUMP_TDE_OBJS = $(PG_DUMP_TDE_SRCS:.c=_bin.o)
+PG_RESTORE_TDE_OBJS = $(PG_RESTORE_TDE_SRCS:.c=_bin.o)
 
 # pkg-config fallback: if not available, use well-known paths.
 HAS_PKG_CONFIG := $(shell command -v pkg-config 2>/dev/null)
@@ -240,18 +248,24 @@ PG_DUMP_TDE_LDFLAGS = \
 pg_dump_tde: $(PG_DUMP_TDE_OBJS)
 	$(CC) -o $@ $^ $(PG_DUMP_TDE_LDFLAGS)
 
+pg_restore_tde: $(PG_RESTORE_TDE_OBJS)
+	$(CC) -o $@ $^ $(PG_DUMP_TDE_LDFLAGS)
+
 # Hook into the standard PGXS targets so pg_dump_tde is always built,
 # installed, and cleaned together with the extension.
-all: pg_dump_tde
+all: pg_dump_tde pg_restore_tde
+
+bindir := $(shell $(PG_CONFIG) --bindir)
 
 .PHONY: install-pg-dump-tde
-install-pg-dump-tde: pg_dump_tde
-	install -m 755 pg_dump_tde $(shell $(PG_CONFIG) --bindir)/pg_dump_tde
+install-pg-dump-tde: pg_dump_tde pg_restore_tde
+	install -m 755 pg_dump_tde $(bindir)/pg_dump_tde
+	install -m 755 pg_restore_tde $(bindir)/pg_restore_tde
 
 install: install-pg-dump-tde
 
 .PHONY: clean-pg-dump-tde
 clean-pg-dump-tde:
-	rm -f pg_dump_tde $(PG_DUMP_TDE_OBJS)
+	rm -f pg_dump_tde pg_restore_tde $(PG_DUMP_TDE_OBJS) $(PG_RESTORE_TDE_OBJS)
 
 clean: clean-pg-dump-tde

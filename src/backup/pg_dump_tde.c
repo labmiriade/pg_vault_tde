@@ -61,7 +61,7 @@ int main(int argc, char **argv) {
         switch (c)
         {
         case 'h':
-            cparams.pghost = optarg;  /*optarg is defined outside this file, contains the parameter*/
+            cparams.pghost = optarg;
             pg_dump_args[pg_dump_argc++] = "-h";
             pg_dump_args[pg_dump_argc++] = optarg;
             break;
@@ -140,6 +140,17 @@ int main(int argc, char **argv) {
         goto error_cleanup;
     }
 
+    /*
+     * Flush before fork: without this the child process would flush the
+     * still-buffered header bytes on fclose(), and the parent would flush
+     * them again after waitpid(), producing a duplicated header.
+     */
+    if(fflush(outfile) != 0) {
+        perror("error: cannot flush backup header");
+        fclose(outfile);
+        goto error_cleanup;
+    }
+
     pid = fork();
     if (pid == -1) {
         perror("error: fork failed");
@@ -166,10 +177,7 @@ int main(int argc, char **argv) {
 
         execvp("pg_dump", pg_dump_args);
 
-        /*
-         * execvp only returns on failure.  pg_dump_args was already pfreed
-         * above so we cannot pfree it again here.
-         */
+        /* execvp only returns on failure. */
         perror("error: could not execute pg_dump");
         pfree(pg_dump_args);
         exit(EXIT_FAILURE);
@@ -177,12 +185,12 @@ int main(int argc, char **argv) {
     } else {
         /* Parent process: read pg_dump output, encrypt each block, write to file. */
         char     in_buffer[TDE_BACKUP_BLOCK_SIZE];
-        /* issue 8: use the named constant so the size is verified at compile time */
         char     *out_buffer = NULL;
         ssize_t  bytes_read;
         Size     out_len;
         uint64   block_seq = 0;
         int      status;
+        uint32   block_len;
 
         close(pipefd[1]);
 
@@ -198,6 +206,17 @@ int main(int argc, char **argv) {
             if (out_buffer == NULL) {
                 close(pipefd[0]);
                 fclose(outfile);
+                goto error_cleanup;
+            }
+
+            block_len = (uint32) out_len;
+
+            if(fwrite(&block_len, 1, sizeof(block_len), outfile) != sizeof(block_len))
+            {
+                perror("error: could not write frame length");
+                close(pipefd[0]);
+                fclose(outfile);
+                pfree(out_buffer);  
                 goto error_cleanup;
             }
 

@@ -914,8 +914,11 @@ local_get_passphrase(char *pass_out, Size pass_max)
     int active_sources = 0;
     bool has_command = (pg_vault_tde_wallet_passphrase_command &&
                         pg_vault_tde_wallet_passphrase_command[0] != '\0');
+    /* Count env source only when the named variable is actually set in the
+     * environment; the GUC just names the variable to look up. */
     bool has_env     = (pg_vault_tde_wallet_passphrase_env &&
-                        pg_vault_tde_wallet_passphrase_env[0] != '\0');
+                        pg_vault_tde_wallet_passphrase_env[0] != '\0' &&
+                        getenv(pg_vault_tde_wallet_passphrase_env) != NULL);
     bool has_file    = (pg_vault_tde_wallet_passphrase_file &&
                         pg_vault_tde_wallet_passphrase_file[0] != '\0');
 

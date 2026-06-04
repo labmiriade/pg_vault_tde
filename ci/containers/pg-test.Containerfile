@@ -81,9 +81,14 @@ COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/lib/pg_vault_tde.so \
      /usr/lib/postgresql/${PG_MAJOR}/lib/
 COPY --from=builder /usr/share/postgresql/${PG_MAJOR}/extension/pg_vault_tde* \
      /usr/share/postgresql/${PG_MAJOR}/extension/
-#Copy the compiled pg_dump_tde from builder stage
-COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/bin/pg_dump_tde \ 
+# Copy the compiled pg_dump_tde from builder stage
+COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/bin/pg_dump_tde \
      /usr/lib/postgresql/${PG_MAJOR}/bin/
+# Copy PostgreSQL Perl test modules (PostgreSQL::Test::Cluster etc.) from builder
+COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/lib/pgxs/src/test/perl/ \
+     /usr/lib/postgresql/${PG_MAJOR}/lib/pgxs/src/test/perl/
+
+ENV PERL5LIB=/usr/lib/postgresql/${PG_MAJOR}/lib/pgxs/src/test/perl
 
 # Copy test assets into the image (for self-contained execution)
 COPY sql/regression_test.sql  /test/regression_test.sql
@@ -92,8 +97,11 @@ COPY tap/                     /test/tap/
 COPY test/isolation/               /test/isolation/
 COPY bench_tde.sh            /test/bench_tde.sh
 
-# Ensure test files are readable
-RUN chmod -R a+r /test
+# Ensure test files are readable and writable by the postgres user
+# (PostgreSQL::Test::Utils writes log/ relative to cwd, which is /test)
+RUN chmod -R a+r /test && \
+    mkdir -p /test/log && \
+    chown -R postgres:postgres /test
 
 EXPOSE 5432
 

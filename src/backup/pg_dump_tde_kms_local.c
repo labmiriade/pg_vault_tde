@@ -1,6 +1,14 @@
 /*
- * pg_dump_tde_kms_local.c — PCKS#12 KMS provider for pg_dump_tde.
+ * pg_dump_tde_kms_local.c — PKCS#12 wallet KMS provider for pg_dump_tde.
  *
+ * Implements PdeKmsProvider using a PKCS#12 file as the Key Encryption Key
+ * (KEK) store.  The KEK is a raw 32-byte private key stored inside the
+ * wallet.  DEK wrapping uses AES-256-WRAP (RFC 3394).
+ *
+ * The wallet passphrase is read from exactly one of:
+ *   1. GUC pg_vault_tde.wallet_passphrase_command  (shell command, stdout)
+ *   2. GUC pg_vault_tde.wallet_passphrase_env      (environment variable name)
+ *   3. GUC pg_vault_tde.wallet_passphrase_file     (file path, mode 0400/0600)
  *
  * Copyright (c) 2026 Miriade S.r.l.
  * Licensed under the PostgreSQL License (BSD).
@@ -60,32 +68,88 @@ static bool     local_unwrap_dek_with_pass(const unsigned char* wrapped_dek, int
 static void     local_shutdown(void);
 
 
-static bool local_unwrap_dek_with_pass(const unsigned char* wrapped_dek, int wrapped_len, 
-                                        unsigned char* dek_out, int dek_len, 
+
+/**
+ * Unwrap a DEK from @wrapped_dek using AES-256-WRAP with the KEK from the wallet.
+ *
+ * @param wrapped_dek   wrapped DEK blob (from tde_backup_header.wrapped_dek)
+ * @param wrapped_len   length of wrapped_dek
+ * @param dek_out       output buffer for the recovered plaintext DEK
+ * @param dek_len       capacity of dek_out (must be >= TDE_DEK_LEN)
+ * @param passphrase    PKCS#12 wallet passphrase
+ * @param wallet_path   path to the .p12 wallet file
+ */
+static bool local_unwrap_dek_with_pass(const unsigned char* wrapped_dek, int wrapped_len,
+                                        unsigned char* dek_out, int dek_len,
                                         const char* passphrase, const char* wallet_path)
 {
-    unsigned char kek[TDE_DEK_LEN];
-
-    //TODO
+    unsigned char kek[KEK_LEN];
+    EVP_CIPHER_CTX *evp_ctx;
+    int update_len = 0;
+    int final_len = 0;
+    bool ok = false;
+    int max_out;
 
     Assert(wrapped_dek != NULL);
     Assert(passphrase != NULL);
     Assert(wallet_path != NULL);
 
+    if(!local_open_wallet(wallet_path, passphrase, kek))
+    {
+        pg_log_error("pg_dump_tde: local_unwrap_dek_with_pass: "
+                     "could not open wallet \"%s\"", wallet_path);
+        return false;
+    }
 
+    evp_ctx = EVP_CIPHER_CTX_new();
+    if(!evp_ctx)
+    {
+        OPENSSL_cleanse(kek, KEK_LEN);
+        pg_log_error("pg_dump_tde: cant allocate CIPHER_CTX");
+        return false;
+    }
+
+    /* AES-256-WRAP adds 8 bytes of overhead; plaintext is always wrapped_len - 8. */
+    max_out = wrapped_len - 8;
+    if(max_out < 0 || max_out > dek_len) 
+    {
+        OPENSSL_cleanse(kek, KEK_LEN);
+        pg_log_error("pg_dump_tde: DEK buffer too small");
+        return false;
+    }
+
+    if(EVP_DecryptInit_ex2(evp_ctx, EVP_aes_256_wrap(), kek, NULL, NULL) == 1 &&
+       EVP_DecryptUpdate(evp_ctx, dek_out, &update_len, wrapped_dek, wrapped_len) == 1 &&
+       EVP_DecryptFinal_ex(evp_ctx, dek_out + update_len, &final_len) == 1)
+    {
+        ok = true;
+    }
+    else
+    {
+        pg_log_error("pg_dump_tde: AES-256-UNWRAP failed (wrong passpharase) "
+                     "or corrupt wrapped DEK: %s", 
+                     ERR_reason_error_string(ERR_get_error()));
+    }
+
+    EVP_CIPHER_CTX_free(evp_ctx);
+    OPENSSL_cleanse(kek, KEK_LEN);
+    return ok;
 }
 
-static bool local_unwrap_dek(const unsigned char* wrapped_dek, int wrapped_len, 
-                                unsigned char* dek_out, int dek_len)
+/**
+ * PdeKmsProvider.unwrap_dek — recover DEK from header using wallet + passphrase.
+ * Reads passphrase via local_get_passphrase() (env/command/file priority order).
+ */
+static bool local_unwrap_dek(const unsigned char* wrapped_dek, int wrapped_len,
+                             unsigned char* dek_out, int dek_len)
 {
     const char* path;
     char pass[1024];
     bool ok;
 
-    Assert(dek != NULL);
+    Assert(wrapped_dek != NULL);
+    Assert(dek_out != NULL);
     Assert(dek_len == TDE_DEK_LEN);
-    Assert(out != NULL);
-    Assert(out_len != NULL);
 
     if(!local_get_passphrase(pass, sizeof(pass)))
     {
@@ -102,13 +166,19 @@ static bool local_unwrap_dek(const unsigned char* wrapped_dek, int wrapped_len,
     } 
 
 
-    ok = 
+    ok = local_unwrap_dek_with_pass(wrapped_dek, 
+                                    wrapped_len, 
+                                    dek_out, 
+                                    dek_len, 
+                                    pass, 
+                                    path);
 
     OPENSSL_cleanse(pass, sizeof(pass));
     return ok;
 }
 
 
+/** PdeKmsProvider.shutdown — cleanse and free config. */
 static void local_shutdown(void)
 {
     OPENSSL_cleanse(config, sizeof(*config));
@@ -116,6 +186,17 @@ static void local_shutdown(void)
     config = NULL;
 }
 
+/**
+ * Wrap @dek using AES-256-WRAP (RFC 3394) with the KEK from the wallet.
+ * Output is always dek_len + 8 bytes (AES-WRAP overhead).
+ *
+ * @param dek           plaintext DEK to wrap
+ * @param dek_len       must equal TDE_DEK_LEN
+ * @param wrapped_out   output buffer (capacity set via *out_len on entry)
+ * @param out_len       on exit: bytes written to wrapped_out
+ * @param passphrase    PKCS#12 wallet passphrase
+ * @param wallet_path   path to the .p12 wallet file
+ */
 static bool local_wrap_dek_with_pass(const unsigned char *dek, int dek_len,
                          unsigned char *wrapped_out, int *out_len,
                          const char *passphrase, const char *wallet_path)
@@ -173,7 +254,14 @@ static bool local_wrap_dek_with_pass(const unsigned char *dek, int dek_len,
 }
 
                                   
-static bool local_open_wallet(const char* path, const char* passphrase, 
+/**
+ * Parse a PKCS#12 wallet and extract the raw 32-byte private key as the KEK.
+ *
+ * @param path       path to the .p12 wallet file
+ * @param passphrase wallet passphrase (verified via PKCS12_verify_mac)
+ * @param kek_out    output buffer; must be at least KEK_LEN bytes
+ */
+static bool local_open_wallet(const char* path, const char* passphrase,
                                 unsigned char* kek_out)
 {
     FILE    *fp;
@@ -361,6 +449,13 @@ local_passphrase_from_command(char *pass_out, Size pass_max)
     return true;
 }
 
+/**
+ * Read the wallet passphrase from the configured source (command > env > file).
+ * Exactly one source must be configured; logs an error if multiple are set.
+ *
+ * @param pass_out  output buffer to fill with the passphrase
+ * @param pass_max  capacity of pass_out (including NUL terminator)
+ */
 static bool local_get_passphrase(char *pass_out, Size pass_max)
 {
     int active_sources = 0;
@@ -399,6 +494,7 @@ static bool local_get_passphrase(char *pass_out, Size pass_max)
 }
 
 
+/** Read all local-wallet GUCs from @conn into @config via LOAD_PARAM. */
 static bool local_config_load(PGconn* conn, PdeLocalConfig* config)
 {
     LOAD_PARAM(passphrase_env,      "pg_vault_tde.wallet_passphrase_env");
@@ -409,7 +505,8 @@ static bool local_config_load(PGconn* conn, PdeLocalConfig* config)
     return true;
 }
 
-static bool 
+/** PdeKmsProvider.generate_dek — fill @out with @len random bytes via pg_strong_random(). */
+static bool
 local_generate_dek(unsigned char *out, int len)
 {
     Assert(out != NULL);
@@ -423,7 +520,8 @@ local_generate_dek(unsigned char *out, int len)
     return true;
 }
 
-static bool 
+/** PdeKmsProvider.wrap_dek — read passphrase, open wallet, AES-256-WRAP the DEK. */
+static bool
 local_wrap_dek(const unsigned char *dek, int dek_len,
                unsigned char *out, int *out_len)
 {   
@@ -458,6 +556,7 @@ local_wrap_dek(const unsigned char *dek, int dek_len,
     return ok;
 }
 
+/** PdeKmsProvider.init — allocate config and load GUCs from @conn. */
 static bool local_init(PGconn *conn)
 {
     config = palloc0(sizeof(PdeLocalConfig));
@@ -476,6 +575,7 @@ static const PdeKmsProvider local_provider_impl = {
     .init           = local_init, 
     .generate_dek   = local_generate_dek, 
     .wrap_dek       = local_wrap_dek, 
+    .unwrap_dek     = local_unwrap_dek,
     .shutdown       = local_shutdown, 
 };
 

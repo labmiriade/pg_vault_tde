@@ -1,5 +1,9 @@
 /*
- * pg_dump_tde_kms.h - AES-256-GCM encrypt/decrypt API
+ * pg_dump_tde_kms.h - KMS provider vtable for pg_dump_tde / pg_restore_tde
+ *
+ * Defines PdeKmsProvider, the abstract interface used by the backup utilities
+ * to generate, wrap, and unwrap the Data Encryption Key (DEK) without being
+ * coupled to a specific KMS backend (Vault Transit or local PKCS#12 wallet).
  *
  * Copyright (c) 2026 Miriade S.r.l.
  * Licensed under the PostgreSQL License (BSD).
@@ -7,10 +11,11 @@
 
 #ifndef PG_DUMP_TDE_KMS_H
 #define PG_DUMP_TDE_KMS_H
-#endif
 
 #include "postgres_fe.h"
 #include "libpq-fe.h"
+
+#define TDE_DEK_LEN      32
 
 typedef struct PdeKmsProvider {
     const char* name; 
@@ -51,10 +56,10 @@ const PdeKmsProvider *pg_dump_tde_kms_local_provider(void);   /* local wallet */
 
 
 /*
-=======================
-Utility for load guc
-=======================
-*/
+ * LOAD_PARAM(field, guc) — read one PostgreSQL GUC into config->field.
+ * Calls PQexec("SHOW <guc>") and snprintf's the result; returns false on error.
+ * Must be called from a function that has a local `conn` and `config` pointer.
+ */
 #define LOAD_PARAM(field, guc)                                          \
     do {                                                                \
         PGresult *_r = PQexec(conn, "SHOW " guc);                      \
@@ -70,5 +75,5 @@ Utility for load guc
         PQclear(_r);                                                    \
     } while (0)
 
-
+#endif
 

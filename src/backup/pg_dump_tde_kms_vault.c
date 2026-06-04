@@ -2,7 +2,7 @@
  * pg_dump_tde_kms_vault.c — Vault KMS provider for pg_dump_tde.
  *
  * Implements PdeKmsProvider for HashiCorp Vault / OpenBao Transit Engine.
- * Runs in a frontend (pg_dump) process — uses palloc/free, not palloc,
+ * Runs in a frontend (pg_dump_tde/pg_restore_tde) process — uses palloc/pfree
  * and pg_log_error instead of ereport.
  *
  * Authentication methods supported:
@@ -23,13 +23,14 @@
 #include "postgres_fe.h"
 #include "common/logging.h"
 #include "common/fe_memutils.h"
-#include "pg_dump_tde_kms.h"
-
+#include "common/base64.h" 
 
 #include <curl/curl.h>
 #include <openssl/rand.h>
 #include <openssl/evp.h>
 #include <openssl/crypto.h>
+
+#include "pg_dump_tde_kms.h"
 
 /* Maximum field sizes for Vault configuration strings. */
 #define VAULT_URL_MAX       512
@@ -82,6 +83,8 @@ static bool     vault_wrap_dek(const unsigned char *dek, int dek_len,
                                 unsigned char *out, int *out_len);
 static char    *vault_perform_login(const PdeVaultConfig *config);
 static bool     vault_config_load(PGconn *conn, PdeVaultConfig *config);
+static bool     vault_unwrap_dek(const unsigned char* wrapped_dek, int wrapped_len,
+                                 unsigned char* dek_out, int dek_len);
 
 /* Public: wrap DEK when a PGconn is available. */
 char           *vault_wrap_dek_with_config(PGconn *conn,
@@ -409,6 +412,35 @@ vault_perform_login(const PdeVaultConfig *config)
     return token;
 }
 
+
+/*
+ * vault_base64_decode — decode a base64 string to raw bytes.
+ *
+ * Uses PostgreSQL's built-in pg_b64_decode (from common/base64.h).
+ * Returns the number of decoded bytes.  Caller must OPENSSL_cleanse +
+ * pfree when the output contains key material.
+ */
+static int
+vault_base64_decode(const char *b64_input, unsigned char *output, int output_maxlen)
+{
+    int decoded_len;
+
+    /*
+     * pg_b64_decode dst type changed: char * in PG17, uint8 * in PG18.
+     */
+#if PG_VERSION_NUM >= 180000
+    decoded_len = pg_b64_decode(b64_input, strlen(b64_input),
+                                (uint8 *) output, output_maxlen);
+#else
+    decoded_len = pg_b64_decode(b64_input, strlen(b64_input),
+                                (char *) output, output_maxlen);
+#endif
+    if (decoded_len < 0)
+        pg_log_error("pg_vault_tde: failed to base64-decode Vault response");
+
+    return decoded_len;
+}
+
 /* -------------------------------------------------------------------------
  * vault_config_load
  * -------------------------------------------------------------------------
@@ -496,19 +528,18 @@ vault_wrap_dek(const unsigned char *dek, int dek_len,
         return false;
     }
 
-    /* Base64-encode the DEK*/
-    size_t b64_len = ((dek_len + 2)/3) * 4 + 1; /* Standard formula 3 byte in -> 4 ASCII out*/
+    /* Base64-encode the DEK for the Vault Transit request body. */
+    size_t b64_len = ((dek_len + 2) / 3) * 4 + 1;
     char *b64_dek = palloc(b64_len);
 
     EVP_EncodeBlock((unsigned char *) b64_dek, dek, dek_len);
 
-    /*POST v1/<mount>/encrypt/<key> {"plaintext": "<b64>"} */
+    /* POST /v1/<mount>/encrypt/<key> {"plaintext": "<b64>"} */
     snprintf(url, sizeof(url), "%s/v1/%s/encrypt/%s", 
              config->vault_url, 
              config->transit_mount[0] != '\0' ? config->transit_mount : "transit", 
              config->key_name);
     
-    /*Write the request body*/
     post_body = palloc(b64_len + 32);
     snprintf(post_body, b64_len + 32, "{\"plaintext\": \"%s\"}", b64_dek);
 
@@ -603,6 +634,176 @@ cleanup:
     return success;
 }
 
+/**
+ * PdeKmsProvider.unwrap_dek — decrypt a Vault Transit ciphertext back to the raw DEK.
+ *
+ * Base64-encodes wrapped_dek, POSTs to /v1/<mount>/decrypt/<key>, base64-decodes
+ * the "plaintext" field into dek_out.
+ *
+ * @param wrapped_dek   ciphertext produced by vault_wrap_dek (stored in header)
+ * @param wrapped_len   length of wrapped_dek
+ * @param dek_out       output buffer for the recovered DEK (TDE_DEK_LEN bytes)
+ * @param dek_len       capacity of dek_out
+ */
+static bool vault_unwrap_dek(const unsigned char* wrapped_dek, int wrapped_len,
+                                 unsigned char* dek_out, int dek_len)
+{
+    char               *vault_token    = NULL;
+    CURL               *curl           = NULL;
+    struct curl_slist  *headers        = NULL;
+    vault_resp_buf      resp;
+    char               *plaintext_b64  = NULL;
+    int                 decoded_len;
+    char                auth_hdr[VAULT_TOKEN_MAX + 20];
+    char                url[VAULT_URL_MAX + 128];
+    char               *post_body      = NULL;
+    long                http_code      = 0;
+    CURLcode            res;
+    bool                success        = false;
+    unsigned char       raw_dek[TDE_DEK_LEN]; 
+
+    if(config == NULL || config->vault_url[0] == '\0')
+    {
+        pg_log_error("pg_dump_tde: vault_url is not set");
+        return false;
+    }
+
+    if((vault_token = vault_perform_login(config)) == NULL)
+    {
+        pg_log_error("pg_dump_tde: authentication failed");
+        return false;
+    }
+
+    /* POST /v1/<mount>/decrypt/<key_name> {"ciphertext": "<wrapped_b64>"} */
+    snprintf(url, sizeof(url), "%s/v1/%s/decrypt/%s",
+             config->vault_url, 
+             config->transit_mount, 
+             config->key_name);
+
+    /* Base64-encode the wrapped DEK for the Vault Transit request body. */
+    size_t b64_len = ((wrapped_len + 2) / 3) * 4 + 1;
+    char *wrapped_b64 = palloc(b64_len);
+
+    EVP_EncodeBlock((unsigned char *) wrapped_b64, wrapped_dek, wrapped_len);
+
+    post_body = palloc(strlen(wrapped_b64) + 64);
+    sprintf(post_body, "{\"ciphertext\": \"%s\"}", wrapped_b64);
+
+    OPENSSL_cleanse(wrapped_b64, b64_len);
+    pfree(wrapped_b64);
+    wrapped_b64 = NULL;
+
+    if(!vault_resp_init(&resp))
+    {
+        pg_log_error("pg_dump_tde: error allocating response");
+        goto unwrap_cleanup;
+    }
+
+    curl = vault_make_curl(config, &resp);
+    if(curl == NULL)
+    {
+        pg_log_error("pg_dump_tde: curl init failed");
+        goto unwrap_cleanup;
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_body);
+
+    snprintf(auth_hdr, sizeof(auth_hdr), 
+             "X-Vault-Token: %s", vault_token);
+
+    headers = curl_slist_append(headers, auth_hdr);
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+
+    if(config->vault_namespace[0] != '\0')
+    {
+        char ns_header[512];
+        snprintf(ns_header, sizeof(ns_header), 
+                 "X-Vault-Namespace: %s", config->vault_namespace);
+        headers = curl_slist_append(headers, ns_header);
+    }
+
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+    res = curl_easy_perform(curl);
+
+    if(res == CURLE_OK)
+    {
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+        if(http_code == 200)
+        {
+            plaintext_b64 = vault_json_extract_string(resp.data, "plaintext");
+            if(plaintext_b64 != NULL)
+            {
+                decoded_len = vault_base64_decode(plaintext_b64, raw_dek, TDE_DEK_LEN);
+                if(decoded_len == TDE_DEK_LEN)
+                {
+                    memcpy(dek_out, raw_dek, dek_len);
+                    success = true;
+                }
+
+                OPENSSL_cleanse(raw_dek, TDE_DEK_LEN);
+                OPENSSL_cleanse(plaintext_b64, strlen(plaintext_b64));
+                pfree(plaintext_b64);
+                plaintext_b64 = NULL;
+            }
+        }
+        else
+        {
+            pg_log_error("pg_dump_tde: Vault Transit decrypt HTTP failed: %ld", 
+                        http_code);
+        }
+    }
+    else
+    {
+        pg_log_error("pg_dump_tde: Vault Transit decrypt HTTP failed: %s", 
+                    curl_easy_strerror(res));
+    }
+
+unwrap_cleanup: 
+    if(wrapped_b64)
+    {
+        OPENSSL_cleanse(wrapped_b64, b64_len);
+        pfree(wrapped_b64);
+    }
+    if(post_body)
+    {
+        OPENSSL_cleanse(post_body, strlen(post_body));
+        pfree(post_body);
+    }
+    if(curl)
+    {
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+    }
+    vault_resp_free(&resp);
+
+    if(vault_token)
+    {
+        OPENSSL_cleanse(auth_hdr, sizeof(auth_hdr));
+        OPENSSL_cleanse(vault_token, strlen(vault_token));
+        pfree(vault_token);
+    }   
+
+    if(plaintext_b64)
+    {
+        OPENSSL_cleanse(plaintext_b64, strlen(plaintext_b64));
+        pfree(plaintext_b64);
+    }
+
+    OPENSSL_cleanse(auth_hdr, sizeof(auth_hdr));
+    
+    if(resp.data)
+    {
+        OPENSSL_cleanse(resp.data, resp.len);
+        pfree(resp.data);
+    }
+
+    return success;
+}
+
+/** PdeKmsProvider.init — allocate config and load Vault GUCs from @conn. */
 static bool vault_init(PGconn *conn)
 {
     config = palloc0(sizeof(PdeVaultConfig));
@@ -615,6 +816,7 @@ static bool vault_init(PGconn *conn)
     return true;
 }
 
+/** PdeKmsProvider.shutdown — cleanse and free Vault config (zeroes credentials). */
 static void vault_shutdown(void)
 {
     if(config != NULL)
@@ -630,6 +832,7 @@ static const PdeKmsProvider vault_provider_impl = {
     .init           = vault_init,
     .generate_dek   = vault_generate_dek,
     .wrap_dek       = vault_wrap_dek,
+    .unwrap_dek     = vault_unwrap_dek,
     .shutdown       = vault_shutdown,
 };
 

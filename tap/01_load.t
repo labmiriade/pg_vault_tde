@@ -1,3 +1,4 @@
+
 # TAP test: verifica caricamento estensione
 use strict;
 use warnings;
@@ -13,3 +14,5 @@ $node->start;
 ok($node->psql('postgres', 'CREATE EXTENSION pg_vault_tde;') == 0, 'CREATE EXTENSION works');
 my $out = $node->safe_psql('postgres', "SELECT extname FROM pg_extension WHERE extname = 'pg_vault_tde';");
 like($out, qr/^pg_vault_tde$/, 'Extension is present');
+
+$node->stop;

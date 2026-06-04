@@ -30,10 +30,12 @@ $RT cp "$REPO_ROOT/tap/." "$CONTAINER:/test/tap/"
 log_info "Running TAP tests with prove ..."
 START=$(timer_start)
 
-# TAP tests need the PG bin dir in PATH and PGDATA set
+# TAP tests need the PG bin dir in PATH, PGDATA, and PG Perl test modules
 if $RT exec -u postgres "$CONTAINER" bash -c '
     export PATH="/usr/lib/postgresql/18/bin:$PATH"
     export PGDATA="/var/lib/postgresql/data"
+    export PERL5LIB="/usr/lib/postgresql/18/lib/pgxs/src/test/perl${PERL5LIB:+:$PERL5LIB}"
+    export PG_REGRESS="/usr/lib/postgresql/18/lib/pgxs/src/test/regress/pg_regress"
     cd /test
     prove -v tap/*.t 2>&1
 '; then
@@ -43,6 +45,5 @@ if $RT exec -u postgres "$CONTAINER" bash -c '
 else
     ELAPSED=$(timer_elapsed "$START")
     log_error "TAP: FAILED after $(timer_fmt "$ELAPSED")"
-    $RT logs "$CONTAINER" --tail 30 2>/dev/null || true
     exit 3
 fi

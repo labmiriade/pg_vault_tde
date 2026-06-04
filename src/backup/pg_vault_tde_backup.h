@@ -8,12 +8,13 @@
 #define PG_VAULT_TDE_BACKUP_H
 
 #ifdef FRONTEND
+
+#include "pg_dump_tde_kms.h"
 /*
  * In frontend builds, pg_vault_tde_kms.h and pg_vault_tde_crypto.h pull in
  * lwlock.h / postgres.h which cannot be included here.  Mirror the constants
  * only; authoritative definitions live in the respective backend headers.
  */
-#define TDE_DEK_LEN      32
 #define TDE_GCM_IV_LEN   12
 #define TDE_GCM_TAG_LEN  16
 #define TDE_V2_GEN_LEN    8
@@ -56,6 +57,8 @@
  * that used (IV + TAG) only must be treated as incompatible.
  */
 #define TDE_BACKUP_ENCRYPT_OVERHEAD   (TDE_GCM_IV_LEN + TDE_GCM_TAG_LEN + 1)
+
+#define TDE_BACKUP_BLOCK_ENC_SIZE (TDE_BACKUP_BLOCK_SIZE + TDE_BACKUP_ENCRYPT_OVERHEAD)
 
 
 /*
