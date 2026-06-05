@@ -86,10 +86,6 @@ int main(int argc, char **argv) {
         case 'j':
             fprintf(stderr, "error: option j is not supported \n");
             goto error_cleanup;
-        
-        case '?':
-            fprintf(stderr, "error: %c invalid option\n", c);
-            goto error_cleanup;
     
         default:
             break;

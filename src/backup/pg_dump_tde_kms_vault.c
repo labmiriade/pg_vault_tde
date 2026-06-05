@@ -76,25 +76,139 @@ typedef struct
     size_t  alloc;
 } vault_resp_buf;
 
-static bool     vault_init(PGconn * conn);
+static bool     vault_init(PGconn *conn);
+static void     vault_shutdown(void);
 
 static bool     vault_generate_dek(unsigned char *out, int len);
 static bool     vault_wrap_dek(const unsigned char *dek, int dek_len,
                                 unsigned char *out, int *out_len);
+static bool     vault_unwrap_dek(const unsigned char *wrapped_dek, int wrapped_len,
+                                 unsigned char *dek_out, int dek_len);
+
 static char    *vault_perform_login(const PdeVaultConfig *config);
 static bool     vault_config_load(PGconn *conn, PdeVaultConfig *config);
-static bool     vault_unwrap_dek(const unsigned char* wrapped_dek, int wrapped_len,
-                                 unsigned char* dek_out, int dek_len);
+static bool     vault_transit_request(PdeVaultConfig *config, const char *operation,
+                                      const char *body, vault_resp_buf *response);
 
-/* Public: wrap DEK when a PGconn is available. */
-char           *vault_wrap_dek_with_config(PGconn *conn,
-                                            const unsigned char *dek,
-                                            int dek_len);
+static size_t   vault_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata);
+static bool     vault_resp_init(vault_resp_buf *buf);
+static void     vault_resp_free(vault_resp_buf *buf);
+
+static char    *vault_json_extract_string(const char *json, const char *key);
+static CURL    *vault_make_curl(const PdeVaultConfig *config, vault_resp_buf *resp);
+static struct curl_slist *vault_add_namespace_header(struct curl_slist *headers,
+                                                     const PdeVaultConfig *config);
+static int      vault_base64_decode(const char *b64_input, unsigned char *output,
+                                    int output_maxlen);
+
+/* Public entry point. */
+const PdeKmsProvider *pg_dump_tde_kms_vault_provider(void);
 
 /* -------------------------------------------------------------------------
  * Internal helpers
  * -------------------------------------------------------------------------
  */
+
+/*
+ * vault_transit_request -- utility used by both vault_wrap_dek 
+ * and vault_unwrap_dek to make a request to the transit endpoints.
+ * 
+ */
+
+static bool vault_transit_request(PdeVaultConfig *config, const char* operation, 
+                                    const char* body, vault_resp_buf *response)
+{
+    char               *vault_token    = NULL;
+    char                url[VAULT_URL_MAX + 128];
+    CURL                *curl          = NULL;
+    char                auth_hdr[VAULT_TOKEN_MAX + 20];
+    struct curl_slist   *headers       = NULL;
+    CURLcode            res; 
+    long                http_code;
+    bool success = false;
+
+    Assert(config != NULL);
+    Assert(operation != NULL);
+    Assert(body != NULL);
+    Assert(response != NULL);
+
+    if(config == NULL || config->vault_url[0] == '\0')
+    {
+        pg_log_error("pg_dump_tde: vault_url is not set");
+        return false;
+    }
+
+    if((vault_token = vault_perform_login(config)) == NULL)
+    {
+        pg_log_error("pg_dump_tde: authentication failed");
+        return false;
+    }
+
+    /* POST /v1/<mount>/<operation>/<key_name> {"ciphertext": "<wrapped_b64>"} */
+    snprintf(url, sizeof(url), "%s/v1/%s/%s/%s",
+             config->vault_url, 
+             config->transit_mount, 
+             operation,
+             config->key_name);
+
+    if(!vault_resp_init(response)) 
+    {
+        pg_log_error("pg_dump_tde: buffer allocation for response failed");
+        goto request_cleanup;
+    }
+
+    curl = vault_make_curl(config, response);   
+    if(curl == NULL)
+    {
+        pg_log_error("pg_dump_tde: curl init failed");
+        goto request_cleanup;
+    }
+
+    snprintf(auth_hdr, sizeof(auth_hdr), 
+            "X-Vault-Token: %s", vault_token);
+
+    headers = curl_slist_append(headers, auth_hdr);
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    headers = vault_add_namespace_header(headers, config);
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+    res = curl_easy_perform(curl);
+
+    if(res == CURLE_OK)
+    {
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+        if(http_code == 200)
+             success = true;
+        else 
+        {
+            pg_log_error("pg_dump_tde: %s returned HTTP %ld (response %.256s)", 
+                         operation, http_code, response->data);
+        }
+    }
+    else
+        pg_log_error("pg_dump_tde: HTTP request failed");
+
+request_cleanup: 
+    if(curl)
+    {
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+    }
+
+    if(vault_token)
+    {
+        OPENSSL_cleanse(auth_hdr, sizeof(auth_hdr));
+        OPENSSL_cleanse(vault_token, strlen(vault_token));
+        pfree(vault_token);
+    }
+
+    return success;
+
+}
 
 /*
  * vault_write_cb — libcurl WRITEFUNCTION that appends data to vault_resp_buf.
@@ -504,29 +618,10 @@ static bool
 vault_wrap_dek(const unsigned char *dek, int dek_len,
                unsigned char *out, int *out_len)
 {
-    char               *vault_token    = NULL;
-    CURL               *curl           = NULL;
-    struct curl_slist  *headers        = NULL;
-    vault_resp_buf      resp;
+    vault_resp_buf      resp = {0};
     char               *ciphertext     = NULL;
-    char                auth_hdr[VAULT_TOKEN_MAX + 20];
-    char                url[VAULT_URL_MAX + 128];
     char               *post_body      = NULL;
-    long                http_code      = 0;
-    CURLcode            res;
-    bool success = false;
-
-    if(config == NULL || config->vault_url[0] == '\0')
-    {
-        pg_log_error("pg_dump_tde: vault_url is not set");
-        return false;
-    }
-
-    if((vault_token = vault_perform_login(config)) == NULL)
-    {
-        pg_log_error("pg_dump_tde: authentication failed");
-        return false;
-    }
+    bool                success        = false;
 
     /* Base64-encode the DEK for the Vault Transit request body. */
     size_t b64_len = ((dek_len + 2) / 3) * 4 + 1;
@@ -534,12 +629,6 @@ vault_wrap_dek(const unsigned char *dek, int dek_len,
 
     EVP_EncodeBlock((unsigned char *) b64_dek, dek, dek_len);
 
-    /* POST /v1/<mount>/encrypt/<key> {"plaintext": "<b64>"} */
-    snprintf(url, sizeof(url), "%s/v1/%s/encrypt/%s", 
-             config->vault_url, 
-             config->transit_mount[0] != '\0' ? config->transit_mount : "transit", 
-             config->key_name);
-    
     post_body = palloc(b64_len + 32);
     snprintf(post_body, b64_len + 32, "{\"plaintext\": \"%s\"}", b64_dek);
 
@@ -547,60 +636,27 @@ vault_wrap_dek(const unsigned char *dek, int dek_len,
     pfree(b64_dek);
     b64_dek = NULL;
 
-    if(!vault_resp_init(&resp))
+    if(vault_transit_request(config, "encrypt", post_body, &resp))
     {
-        pg_log_error("pg_dump_tde: error allocating response");
-        goto cleanup;
-    }
-
-    curl = vault_make_curl(config, &resp);
-    if(curl == NULL)
-    {
-        pg_log_error("pg_dump_tde: curl init failed");
-        goto cleanup;
-    }
-
-    snprintf(auth_hdr, sizeof(auth_hdr), "X-Vault-Token: %s", vault_token);
-    headers = curl_slist_append(headers, auth_hdr);
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-    headers = vault_add_namespace_header(headers, config);
-
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_POST, 1);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_body);
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-    res = curl_easy_perform(curl);
-
-    if(res == CURLE_OK)
-    {
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-        if(http_code == 200)
+        ciphertext = vault_json_extract_string(resp.data, "ciphertext");
+        
+        if(ciphertext != NULL)
         {
-            ciphertext = vault_json_extract_string(resp.data, "ciphertext");
-            
-            if(ciphertext != NULL)
-            {
-                size_t new_len = strlen(ciphertext);
+            size_t new_len = strlen(ciphertext);
 
-                if(new_len > (size_t)*out_len)
-                    pg_log_error("pg_dump_tde: Buffer Overflow on ciphertext");
-                else{
-                    memcpy(out, ciphertext, new_len);
-                    *out_len = new_len;
-                    success = true;
-                }
-                
+            if(new_len > (size_t)*out_len)
+                pg_log_error("pg_dump_tde: Buffer Overflow on ciphertext");
+            else{
+                memcpy(out, ciphertext, new_len);
+                *out_len = new_len;
+                success = true;
             }
+            
         }
-        else
-            pg_log_error("pg_dump_tde: encrypt returned HTTP %ld (reponse %.256s)", 
-                         http_code, resp.data);
     }
     else    
         pg_log_error("pg_dump_tde: HTTP request failed");
 
-cleanup: 
     if(b64_dek)
     {
         OPENSSL_cleanse(b64_dek, b64_len);
@@ -611,26 +667,13 @@ cleanup:
         OPENSSL_cleanse(post_body, strlen(post_body));
         pfree(post_body);
     }
-    if(curl)
-    {
-        curl_slist_free_all(headers);
-        curl_easy_cleanup(curl);
-    }
     vault_resp_free(&resp);
-
-    if(vault_token)
-    {
-        OPENSSL_cleanse(auth_hdr, sizeof(auth_hdr));
-        OPENSSL_cleanse(vault_token, strlen(vault_token));
-        pfree(vault_token);
-    }   
 
     if(ciphertext)
     {
         OPENSSL_cleanse(ciphertext, strlen(ciphertext));
         pfree(ciphertext);
     }
-
     return success;
 }
 
@@ -648,158 +691,51 @@ cleanup:
 static bool vault_unwrap_dek(const unsigned char* wrapped_dek, int wrapped_len,
                                  unsigned char* dek_out, int dek_len)
 {
-    char               *vault_token    = NULL;
-    CURL               *curl           = NULL;
-    struct curl_slist  *headers        = NULL;
     vault_resp_buf      resp;
     char               *plaintext_b64  = NULL;
-    int                 decoded_len;
-    char                auth_hdr[VAULT_TOKEN_MAX + 20];
-    char                url[VAULT_URL_MAX + 128];
     char               *post_body      = NULL;
-    long                http_code      = 0;
-    CURLcode            res;
     bool                success        = false;
     unsigned char       raw_dek[TDE_DEK_LEN]; 
+    int                 decoded_len;
+    
+    post_body = palloc(wrapped_len + 64);
+    sprintf(post_body, "{\"ciphertext\": \"%s\"}", wrapped_dek);
 
-    if(config == NULL || config->vault_url[0] == '\0')
+    if(vault_transit_request(config, "decrypt", post_body, &resp))
     {
-        pg_log_error("pg_dump_tde: vault_url is not set");
-        return false;
-    }
-
-    if((vault_token = vault_perform_login(config)) == NULL)
-    {
-        pg_log_error("pg_dump_tde: authentication failed");
-        return false;
-    }
-
-    /* POST /v1/<mount>/decrypt/<key_name> {"ciphertext": "<wrapped_b64>"} */
-    snprintf(url, sizeof(url), "%s/v1/%s/decrypt/%s",
-             config->vault_url, 
-             config->transit_mount, 
-             config->key_name);
-
-    /* Base64-encode the wrapped DEK for the Vault Transit request body. */
-    size_t b64_len = ((wrapped_len + 2) / 3) * 4 + 1;
-    char *wrapped_b64 = palloc(b64_len);
-
-    EVP_EncodeBlock((unsigned char *) wrapped_b64, wrapped_dek, wrapped_len);
-
-    post_body = palloc(strlen(wrapped_b64) + 64);
-    sprintf(post_body, "{\"ciphertext\": \"%s\"}", wrapped_b64);
-
-    OPENSSL_cleanse(wrapped_b64, b64_len);
-    pfree(wrapped_b64);
-    wrapped_b64 = NULL;
-
-    if(!vault_resp_init(&resp))
-    {
-        pg_log_error("pg_dump_tde: error allocating response");
-        goto unwrap_cleanup;
-    }
-
-    curl = vault_make_curl(config, &resp);
-    if(curl == NULL)
-    {
-        pg_log_error("pg_dump_tde: curl init failed");
-        goto unwrap_cleanup;
-    }
-
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_POST, 1L);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_body);
-
-    snprintf(auth_hdr, sizeof(auth_hdr), 
-             "X-Vault-Token: %s", vault_token);
-
-    headers = curl_slist_append(headers, auth_hdr);
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-
-    if(config->vault_namespace[0] != '\0')
-    {
-        char ns_header[512];
-        snprintf(ns_header, sizeof(ns_header), 
-                 "X-Vault-Namespace: %s", config->vault_namespace);
-        headers = curl_slist_append(headers, ns_header);
-    }
-
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-    res = curl_easy_perform(curl);
-
-    if(res == CURLE_OK)
-    {
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-        if(http_code == 200)
+        plaintext_b64 = vault_json_extract_string(resp.data, "plaintext");
+        if(plaintext_b64 != NULL)
         {
-            plaintext_b64 = vault_json_extract_string(resp.data, "plaintext");
-            if(plaintext_b64 != NULL)
+            decoded_len = vault_base64_decode(plaintext_b64, raw_dek, TDE_DEK_LEN);
+            if(decoded_len == TDE_DEK_LEN)
             {
-                decoded_len = vault_base64_decode(plaintext_b64, raw_dek, TDE_DEK_LEN);
-                if(decoded_len == TDE_DEK_LEN)
-                {
-                    memcpy(dek_out, raw_dek, dek_len);
-                    success = true;
-                }
-
-                OPENSSL_cleanse(raw_dek, TDE_DEK_LEN);
-                OPENSSL_cleanse(plaintext_b64, strlen(plaintext_b64));
-                pfree(plaintext_b64);
-                plaintext_b64 = NULL;
+                memcpy(dek_out, raw_dek, dek_len);
+                success = true;
             }
-        }
-        else
-        {
-            pg_log_error("pg_dump_tde: Vault Transit decrypt HTTP failed: %ld", 
-                        http_code);
+
+            OPENSSL_cleanse(raw_dek, TDE_DEK_LEN);
+            OPENSSL_cleanse(plaintext_b64, strlen(plaintext_b64));
+            pfree(plaintext_b64);
+            plaintext_b64 = NULL;
         }
     }
     else
     {
-        pg_log_error("pg_dump_tde: Vault Transit decrypt HTTP failed: %s", 
-                    curl_easy_strerror(res));
+        pg_log_error("pg_dump_tde: Vault Transit decrypt HTTP failed");
     }
 
-unwrap_cleanup: 
-    if(wrapped_b64)
-    {
-        OPENSSL_cleanse(wrapped_b64, b64_len);
-        pfree(wrapped_b64);
-    }
     if(post_body)
     {
         OPENSSL_cleanse(post_body, strlen(post_body));
         pfree(post_body);
     }
-    if(curl)
-    {
-        curl_slist_free_all(headers);
-        curl_easy_cleanup(curl);
-    }
     vault_resp_free(&resp);
-
-    if(vault_token)
-    {
-        OPENSSL_cleanse(auth_hdr, sizeof(auth_hdr));
-        OPENSSL_cleanse(vault_token, strlen(vault_token));
-        pfree(vault_token);
-    }   
 
     if(plaintext_b64)
     {
         OPENSSL_cleanse(plaintext_b64, strlen(plaintext_b64));
         pfree(plaintext_b64);
     }
-
-    OPENSSL_cleanse(auth_hdr, sizeof(auth_hdr));
-    
-    if(resp.data)
-    {
-        OPENSSL_cleanse(resp.data, resp.len);
-        pfree(resp.data);
-    }
-
     return success;
 }
 

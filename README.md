@@ -428,8 +428,9 @@ CREATE INDEX ON secrets USING tde_btree (id);
 | DELETE | ✅ Full | No-op (heapam header-only delete, no column data touched) |
 | HOT chains | ✅ Full | Header plaintext → HOT chain pointers preserved |
 | VACUUM | ✅ Full | Inherited from heapam (dead-tuple header only) |
+| CTAS   | ✅ Full | Per-table DEK registration before SELECT is executed |
 | `pg_dump` (plain) | ⚠️ Dump is plaintext | pg_dump reads via scan_getnextslot → decrypted. Use `pg_dump_tde` to re-encrypt the output. |
-| `pg_dump_tde` / `pg_restore_tde` | ✅ / 🚧 In progress | Encrypted logical backup: dump wrapped with AES-256-GCM + DEK sealed in backup header. Restore tool skeleton committed. |
+| `pg_dump_tde` / `pg_restore_tde` | ✅ Full | Encrypted logical backup: dump wrapped with AES-256-GCM + DEK sealed in backup header. |
 | Streaming replication | ✅ Full | WAL ships encrypted bytes; standby decrypts at TAM layer |
 | Page checksums | ✅ Full | Checksums over encrypted content (complementary to GCM) |
 | Logical replication (non-TOAST) | ✅ Full (v1.2) | `pg_vault_tde_pgoutput` plugin decrypts tuples before streaming |
@@ -661,9 +662,11 @@ AES-256-GCM before touching disk:
 # Encrypted dump
 pg_dump_tde -h localhost -U postgres -d mydb -o /backup/mydb.tde
 
-# Restore (pg_restore_tde — in progress, decrypt loop pending)
-# pg_restore_tde -h localhost -U postgres -d mydb -i /backup/mydb.tde
+# Restore encrypted dump
+pg_restore_tde -h localhost -U postgres -d mydb -i /backup/mydb.tde
 ```
+
+>All other `pg_dump` options are fed directly to it.
 
 ### How it works
 
@@ -672,22 +675,44 @@ pg_dump_tde -h localhost -U postgres -d mydb -o /backup/mydb.tde
 3. Generates a fresh DEK, wraps it via the active KMS provider, writes a
    `tde_backup_header` (magic + format_version + wrapped_dek) to the output file.
 4. Reads the `pg_dump` stream in 64 KB blocks; encrypts each block as:
-   `[ 0x02 (1) | IV (12) | Ciphertext | GCM-TAG (16) ]`
+
+   `[ Block length (4) | 0x02 (1) | IV (12) | Ciphertext | GCM-TAG (16) ]`
+
    Block sequence number is bound as GCM AAD — reordering blocks is detectable.
+   
+   (Reading from a stream with `fread` not guarantee that the block is 64 KB every time,
+   that's why the block length is stored)
 5. If `pg_dump` fails mid-stream the partial output file is deleted automatically.
 
 ### Block wire format
 
 ```
-[ tde_backup_header (fixed size) ]
-[ Block 0: 0x02 | IV(12) | CT(64 KB) | TAG(16) ]
-[ Block 1: 0x02 | IV(12) | CT(64 KB) | TAG(16) ]
+[ tde_backup_header ]
+[ Block 0: Block length (4) | 0x02 | IV(12) | CT(64 KB) | TAG(16) ]
+[ Block 1: Block length (4) | 0x02 | IV(12) | CT(64 KB) | TAG(16) ]
 ...
 ```
 
 Each block is independently authenticated — corruption is detected at the block
 level, not only at EOF.
 
+### Current limitations
+
+1. Only `-Fc` format is supported.
+
+2. `-j` option is **NOT** supported. Parallel jobs are only supported by `pg_dump`
+if the directory format (`-Fd`) is set.
+
+3. Fixed block size: 64 KB.
+
+4. Restore is locked to the original KEK used for DEK wrapping. This means that if we need to restore a dump into a new database that is using a different wallet (KMS local speaking) from the original, we can't. The old wallet or a new wallet containing the old KEK is needed.
+
+   Currently (v1.7) deleting a database (`DROP DATABASE`) deletes his .p12 wallet file. Dump files previous created from this database becomes undecryptable (if wallet file is lost).
+
+5. File-only output and input. The option `--output` or `-o` (for `pg_dump_tde`) and `--input`
+or `-i` (for `pg_restore_tde`) are mandatory. Neither piping nor reading from `stdin` are supported.
+
+6. Executing `pg_dump` still produces a plain-text backup
 ---
 
 ## Performance

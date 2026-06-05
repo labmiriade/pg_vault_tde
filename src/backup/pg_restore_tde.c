@@ -99,10 +99,7 @@ int main(int argc, char** argv) {
         case 'j':
             fprintf(stderr, "error: -j (parallel jobs) is not supported\n");
             goto error_cleanup;
-        case '?': 
-            fprintf(stderr, "error: %c invalid option\n", c);
-            goto error_cleanup;
-        
+
         default:
             break;
         }
@@ -198,7 +195,7 @@ int main(int argc, char** argv) {
         while(fread(&block_len, sizeof(block_len), 1, infile))
         {
             if(block_len < (uint32) TDE_BACKUP_ENCRYPT_OVERHEAD || 
-                block_len > (uint32) TDE_BACKUP_BLOCK_SIZE)
+                block_len > (uint32) TDE_BACKUP_BLOCK_ENC_SIZE)
             {
                 perror("error: invalid block size");
                 goto error_cleanup;

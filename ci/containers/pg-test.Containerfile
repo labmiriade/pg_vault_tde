@@ -81,8 +81,10 @@ COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/lib/pg_vault_tde.so \
      /usr/lib/postgresql/${PG_MAJOR}/lib/
 COPY --from=builder /usr/share/postgresql/${PG_MAJOR}/extension/pg_vault_tde* \
      /usr/share/postgresql/${PG_MAJOR}/extension/
-# Copy the compiled pg_dump_tde from builder stage
+# Copy the compiled pg_dump_tde and pg_restore_tde from builder stage
 COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/bin/pg_dump_tde \
+     /usr/lib/postgresql/${PG_MAJOR}/bin/
+COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/bin/pg_restore_tde \
      /usr/lib/postgresql/${PG_MAJOR}/bin/
 # Copy PostgreSQL Perl test modules (PostgreSQL::Test::Cluster etc.) from builder
 COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/lib/pgxs/src/test/perl/ \
