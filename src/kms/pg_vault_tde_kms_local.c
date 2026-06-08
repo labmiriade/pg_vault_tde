@@ -42,6 +42,7 @@
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "catalog/indexing.h"
+#include "catalog/pg_db_role_setting.h"
 
 #include <openssl/evp.h>
 #include <openssl/pkcs12.h>
@@ -164,6 +165,7 @@ static bool local_unwrap_dek_with_kek(const unsigned char *wrapped,
 static bool local_derive_kek_from_pass(const char *passphrase,
                                        unsigned char *kek_out);
 static const char *local_get_wallet_path(void);
+static void local_set_wallet(const char *path);
 static bool local_get_passphrase(char *pass_out, Size pass_max);
 static bool local_passphrase_from_env(char *pass_out, Size pass_max);
 static bool local_passphrase_from_file(char *pass_out, Size pass_max);
@@ -192,18 +194,6 @@ pg_vault_tde_kms_local_provider(void)
     return &local_provider_impl;
 }
 
-/*
- * wallet_path_show_hook — registered as the show_hook for pg_vault_tde.wallet_path.
- *
- * Without this, SHOW pg_vault_tde.wallet_path returns the GUC storage value
- * (empty string when not set in postgresql.conf) even though the effective path
- * is the computed default.  Delegating to local_get_wallet_path() makes SHOW
- * reflect what the provider will actually use at runtime.
- */
-const char* wallet_path_show_hook(void)
-{
-    return local_get_wallet_path();
-}
 
 
 /* -------------------------------------------------------------------------
@@ -749,6 +739,37 @@ local_get_wallet_path(void)
     return path_buf;
 }
 
+/*
+ * local_set_wallet — set wallet_path GUC for the current session and persist
+ * it at database level so reconnecting backends inherit the same path.
+ *
+ * Must be called after the wallet file path is finalised (i.e. after the
+ * parent directory is created but before writing the wallet).
+ */
+static void
+local_set_wallet(const char *path)
+{
+    VariableSetStmt *setstmt;
+
+    Assert(path != NULL && path[0] != '\0');
+
+    /* 1. Update the current session so SHOW returns the correct value. */
+    SetConfigOption("pg_vault_tde.wallet_path", path, PGC_SUSET, PGC_S_SESSION);
+
+    /*
+     * 2. Persist the current session value to pg_db_role_setting for this
+     *    database only (equivalent to ALTER DATABASE … SET FROM CURRENT).
+     *    VAR_SET_CURRENT requires no args — it reads the value already set
+     *    by the SetConfigOption call above.
+     */
+    setstmt        = makeNode(VariableSetStmt);
+    setstmt->kind  = VAR_SET_CURRENT;
+    setstmt->name  = "pg_vault_tde.wallet_path";
+    setstmt->args  = NIL;
+
+    AlterSetting(MyDatabaseId, InvalidOid, setstmt);
+}
+
 /* -------------------------------------------------------------------------
  * Passphrase resolution helpers (v1.6 multi-source)
  *
@@ -1089,9 +1110,6 @@ pg_vault_tde_wallet_init_sql(PG_FUNCTION_ARGS)
     passphrase = text_to_cstring(passphrase_t);
     path       = local_get_wallet_path();
 
-     /* Properly update the GUC so SHOW reflects the computed path in this session */
-    SetConfigOption("pg_vault_tde.wallet_path", path, PGC_SUSET, PGC_S_SESSION);
-
     /* Refuse to overwrite an existing wallet without explicit delete */
     if (stat(path, &st) == 0)
         ereport(ERROR,
@@ -1143,6 +1161,8 @@ pg_vault_tde_wallet_init_sql(PG_FUNCTION_ARGS)
                            dir));
         }
     }
+
+    local_set_wallet(path);
 
     if(!pg_strong_random(kek, 32))
     {

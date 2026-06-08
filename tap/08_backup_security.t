@@ -1,12 +1,12 @@
 # tap/08_backup_security.t - Cryptographic security properties: no plaintext leakage, IV uniqueness, opaque output
 use strict;
 use warnings;
-use Test::More tests => 9;
+use Test::More tests => 8;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 
-# Offset of first ciphertext byte (header=528 + block_len=4 + version=1 + IV=12)
-use constant OFF_CIPHERTEXT => 545;
+# Offset of first ciphertext byte (header=532 + block_len=4 + version=1 + IV=12)
+use constant OFF_CIPHERTEXT => 549;
 
 my $node = PostgreSQL::Test::Cluster->new('security_test_node');
 $node->init;

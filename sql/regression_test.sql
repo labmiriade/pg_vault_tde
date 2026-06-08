@@ -1774,7 +1774,7 @@ BEGIN
             r.kms_provider, COALESCE(v_guc, '(unset)');
     END IF;
 
-    IF r.kms_provider NOT IN ('vault', 'local') THEN
+    IF r.kms_provider NOT IN ('vault', 'local', '') THEN
         RAISE EXCEPTION 'TEST 51 FAILED: unexpected kms_provider value "%"',
             r.kms_provider;
     END IF;

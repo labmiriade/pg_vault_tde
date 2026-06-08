@@ -471,13 +471,16 @@ static bool local_get_passphrase(char *pass_out, Size pass_max)
     if(has_file) active_sources++;
 
     if(active_sources > 1)
+    {
         pg_log_error("pg_vault_tde: multiple wallet passphrase sources "
                        "are configured (command=%s, env=%s, file=%s); "
                        "set at most one",
                        has_command ? "yes" : "no",
                        has_env     ? "yes" : "no",
                        has_file    ? "yes" : "no");
-
+        return false;
+    }
+        
     if(has_command && local_passphrase_from_command(pass_out, pass_max))
         return true;
     

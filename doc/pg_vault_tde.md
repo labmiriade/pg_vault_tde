@@ -751,7 +751,7 @@ start (`PGC_POSTMASTER`); `enabled` is changeable by superusers at runtime
 | `vault_key_name` | string | `pg-tde-dek` | Transit key name for DEK wrapping |
 | `vault_ca_cert` | string | `''` | Path to CA bundle for Vault TLS (`CURLOPT_CAINFO`) |
 | `vault_timeout_ms` | integer | `5000` | Vault HTTP timeout in ms (0 = no timeout; range 0–300000) |
-| `bgw_enabled` | boolean | `off` | Enable background worker for automatic token renewal |
+| `bgw_enabled` | boolean | `off` | Enable background worker for automatic token renewal. **Requires cluster restart** to take effect: the background worker is registered at postmaster startup via `RegisterBackgroundWorker()`, so changing this GUC via `pg_reload_conf()` updates the value but does not start or stop the worker dynamically. |
 | `token_renewal_interval` | integer | `3600` | Token renewal interval in seconds (60–86400) |
 | `enabled` | boolean | `on` | Master switch: `off` disables crypto for benchmarking overhead |
 

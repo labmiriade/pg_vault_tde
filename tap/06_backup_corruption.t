@@ -1,20 +1,20 @@
 # tap/06_backup_corruption.t - Integrity checks: corrupted ciphertext, truncation, wrong magic, IV randomness
 use strict;
 use warnings;
-use Test::More tests => 18;
+use Test::More tests => 17;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 
 # Offset constants matching tde_backup_header C struct layout (little-endian host)
-# magic(10) | format_version(4) | wrapped_dek_len(2) | wrapped_dek(512) = 528
+# magic(10) | pad(2) | format_version(4) | wrapped_dek_len(2) | wrapped_dek(512) | tail_pad(2) = 532
 # First block: block_len(4) | version_byte(1) | IV(12) | CT(var) | TAG(16)
-use constant HEADER_SIZE     => 528;   # sizeof(tde_backup_header)
-use constant OFF_FMT_VERSION => 10;    # offset of format_version field
-use constant OFF_DEK_LEN     => 14;    # offset of wrapped_dek_len field
-use constant OFF_BLOCK_LEN   => 528;   # offset of first block_len field
-use constant OFF_VERSION_BYTE => 532;  # HEADER_SIZE + 4 (block_len)
-use constant OFF_IV           => 533;  # version_byte + 1
-use constant OFF_CIPHERTEXT   => 545;  # IV(12) + version_byte(1) + block_len(4) + header
+use constant HEADER_SIZE      => 532;  # sizeof(tde_backup_header) with compiler padding
+use constant OFF_FMT_VERSION  => 12;   # offset of format_version (after magic[10] + 2-byte pad)
+use constant OFF_DEK_LEN      => 16;   # offset of wrapped_dek_len (after format_version uint32)
+use constant OFF_BLOCK_LEN    => 532;  # offset of first block_len field (= HEADER_SIZE)
+use constant OFF_VERSION_BYTE => 536;  # HEADER_SIZE + 4 (block_len)
+use constant OFF_IV           => 537;  # version_byte + 1
+use constant OFF_CIPHERTEXT   => 549;  # HEADER_SIZE + block_len(4) + version_byte(1) + IV(12)
 
 sub slurp_binary {
     my ($path) = @_;
@@ -27,13 +27,6 @@ sub write_binary {
     open(my $fh, '>:raw', $path) or die "Cannot write $path: $!";
     print $fh $data; close($fh);
 }
-
-
-Fallo continuare da qua: 
-
-Resume this session with:
-claude --resume 14a2ee7f-bb6e-413a-94af-2ef6b0e87fae
-
 
 sub flip_byte {
     my ($data, $offset) = @_;

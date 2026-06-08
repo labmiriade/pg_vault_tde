@@ -4,6 +4,7 @@ use warnings;
 use Test::More tests => 8;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
+use IPC::Run qw(run);
 
 my $node = PostgreSQL::Test::Cluster->new('cross_db_node');
 $node->init;
@@ -19,11 +20,19 @@ $node->safe_psql('postgres', "SELECT pg_vault_tde_wallet_init('test-password')")
 # Source database: 'source_db'
 $node->safe_psql('postgres', 'CREATE DATABASE source_db;');
 $node->safe_psql('source_db', 'CREATE EXTENSION pg_vault_tde;');
+$node->safe_psql('source_db', "SELECT pg_vault_tde_wallet_init('test-password')");
+$node->safe_psql('source_db', "SELECT pg_vault_tde_wallet_unlock('test-password')");
 $node->safe_psql('source_db', q{
     CREATE TABLE cross_test (id serial PRIMARY KEY, val text) USING encrypted_heap;
     INSERT INTO cross_test (val) VALUES ('cross_db_sentinel_row1'), ('cross_db_sentinel_row2');
 });
 ok(1, 'source_db created with TDE table and data');
+
+my $souce_oid = $node->safe_psql('postgres',
+    "SELECT oid FROM pg_database WHERE datname = 'source_db'"
+);
+my $source_db_dir = $node->data_dir . "/base/$souce_oid/pg_vault_tde";
+my $source_wallet = $source_db_dir . "/wallet.p12";
 
 my $dump_file = $node->data_dir . '/cross_db.dump';
 $node->command_ok(
@@ -40,13 +49,30 @@ unlike($dump_content, qr/cross_db_sentinel/, 'Cross-db dump does not contain pla
 # Target database: fresh 'restore_db'
 $node->safe_psql('postgres', 'CREATE DATABASE restore_db;');
 $node->safe_psql('restore_db', 'CREATE EXTENSION pg_vault_tde;');
-ok(1, 'restore_db created and extension initialized');
+$node->safe_psql('restore_db', "SELECT pg_vault_tde_wallet_init('test-password')");
+
+my $restore_oid = $node->safe_psql('postgres',
+    "SELECT oid FROM pg_database WHERE datname = 'restore_db'"
+);
+my $restore_db_dir = $node->data_dir . "/base/$restore_oid/pg_vault_tde";
 
 $node->command_ok(
+   ['cp', $source_wallet, $restore_db_dir,], 
+   "Copy of the source wallet into the restore wallet path"
+);
+
+ok(1, 'restore_db created and extension initialized');
+
+
+my ($stdout, $stderr);
+run(
     ['pg_restore_tde', '-i', $dump_file,
      '-U', 'postgres', '-d', 'restore_db',
      '-h', $node->host, '-p', $node->port],
-    'pg_restore_tde into restore_db completes');
+    '>', \$stdout,
+    '2>', \$stderr
+);
+diag $stderr;
 
 # Verify data is present in target database
 my $target_result = $node->safe_psql('restore_db', 'SELECT val FROM cross_test ORDER BY id;');

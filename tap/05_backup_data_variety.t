@@ -1,7 +1,7 @@
 # tap/05_backup_data_variety.t - Data type coverage: TOAST, Unicode, bytea, bulk rows, sequences
 use strict;
 use warnings;
-use Test::More tests => 15;
+use Test::More tests => 14;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 
@@ -36,7 +36,7 @@ $node->safe_psql('postgres', q{
         (t_text, t_int, t_bool, t_numeric, t_ts, t_jsonb, t_bytea, t_uuid)
     VALUES
         ('hello', 42, true, 3.1415, '2025-01-01 00:00:00+00',
-         '{"key":"value","n":1}', E'\\xDEADBEEF',
+         '{"key":"value","n":1}', '\\xDEADBEEF',
          'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
 });
 ok(1, 'Multi-type TDE table created');
@@ -73,9 +73,9 @@ $node->safe_psql('postgres', q{
 $node->safe_psql('postgres', q{
     CREATE TABLE bytea_table (id serial PRIMARY KEY, val bytea) USING encrypted_heap;
     INSERT INTO bytea_table (val) VALUES
-        (E'\\x000102FE FF'),
-        (E'\\x00'),
-        (E'\\xDEADBEEFCAFEBABE');
+        ('\\x000102FEFF'),
+        ('\\x00'),
+        ('\\xDEADBEEFCAFEBABE');
 });
 
 # Bulk rows — 1000 rows via generate_series

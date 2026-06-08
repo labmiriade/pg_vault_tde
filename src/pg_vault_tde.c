@@ -665,44 +665,44 @@ _PG_init(void)
     /* Vault endpoint URL */
     DefineCustomStringVariable("pg_vault_tde.vault_url",
         "HashiCorp Vault / OpenBao URL (e.g. https://vault.example.com:8200)",
-        NULL, &pg_vault_tde_vault_url, "", PGC_POSTMASTER,
-        0, NULL, NULL, NULL);
+        NULL, &pg_vault_tde_vault_url, "", PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /* Vault namespace */
     DefineCustomStringVariable("pg_vault_tde.vault_namespace",
         "Vault namespace (enterprise only, empty for community)",
-        NULL, &pg_vault_tde_vault_namespace, "", PGC_POSTMASTER,
-        0, NULL, NULL, NULL);
+        NULL, &pg_vault_tde_vault_namespace, "", PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /* Vault token — secret, not shown in pg_settings */
     DefineCustomStringVariable("pg_vault_tde.vault_token",
         "Vault token for authentication",
-        NULL, &pg_vault_tde_vault_token, "", PGC_POSTMASTER,
+        NULL, &pg_vault_tde_vault_token, "", PGC_SUSET,
         GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 
     /* Transit engine mount path */
     DefineCustomStringVariable("pg_vault_tde.vault_transit_mount",
         "Vault Transit secrets engine mount path",
-        NULL, &pg_vault_tde_vault_transit_mount, "transit", PGC_POSTMASTER,
-        0, NULL, NULL, NULL);
+        NULL, &pg_vault_tde_vault_transit_mount, "transit", PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /* Transit key name for DEK wrapping */
     DefineCustomStringVariable("pg_vault_tde.vault_key_name",
         "Vault Transit key name for DEK wrapping",
-        NULL, &pg_vault_tde_vault_key_name, "pg-tde-dek", PGC_POSTMASTER,
-        0, NULL, NULL, NULL);
+        NULL, &pg_vault_tde_vault_key_name, "pg-tde-dek", PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /* TLS CA certificate bundle path */
     DefineCustomStringVariable("pg_vault_tde.vault_ca_cert",
         "Path to CA certificate bundle for Vault TLS verification",
-        NULL, &pg_vault_tde_vault_ca_cert, "", PGC_POSTMASTER,
-        0, NULL, NULL, NULL);
+        NULL, &pg_vault_tde_vault_ca_cert, "", PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /* Vault HTTP request timeout */
     DefineCustomIntVariable("pg_vault_tde.vault_timeout_ms",
         "Vault HTTP request timeout in milliseconds (0 = no timeout)",
         NULL, &pg_vault_tde_vault_timeout_ms, 5000, 0, 300000,
-        PGC_POSTMASTER, 0, NULL, NULL, NULL);
+        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /* Master on/off switch — useful for benchmarking overhead */
     DefineCustomBoolVariable("pg_vault_tde.enabled",
@@ -716,24 +716,24 @@ _PG_init(void)
         "When > 0, each backend re-reads the DEK from shared memory "
         "after this many seconds, even if key rotation has not occurred.",
         &pg_vault_tde_dek_cache_ttl, 0, 0, 86400,
-        PGC_SIGHUP, 0, NULL, NULL, NULL);
+        PGC_SUSET, 0, NULL, NULL, NULL);
 
     /* Vault auth method (v1.1): token, approle, or kubernetes */
     DefineCustomStringVariable("pg_vault_tde.vault_auth_method",
         "Vault authentication method: token, approle, or kubernetes",
-        NULL, &pg_vault_tde_vault_auth_method, "token", PGC_POSTMASTER,
-        0, NULL, NULL, NULL);
+        NULL, &pg_vault_tde_vault_auth_method, "token", PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /* AppRole role_id (v1.1) */
     DefineCustomStringVariable("pg_vault_tde.vault_role_id",
         "Vault AppRole role_id for authentication",
-        NULL, &pg_vault_tde_vault_role_id, "", PGC_POSTMASTER,
+        NULL, &pg_vault_tde_vault_role_id, "", PGC_SUSET,
         GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 
     /* AppRole secret_id (v1.1) */
     DefineCustomStringVariable("pg_vault_tde.vault_secret_id",
         "Vault AppRole secret_id for authentication",
-        NULL, &pg_vault_tde_vault_secret_id, "", PGC_POSTMASTER,
+        NULL, &pg_vault_tde_vault_secret_id, "", PGC_SUSET,
         GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 
     /* AppRole role name (v1.4) — used for secret_id rotation after login */
@@ -743,20 +743,20 @@ _PG_init(void)
         "successful AppRole login, implementing the response_wrapping "
         "single-use pattern.  Must match the role name in "
         "`vault write auth/approle/role/<name> ...`.",
-        &pg_vault_tde_vault_role_name, "", PGC_POSTMASTER,
-        0, NULL, NULL, NULL);
+        &pg_vault_tde_vault_role_name, "", PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /* Kubernetes auth role (v1.1) */
     DefineCustomStringVariable("pg_vault_tde.vault_k8s_role",
         "Vault Kubernetes auth role name",
-        NULL, &pg_vault_tde_vault_k8s_role, "", PGC_POSTMASTER,
-        0, NULL, NULL, NULL);
+        NULL, &pg_vault_tde_vault_k8s_role, "", PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /* Kubernetes auth mount path (v1.1) */
     DefineCustomStringVariable("pg_vault_tde.vault_k8s_mount",
         "Vault Kubernetes auth engine mount path",
-        NULL, &pg_vault_tde_vault_k8s_mount, "kubernetes", PGC_POSTMASTER,
-        0, NULL, NULL, NULL);
+        NULL, &pg_vault_tde_vault_k8s_mount, "kubernetes", PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /* OpenSSL 3.x crypto provider for hardware acceleration (v1.1) */
     DefineCustomStringVariable("pg_vault_tde.crypto_provider",
@@ -772,8 +772,8 @@ _PG_init(void)
         "When true, a background worker periodically renews the Vault "
         "token and stores it in shared memory for all backends.  "
         "Only useful with AppRole or Kubernetes auth methods.",
-        &pg_vault_tde_bgw_enabled, false, PGC_POSTMASTER,
-        0, NULL, NULL, NULL);
+        &pg_vault_tde_bgw_enabled, false, PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /* Token renewal interval in seconds (v1.3) */
     DefineCustomIntVariable("pg_vault_tde.token_renewal_interval",
@@ -781,7 +781,7 @@ _PG_init(void)
         "How often the background worker renews the Vault token.  "
         "Ignored if bgw_enabled is false.",
         &pg_vault_tde_token_renewal_interval, 3600, 60, 86400,
-        PGC_POSTMASTER, 0, NULL, NULL, NULL);
+        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /* ----------------------------------------------------------------
      * v1.5 GUC registrations
@@ -793,8 +793,8 @@ _PG_init(void)
         "Selects which Key Management Service backend is active.  "
         "'vault' (default): uses HashiCorp Vault / OpenBao Transit API.  "
         "'local': uses a PKCS#12 wallet at pg_vault_tde.wallet_path.",
-        &pg_vault_tde_kms_provider, "vault", PGC_POSTMASTER,
-        0, NULL, NULL, NULL);
+        &pg_vault_tde_kms_provider, "", PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /* Local wallet path (v1.5) — default resolved at runtime from $PGDATA */
     DefineCustomStringVariable("pg_vault_tde.wallet_path",
@@ -802,15 +802,15 @@ _PG_init(void)
         "Used only when pg_vault_tde.kms_provider = 'local'.  "
         "Default: $PGDATA/base/<DB_OID>/pg_vault_tde/wallet.p12",
         &pg_vault_tde_wallet_path, "", PGC_SUSET,
-        0, NULL, NULL, wallet_path_show_hook);
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /* Passphrase env var NAME — never the passphrase itself (v1.5) */
     DefineCustomStringVariable("pg_vault_tde.wallet_passphrase_env",
         "Name of the environment variable holding the wallet passphrase",
         "The passphrase is read from getenv(wallet_passphrase_env) at "
         "startup.  NEVER put the passphrase in postgresql.conf directly.",
-        &pg_vault_tde_wallet_passphrase_env, "PG_TDE_WALLET_PASS",
-        PGC_POSTMASTER, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+        &pg_vault_tde_wallet_passphrase_env, "",
+        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /* Auto-open wallet on startup (v1.5) */
     DefineCustomBoolVariable("pg_vault_tde.wallet_auto_open",
@@ -818,8 +818,8 @@ _PG_init(void)
         "When true (default), opens the wallet during shmem_startup_hook "
         "if the passphrase env var is set.  When false, defers opening "
         "until the first encrypted relation access.",
-        &pg_vault_tde_wallet_auto_open, true, PGC_POSTMASTER,
-        0, NULL, NULL, NULL);
+        &pg_vault_tde_wallet_auto_open, true, PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /* Max encrypted relations in shmem cache (v1.5) */
     DefineCustomIntVariable("pg_vault_tde.max_encrypted_relations",
@@ -837,7 +837,7 @@ _PG_init(void)
         "When true (default in v1.5), TOAST tables for encrypted_heap "
         "relations use encrypted_heap AM and encrypt each chunk with "
         "AES-256-GCM.  Set to false only for debugging or migration.",
-        &pg_vault_tde_toast_encryption, true, PGC_SIGHUP,
+        &pg_vault_tde_toast_encryption, true, PGC_SUSET,
         0, NULL, NULL, NULL);
 
     /* ----------------------------------------------------------------
@@ -856,7 +856,7 @@ _PG_init(void)
         "Incompatible with wallet_passphrase_env if both are set.  "
         "wallet_passphrase_command takes priority if set.",
         &pg_vault_tde_wallet_passphrase_file, "",
-        PGC_POSTMASTER, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /*
      * wallet_passphrase_command — shell command whose stdout is the
@@ -872,7 +872,7 @@ _PG_init(void)
         "and wallet_passphrase_file.  Never use in production without "
         "securing the command output.",
         &pg_vault_tde_wallet_passphrase_command, "",
-        PGC_POSTMASTER, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /*
      * wallet_dev_mode_passphrase — literal plaintext passphrase for
@@ -884,7 +884,7 @@ _PG_init(void)
         "Convenience for CI pipelines.  Never set in production.  "
         "Emits a WARNING on every use.  Ignored when dev_mode = off.",
         &pg_vault_tde_wallet_dev_mode_passphrase, "",
-        PGC_USERSET, GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE,
+        PGC_SUSET, GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE,
         NULL, NULL, NULL);
 
     /*
@@ -896,8 +896,8 @@ _PG_init(void)
         "Enable development-only conveniences (insecure in production)",
         "When true, pg_vault_tde.wallet_dev_mode_passphrase may be used "
         "as the wallet passphrase.  Always false in production.",
-        &pg_vault_tde_dev_mode, false, PGC_POSTMASTER,
-        0, NULL, NULL, NULL);
+        &pg_vault_tde_dev_mode, false, PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /* Chain hooks so other extensions coexist correctly. */
     prev_shmem_request_hook = shmem_request_hook;

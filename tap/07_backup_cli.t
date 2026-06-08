@@ -1,7 +1,7 @@
 # tap/07_backup_cli.t - CLI argument validation: missing required flags, unsupported options, bad connections
 use strict;
 use warnings;
-use Test::More tests => 12;
+use Test::More tests => 16;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 

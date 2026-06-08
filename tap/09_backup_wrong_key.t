@@ -1,7 +1,7 @@
 # tap/09_backup_wrong_key.t - Wrong passphrase and missing wallet scenarios
 use strict;
 use warnings;
-use Test::More tests => 8;
+use Test::More tests => 9;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 
@@ -28,18 +28,19 @@ $node->command_ok(
 
 $node->safe_psql('postgres', 'DROP TABLE keyed_data;');
 
-# Switch passphrase to wrong value and reload
-$node->adjust_conf('postgresql.conf',
-    'pg_vault_tde.wallet_passphrase_command', "'echo wrong-password'");
+$node->append_conf('postgresql.conf',
+    "pg_vault_tde.wallet_passphrase_command = 'echo wrong-password'\n");
 $node->reload;
+
+my $debug = $node->safe_psql('postgres', 'SHOW pg_vault_tde.wallet_passphrase_command');
+like($debug, qr/echo wrong-password/);
 
 $node->command_fails(
     ['pg_restore_tde', '-i', $dump_file, '-U', 'postgres', '-d', 'postgres'],
     'pg_restore_tde fails when passphrase is wrong (DEK unwrap fails)');
 
-# Restore correct passphrase — restore must now succeed
-$node->adjust_conf('postgresql.conf',
-    'pg_vault_tde.wallet_passphrase_command', "'echo correct-password'");
+$node->append_conf('postgresql.conf',
+    "pg_vault_tde.wallet_passphrase_command = 'echo correct-password'\n");
 $node->reload;
 
 $node->command_ok(
@@ -74,10 +75,9 @@ SKIP: {
     ok(-f $wallet_path, 'Wallet file restored after test');
 }
 
-# pg_vault_tde.wallet_path points to non-existent file
-$node->adjust_conf('postgresql.conf',
-    'pg_vault_tde.wallet_path', "'/nonexistent/path/wallet_" . $$ . ".p12'");
-$node->reload;
+my $nonexistent_wallet = '/nonexistent/path/wallet_' . $$ . '.p12';
+$node->safe_psql('postgres',
+    "ALTER DATABASE postgres SET pg_vault_tde.wallet_path TO '$nonexistent_wallet'");
 
 $node->command_fails(
     ['pg_dump_tde', '-o', $node->data_dir . '/missing_wallet.dump',
