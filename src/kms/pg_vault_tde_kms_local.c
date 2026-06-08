@@ -40,7 +40,9 @@
 #include "utils/elog.h"
 #include "access/table.h"
 #include "utils/fmgroids.h"
+#include "utils/guc.h"
 #include "catalog/indexing.h"
+#include "catalog/pg_db_role_setting.h"
 
 #include <openssl/evp.h>
 #include <openssl/pkcs12.h>
@@ -141,7 +143,9 @@ static void local_shutdown(void);
 static bool local_open_wallet(const char *path, const char *passphrase,
                               unsigned char *kek_out);
 static void local_create_wallet_file(const char *path,
-                                     const char *passphrase);
+                                     const char *passphrase, 
+                                     const unsigned char* kek, 
+                                     int kek_len);
 static bool local_wrap_dek_with_pass(const unsigned char *dek, int dek_len,
                                      unsigned char *wrapped_out, int *out_len,
                                      const char *passphrase,
@@ -161,6 +165,7 @@ static bool local_unwrap_dek_with_kek(const unsigned char *wrapped,
 static bool local_derive_kek_from_pass(const char *passphrase,
                                        unsigned char *kek_out);
 static const char *local_get_wallet_path(void);
+static void local_set_wallet(const char *path);
 static bool local_get_passphrase(char *pass_out, Size pass_max);
 static bool local_passphrase_from_env(char *pass_out, Size pass_max);
 static bool local_passphrase_from_file(char *pass_out, Size pass_max);
@@ -188,6 +193,8 @@ pg_vault_tde_kms_local_provider(void)
 {
     return &local_provider_impl;
 }
+
+
 
 /* -------------------------------------------------------------------------
  * local_init — open wallet on backend startup
@@ -520,7 +527,7 @@ local_derive_kek_from_pass(const char *passphrase, unsigned char *kek_out)
 
     if (PKCS5_PBKDF2_HMAC(passphrase, -1,
                           (const unsigned char *) "pg_vault_tde_kek_v1",
-                          19,                       /* salt length */
+                          19,                                 /* salt length */
                           LOCAL_PBKDF2_ITERS,
                           EVP_sha256(),
                           TDE_DEK_LEN, kek_out) != 1)
@@ -577,7 +584,7 @@ local_wrap_dek(const unsigned char *dek, int dek_len,
         path = (local_wallet_state && local_wallet_state->wallet_path[0])
                ? local_wallet_state->wallet_path
                : local_get_wallet_path();
-
+               
         ok = local_wrap_dek_with_pass(dek, dek_len, wrapped_out, out_len,
                                       pass, path);
         OPENSSL_cleanse(pass, sizeof(pass));
@@ -706,7 +713,9 @@ local_shutdown(void)
 /*
  * local_get_wallet_path — resolve wallet path from GUC or default.
  *
- * Returns a pointer to a static buffer — do not free.
+ * Also registered as the show_hook for pg_vault_tde.wallet_path so that
+ * SHOW returns the computed default even when the GUC is not set in
+ * postgresql.conf.  Returns a pointer to a static buffer — do not free.
  */
 static const char *
 local_get_wallet_path(void)
@@ -716,10 +725,49 @@ local_get_wallet_path(void)
     if (pg_vault_tde_wallet_path && pg_vault_tde_wallet_path[0] != '\0')
         return pg_vault_tde_wallet_path;
 
-    
+    /*
+     * DataDir is set during postmaster startup; MyDatabaseId is valid only
+     * after the backend has attached to a database.  Both can be absent when
+     * this function is called from _PG_init or early GUC-show hooks.
+     */
+    if (!DataDir || !OidIsValid(MyDatabaseId))
+        return "";
+
     snprintf(path_buf, sizeof(path_buf),
              "%s/base/%u/pg_vault_tde/wallet.p12", DataDir, MyDatabaseId);
+
     return path_buf;
+}
+
+/*
+ * local_set_wallet — set wallet_path GUC for the current session and persist
+ * it at database level so reconnecting backends inherit the same path.
+ *
+ * Must be called after the wallet file path is finalised (i.e. after the
+ * parent directory is created but before writing the wallet).
+ */
+static void
+local_set_wallet(const char *path)
+{
+    VariableSetStmt *setstmt;
+
+    Assert(path != NULL && path[0] != '\0');
+
+    /* 1. Update the current session so SHOW returns the correct value. */
+    SetConfigOption("pg_vault_tde.wallet_path", path, PGC_SUSET, PGC_S_SESSION);
+
+    /*
+     * 2. Persist the current session value to pg_db_role_setting for this
+     *    database only (equivalent to ALTER DATABASE … SET FROM CURRENT).
+     *    VAR_SET_CURRENT requires no args — it reads the value already set
+     *    by the SetConfigOption call above.
+     */
+    setstmt        = makeNode(VariableSetStmt);
+    setstmt->kind  = VAR_SET_CURRENT;
+    setstmt->name  = "pg_vault_tde.wallet_path";
+    setstmt->args  = NIL;
+
+    AlterSetting(MyDatabaseId, InvalidOid, setstmt);
 }
 
 /* -------------------------------------------------------------------------
@@ -887,8 +935,11 @@ local_get_passphrase(char *pass_out, Size pass_max)
     int active_sources = 0;
     bool has_command = (pg_vault_tde_wallet_passphrase_command &&
                         pg_vault_tde_wallet_passphrase_command[0] != '\0');
+    /* Count env source only when the named variable is actually set in the
+     * environment; the GUC just names the variable to look up. */
     bool has_env     = (pg_vault_tde_wallet_passphrase_env &&
-                        pg_vault_tde_wallet_passphrase_env[0] != '\0');
+                        pg_vault_tde_wallet_passphrase_env[0] != '\0' &&
+                        getenv(pg_vault_tde_wallet_passphrase_env) != NULL);
     bool has_file    = (pg_vault_tde_wallet_passphrase_file &&
                         pg_vault_tde_wallet_passphrase_file[0] != '\0');
 
@@ -961,7 +1012,10 @@ local_open_wallet(const char *path, const char *passphrase,
     PKCS12   *p12 = NULL;
     EVP_PKEY *pkey = NULL;
     X509     *cert = NULL;
+    STACK_OF(X509) *ca  = NULL;
     bool      ok   = false;
+    unsigned char kek_buffer[32];
+    size_t kek_len     = sizeof(kek_buffer);
 
     Assert(path != NULL);
     Assert(passphrase != NULL);
@@ -986,54 +1040,34 @@ local_open_wallet(const char *path, const char *passphrase,
         return false;
     }
 
-    /*
-     * pg_vault_tde wallet uses a "passphrase-only" PKCS#12 structure:
-     * no certificates or private keys.  We derive the KEK from the
-     * passphrase using PKCS5_PBKDF2_HMAC with SHA-256, using the
-     * PKCS#12 MAC salt as the PBKDF2 salt.
-     *
-     * This is a simplified model.  In production we would use
-     * PKCS12_parse() to extract an explicitly stored AES-256-CBC
-     * wrapped KEK from a PrivateKeyInfo bag.  That is planned for
-     * v1.5 RTM; this skeleton uses PBKDF2 derivation for now to
-     * allow the test suite to pass.
-     */
-    if (PKCS12_verify_mac(p12, passphrase, -1))
+    if(PKCS12_verify_mac(p12, passphrase, -1))
     {
-        /*
-         * Derive KEK from passphrase + PKCS#12 MAC salt.
-         * We need the raw salt bytes from the PKCS#12 MAC data.
-         * For now use the passphrase directly with a fixed iteration
-         * count as a placeholder — the full implementation uses
-         * PKCS12_get_attr() to extract the stored KEK bag.
-         */
-        if (PKCS5_PBKDF2_HMAC(passphrase, -1,
-                               (const unsigned char *) "pg_vault_tde_kek_v1",
-                               19,   /* salt length */
-                               LOCAL_PBKDF2_ITERS,
-                               EVP_sha256(),
-                               TDE_DEK_LEN, kek_out) == 1)
-        {
-            ok = true;
+        if(PKCS12_parse(p12, passphrase, &pkey, &cert, &ca)){
+            if(EVP_PKEY_get_raw_private_key(pkey, kek_buffer, &kek_len) != 1)
+                ereport(WARNING,
+                    errmsg("pg_vault_tde: error while extracting the kek"));
+            else 
+                ok = true;
         }
         else
-        {
             ereport(WARNING,
-                    errmsg("pg_vault_tde: PBKDF2 key derivation failed: %s",
-                           ERR_reason_error_string(ERR_get_error())));
-        }
+                errmsg("pg_vault_tde: PKCS#12 parsing failed"));
     }
-    else
-    {
+    else    
         ereport(WARNING,
-                errmsg("pg_vault_tde: wallet MAC verification failed — "
-                       "wrong passphrase or corrupt wallet"));
-    }
+                errmsg(("pg_vault_tde: wallet MAC verification failed - "
+                     "wrong passphrase or corrupt wallet")));
 
-    if (pkey) EVP_PKEY_free(pkey);
-    if (cert) X509_free(cert);
+    if(pkey) EVP_PKEY_free(pkey);
+    if(cert) X509_free(cert);
+    if(ca) sk_X509_pop_free(ca, X509_free);
+
     PKCS12_free(p12);
 
+    /* Only copy the KEK when parsing succeeded; avoids writing uninitialized bytes on error. */
+    if(ok) memcpy(kek_out, kek_buffer, kek_len);
+
+    OPENSSL_cleanse(kek_buffer, kek_len);
     return ok;
 }
 
@@ -1064,6 +1098,8 @@ pg_vault_tde_wallet_init_sql(PG_FUNCTION_ARGS)
     PKCS12       *p12 = NULL;
     FILE         *fp;
     struct stat   st;
+    unsigned char kek[32];
+    EVP_PKEY       *pkey = NULL;
 
     /* Superuser check */
     if (!superuser())
@@ -1126,49 +1162,55 @@ pg_vault_tde_wallet_init_sql(PG_FUNCTION_ARGS)
         }
     }
 
-    /*
-     * Build a passphrase-authenticated PKCS#12 structure.
-     *
-     * PKCS12_create_ex(pkey=NULL, cert=NULL, ca=NULL) is rejected on
-     * OpenSSL 3.0.x (Ubuntu 22.04 ships 3.0.2) with
-     * PKCS12_R_INVALID_NULL_ARGUMENT — the 3.0.x code requires at least
-     * one of pkey/cert/ca to be non-NULL.  This was relaxed in 3.3+.
-     *
-     * We use the lower-level API instead:
-     *   PKCS12_init(NID_pkcs7_data) — allocate an empty AuthSafe
-     *   PKCS12_set_mac(...)         — attach a passphrase-based MAC
-     *
-     * The wallet file is used solely for passphrase verification.
-     * Actual DEKs are wrapped with AES-256-WRAP and stored in
-     * pg_vault_tde_catalog — they are never inside this file.
-     */
-    p12 = PKCS12_init(NID_pkcs7_data);
-    if (!p12)
+    local_set_wallet(path);
+
+    if(!pg_strong_random(kek, 32))
     {
         OPENSSL_cleanse(passphrase, strlen(passphrase));
         pfree(passphrase);
-        ereport(ERROR,
-                errmsg("pg_vault_tde: PKCS12_init failed: %s",
-                       ERR_reason_error_string(ERR_get_error())));
+
+        ereport(ERROR, 
+                errmsg("pg_vault_tde: KEK generation failed"));
     }
-    /*
-     * salt=NULL tells OpenSSL to generate a random 8-byte salt internally.
-     * iter=PKCS12_DEFAULT_ITER (2048), md=SHA-256.
-     */
-    if (PKCS12_set_mac(p12, passphrase, -1,
-                       NULL, 0,                 /* salt: random */
-                       PKCS12_DEFAULT_ITER,
-                       EVP_sha256()) != 1)
+    
+    pkey = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, kek, sizeof(kek));
+    if(!pkey)
     {
-        PKCS12_free(p12);
+        OPENSSL_cleanse(kek, sizeof(kek));
         OPENSSL_cleanse(passphrase, strlen(passphrase));
         pfree(passphrase);
-        ereport(ERROR,
-                errmsg("pg_vault_tde: PKCS12_set_mac failed: %s",
-                       ERR_reason_error_string(ERR_get_error())));
+        ereport(ERROR, 
+                errmsg("pg_vault_tde: EVP_KEY creation failed"));
     }
 
-    /* Write wallet to disk with exclusive mode (O_EXCL) and 0600 perms */
+    /*
+     * The 8th argument (maciter) was previously -1, which in OpenSSL 3.x
+     * disables the PKCS#12 MAC entirely.  A wallet without a MAC cannot be
+     * verified by PKCS12_verify_mac, breaking local_open_wallet on the first
+     * unwrap attempt.  PKCS12_DEFAULT_ITER (2048) enables proper MAC protection.
+     */
+    p12 = PKCS12_create(passphrase,
+                        "pg_vault_tde_kek",
+                        pkey,
+                        NULL,
+                        NULL,
+                        NID_aes_256_cbc,
+                        NID_aes_256_cbc,
+                        PKCS12_DEFAULT_ITER,
+                        PKCS12_DEFAULT_ITER,
+                        0);
+
+    OPENSSL_cleanse(kek, sizeof(kek));
+    EVP_PKEY_free(pkey);
+
+    if(!p12)
+    {
+        OPENSSL_cleanse(passphrase, strlen(passphrase));
+        pfree(passphrase);
+        ereport(ERROR, 
+                errmsg("pg_vault_tde: PKCS12 wallet creation failed"));
+    }
+
     fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
     if (fd < 0)
     {
@@ -1199,9 +1241,37 @@ pg_vault_tde_wallet_init_sql(PG_FUNCTION_ARGS)
         ereport(WARNING,
                 errmsg("pg_vault_tde: chmod(wallet, 0600) failed: %m"));
 
-    /* Mark wallet as open */
+    /*
+     * Open the freshly created wallet to derive and cache the KEK.
+     * Without this, the first wrap_dek call after wallet_init would take the
+     * slow path (re-read passphrase from GUC source), which adds latency and
+     * fails if the env var passphrase differs from the one just used here.
+     */
     if (local_wallet_state)
-        local_wallet_state->wallet_open = true;
+    {
+        unsigned char kek_cache[TDE_DEK_LEN];
+
+        if (local_open_wallet(path, passphrase, kek_cache))
+        {
+            memcpy(local_wallet_state->kek, kek_cache, TDE_DEK_LEN);
+            local_wallet_state->kek_loaded  = true;
+            local_wallet_state->wallet_open = true;
+            local_wallet_state->last_opened = GetCurrentTimestamp();
+            if (local_wallet_state->wallet_path == NULL ||
+                local_wallet_state->wallet_path[0] == '\0')
+                local_wallet_state->wallet_path =
+                    MemoryContextStrdup(TopMemoryContext, path);
+        }
+        else
+        {
+            /* Wallet was just written — this should never fail */
+            ereport(WARNING,
+                    errmsg("pg_vault_tde: wallet created but could not be "
+                           "re-opened for KEK caching at \"%s\"", path));
+            local_wallet_state->wallet_open = true;
+        }
+        OPENSSL_cleanse(kek_cache, TDE_DEK_LEN);
+    }
 
     OPENSSL_cleanse(passphrase, strlen(passphrase));
     pfree(passphrase);
@@ -1221,36 +1291,44 @@ pg_vault_tde_wallet_init_sql(PG_FUNCTION_ARGS)
  * Returns true on success; on error emits ereport(ERROR) (longjmp).
  * -------------------------------------------------------------------------*/
 static void
-local_create_wallet_file(const char *dest_path, const char *passphrase)
+local_create_wallet_file(const char *dest_path, const char *passphrase, const unsigned char* kek, int kek_len)
 {
     char    tmp_path[MAXPGPATH];
     PKCS12 *p12;
     int     fd;
     FILE   *fp;
+    EVP_PKEY* pkey;
 
     Assert(dest_path != NULL);
     Assert(passphrase != NULL);
+    Assert(kek != NULL);
+    Assert(kek_len != NULL);
 
     snprintf(tmp_path, sizeof(tmp_path), "%s.new", dest_path);
 
-    /*
-     * Build a MAC-only PKCS#12 (see wallet_init_sql for full rationale).
-     * PKCS12_create_ex rejects pkey=cert=ca=NULL on OpenSSL 3.0.x.
-     */
-    p12 = PKCS12_init(NID_pkcs7_data);
-    if (!p12)
-        ereport(ERROR,
-                errmsg("pg_vault_tde: PKCS12_init failed: %s",
-                       ERR_reason_error_string(ERR_get_error())));
-    if (PKCS12_set_mac(p12, passphrase, -1,
-                       NULL, 0,              /* salt: random */
-                       PKCS12_DEFAULT_ITER,
-                       EVP_sha256()) != 1)
+    pkey = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, kek, kek_len);
+    if(!pkey)
     {
-        PKCS12_free(p12);
-        ereport(ERROR,
-                errmsg("pg_vault_tde: PKCS12_set_mac failed: %s",
-                       ERR_reason_error_string(ERR_get_error())));
+        ereport(ERROR, 
+                errmsg("pg_vault_tde: EVP_KEY creation failed"));
+    }
+
+    p12 = PKCS12_create(passphrase, 
+                        "pg_vault_tde_kek", 
+                        pkey, 
+                        NULL, 
+                        NULL, 
+                        NID_aes_256_cbc, 
+                        NID_aes_256_cbc, 
+                        PKCS12_DEFAULT_ITER, 
+                        PKCS12_DEFAULT_ITER, 
+                        0);
+    EVP_PKEY_free(pkey);
+
+    if(!p12)
+    {
+        ereport(ERROR, 
+                errmsg("pg_vault_tde: PKCS12 wallet creation failed"));
     }
 
     fd = open(tmp_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
@@ -1453,14 +1531,7 @@ pg_vault_tde_wallet_change_passphrase_sql(PG_FUNCTION_ARGS)
                 errmsg("pg_vault_tde: wrong passphrase (could not open wallet)"));
     }
 
-    /*
-     * Step 1b: derive the NEW KEK from new_pass via PBKDF2 ONLY — do NOT
-     * call local_open_wallet() with new_pass: the wallet file is still
-     * MAC-authenticated under the old passphrase, so PKCS12_verify_mac()
-     * would fail and the rotation would never start.  We rebuild the
-     * file under new_pass at the end of this function.
-     */
-    if (!local_derive_kek_from_pass(new_pass, new_kek))
+    if(!pg_strong_random(new_kek, sizeof(new_kek)))
     {
         OPENSSL_cleanse(old_pass, strlen(old_pass));
         OPENSSL_cleanse(new_pass, strlen(new_pass));
@@ -1469,7 +1540,7 @@ pg_vault_tde_wallet_change_passphrase_sql(PG_FUNCTION_ARGS)
         pfree(old_pass);
         pfree(new_pass);
         ereport(ERROR,
-                errmsg("pg_vault_tde: change_passphrase: could not derive new KEK"));
+                errmsg("pg_vault_tde: change_passphrase: could not generate new KEK"));
     }
 
     /* Step 2: fetch catalog entries */
@@ -1607,7 +1678,7 @@ pg_vault_tde_wallet_change_passphrase_sql(PG_FUNCTION_ARGS)
     /* Step 4: write new wallet file with new passphrase (atomic rename).
      * From here on, on-disk MAC is authenticated under new_pass.
      */
-    local_create_wallet_file(path, new_pass);
+    local_create_wallet_file(path, new_pass, new_kek, TDE_DEK_LEN);
 
     /* Step 5: evict shmem — next access loads with new KEK */
     pg_vault_tde_catalog_evict_all();
@@ -1859,7 +1930,7 @@ pg_vault_tde_wallet_rotate_kek_sql(PG_FUNCTION_ARGS)
                            "with current passphrase"));
         }
     }
-    if (!local_derive_kek_from_pass(new_pass, new_kek))
+    if (!pg_strong_random(new_kek, sizeof(new_kek)))
     {
         OPENSSL_cleanse(old_pass, sizeof(old_pass));
         OPENSSL_cleanse(new_pass, strlen(new_pass));
@@ -1879,7 +1950,7 @@ pg_vault_tde_wallet_rotate_kek_sql(PG_FUNCTION_ARGS)
         OPENSSL_cleanse(new_pass, strlen(new_pass));
         OPENSSL_cleanse(old_kek, TDE_DEK_LEN);
         OPENSSL_cleanse(new_kek, TDE_DEK_LEN);
-        pfree(old_pass); pfree(new_pass);
+        pfree(new_pass);
         ereport(ERROR, errmsg("pg_vault_tde: catalog table pg_vault_tde_catalog absent"));
     }
 
@@ -1996,7 +2067,7 @@ pg_vault_tde_wallet_rotate_kek_sql(PG_FUNCTION_ARGS)
     table_close(catalog_rel, ShareRowExclusiveLock);
 
     /* Write the new wallet file (contains new passphrase protecting the KEK) */
-    local_create_wallet_file(path, new_pass);
+    local_create_wallet_file(path, new_pass, new_kek, sizeof(new_kek));
 
     pg_vault_tde_catalog_evict_all();
 

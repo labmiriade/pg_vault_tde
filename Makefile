@@ -69,7 +69,6 @@ OBJS = \
 	src/tam/pg_vault_tde_tam.o \
 	src/tam/pg_vault_tde_toast.o \
 	src/iam/pg_vault_tde_iam.o \
-	src/backup/pg_vault_tde_backup.o \
 	src/logical/pg_vault_tde_pgoutput.o
 
 # SQL scripts installed as part of the extension
@@ -77,7 +76,8 @@ OBJS = \
 DATA = sql/pg_vault_tde--1.0.sql \
        sql/pg_vault_tde--1.0--1.4.sql \
        sql/pg_vault_tde--1.4--1.5.sql \
-       sql/pg_vault_tde--1.5--1.6.sql
+       sql/pg_vault_tde--1.5--1.6.sql \
+       sql/pg_vault_tde--1.6--1.7.sql
 
 # pg_regress test targets (filenames without .sql suffix)
 REGRESS = pg_vault_tde_init
@@ -173,3 +173,100 @@ ci-clean:
 # Full pipeline alias
 .PHONY: ci-full
 ci-full: ci-all
+
+# ---------------------------------------------------------------------------
+# pg_dump_tde: standalone backup encryption wrapper for pg_dump
+#
+# This binary is NOT a PostgreSQL extension module (.so).  It is a standalone
+# C tool that forks pg_dump, intercepts its stdout through a pipe, and
+# re-encrypts each 64 KB block with AES-256-GCM before writing to disk.
+#
+# Build:    make pg_dump_tde
+# Install:  make install-pg-dump-tde
+# Clean:    make clean-pg-dump-tde
+#
+# The object files use a _bin.o suffix to avoid collisions with the _bin.o
+# objects already compiled as -fPIC for the extension .so.
+# ---------------------------------------------------------------------------
+PG_DUMP_TDE_SHARED = \
+	src/backup/pg_vault_tde_backup.c \
+	src/backup/pg_dump_tde_kms_vault.c \
+	src/backup/pg_dump_tde_kms_local.c 
+
+PG_DUMP_TDE_SRCS = \
+	$(PG_DUMP_TDE_SHARED) \
+	src/backup/pg_dump_tde.c 
+
+PG_RESTORE_TDE_SRCS = \
+	$(PG_DUMP_TDE_SHARED) \
+	src/backup/pg_restore_tde.c 
+
+PG_DUMP_TDE_OBJS = $(PG_DUMP_TDE_SRCS:.c=_bin.o)
+PG_RESTORE_TDE_OBJS = $(PG_RESTORE_TDE_SRCS:.c=_bin.o)
+
+# pkg-config fallback: if not available, use well-known paths.
+HAS_PKG_CONFIG := $(shell command -v pkg-config 2>/dev/null)
+
+ifdef HAS_PKG_CONFIG
+  OPENSSL_CFLAGS  := $(shell pkg-config --cflags openssl)
+  OPENSSL_LIBS    := $(shell pkg-config --libs openssl)
+  LIBCURL_CFLAGS  := $(shell pkg-config --cflags libcurl)
+  LIBCURL_LIBS    := $(shell pkg-config --libs libcurl)
+else
+  OPENSSL_CFLAGS  :=
+  OPENSSL_LIBS    := -lssl -lcrypto
+  LIBCURL_CFLAGS  :=
+  LIBCURL_LIBS    := -lcurl
+endif
+
+PG_DUMP_TDE_CFLAGS = \
+	$(TDE_OPT_CFLAGS) \
+	$(TDE_ARCH_CFLAGS) \
+	-Wall -Wextra -std=c99 \
+	-Wno-unused-parameter \
+	-DFRONTEND \
+	-D_GNU_SOURCE \
+	-I$(shell $(PG_CONFIG) --includedir) \
+	-I$(shell $(PG_CONFIG) --includedir-server) \
+	-Isrc \
+	-Isrc/include \
+	$(OPENSSL_CFLAGS) \
+	$(LIBCURL_CFLAGS)
+
+PG_DUMP_TDE_LDFLAGS = \
+    -L$(shell $(PG_CONFIG) --libdir) \
+    -L$(shell $(PG_CONFIG) --pkglibdir) \
+    -lpq -lpgfeutils -lpgcommon -lpgport \
+    $(OPENSSL_LIBS) \
+    $(LIBCURL_LIBS)
+
+# Pattern rule for _bin.o objects (standalone compilation, no -fPIC).
+# Must be declared before include $(PGXS) would shadow it, but we define
+# it after so PGXS %.o rules are not confused.
+%_bin.o: %.c
+	$(CC) $(PG_DUMP_TDE_CFLAGS) -c -o $@ $<
+
+pg_dump_tde: $(PG_DUMP_TDE_OBJS)
+	$(CC) -o $@ $^ $(PG_DUMP_TDE_LDFLAGS)
+
+pg_restore_tde: $(PG_RESTORE_TDE_OBJS)
+	$(CC) -o $@ $^ $(PG_DUMP_TDE_LDFLAGS)
+
+# Hook into the standard PGXS targets so pg_dump_tde is always built,
+# installed, and cleaned together with the extension.
+all: pg_dump_tde pg_restore_tde
+
+bindir := $(shell $(PG_CONFIG) --bindir)
+
+.PHONY: install-pg-dump-tde
+install-pg-dump-tde: pg_dump_tde pg_restore_tde
+	install -m 755 pg_dump_tde $(bindir)/pg_dump_tde
+	install -m 755 pg_restore_tde $(bindir)/pg_restore_tde
+
+install: install-pg-dump-tde
+
+.PHONY: clean-pg-dump-tde
+clean-pg-dump-tde:
+	rm -f pg_dump_tde pg_restore_tde $(PG_DUMP_TDE_OBJS) $(PG_RESTORE_TDE_OBJS)
+
+clean: clean-pg-dump-tde

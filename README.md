@@ -9,7 +9,7 @@ decrypted after it leaves. Encryption keys are managed by **HashiCorp Vault** /
 **OpenBao** or a **local PKCS#12 wallet** and cached in shared memory with
 automatic rotation.
 
-**Current release: v1.6** - 109 regression tests (52 v1.4 + 20 v1.5 + 37 v1.6), zero compiler warnings on PG 17 + PG 18.
+**Current release: v1.7** — 109 regression tests (52 v1.4 + 20 v1.5 + 37 v1.6), zero compiler warnings on PG 17 + PG 18.
 
 ### PostgreSQL Version Compatibility
 
@@ -243,6 +243,37 @@ pg_vault_tde.kms_provider = 'vault'   # HashiCorp Vault / OpenBao (default)
 # pg_vault_tde.kms_provider = 'kmip'   # KMIP 1.2 (v1.8)
 ```
 
+### Per-Database KMS Configuration
+
+Because all `pg_vault_tde` GUC parameters are declared `PGC_SUSET`, a superuser
+can assign **different KMS settings to individual databases** in the same cluster
+without restarting PostgreSQL.  Each connection picks up the effective GUC value
+for its own database, so `postgres` can use a central Vault instance while
+`tenant_a` uses a dedicated transit key and `tenant_b` uses a local wallet:
+
+```sql
+-- cluster-level default (postgresql.conf / ALTER SYSTEM)
+-- pg_vault_tde.kms_provider = 'vault'
+
+-- database "tenant_a" uses a dedicated Vault transit key
+ALTER DATABASE tenant_a SET pg_vault_tde.vault_key_name     = 'tde-dek-tenant-a';
+ALTER DATABASE tenant_a SET pg_vault_tde.vault_transit_mount = 'transit-tenants';
+
+-- database "tenant_b" uses a local wallet (no Vault dependency)
+ALTER DATABASE tenant_b SET pg_vault_tde.kms_provider = 'local';
+ALTER DATABASE tenant_b SET pg_vault_tde.wallet_passphrase_env = 'TDE_WALLET_B';
+
+-- verify effective settings for a database
+\connect tenant_b
+SHOW pg_vault_tde.kms_provider;        -- 'local'
+SELECT pg_vault_tde_health_check();
+```
+
+Settings applied with `ALTER DATABASE SET` take effect for **new connections**
+to that database and do not require a server restart.  The cluster-level defaults
+in `postgresql.conf` (or `ALTER SYSTEM`) act as the fallback for any database
+that does not override a parameter.
+
 ### Local Wallet Provider (v1.6 — Offline, No External Service)
 
 A PKCS#12-based encrypted file at
@@ -319,50 +350,64 @@ SELECT pg_vault_tde_rotate_online(tablename, batch_size);
 
 All parameters are in the `pg_vault_tde` namespace.
 
+Most parameters have context `suset` (superuser-settable), meaning a superuser
+can change them without restarting PostgreSQL and can scope them per-database
+with `ALTER DATABASE SET`.  The only exception is `max_encrypted_relations`,
+which has context `postmaster` because it controls shared memory allocation at
+startup.
+
+**Context summary:**
+- `suset` — superuser can `SET` at session level or via `ALTER DATABASE SET` /
+  `ALTER ROLE SET`; takes effect for new connections with no restart required.
+- `postmaster` — requires a server restart; set in `postgresql.conf` or via
+  `ALTER SYSTEM`.
+
 ### KMS Provider (v1.5+)
 
 | Parameter | Type | Default | Context | Description |
 |---|---|---|---|---|
-| `kms_provider` | string | `vault` | postmaster | Active KMS backend: `vault`, `local` (v1.6), `pkcs11` (v1.7), `kmip` (v1.8) |
-| `wallet_path` | string | `$PGDATA/base/<DB_OID>/pg_vault_tde/wallet.p12` | postmaster | Local wallet PKCS#12 file path (`kms_provider = 'local'`) |
-| `wallet_passphrase_env` | string | `''` | postmaster | Env var name holding wallet passphrase — env var NAME only, never the value |
-| `wallet_passphrase_file` | string | `''` | postmaster | File path containing wallet passphrase (trimmed; `0400` permission enforced) **(v1.6)** |
-| `wallet_passphrase_command` | string | `''` | postmaster | Shell command to retrieve passphrase (analogous to PG's `ssl_passphrase_command`) **(v1.6)** |
-| `wallet_dev_mode_passphrase` | string | `''` | userset | Convenience passphrase for dev/CI (only honoured when `dev_mode = on`) **(v1.6)** |
-| `dev_mode` | boolean | `off` | postmaster | Enable development mode features (wallet_dev_mode_passphrase) **(v1.6)** |
-| `wallet_auto_open` | boolean | `on` | postmaster | Auto-open wallet on startup if passphrase env var is set |
-| `max_encrypted_relations` | integer | `1024` | postmaster | Maximum number of per-table DEK entries in shmem (64–65536) |
-| `toast_encryption` | boolean | `on` | postmaster | Encrypt TOAST chunks with the parent relation's DEK (v1.5) |
+| `kms_provider` | string | `vault` | suset | Active KMS backend: `vault`, `local` (v1.6), `pkcs11` (v1.7), `kmip` (v1.8). Settable per-database via `ALTER DATABASE SET`. |
+| `wallet_path` | string | `$PGDATA/base/<DB_OID>/pg_vault_tde/wallet.p12` | suset | Local wallet PKCS#12 file path (`kms_provider = 'local'`). Default computed at runtime — `SHOW` returns the effective path even when not set in `postgresql.conf`. |
+| `wallet_passphrase_env` | string | `''` | suset | Env var name holding wallet passphrase — env var NAME only, never the value |
+| `wallet_passphrase_file` | string | `''` | suset | File path containing wallet passphrase (trimmed; `0400` permission enforced) **(v1.6)** |
+| `wallet_passphrase_command` | string | `''` | suset | Shell command to retrieve passphrase (analogous to PG's `ssl_passphrase_command`) **(v1.6)** |
+| `wallet_dev_mode_passphrase` | string | `''` | suset | Convenience passphrase for dev/CI (only honoured when `dev_mode = on`) **(v1.6)** |
+| `dev_mode` | boolean | `off` | suset | Enable development mode features (wallet_dev_mode_passphrase) **(v1.6)** |
+| `wallet_auto_open` | boolean | `on` | suset | Auto-open wallet on startup if passphrase env var is set |
+| `max_encrypted_relations` | integer | `1024` | postmaster | Maximum number of per-table DEK entries in shmem (64–65536). Requires restart — affects shared memory sizing. |
+| `toast_encryption` | boolean | `on` | suset | Encrypt TOAST chunks with the parent relation's DEK (v1.5) |
 
 ### Vault / OpenBao (`kms_provider = 'vault'`)
 
+All parameters are `suset` — settable per-database with `ALTER DATABASE SET`.
+
 | Parameter | Type | Default | Context | Description |
 |---|---|---|---|---|
-| `vault_url` | string | `''` | postmaster | Vault / OpenBao base URL |
-| `vault_namespace` | string | `''` | postmaster | Vault namespace (enterprise; empty for community) |
-| `vault_token` | string | `''` | postmaster | Auth token — hidden from `pg_settings` (superuser only) |
-| `vault_role_id` | string | `''` | postmaster | AppRole role_id UUID |
-| `vault_secret_id` | string | `''` | postmaster | AppRole secret_id — hidden from `pg_settings` (superuser only) |
-| `vault_role_name` | string | `''` | postmaster | AppRole role name for secret_id rotation after login **(v1.4)** |
-| `vault_k8s_role` | string | `''` | postmaster | Kubernetes JWT auth role name |
-| `vault_transit_mount` | string | `transit` | postmaster | Transit secrets engine mount path |
-| `vault_key_name` | string | `pg-tde-dek` | postmaster | Transit key name for DEK wrapping |
-| `vault_ca_cert` | string | `''` | postmaster | Path to CA bundle for Vault TLS verification |
-| `vault_timeout_ms` | integer | `5000` | postmaster | Vault HTTP timeout in ms (0 = no timeout) |
-| `vault_response_wrapping` | boolean | `off` | postmaster | Use Vault response-wrapping for AppRole secret_id (v1.5) |
+| `vault_url` | string | `''` | suset | Vault / OpenBao base URL |
+| `vault_namespace` | string | `''` | suset | Vault namespace (enterprise; empty for community) |
+| `vault_token` | string | `''` | suset | Auth token — hidden from `pg_settings` (superuser only) |
+| `vault_role_id` | string | `''` | suset | AppRole role_id UUID |
+| `vault_secret_id` | string | `''` | suset | AppRole secret_id — hidden from `pg_settings` (superuser only) |
+| `vault_role_name` | string | `''` | suset | AppRole role name for secret_id rotation after login **(v1.4)** |
+| `vault_k8s_role` | string | `''` | suset | Kubernetes JWT auth role name |
+| `vault_transit_mount` | string | `transit` | suset | Transit secrets engine mount path |
+| `vault_key_name` | string | `pg-tde-dek` | suset | Transit key name for DEK wrapping. Override per-database to isolate tenant keys. |
+| `vault_ca_cert` | string | `''` | suset | Path to CA bundle for Vault TLS verification |
+| `vault_timeout_ms` | integer | `5000` | suset | Vault HTTP timeout in ms (0 = no timeout) |
+| `vault_response_wrapping` | boolean | `off` | suset | Use Vault response-wrapping for AppRole secret_id (v1.5) |
 
 ### Background Worker
 
 | Parameter | Type | Default | Context | Description |
 |---|---|---|---|---|
-| `bgw_enabled` | boolean | `off` | postmaster | Enable background worker for automatic token renewal |
-| `token_renewal_interval` | integer | `3600` | postmaster | Token renewal interval in seconds (60–86400) |
+| `bgw_enabled` | boolean | `off` | suset | Enable background worker for automatic token renewal |
+| `token_renewal_interval` | integer | `3600` | suset | Token renewal interval in seconds (60–86400) |
 
 ### General
 
 | Parameter | Type | Default | Context | Description |
 |---|---|---|---|---|
-| `enabled` | boolean | `on` | superuser | Master switch — set `off` to measure TAM overhead without crypto |
+| `enabled` | boolean | `on` | suset | Master switch — set `off` to measure TAM overhead without crypto. Settable per-database. |
 | `dump_plaintext_warning` | boolean | `on` | sighup | Emit WARNING when `pg_dump`/`COPY TO` reads from an encrypted table (v1.7) |
 | `encrypt_statistics` | boolean | `off` | sighup | Encrypt `pg_statistic` MCVs/histograms for encrypted columns (v1.8) |
 | `audit_enabled` | boolean | `on` | sighup | Enable audit event logging to `pg_vault_tde_audit_log` (v1.7) |
@@ -376,7 +421,6 @@ All parameters are in the `pg_vault_tde` namespace.
 | `pg_vault_tde_set_test_dek()` | void | Inject a random ephemeral DEK (**dev/test only**) |
 |  `pg_vault_tde_rotate_key()` **deprecated** | void | Wipe DEK from shared cache, bump generation |
 | `pg_vault_tde_key_generation()` | bigint | Current generation counter |
-| `pg_vault_tde_backup_status()` | text | Backup encryption status string |
 | `pg_vault_tde_encrypt_test(text)` | bytea | Encrypt text via GCM (**test only**) |
 | `pg_vault_tde_decrypt_test(bytea)` | text | Decrypt bytea via GCM (**test only**) |
 | `pg_vault_tde_health_check()` | composite | KMS, DEK, crypto, and wallet status (15 columns) |
@@ -429,7 +473,9 @@ CREATE INDEX ON secrets USING tde_btree (id);
 | DELETE | ✅ Full | No-op (heapam header-only delete, no column data touched) |
 | HOT chains | ✅ Full | Header plaintext → HOT chain pointers preserved |
 | VACUUM | ✅ Full | Inherited from heapam (dead-tuple header only) |
-| pg_dump / pg_restore | ✅ Full | pg_dump reads via scan_getnextslot → decrypted |
+| CTAS   | ✅ Full | Per-table DEK registration before SELECT is executed |
+| `pg_dump` (plain) | ⚠️ Dump is plaintext | pg_dump reads via scan_getnextslot → decrypted. Use `pg_dump_tde` to re-encrypt the output. |
+| `pg_dump_tde` / `pg_restore_tde` | ✅ Full | Encrypted logical backup: dump wrapped with AES-256-GCM + DEK sealed in backup header. |
 | Streaming replication | ✅ Full | WAL ships encrypted bytes; standby decrypts at TAM layer |
 | Page checksums | ✅ Full | Checksums over encrypted content (complementary to GCM) |
 | Logical replication (non-TOAST) | ✅ Full (v1.2) | `pg_vault_tde_pgoutput` plugin decrypts tuples before streaming |
@@ -450,7 +496,7 @@ make ci-all
 PG_VERSION=17 make ci-all
 
 # Individual test stages:
-make ci-regress          # 109 SQL regression tests (vault provider)
+make ci-regress          # 109 SQL regression tests (vault provider) — tests 1-109 (test 110 deferred)
 make ci-wallet           # 109 SQL regression tests (local wallet provider)
 make ci-checksums        # 109 tests + page checksum compatibility
 make ci-tap              # TAP tests with mock Vault
@@ -522,8 +568,9 @@ Test coverage (109 tests = 52 v1.4 + 20 v1.5 + 37 v1.6):
 - Test 109: VACUUM FULL on table with STORAGE EXTERNAL columns **(v1.6)**
 
 > Test runner notes:
-> - `make ci-regress` (vault provider): 109/109 PASS, with conditional skips for `wal_level` (test 48), `pageinspect` (test 61) and wallet-only assertions (tests 74-80 when `kms_provider=local` is required).
-> - `make ci-wallet` (local provider): tests 73-79 PASS; test 80 SKIPS unless `wallet_passphrase_env` is wired up; tests 81-109 also PASS in wallet mode.
+> - `make ci-regress` (vault provider): 109/109 PASS, with conditional skips for `wal_level` (test 48), `pageinspect` (test 61) and wallet-only assertions (tests 74–80 when `kms_provider=local` is required).
+> - `make ci-wallet` (local provider): tests 73–79 PASS; test 80 SKIPS unless `wallet_passphrase_env` is wired up; tests 81–109 also PASS in wallet mode.
+> - Test 110 (WITH HOLD cursor plaintext spill) is permanently deferred — the executor's tuplestore layer bypasses the TAM write path, so pg_vault_tde cannot intercept it without core modifications. The test is commented out in `regression_test_v16.sql`.
 
 ---
 
@@ -650,6 +697,69 @@ rpmbuild -ba packaging/rpm/pg_vault_tde-arm.spec        # ARM CE optimised
 
 ---
 
+## Encrypted Backups (`pg_dump_tde` / `pg_restore_tde`)
+
+Plain `pg_dump` decrypts rows at read time (via the TAM), so the dump file is
+**plaintext**.  `pg_dump_tde` closes this gap by piping the dump through
+AES-256-GCM before touching disk:
+
+```bash
+# Encrypted dump
+pg_dump_tde -h localhost -U postgres -d mydb -o /backup/mydb.tde
+
+# Restore encrypted dump
+pg_restore_tde -h localhost -U postgres -d mydb -i /backup/mydb.tde
+```
+
+>All other `pg_dump` options are fed directly to it.
+
+### How it works
+
+1. `pg_dump_tde` forks `pg_dump -Fc` with stdout redirected to a pipe.
+2. It connects to PostgreSQL to read `pg_vault_tde.kms_provider` from GUCs.
+3. Generates a fresh DEK, wraps it via the active KMS provider, writes a
+   `tde_backup_header` (magic + format_version + wrapped_dek) to the output file.
+4. Reads the `pg_dump` stream in 64 KB blocks; encrypts each block as:
+
+   `[ Block length (4) | 0x02 (1) | IV (12) | Ciphertext | GCM-TAG (16) ]`
+
+   Block sequence number is bound as GCM AAD — reordering blocks is detectable.
+   
+   (Reading from a stream with `fread` not guarantee that the block is 64 KB every time,
+   that's why the block length is stored)
+5. If `pg_dump` fails mid-stream the partial output file is deleted automatically.
+
+### Block wire format
+
+```
+[ tde_backup_header ]
+[ Block 0: Block length (4) | 0x02 | IV(12) | CT(64 KB) | TAG(16) ]
+[ Block 1: Block length (4) | 0x02 | IV(12) | CT(64 KB) | TAG(16) ]
+...
+```
+
+Each block is independently authenticated — corruption is detected at the block
+level, not only at EOF.
+
+### Current limitations
+
+1. Only `-Fc` format is supported.
+
+2. `-j` option is **NOT** supported. Parallel jobs are only supported by `pg_dump`
+if the directory format (`-Fd`) is set.
+
+3. Fixed block size: 64 KB.
+
+4. Restore is locked to the original KEK used for DEK wrapping. This means that if we need to restore a dump into a new database that is using a different wallet (KMS local speaking) from the original, we can't. The old wallet or a new wallet containing the old KEK is needed.
+
+   Currently (v1.7) deleting a database (`DROP DATABASE`) deletes his .p12 wallet file. Dump files previous created from this database becomes undecryptable (if wallet file is lost).
+
+5. File-only output and input. The option `--output` or `-o` (for `pg_dump_tde`) and `--input`
+or `-i` (for `pg_restore_tde`) are mandatory. Neither piping nor reading from `stdin` are supported.
+
+6. Executing `pg_dump` still produces a plain-text backup
+---
+
 ## Performance
 
 ### Overhead vs Plain Heap
@@ -675,7 +785,7 @@ number of **pages**, not rows).
 
 ---
 
-## Limitations (v1.6)
+## Limitations (v1.7)
 
 See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
 

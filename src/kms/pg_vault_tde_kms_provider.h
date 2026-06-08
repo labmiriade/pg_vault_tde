@@ -152,7 +152,7 @@ typedef struct TdeKmsProvider
 } TdeKmsProvider;
 
 /*
- * tde_active_kms_provider — the selected KMS backend for this server.
+ * tde_active_kms_provider — the selected KMS backend for this connection.
  *
  * Assigned in pg_vault_tde.c _PG_init based on pg_vault_tde.kms_provider GUC.
  * All callers that need KMS operations use this pointer — NEVER call provider
@@ -160,6 +160,19 @@ typedef struct TdeKmsProvider
  *
  * Defined in pg_vault_tde.c; declared extern here so kms.c and tam.c can read
  * it without including pg_vault_tde.c's internals.
+ *
+ * PER-DATABASE KMS:
+ * Because pg_vault_tde.kms_provider (and all companion GUCs) are declared
+ * PGC_SUSET, a superuser can assign different KMS settings to individual
+ * databases in the same cluster without restarting PostgreSQL:
+ *
+ *   ALTER DATABASE tenant_a SET pg_vault_tde.kms_provider   = 'vault';
+ *   ALTER DATABASE tenant_a SET pg_vault_tde.vault_key_name = 'tde-dek-a';
+ *   ALTER DATABASE tenant_b SET pg_vault_tde.kms_provider   = 'local';
+ *
+ * Each backend resolves tde_active_kms_provider from the effective GUC value
+ * for its own database during connection setup.  The cluster-wide default in
+ * postgresql.conf is the fallback for databases that do not override.
  */
 extern const TdeKmsProvider *tde_active_kms_provider;
 

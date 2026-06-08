@@ -179,7 +179,8 @@ typedef struct TdeKmsProvider {
     bool (*health_check)(StringInfo report);
 } TdeKmsProvider;
 
-/* Global active provider — set by pg_vault_tde.kms_provider GUC at startup */
+/* Active provider for this connection — resolved from pg_vault_tde.kms_provider
+ * GUC at connection time (PGC_SUSET: may differ per database). */
 extern const TdeKmsProvider *tde_active_kms_provider;
 ```
 
@@ -315,6 +316,42 @@ else if (strcmp(guc_kms_provider, "kmip") == 0)
   DEK to caller's stack frame; `OPENSSL_cleanse(kek, 32)` immediately after
 - Wallet file permissions MUST be `0600` — enforced at create time and in `health_check()`
 - PKCS#11 (HSM-backed keys) is a separate `pkcs11` provider — `local` is software-only
+
+#### GUC context: all KMS parameters are PGC_SUSET
+
+All `pg_vault_tde` KMS GUCs (including `wallet_path`, `kms_provider`, all
+`vault_*` parameters, and all `wallet_*` parameters) use `PGC_SUSET` rather
+than `PGC_POSTMASTER`.  This serves two purposes:
+
+1. **Per-database KMS isolation**: a superuser can assign different KMS settings
+   to individual databases via `ALTER DATABASE SET pg_vault_tde.kms_provider = ...`
+   without restarting the server.  Each new connection resolves the effective GUC
+   value for its own database.
+
+2. **Runtime wallet init**: `pg_vault_tde_wallet_init()` can call
+   `SetConfigOption(..., PGC_SUSET, PGC_S_SESSION)` to update `wallet_path` for
+   the current session immediately after wallet creation.
+
+The only parameters that remain `PGC_POSTMASTER` are `max_encrypted_relations`
+(shared-memory sizing) and `crypto_provider` (OpenSSL provider selection at startup).
+
+A `show_hook` (`wallet_path_show_hook`, implemented in `pg_vault_tde_kms_local.c`) is
+registered so that `SHOW pg_vault_tde.wallet_path` returns the **computed** default path
+(`$PGDATA/base/<DB_OID>/pg_vault_tde/wallet.p12`) even when the GUC is not explicitly
+set in `postgresql.conf`.  Without the hook, `SHOW` returns the empty string stored in
+the GUC variable.
+
+`local_get_wallet_path()` guards against early calls (before `DataDir` is set or before
+the backend has connected to a database) by returning `""` when `DataDir == NULL` or
+`!OidIsValid(MyDatabaseId)`.
+
+#### `PKCS12_create` maciter parameter (v1.6 patch)
+
+The 8th argument to `PKCS12_create()` / `PKCS12_create_ex2()` (`maciter`) must be
+`PKCS12_DEFAULT_ITER` (2048), **not** `-1`.  In OpenSSL 3.x, `-1` disables the
+PKCS#12 MAC entirely, producing a wallet that `PKCS12_verify_mac` cannot authenticate
+— this causes `local_open_wallet` to fail with "wallet MAC verification failed" on
+the very first `wrap_dek` call after `wallet_init`.  Always use `PKCS12_DEFAULT_ITER`.
 
 ### Per-Table DEK Cache (v1.5+)
 

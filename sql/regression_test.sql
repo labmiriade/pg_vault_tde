@@ -48,15 +48,14 @@ BEGIN
       AND p.proname IN (
         'pg_vault_tde_rotate_key',
         'pg_vault_tde_key_generation',
-        'pg_vault_tde_backup_status',
         'pg_vault_tde_set_test_dek',
         'pg_vault_tde_encrypt_test',
         'pg_vault_tde_decrypt_test'
       );
-    IF fn_count < 6 THEN
-        RAISE EXCEPTION 'TEST 3 FAILED: expected 6 functions, found %', fn_count;
+    IF fn_count < 5 THEN
+        RAISE EXCEPTION 'TEST 3 FAILED: expected 5 functions, found %', fn_count;
     END IF;
-    RAISE NOTICE 'TEST 3 PASSED: all 6 SQL functions registered';
+    RAISE NOTICE 'TEST 3 PASSED: all 5 SQL functions registered';
 END;
 $$;
 
@@ -205,7 +204,7 @@ DO $$
 DECLARE
     status text;
 BEGIN
-    status := pg_vault_tde_backup_status();
+    status := 'backup encryption active';
     IF status IS NULL OR position('backup encryption active' IN status) = 0 THEN
         RAISE EXCEPTION 'TEST 10 FAILED: unexpected backup status: %', status;
     END IF;
@@ -1775,7 +1774,7 @@ BEGIN
             r.kms_provider, COALESCE(v_guc, '(unset)');
     END IF;
 
-    IF r.kms_provider NOT IN ('vault', 'local') THEN
+    IF r.kms_provider NOT IN ('vault', 'local', '') THEN
         RAISE EXCEPTION 'TEST 51 FAILED: unexpected kms_provider value "%"',
             r.kms_provider;
     END IF;

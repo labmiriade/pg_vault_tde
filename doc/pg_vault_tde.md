@@ -1,6 +1,6 @@
 # pg_vault_tde Technical Reference
 
-**Version**: 1.6  
+**Version**: 1.7  
 **PostgreSQL**: 17.x, 18.x (19.x planned)  
 **License**: BSD (PostgreSQL License)  
 **Copyright**: © 2026 Miriade S.r.l.
@@ -552,7 +552,7 @@ CREATE OPERATOR CLASS tde_bytea_ops DEFAULT FOR TYPE bytea USING tde_btree AS
     FUNCTION 1 byteacmp(bytea, bytea);
 ```
 
-### IAM Limitations (v1.6)
+### IAM Limitations (v1.7)
 
 `tde_btree` now supports native operator classes for `text`, `int4`, `int8`, `uuid`,
 `numeric`, `date`, `timestamptz` (added v1.5). **Caveat**: varlena types (`text`,
@@ -568,7 +568,7 @@ preserved by AES-SIV, regardless of type).
 
 ## Known Limitations
 
-### Current Limitations (v1.7)
+### Current Limitations (v1.7 — Current Release)
 
 | # | Limitation | Fix Version |
 |---|-----------|-------------|
@@ -725,8 +725,6 @@ SELECT pg_vault_tde_set_test_dek();     -- inject random ephemeral DEK (DEV/TEST
 SELECT pg_vault_tde_rotate_key();       -- wipe DEK from shmem, bump generation
 SELECT pg_vault_tde_key_generation();   -- → bigint: current epoch counter
 
--- Operations / monitoring
-SELECT pg_vault_tde_backup_status();    -- → text: backup encryption status
 
 -- Test / diagnostic (require DEK set; never use in production)
 SELECT pg_vault_tde_encrypt_test('text');   -- → bytea: [IV(12)|CT|TAG(16)]
@@ -736,28 +734,71 @@ SELECT pg_vault_tde_decrypt_test(bytes);    -- → text: plaintext (verifies GCM
 ### GUC Parameters
 
 All parameters are in the `pg_vault_tde` namespace and are registered in
-`_PG_init` via `DefineCustomXxxVariable`. They take effect at postmaster
-start (`PGC_POSTMASTER`); `enabled` is changeable by superusers at runtime
-(`PGC_SUSET`).
+`_PG_init` via `DefineCustomXxxVariable`.
 
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `vault_url` | string | `''` | Vault / OpenBao base URL |
-| `vault_namespace` | string | `''` | Vault namespace (enterprise; empty for community) |
-| `vault_token` | string | `''` | Auth token — hidden from `pg_settings` (`GUC_SUPERUSER_ONLY`) |
-| `vault_role_id` | string | `''` | AppRole role_id UUID |
-| `vault_secret_id` | string | `''` | AppRole secret_id — hidden from `pg_settings` (`GUC_SUPERUSER_ONLY`) |
-| `vault_role_name` | string | `''` | AppRole role name for secret_id rotation **(v1.4)** — calls `secret-id/destroy` after login |
-| `vault_k8s_role` | string | `''` | Kubernetes JWT auth role name |
-| `vault_transit_mount` | string | `transit` | Transit secrets engine mount path |
-| `vault_key_name` | string | `pg-tde-dek` | Transit key name for DEK wrapping |
-| `vault_ca_cert` | string | `''` | Path to CA bundle for Vault TLS (`CURLOPT_CAINFO`) |
-| `vault_timeout_ms` | integer | `5000` | Vault HTTP timeout in ms (0 = no timeout; range 0–300000) |
-| `bgw_enabled` | boolean | `off` | Enable background worker for automatic token renewal |
-| `token_renewal_interval` | integer | `3600` | Token renewal interval in seconds (60–86400) |
-| `enabled` | boolean | `on` | Master switch: `off` disables crypto for benchmarking overhead |
+**Context**: all KMS-related parameters are `PGC_SUSET` — superusers can set
+them at session level or scope them to individual databases with
+`ALTER DATABASE SET` / `ALTER ROLE SET`.  No server restart is needed.
+The only exceptions are `max_encrypted_relations` (controls shared-memory
+sizing, `PGC_POSTMASTER`) and `crypto_provider` (OpenSSL provider selection,
+`PGC_POSTMASTER`).
 
-All variables are declared as `extern` in `src/include/pg_vault_tde_guc.h`
+#### Per-Database KMS Configuration
+
+Because all GUCs are `PGC_SUSET`, each database in the same PostgreSQL cluster
+can independently select its KMS backend and credentials.  This is the primary
+mechanism for multi-tenant key isolation:
+
+```sql
+-- cluster-wide default (postgresql.conf or ALTER SYSTEM)
+-- pg_vault_tde.kms_provider = 'vault'
+
+-- tenant_a: dedicated Transit key, no change to other settings
+ALTER DATABASE tenant_a SET pg_vault_tde.vault_key_name     = 'tde-dek-a';
+ALTER DATABASE tenant_a SET pg_vault_tde.vault_transit_mount = 'transit-tenants';
+
+-- tenant_b: offline local wallet, completely different backend
+ALTER DATABASE tenant_b SET pg_vault_tde.kms_provider          = 'local';
+ALTER DATABASE tenant_b SET pg_vault_tde.wallet_passphrase_env  = 'TDE_WALLET_B';
+
+-- verify effective configuration
+\connect tenant_b
+SHOW pg_vault_tde.kms_provider;   -- 'local'
+SELECT * FROM pg_vault_tde_health_check();
+```
+
+Settings applied with `ALTER DATABASE SET` take effect for new connections to
+that database.  The provider is selected per-connection from the effective GUC
+value; no shared state is changed.
+
+| Parameter | Type | Default | Context | Description |
+|---|---|---|---|---|
+| `kms_provider` | string | `vault` | suset | Active KMS backend: `vault`, `local` (v1.6). Settable per-database. |
+| `vault_url` | string | `''` | suset | Vault / OpenBao base URL |
+| `vault_namespace` | string | `''` | suset | Vault namespace (enterprise; empty for community) |
+| `vault_token` | string | `''` | suset | Auth token — hidden from `pg_settings` (`GUC_NOT_IN_SAMPLE`) |
+| `vault_role_id` | string | `''` | suset | AppRole role_id UUID — hidden from `pg_settings` |
+| `vault_secret_id` | string | `''` | suset | AppRole secret_id — hidden from `pg_settings` |
+| `vault_role_name` | string | `''` | suset | AppRole role name for secret_id rotation **(v1.4)** — calls `secret-id/destroy` after login |
+| `vault_k8s_role` | string | `''` | suset | Kubernetes JWT auth role name |
+| `vault_k8s_mount` | string | `kubernetes` | suset | Kubernetes auth engine mount path |
+| `vault_transit_mount` | string | `transit` | suset | Transit secrets engine mount path |
+| `vault_key_name` | string | `pg-tde-dek` | suset | Transit key name for DEK wrapping. Override per-database to isolate tenant keys. |
+| `vault_ca_cert` | string | `''` | suset | Path to CA bundle for Vault TLS (`CURLOPT_CAINFO`) |
+| `vault_timeout_ms` | integer | `5000` | suset | Vault HTTP timeout in ms (0 = no timeout; range 0–300000) |
+| `wallet_path` | string | `$PGDATA/base/<OID>/pg_vault_tde/wallet.p12` | suset | Local wallet PKCS#12 path (`kms_provider = 'local'`) |
+| `wallet_passphrase_env` | string | `''` | suset | Env var NAME holding the wallet passphrase |
+| `wallet_passphrase_file` | string | `''` | suset | File path containing the wallet passphrase (mode 0400 enforced) |
+| `wallet_passphrase_command` | string | `''` | suset | Shell command whose stdout is the passphrase (highest priority) |
+| `wallet_auto_open` | boolean | `on` | suset | Auto-open wallet at startup if passphrase env var is set |
+| `toast_encryption` | boolean | `on` | suset | Encrypt TOAST chunks with the parent relation's DEK |
+| `bgw_enabled` | boolean | `off` | suset | Enable background worker for automatic token renewal. **Requires cluster restart**: the BGW is registered via `RegisterBackgroundWorker()` at postmaster startup; changing via `pg_reload_conf()` updates the value but does not start/stop the worker dynamically. |
+| `token_renewal_interval` | integer | `3600` | suset | Token renewal interval in seconds (60–86400) |
+| `enabled` | boolean | `on` | suset | Master switch: `off` disables crypto for benchmarking overhead. Settable per-database. |
+| `max_encrypted_relations` | integer | `1024` | postmaster | Max per-table DEK entries in shmem (64–65536). **Requires restart** — controls shared-memory allocation. |
+| `crypto_provider` | string | `''` | postmaster | OpenSSL 3.x provider name (`qatprovider`, `fips`; empty = built-in dispatch). **Requires restart**. |
+
+All variables are declared `extern` in `src/include/pg_vault_tde_guc.h`
 and included by any translation unit that needs them (`tam.c`, `kms.c`).
 
 ---
@@ -768,9 +809,9 @@ and included by any translation unit that needs them (`tam.c`, `kms.c`).
 
 ```
 _PG_init()
-  ├── DefineCustomStringVariable("pg_vault_tde.vault_url", ...)
-  ├── DefineCustomStringVariable("pg_vault_tde.vault_token", ...)  [GUC_SUPERUSER_ONLY]
-  ├── ... 6 more GUC parameters ...
+  ├── DefineCustomStringVariable("pg_vault_tde.vault_url", ...)      [PGC_SUSET]
+  ├── DefineCustomStringVariable("pg_vault_tde.vault_token", ...)    [PGC_SUSET, GUC_NOT_IN_SAMPLE]
+  ├── ... ~20 more GUC parameters (all PGC_SUSET except max_encrypted_relations/crypto_provider) ...
   ├── install shmem_request_hook  → pg_vault_tde_shmem_request()
   │       └── pg_vault_tde_kms_shmem_request()
   │               └── RequestAddinShmemSpace(sizeof(pg_vault_tde_dek_cache))
@@ -851,7 +892,7 @@ Starts PostgreSQL with `initdb -k` (`--data-checksums`). Verifies that:
 | File | Coverage |
 |---|---|
 | `tap/01_load.t` | Extension load, AM registration, basic SQL round-trip |
-| `tap/02_backup.t` | `pg_basebackup` + `pg_vault_tde_backup_status()` |
+| `tap/02_backup.t` | `pg_basebackup` |
 
 ### Isolation Tests (`isolation/dek_rotation.spec`)
 
@@ -921,8 +962,8 @@ generic build. See `packaging/rpm/pg_vault_tde-arm.spec`.
 
 | pg_vault_tde | PostgreSQL | OpenSSL | Status |
 |---|---|---|---|
-| 1.6.x | 17.x, 18.x | 3.x | ✅ Current |
-| 1.7.x | 17.x, 18.x, 19.x | 3.x | 📋 Planned |
+| 1.6.x | 17.x, 18.x | 3.x | ✅ Completed |
+| 1.7.x | 17.x, 18.x | 3.x | 🔄 Current |
 | 1.8.x | 17.x, 18.x, 19.x | 3.x | 📋 Planned |
 
 ---
@@ -938,9 +979,10 @@ See [ROADMAP.md](ROADMAP.md) for the full release roadmap.
 | **v1.3** | Vault KEK + multi_insert + BGW | ✅ Completed | 48 |
 | **v1.4** | CI/CD + tde_btree + Wire Format v2 | ✅ Completed | 52 |
 | **v1.5** | Per-Table DEK + Online Rotation + AAD | ✅ Completed | 72 |
-| **v1.6** | Local Wallet KMS (production-ready) | ✅ Completed | 72 |
-| **v1.7** | TOAST Chunks + HSM + Audit | 📋 Q4 2027 | ~100 |
-| **v1.8** | KMIP + Column-Level + HA | 📋 Q2 2028 | ~130 |
+| **v1.6** | Local Wallet KMS (production-ready) | ✅ Completed | 109 |
+| **v1.7** | Per-database KMS + pg_restore_tde + PGC_SUSET | 🔄 Current | 109 |
+| **v1.8** | TOAST Chunks + HSM + Audit | 📋 Q4 2027 | ~100 |
+| **v1.9** | KMIP + Column-Level + HA | 📋 Q2 2028 | ~130 |
 
 ### Permanent Deferrals
 

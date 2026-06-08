@@ -43,153 +43,401 @@
  * Each 64KB block is independently authenticated so corruption is detected
  * at the block level, not only at EOF.
  */
-#include "postgres.h"
-#include "fmgr.h"
-#include "funcapi.h"
-#include "utils/builtins.h"
-#include "utils/memutils.h"
+#include "postgres_fe.h"
+#include "fe_utils/connect_utils.h"
+#include "common/logging.h"
+#include "port/pg_bswap.h"
+
 #include <openssl/evp.h>
 #include <openssl/rsa.h>
 #include <openssl/pem.h>
 #include <openssl/crypto.h>
 
-#include "src/include/pg_vault_tde_crypto.h"
-#include "src/include/pg_vault_tde_kms.h"
-#include "src/include/pg_vault_tde_backup.h"
+#include "pg_vault_tde_backup.h"
 
-/* Current backup format version — increment on breaking changes. */
-#define TDE_BACKUP_FORMAT_VERSION 1
-#define TDE_BACKUP_MAGIC          "PGVAULTTDE"
-/* TDE_BACKUP_MAGIC_LEN is defined in pg_vault_tde_backup.h */
-#define TDE_BACKUP_BLOCK_SIZE     (64 * 1024) /* 64KB streaming blocks */
+static PGconn *init_db_conn(ConnParams *params);
+
+const PdeKmsProvider* dump_tde_active_provider = NULL;
+static EVP_CIPHER_CTX* dump_evp_ctx = NULL;
+
+/*
+ * tde_backup_init
+ *
+ * Initialises the backup operation: opens a database connection, reads the
+ * pg_vault_tde.kms_provider GUC, and calls the matching provider's init()
+ * to load credentials from the remaining GUCs.
+ *
+ * @param params    pointer to ConnParams struct with connection info
+ * @returns         true on success
+ */
+
+bool tde_backup_init(ConnParams* params)
+{
+    PGconn* conn = init_db_conn(params);
+    char kms_provider[64];
+
+    if(!conn) {
+        fprintf(stderr, "pg_dump_tde: can't connect to db %s", params->dbname);
+        return false;
+    }
+
+    PGresult *r = PQexec(conn, "SHOW pg_vault_tde.kms_provider");
+    if(PQresultStatus(r) != PGRES_TUPLES_OK) 
+    {
+        fprintf(stderr, "pg_dump_tde: cannot read GUC pg_vault_tde.kms_provider: %s",
+                        PQerrorMessage(conn));                   
+        PQclear(r);                                               
+        return false;                            
+    }
+    snprintf(kms_provider, sizeof(kms_provider), "%s", PQgetvalue(r, 0, 0));
+    PQclear(r);
+
+    if(strcmp(kms_provider, VAULT_PROVIDER) == 0)
+    {
+        dump_tde_active_provider = pg_dump_tde_kms_vault_provider();
+    }
+    else if(strcmp(kms_provider, LOCAL_PROVIDER) == 0)
+    {
+        dump_tde_active_provider = pg_dump_tde_kms_local_provider();
+    }
+    else{
+        fprintf(stderr, "pg_dump_tde: unknown KMS provider %s", kms_provider);
+        return false;
+    }
+
+    if(!dump_tde_active_provider->init(conn))
+    {
+        PQfinish(conn);
+        return false;
+    }
+
+    PQfinish(conn);
+    return true;
+}
 
 /*
  * tde_backup_header_init
  *
  * Initialises an in-memory tde_backup_header struct by:
- *  1. Fetching the current DEK from shared memory.
- *  2. Fetching the RSA-4096 public key (KEK pub) from Vault.
- *  3. Encrypting (wrapping) the DEK with RSA-OAEP-SHA256.
- *  4. Storing the wrapped DEK and a fresh GCM IV in the header.
- *
- * The caller MUST OPENSSL_cleanse the local DEK copy immediately after this
- * function returns (see: dek[] in the caller's stack frame).
+ *  1. Generating a fresh DEK via the active KMS provider.
+ *  2. Wrapping (encrypting) the DEK with the KEK held by the provider
+ *     (AES-256-WRAP for the local wallet; Vault Transit /encrypt for vault).
+ *  3. Storing the wrapped DEK in the header and the plaintext DEK in ctx->dek
+ *     for subsequent use by tde_backup_encrypt_block().
  *
  * @param hdr     pointer to caller-allocated tde_backup_header struct
- * @returns       true on success, false if DEK unavailable
+ * @param ctx     pointer to caller-allocated TdeBackupContext to populate
+ * @returns       true on success
  */
 bool
-tde_backup_header_init(tde_backup_header *hdr)
+tde_backup_header_init(tde_backup_header *hdr, TdeBackupContext* ctx)
 {
-    char dek[TDE_DEK_LEN];
+    unsigned char wrapped_dek[TDE_BACKUP_WRAPPED_LEN]; 
+
+    int new_len = sizeof(wrapped_dek);
 
     Assert(hdr != NULL);
 
-    memcpy(hdr->magic, TDE_BACKUP_MAGIC, TDE_BACKUP_MAGIC_LEN);
+    memset(hdr, 0, sizeof(*hdr));
+
+    sprintf(hdr->magic, TDE_BACKUP_MAGIC);
     hdr->format_version = TDE_BACKUP_FORMAT_VERSION;
 
-    /* Fetch live DEK from the shared memory cache */
-    if (!pg_vault_tde_kms_get_dek(dek, TDE_DEK_LEN))
+    if(!dump_tde_active_provider->generate_dek(ctx->dek, TDE_DEK_LEN))
     {
-        ereport(WARNING,
-                (errmsg("[BACKUP] DEK unavailable; cannot initialise "
-                        "backup header")));
+        pg_log_error("[BACKUP] Failed to generate backup DEK");
         return false;
     }
 
-    /*
-     * Generate a fresh IV for the backup stream.  Each backup gets its own
-     * IV even when using the same DEK, so two dumps of identical data
-     * produce different encrypted files (prevents chosen-plaintext attacks
-     * on the backup archive).
-     */
-    if (!pg_strong_random(hdr->stream_iv, TDE_GCM_IV_LEN))
+    if(!dump_tde_active_provider->wrap_dek(ctx->dek, TDE_DEK_LEN, 
+                                            wrapped_dek, &new_len))
     {
-        OPENSSL_cleanse(dek, TDE_DEK_LEN);
-        ereport(ERROR,
-                (errmsg("[BACKUP] Failed to generate backup stream IV")));
+        pg_log_error("[BACKUP] Failed to wrap backup dek");
+        return false;
     }
 
-    /*
-     * TODO: wrap the DEK with RSA-4096 OAEP-SHA256 using the KEK public key
-     * fetched from Vault.  Store the wrapped blob in hdr->wrapped_dek and
-     * its length in hdr->wrapped_dek_len.
-     *
-     * RSA_public_encrypt(TDE_DEK_LEN, dek, hdr->wrapped_dek,
-     *                    rsa_pub_key, RSA_PKCS1_OAEP_PADDING);
-     *
-     * For now, store a zeroed placeholder; the TAP test will verify this
-     * field is non-zero once the KMS RSA integration is complete.
-     */
-    OPENSSL_cleanse(hdr->wrapped_dek, sizeof(hdr->wrapped_dek));
-    hdr->wrapped_dek_len = 0; /* placeholder */
+    memcpy(hdr->wrapped_dek, wrapped_dek, new_len);
+    hdr->wrapped_dek_len = new_len;
+    
+    OPENSSL_cleanse(wrapped_dek, sizeof(wrapped_dek));
 
-    OPENSSL_cleanse(dek, TDE_DEK_LEN);
+    dump_tde_active_provider->shutdown();
+     
     return true;
+}
+
+
+/*
+ * tde_backup_header_validate
+ *
+ * Validates a tde_backup_header read from a pg_dump_tde file: checks magic,
+ * format version, and wrapped_dek_len, then unwraps the DEK via the active
+ * KMS provider into ctx->dek.
+ *
+ * @param hdr     pointer to tde_backup_header read from the backup file
+ * @param ctx     pointer to caller-allocated TdeBackupContext to populate
+ * @returns       true on success, false if the header is invalid or DEK unwrap fails
+ */
+
+bool tde_backup_header_validate(tde_backup_header *hdr, TdeBackupContext* ctx)
+{
+
+    unsigned char dek[TDE_DEK_LEN];
+    int dek_len = sizeof(dek);
+
+    Assert(hdr != NULL);
+    Assert(ctx != NULL);
+    
+    if(hdr->wrapped_dek_len > TDE_BACKUP_WRAPPED_LEN)
+    {
+        pg_log_error("pg_dump_tde: wrapped DEK too long");
+        return false;
+    }
+
+    if(strcmp(hdr->magic, TDE_BACKUP_MAGIC) != 0) return false;
+    if(hdr->format_version != TDE_BACKUP_FORMAT_VERSION) return false;
+
+    if(!dump_tde_active_provider->unwrap_dek(hdr->wrapped_dek, hdr->wrapped_dek_len, 
+                                             dek, dek_len))
+    {
+        pg_log_error("pg_dump_tde: cant unwrap DEK: wrong passphrase or corrupted wrapped dek");
+        return false;
+    }
+    
+    memcpy(ctx->dek, dek, TDE_DEK_LEN);
+    ctx->dek_len = dek_len;
+    
+    OPENSSL_cleanse(dek, dek_len);
+
+    return true;
+}
+
+
+
+/** Open a libpq connection; returns NULL and logs on failure. */
+static PGconn* init_db_conn(ConnParams* params)
+{
+    PGconn* conn = connectDatabase(params, "pg_dump_tde", false, true, false);
+
+    if(PQstatus(conn) != CONNECTION_OK)
+    {
+        fprintf(stderr, "pg_dump_tde: can't connect to the database: %s", PQerrorMessage(conn));
+        PQfinish(conn);
+        return NULL;
+    }
+    
+    return conn;
 }
 
 /*
  * tde_backup_encrypt_block
  *
- * Encrypts one TDE_BACKUP_BLOCK_SIZE block from an open pg_dump stream.
- * Produces an authenticated ciphertext block written to @out_buf.
- * Returns the number of encrypted bytes written (always
- * block_len + TDE_GCM_OVERHEAD).
+ * Encrypts one plaintext block using AES-256-GCM.  Generates a fresh random
+ * IV per block.  Returns a palloc'd buffer (caller must pfree) with layout:
+ *   [ 0x02 (1) | IV (12) | CT (block_len) | TAG (16) ]
  *
- * Because each block uses the same stream IV + a block counter as GCM AAD
- * (additional authenticated data), reordering or truncating blocks is
- * detectable at decryption time.
+ * block_seq is encoded as big-endian uint64 and passed as GCM AAD, so
+ * reordering or truncating blocks is detectable at decryption time.
  *
+ * @param ctx           backup context holding the DEK
  * @param block_data    plaintext block
  * @param block_len     length of plaintext (up to TDE_BACKUP_BLOCK_SIZE)
- * @param block_seq     block sequence number (used as AAD; prevents reorder)
- * @param out_buf       caller-allocated output buffer
- *                      (must be at least block_len + TDE_GCM_OVERHEAD)
- * @param out_len       set to encrypted output length
+ * @param block_seq     monotonically increasing block counter (used as AAD)
+ * @param out_len       set to total encrypted output length on success
+ * @returns             palloc'd encrypted buffer, or NULL on error
  */
-void
-tde_backup_encrypt_block(const char *block_data, Size block_len,
-                         uint64 block_seq,
-                         char *out_buf, Size *out_len)
-{
-    char   *encrypted;
-    Size    enc_len;
+char*
+tde_backup_encrypt_block(const TdeBackupContext* tde_ctx,
+                         const char *block_data, Size block_len,
+                         uint64 block_seq, Size *out_len)
+{  
+    EVP_CIPHER_CTX  *evp_ctx;
+    char*           out_buf;
+    int             flen;
+    int             olen;
+    int             aad_len;
+    Size            total;
+    unsigned char*  iv_ptr;
+    unsigned char*  ct_ptr;
+    unsigned char*  tag_ptr;
 
-    Assert(block_data != NULL && out_buf != NULL && out_len != NULL);
-    Assert(block_len > 0 && block_len <= TDE_BACKUP_BLOCK_SIZE);
+    total = block_len + TDE_BACKUP_ENCRYPT_OVERHEAD;
+    out_buf = (char*) palloc0(total);
 
-    /*
-     * Backup blocks are not table-scoped, so we use InvalidOid which selects
-     * the v1.4 global DEK.  A per-table backup DEK (v1.7) will pass the
-     * correct relid once the backup bundle format is redesigned.
-     * TODO: pass block_seq as GCM AAD via EVP_EncryptUpdate with a NULL
-     * output pointer (standard GCM AAD pattern) before encrypting payload.
-     */
-    encrypted = tde_gcm_encrypt(InvalidOid, block_data, block_len, &enc_len);
+    /* Write version byte. */
+    ((unsigned char*) out_buf)[0] = TDE_V2_VERSION_BYTE;
 
-    memcpy(out_buf, encrypted, enc_len);
-    *out_len = enc_len;
+    /* Set pointers to each field within the output buffer. */
+    iv_ptr = (unsigned char *) out_buf + 1;
+    ct_ptr = iv_ptr + TDE_GCM_IV_LEN;
+    tag_ptr = ct_ptr + block_len;
 
-    OPENSSL_cleanse(encrypted, enc_len);
-    pfree(encrypted);
-}
+    /* Generate per-block random IV */
+    pg_strong_random(iv_ptr, TDE_GCM_IV_LEN);
 
-/*
- * pg_vault_tde_backup_status (SQL-callable)
+    if(dump_evp_ctx == NULL){
+        dump_evp_ctx = EVP_CIPHER_CTX_new();
+        if(dump_evp_ctx == NULL)
+        {
+            OPENSSL_cleanse(out_buf, total);
+            pfree(out_buf);
+            pg_log_error("pg_dump_tde: failed to allocate GCM encrypt context");
+            return NULL;
+        }
+    }
+    else 
+    {
+        EVP_CIPHER_CTX_reset(dump_evp_ctx);
+    }
+    evp_ctx = dump_evp_ctx;
+
+    if(EVP_EncryptInit_ex2(evp_ctx, EVP_aes_256_gcm(), tde_ctx->dek, iv_ptr, NULL) != 1)
+        goto gcm_error;
+
+    /* Pass block_seq (big-endian) as GCM AAD. */
+    uint64 seq_n = pg_hton64(block_seq);
+    if(EVP_EncryptUpdate(evp_ctx, NULL, &aad_len, (const uint8 *) &seq_n, sizeof(seq_n)) != 1)
+    {
+        OPENSSL_cleanse(&seq_n, sizeof(seq_n));
+        goto gcm_error;
+    }
+    OPENSSL_cleanse(&seq_n, sizeof(seq_n));
+
+    /* Encrypt the payload. */
+    if(EVP_EncryptUpdate(evp_ctx, ct_ptr, &olen,
+                      (const unsigned char*) block_data, 
+                      (int) block_len) != 1)
+        goto gcm_error;
+    
+    if(EVP_EncryptFinal_ex(evp_ctx, ct_ptr + olen, &flen) != 1)
+        goto gcm_error;
+
+    if(flen != 0)
+        goto gcm_error;
+
+    if(EVP_CIPHER_CTX_ctrl(evp_ctx, EVP_CTRL_GCM_GET_TAG, 
+                         TDE_GCM_TAG_LEN, tag_ptr) != 1)
+        goto gcm_error;
+
+    *out_len = total;
+    return out_buf;
+
+gcm_error:
+        EVP_CIPHER_CTX_free(evp_ctx);
+        evp_ctx = NULL;
+        dump_evp_ctx = NULL;
+        OPENSSL_cleanse(out_buf, total);
+        pfree(out_buf);
+        pg_log_error("pg_dump_tde: error while encrypting a block");
+        return NULL;
+} 
+
+
+/**
+ * Decrypt one AES-256-GCM block produced by tde_backup_encrypt_block().
  *
- * Returns a text status message indicating whether backup encryption is
- * active.  Exposes the backup format version so monitoring tools can detect
- * version mismatches without opening the backup file.
+ * Verifies the version byte, GCM tag, and block_seq AAD before returning
+ * plaintext.  Returns a palloc'd buffer (caller must pfree), or NULL on
+ * any authentication or decryption failure.
+ *
+ * @param ctx       backup context holding the DEK
+ * @param block_data encrypted block (version byte + IV + CT + TAG)
+ * @param block_len  total length of block_data
+ * @param block_seq  expected block sequence number (AAD)
+ * @param out_len    set to plaintext length on success
  */
-PG_FUNCTION_INFO_V1(pg_vault_tde_backup_status);
-Datum
-pg_vault_tde_backup_status(PG_FUNCTION_ARGS)
+char *tde_backup_decrypt_block(const TdeBackupContext* ctx,
+                                const char* block_data, Size block_len,
+                                uint64 block_seq, Size* out_len)
 {
-    char   *msg;
+    EVP_CIPHER_CTX  *evp_ctx;
+    const unsigned char* iv_ptr;
+    const unsigned char* ct_ptr;
+    const unsigned char* tag_ptr;   
+    char* out_buf;
+    Size pt_len;
+    int olen = 0;
+    int flen = 0;
+    int aad_len = 0;
+    uint64 seq_n;
 
-    msg = psprintf("pg_vault_tde backup encryption active "
-                   "(format_version=%d, block_size=%d)",
-                   TDE_BACKUP_FORMAT_VERSION,
-                   TDE_BACKUP_BLOCK_SIZE);
-    PG_RETURN_TEXT_P(cstring_to_text(msg));
+    Assert(block_data != NULL);
+    Assert(out_len != NULL);
+    Assert(ctx->dek != NULL);
+    Assert(ctx->dek_len == TDE_DEK_LEN);
+
+    if(block_len < (Size)(TDE_BACKUP_ENCRYPT_OVERHEAD)){
+        pg_log_error("pg_dump_tde: [CRYPTO] Ciphertext too short for AES-256-GCM");
+        return NULL;
+    }
+        
+    if((unsigned char) block_data[0] != TDE_V2_VERSION_BYTE)
+    {
+        pg_log_error("pg_dump_tde [CRYPTO]: error while decrypting");
+        return NULL;
+    }
+
+    pt_len = block_len - TDE_BACKUP_ENCRYPT_OVERHEAD;
+    iv_ptr = (const unsigned char* ) block_data + 1;
+    ct_ptr = iv_ptr + TDE_GCM_IV_LEN;
+    tag_ptr = ct_ptr + pt_len;
+
+    out_buf = (char*) palloc0(pt_len + 1);
+
+    if(dump_evp_ctx == NULL)
+    {
+        dump_evp_ctx = EVP_CIPHER_CTX_new();
+        if(dump_evp_ctx == NULL)
+        {
+            pfree(out_buf);
+            pg_log_error("pg_dump_tde [CRYPTO]: Failed to allocate GCM decrypt context");
+            return NULL;
+        }
+    }
+    else
+    {
+        EVP_CIPHER_CTX_reset(dump_evp_ctx);
+    }
+    evp_ctx = dump_evp_ctx;
+
+    if(EVP_DecryptInit_ex2(evp_ctx, EVP_aes_256_gcm(), ctx->dek, iv_ptr, NULL) != 1)
+        goto gcm_dec_error;
+        
+    /* Set the expected GCM tag BEFORE calling DecryptFinal. */
+    if(EVP_CIPHER_CTX_ctrl(evp_ctx, EVP_CTRL_GCM_SET_TAG, 
+                        TDE_GCM_TAG_LEN, (void*) tag_ptr) != 1)
+        goto gcm_dec_error;
+
+    /* Reproduce the same AAD that was used during encryption. */
+    seq_n = pg_hton64(block_seq);
+    if(EVP_DecryptUpdate(evp_ctx, NULL, &aad_len, (const uint8 *)&seq_n, sizeof(seq_n)) != 1)
+    {
+        OPENSSL_cleanse(&seq_n, sizeof(seq_n));
+        goto gcm_dec_error;
+    }
+    OPENSSL_cleanse(&seq_n, sizeof(seq_n));
+
+    if(EVP_DecryptUpdate(evp_ctx, (unsigned char*)out_buf, &olen, 
+                         ct_ptr, (int)pt_len) != 1)
+        goto gcm_dec_error;
+    
+    if(EVP_DecryptFinal_ex(evp_ctx, (unsigned char*)out_buf + olen, &flen) != 1)
+        goto gcm_dec_error;
+    
+    
+    *out_len = pt_len;
+    return out_buf;
+
+gcm_dec_error:
+    /*
+     * Free and NULL-out the cached context — unknown state after an error.
+     */
+    EVP_CIPHER_CTX_free(dump_evp_ctx);
+    dump_evp_ctx = NULL;
+    evp_ctx = NULL;
+    OPENSSL_cleanse(out_buf, pt_len + 1);
+    pfree(out_buf);
+    pg_log_error("[CRYPTO] AES-256-GCM decryption setup failed");
+    return NULL; 
+
 }

@@ -33,12 +33,6 @@ CREATE ACCESS METHOD tde_btree
     TYPE INDEX
     HANDLER pg_vault_tde_iam_handler;
 
--- Expose backup status to monitoring tools
-CREATE FUNCTION pg_vault_tde_backup_status()
-    RETURNS text
-    LANGUAGE C STRICT
-    AS 'MODULE_PATHNAME', 'pg_vault_tde_backup_status';
-
 -- Expose DEK rotation trigger (called by DBA or automation)
 CREATE FUNCTION pg_vault_tde_rotate_key()
     RETURNS void

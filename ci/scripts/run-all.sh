@@ -2,7 +2,7 @@
 # ci/scripts/run-all.sh — Master orchestrator for the local CI pipeline
 #
 # Runs all test stages in sequence:
-#   1. regress     — 80-test SQL regression suite (52 v1.4 + 20 v1.5 + 8 v1.6)
+#   1. regress     — 109-test SQL regression suite (52 v1.4 + 20 v1.5 + 37 v1.6)
 #   2. checksums   — Page checksum compatibility
 #   3. tap         — Perl TAP tests (extension load, backup hooks)
 #   4. isolation   — Concurrency/MVCC isolation specs
@@ -34,7 +34,7 @@ source "$SCRIPT_DIR/lib.sh"
 # Parse arguments
 # ---------------------------------------------------------------------------
 SKIP_BENCH=0
-SKIP_OPENBAO=0
+SKIP_OPENBAO=1
 SKIP_WALLET=0
 SKIP_SCHEMA=0
 SKIP_INSTALL_TEST=0

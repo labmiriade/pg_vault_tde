@@ -31,10 +31,10 @@
 #
 # Examples:
 #   bash packaging/build_in_container.sh
-#       → ./dist/postgresql-18-pg-vault-tde_1.6-1_amd64.deb
+#       → ./dist/postgresql-18-pg-vault-tde_1.7-1_amd64.deb
 #
 #   bash packaging/build_in_container.sh --format rpm --pg-version 17
-#       → ./dist/postgresql17-pg_vault_tde-1.6-1.el9.x86_64.rpm
+#       → ./dist/postgresql17-pg_vault_tde-1.7-1.el9.x86_64.rpm
 #
 #   bash packaging/build_in_container.sh --os-version ubuntu:24.04
 #       → DEB PG18 built on Ubuntu 24.04 Noble
@@ -43,7 +43,7 @@
 #       → RPM PG17 built on Rocky Linux 8 (EL8)
 #
 #   bash packaging/build_in_container.sh --arch-variant aesni
-#       → ./dist/postgresql-18-pg-vault-tde-aesni_1.6-1_amd64.deb
+#       → ./dist/postgresql-18-pg-vault-tde-aesni_1.7-1_amd64.deb
 #
 #   bash packaging/build_in_container.sh --format rpm --arch-variant vaes --os-version almalinux:9
 #       → RPM AES-VAES on AlmaLinux 9
@@ -56,7 +56,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."   # project root
 
-VERSION="1.6"
+VERSION="1.7"
 
 # ---------------------------------------------------------------------------
 # Defaults

@@ -221,4 +221,16 @@ $$;
 REVOKE ALL   ON FUNCTION pg_vault_tde_reencrypt_table(text, int) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION pg_vault_tde_reencrypt_table(text, int) TO pg_monitor;
 
+REVOKE ALL ON FUNCTION pg_vault_tde_reencrypt_table(regclass, int) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION pg_vault_tde_reencrypt_table(regclass, int) TO pg_monitor;
 
+REVOKE ALL   ON FUNCTION pg_vault_tde_rotate_key() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION pg_vault_tde_rotate_key() TO pg_monitor;
+
+REVOKE ALL   ON FUNCTION pg_vault_tde_set_test_dek() FROM PUBLIC;
+
+REVOKE ALL ON FUNCTION pg_vault_tde_clear_prev_dek() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION pg_vault_tde_clear_prev_dek() TO pg_monitor;
+
+REVOKE ALL ON FUNCTION pg_vault_tde_vault_fetch_dek() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION pg_vault_tde_vault_fetch_dek() to pg_monitor;

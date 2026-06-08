@@ -106,12 +106,19 @@ extern int         pg_vault_tde_token_renewal_interval;
 extern char       *pg_vault_tde_kms_provider;
 
 /*
- * Local wallet path (PGC_POSTMASTER).
+ * Local wallet path (PGC_SUSET).
  * Absolute path to the PKCS#12 wallet file.
  * Default: $PGDATA/base/<DB_OID>/pg_vault_tde/wallet.p12 (resolved at runtime).
  * Used only when kms_provider = 'local'.
  */
 extern char       *pg_vault_tde_wallet_path;
+
+/*
+ * show_hook for pg_vault_tde.wallet_path.
+ * Returns the effective wallet path (computed default when GUC is empty).
+ * Registered in DefineCustomStringVariable so SHOW works immediately on connect.
+ */
+extern const char *wallet_path_show_hook(void);
 
 /*
  * Environment variable name that holds the wallet passphrase

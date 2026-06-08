@@ -1,0 +1,76 @@
+# ci/dump-compose.yml — Podman/Docker Compose orchestration for pg_dump_tde compose
+#
+# Usage:
+#   podman-compose -f ci/dump-compose.yml up -d
+#   podman-compose -f ci/dump-compose.yml down -v
+#
+# The pg-test service depends on real-vault being healthy before starting.
+# Both containers share a bridge network so pg-vault can reach Vault
+
+
+services:
+
+  vault: 
+    build: 
+      context: ..
+      dockerfile: ci/containers/real-vault.Containerfile
+    image: ${REAL_VAULT:-real-vault}
+    container_name: real-vault
+    environment: 
+      VAULT_MOCK_PORT: ${VAULT_MOCK_PORT:-8200}
+      VAULT_MOCK_TOKEN: ${VAULT_MOCK_TOKEN:-test-token}
+      VAULT_MOCK_MOUNT: ${VAULT_MOCK_MOUNT:-transit}
+      VAULT_MOCK_KEY_NAME: ${VAUL_MOCK_KEY_NAME:-pg-tde-dek}
+      VAULT_API_ADDR: http://127.0.0.1:${VAULT_MOCK_PORT}
+      SKIP_SETCAP: 1
+      VAULT_DISABLE_MLOCK: "true"
+    ports:
+      - "${VAULT_MOCK_PORT:-8200}:8200"
+    healthcheck: 
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8200/v1/sys/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 5
+      start_period: 2s
+    networks: 
+      - tde-test
+
+   # ── PostgreSQL with Vault integration ─────────────────────────────────
+  pg-vault:
+    build:
+      context: ..
+      dockerfile: ci/containers/pg-test.Containerfile
+    image: ${PG_TEST_IMAGE:-pg-tde-test}:latest
+    container_name: pg-tde-vault
+    environment:
+      POSTGRES_PASSWORD: postgres
+      VAULT_ADDR: http://vault:${VAULT_MOCK_PORT:-8200}
+      VAULT_TOKEN: ${VAULT_MOCK_TOKEN:-test-token}
+      VAULT_MOUNT: ${VAULT_MOCK_MOUNT:-transit}
+      VAULT_KEY_NAME: ${VAULT_MOCK_KEY_NAME:-pg-tde-dek}
+    command: >
+      postgres
+        -c shared_preload_libraries=pg_vault_tde
+        -c pg_vault_tde.dev_mode=on
+        -c pg_vault_tde.vault_url=http://vault:${VAULT_MOCK_PORT:-8200}
+        -c pg_vault_tde.vault_token=test-token
+        -c pg_vault_tde.vault_mount=transit
+        -c pg_vault_tde.vault_key_name=pg-tde-dek
+        -c log_min_messages=warning
+    ports:
+      - "${PG_VAULT_PORT:-15434}:5432"
+    depends_on:
+      vault:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+      start_period: 5s
+    networks:
+      - tde-test
+
+networks:
+  tde-test:
+    driver: bridge

@@ -25,15 +25,15 @@
 #     Build with TDE_TARGET_ARCH=x86_64-vaes TDE_OPTIMIZE=max.
 #     Package name: postgresql-PG-pg-vault-tde-vaes
 #
-# Output: ../postgresql-PG-pg-vault-tde[_variant]_1.6-1_<arch>.deb
+# Output: ../postgresql-PG-pg-vault-tde[_variant]_1.7-1_<arch>.deb
 #
 # Copyright (c) 2026 Miriade Srl — PostgreSQL License
 
 set -e
 cd "$(dirname "$0")/.."   # move to project root
 
-VERSION="1.6"
-PKG_VERSION="1.6-1"
+VERSION="1.7"
+PKG_VERSION="1.7-1"
 ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 
 # ---------------------------------------------------------------------------

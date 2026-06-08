@@ -138,6 +138,8 @@ static TM_Result pg_vault_tde_tuple_delete(Relation rel,
                                            TM_FailureData *tmfd,
                                            bool changingPart);
 
+static bool tde_tuple_has_external_slow(HeapTuple tup, TupleDesc tupdesc);
+
 
 /*
  * index_build_range_scan: called by CREATE INDEX to scan the table and build
@@ -1220,11 +1222,8 @@ pg_vault_tde_tuple_update(Relation rel, ItemPointer otid,
              * If old row had external TOAST chunks but the updated row no longer
              * does, proactively delete the old TOAST payload after TM_Ok.
              */
-            if (old_tuple != NULL && old_has_external &&
-                !HeapTupleHasExternal(toasted))
-            {
+            if (old_tuple != NULL && old_has_external && !HeapTupleHasExternal(toasted))
                 heap_toast_delete(rel, old_tuple, false);
-            }
         }
     }
     PG_CATCH();
