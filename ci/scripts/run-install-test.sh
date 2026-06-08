@@ -12,7 +12,7 @@
 #   3. Installs the built package
 #   4. Starts PostgreSQL with shared_preload_libraries = 'pg_vault_tde'
 #   5. CREATE EXTENSION pg_vault_tde  ← main gate
-#   6. Asserts extversion = '1.6'
+#   6. Asserts extversion = '1.7'
 #   7. Asserts every expected function/AM/table exists in pg_catalog
 #   8. Smoke-test: SET_TEST_DEK → CREATE TABLE USING encrypted_heap
 #      → INSERT → SELECT → compare plaintext → DROP TABLE
@@ -88,8 +88,8 @@ log_stage()  { echo -e "\n${BOLD}═══════════════�
 # Must ALL succeed; any error causes psql -v ON_ERROR_STOP=1 to exit ≠0.
 # ---------------------------------------------------------------------------
 #  § 1  CREATE EXTENSION — tests the full upgrade-script chain
-#  § 2  Version assertion — extversion must equal '1.6'
-#  § 3  Function catalogue — every function that shipped in 1.0–1.6 must exist
+#  § 2  Version assertion — extversion must equal '1.7'
+#  § 3  Function catalogue — every function that shipped in 1.0–1.7 must exist
 #  § 4  Access-method catalogue — encrypted_heap and tde_btree must be registered
 #  § 5  Catalog tables — pg_vault_tde_catalog and rotation progress must exist
 #  § 6  Smoke round-trip — inject DEK, encrypt a row, decrypt, compare
@@ -97,7 +97,7 @@ log_stage()  { echo -e "\n${BOLD}═══════════════�
 SMOKE_SQL='
 \set ON_ERROR_STOP on
 
--- §1 ─ CREATE EXTENSION (traverses the full 1.0→1.4→1.5→1.6 chain)
+-- §1 ─ CREATE EXTENSION (traverses the full 1.0→1.4→1.5→1.6→1.7 chain)
 CREATE EXTENSION pg_vault_tde;
 
 -- §2 ─ version
@@ -106,8 +106,8 @@ DECLARE ver text;
 BEGIN
     SELECT extversion INTO ver
     FROM pg_extension WHERE extname = '"'"'pg_vault_tde'"'"';
-    IF ver IS DISTINCT FROM '"'"'1.6'"'"' THEN
-        RAISE EXCEPTION '"'"'expected extversion 1.6, got %'"'"', ver;
+    IF ver IS DISTINCT FROM '"'"'1.7'"'"' THEN
+        RAISE EXCEPTION '"'"'expected extversion 1.7, got %'"'"', ver;
     END IF;
     RAISE NOTICE '"'"'version OK: %'"'"', ver;
 END;

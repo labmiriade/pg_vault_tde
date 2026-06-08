@@ -1,6 +1,6 @@
 # pg_vault_tde Roadmap
 
-> Last updated: 2026-06-04 — 109 regression tests (52 v1.4 + 20 v1.5 + 37 v1.6); test 110 (WITH HOLD cursor spill) deferred as permanent extension limit. `pg_restore_tde` completed (decrypt-and-pipe loop); wallet_path GUC changed to PGC_SUSET; PKCS12 maciter=-1 bug fixed; wallet_path_show_hook added.
+> Last updated: 2026-06-08 — **v1.7 current**. 109 regression tests (52 v1.4 + 20 v1.5 + 37 v1.6) carried forward. Key v1.7 changes: all KMS GUCs promoted to PGC_SUSET (per-database KMS via `ALTER DATABASE SET`); `pg_restore_tde` decrypt-and-pipe loop completed; documentation updated throughout.
 
 ---
 
@@ -104,12 +104,19 @@ all `pg_vault_tde_catalog` rows, calls Vault unwrap then local wrap per entry, a
 
 #### 7. New GUCs (v1.6)
 
+All new GUCs use `PGC_SUSET` — superusers can set them without restart and
+scope them per-database via `ALTER DATABASE SET`.
+
 | GUC | Type | Default | Context |
 |-----|------|---------|---------|
-| `pg_vault_tde.wallet_passphrase_file` | string | `''` | PGC_POSTMASTER |
-| `pg_vault_tde.wallet_passphrase_command` | string | `''` | PGC_POSTMASTER |
-| `pg_vault_tde.wallet_dev_mode_passphrase` | string | `''` | PGC_USERSET |
-| `pg_vault_tde.dev_mode` | bool | `off` | PGC_POSTMASTER |
+| `pg_vault_tde.wallet_passphrase_file` | string | `''` | PGC_SUSET |
+| `pg_vault_tde.wallet_passphrase_command` | string | `''` | PGC_SUSET |
+| `pg_vault_tde.wallet_dev_mode_passphrase` | string | `''` | PGC_SUSET |
+| `pg_vault_tde.dev_mode` | bool | `off` | PGC_SUSET |
+
+> Note: Initial design used `PGC_POSTMASTER` for these parameters.
+> Migrated to `PGC_SUSET` together with all other KMS GUCs to enable
+> per-database KMS configuration without server restart.
 
 ### v1.6 Deferred Items (Moved to v1.7+)
 
@@ -415,6 +422,7 @@ These gaps **cannot be closed without modifying PostgreSQL core**.
 | **v1.3** | Vault KEK + multi_insert + BGW | ✅ 2026 | 48 | Transit KEK wrapping, batch COPY, token renewal BGW, health_check |
 | **v1.4** | CI/CD + tde_btree + Wire Format v2 | ✅ 2026-07-05 | 52 | OpenBao 3-node Raft, ambuild/aminsert/amrescan, generation tag |
 | **v1.5** | Per-Table DEK + Online Rotation + AAD | ✅ 2026 | 72 | Per-table catalog, native type ops, wire format v3, rotate_online BGW |
-| **v1.6** | Local Wallet KMS (production-ready) + write-path / catalog bugfix patch | ✅ 2026-07-20 (patched 2026-05-08) | 109 | Wallet unlock/lock, passphrase flexibility, KEK rotation, export/import, Vault→wallet migration; PG_TRY widening; TOAST relid auto-registration; STORAGE EXTERNAL TAM read bypass; all-read-paths TOAST coverage; forensic helpers; tests 73–109 (test 110 — WITH HOLD cursor spill — deferred as permanent extension limit) |
-| **v1.7** | TOAST Chunks + HSM + Audit | Q4 2027 | ~100 | TOAST chunk AES-GCM, PKCS#11/HSM, audit trail, KEK/DEK hierarchy; `pg_restore_tde` ✅ |
-| **v1.8** | KMIP + Column-Level + HA | Q2 2028 | ~130 | KMIP 1.2, column-level encryption, GIN/Hash AMs, streaming replication HA |
+| **v1.6** | Local Wallet KMS (production-ready) + write-path / catalog bugfix patch | ✅ 2026-07-20 (patched 2026-05-08) | 109 | Wallet unlock/lock, passphrase flexibility, KEK rotation, export/import, Vault→wallet migration; PG_TRY widening; TOAST relid auto-registration; STORAGE EXTERNAL TAM read bypass; all-read-paths TOAST coverage; forensic helpers; tests 73–109 |
+| **v1.7** | Per-database KMS + pg_restore_tde + PGC_SUSET | 🔄 Current (2026-06-08) | 109 | All KMS GUCs PGC_SUSET → per-database KMS via `ALTER DATABASE SET`; `pg_restore_tde` full decrypt-and-pipe restore loop; documentation overhaul |
+| **v1.8** | TOAST Chunks + HSM + Audit | Q4 2027 | ~100 | TOAST chunk AES-GCM, PKCS#11/HSM, audit trail, KEK/DEK hierarchy |
+| **v1.9** | KMIP + Column-Level + HA | Q2 2028 | ~130 | KMIP 1.2, column-level encryption, GIN/Hash AMs, streaming replication HA |

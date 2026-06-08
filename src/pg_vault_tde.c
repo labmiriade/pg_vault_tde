@@ -660,51 +660,91 @@ _PG_init(void)
     /*
      * GUC parameter registration must happen in _PG_init, before any shmem
      * or hook setup.
+     *
+     * WHY PGC_SUSET FOR ALMOST EVERYTHING:
+     * All KMS-related GUCs use PGC_SUSET (superuser-settable) rather than
+     * PGC_POSTMASTER.  This enables per-database KMS configuration without
+     * a server restart: a superuser can run
+     *
+     *   ALTER DATABASE tenant_a SET pg_vault_tde.vault_key_name = 'tde-a';
+     *   ALTER DATABASE tenant_b SET pg_vault_tde.kms_provider   = 'local';
+     *
+     * and each new connection picks up the effective value for its database.
+     * This is the primary mechanism for multi-tenant key isolation within a
+     * single PostgreSQL cluster.
+     *
+     * The only parameters that remain PGC_POSTMASTER are those that affect
+     * shared-memory sizing at startup (max_encrypted_relations) or that
+     * require a deterministic provider selection before shmem is mapped
+     * (crypto_provider).
      */
 
-    /* Vault endpoint URL */
+    /*
+     * vault_url — PGC_SUSET so different databases can target separate Vault
+     * clusters or namespaced endpoints without restarting the server.
+     */
     DefineCustomStringVariable("pg_vault_tde.vault_url",
         "HashiCorp Vault / OpenBao URL (e.g. https://vault.example.com:8200)",
         NULL, &pg_vault_tde_vault_url, "", PGC_SUSET,
         GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
-    /* Vault namespace */
+    /*
+     * vault_namespace — PGC_SUSET so databases can be isolated into separate
+     * Vault Enterprise namespaces (e.g. tenant_a vs. tenant_b) via
+     * ALTER DATABASE SET without a restart.
+     */
     DefineCustomStringVariable("pg_vault_tde.vault_namespace",
         "Vault namespace (enterprise only, empty for community)",
         NULL, &pg_vault_tde_vault_namespace, "", PGC_SUSET,
         GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
-    /* Vault token — secret, not shown in pg_settings */
+    /* Vault token — secret, not shown in pg_settings (GUC_NOT_IN_SAMPLE) */
     DefineCustomStringVariable("pg_vault_tde.vault_token",
         "Vault token for authentication",
         NULL, &pg_vault_tde_vault_token, "", PGC_SUSET,
         GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 
-    /* Transit engine mount path */
+    /*
+     * vault_transit_mount — PGC_SUSET so databases can use dedicated Transit
+     * engine mounts (e.g. "transit/tenant-a") for key isolation without restart.
+     */
     DefineCustomStringVariable("pg_vault_tde.vault_transit_mount",
         "Vault Transit secrets engine mount path",
         NULL, &pg_vault_tde_vault_transit_mount, "transit", PGC_SUSET,
         GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
-    /* Transit key name for DEK wrapping */
+    /*
+     * vault_key_name — PGC_SUSET to enable per-database key isolation: each
+     * tenant database can point to a dedicated Transit key (e.g. "tde-dek-a",
+     * "tde-dek-b") via ALTER DATABASE SET without requiring a restart.
+     */
     DefineCustomStringVariable("pg_vault_tde.vault_key_name",
         "Vault Transit key name for DEK wrapping",
         NULL, &pg_vault_tde_vault_key_name, "pg-tde-dek", PGC_SUSET,
         GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
-    /* TLS CA certificate bundle path */
+    /*
+     * vault_ca_cert — PGC_SUSET so databases routed to different Vault
+     * clusters (with different CAs) can supply the correct trust anchor.
+     */
     DefineCustomStringVariable("pg_vault_tde.vault_ca_cert",
         "Path to CA certificate bundle for Vault TLS verification",
         NULL, &pg_vault_tde_vault_ca_cert, "", PGC_SUSET,
         GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
-    /* Vault HTTP request timeout */
+    /*
+     * vault_timeout_ms — PGC_SUSET so high-latency secondary Vault clusters
+     * can get a longer timeout without affecting the cluster-wide default.
+     */
     DefineCustomIntVariable("pg_vault_tde.vault_timeout_ms",
         "Vault HTTP request timeout in milliseconds (0 = no timeout)",
         NULL, &pg_vault_tde_vault_timeout_ms, 5000, 0, 300000,
         PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
-    /* Master on/off switch — useful for benchmarking overhead */
+    /*
+     * enabled — PGC_SUSET so a superuser can toggle crypto off per-session
+     * (e.g. for benchmarking overhead) or per-database without a restart.
+     */
     DefineCustomBoolVariable("pg_vault_tde.enabled",
         "Enable AES-256-GCM encryption for encrypted_heap tables",
         NULL, &pg_vault_tde_enabled, true, PGC_SUSET,
@@ -718,19 +758,26 @@ _PG_init(void)
         &pg_vault_tde_dek_cache_ttl, 0, 0, 86400,
         PGC_SUSET, 0, NULL, NULL, NULL);
 
-    /* Vault auth method (v1.1): token, approle, or kubernetes */
+    /*
+     * vault_auth_method — PGC_SUSET so databases on different Kubernetes
+     * namespaces or with different credential stores can use different auth
+     * methods (e.g. one uses 'approle', another uses 'kubernetes').
+     */
     DefineCustomStringVariable("pg_vault_tde.vault_auth_method",
         "Vault authentication method: token, approle, or kubernetes",
         NULL, &pg_vault_tde_vault_auth_method, "token", PGC_SUSET,
         GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
-    /* AppRole role_id (v1.1) */
+    /*
+     * vault_role_id / vault_secret_id — PGC_SUSET + GUC_NOT_IN_SAMPLE so each
+     * database can supply its own AppRole credentials without the secrets
+     * appearing in pg_settings, pg_file_settings, or config file samples.
+     */
     DefineCustomStringVariable("pg_vault_tde.vault_role_id",
         "Vault AppRole role_id for authentication",
         NULL, &pg_vault_tde_vault_role_id, "", PGC_SUSET,
         GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 
-    /* AppRole secret_id (v1.1) */
     DefineCustomStringVariable("pg_vault_tde.vault_secret_id",
         "Vault AppRole secret_id for authentication",
         NULL, &pg_vault_tde_vault_secret_id, "", PGC_SUSET,
@@ -746,13 +793,16 @@ _PG_init(void)
         &pg_vault_tde_vault_role_name, "", PGC_SUSET,
         GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
-    /* Kubernetes auth role (v1.1) */
+    /*
+     * vault_k8s_role / vault_k8s_mount — PGC_SUSET so each database (or
+     * Kubernetes namespace) can bind to a distinct K8s auth role and mount
+     * path without restarting the server.
+     */
     DefineCustomStringVariable("pg_vault_tde.vault_k8s_role",
         "Vault Kubernetes auth role name",
         NULL, &pg_vault_tde_vault_k8s_role, "", PGC_SUSET,
         GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
-    /* Kubernetes auth mount path (v1.1) */
     DefineCustomStringVariable("pg_vault_tde.vault_k8s_mount",
         "Vault Kubernetes auth engine mount path",
         NULL, &pg_vault_tde_vault_k8s_mount, "kubernetes", PGC_SUSET,
@@ -787,12 +837,18 @@ _PG_init(void)
      * v1.5 GUC registrations
      * ---------------------------------------------------------------- */
 
-    /* KMS provider selector (v1.5) */
+    /*
+     * kms_provider — PGC_SUSET so each database can independently use a
+     * different KMS backend (e.g. cluster-default 'vault' but one offline
+     * database uses 'local') via ALTER DATABASE SET pg_vault_tde.kms_provider.
+     * The provider is re-evaluated per connection from the effective GUC value.
+     */
     DefineCustomStringVariable("pg_vault_tde.kms_provider",
         "KMS provider backend: vault (default) or local (PKCS#12 wallet)",
         "Selects which Key Management Service backend is active.  "
         "'vault' (default): uses HashiCorp Vault / OpenBao Transit API.  "
-        "'local': uses a PKCS#12 wallet at pg_vault_tde.wallet_path.",
+        "'local': uses a PKCS#12 wallet at pg_vault_tde.wallet_path.  "
+        "Settable per-database via ALTER DATABASE SET.",
         &pg_vault_tde_kms_provider, "", PGC_SUSET,
         GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 

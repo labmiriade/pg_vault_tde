@@ -61,7 +61,7 @@ $RT run --rm -d \
 wait_pg_ready "$CONTAINER"
 
 # ── Create extension and upgrade to v1.6 ─────────────────────────────────
-log_info "Creating pg_vault_tde extension (installs at default_version=1.6) ..."
+log_info "Creating pg_vault_tde extension (installs at default_version=1.7) ..."
 if ! container_psql "$CONTAINER" -v ON_ERROR_STOP=1 -c \
         "CREATE EXTENSION IF NOT EXISTS pg_vault_tde;"; then
     log_error "WALLET: CREATE EXTENSION IF NOT EXISTS failed"

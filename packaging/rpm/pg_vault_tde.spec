@@ -7,7 +7,7 @@
 %global pginstdir /usr/pgsql-%{pgmajorversion}
 
 Name:           postgresql%{pgmajorversion}-%{sname}
-Version:        1.6
+Version:        1.7
 Release:        1%{?dist}
 Summary:        Transparent Data Encryption (TDE) extension for PostgreSQL %{pgmajorversion}
 License:        BSD
@@ -69,6 +69,11 @@ export PG_CONFIG
 %{pginstdir}/lib/bitcode/%{sname}*
 
 %changelog
+* Sun Jun 08 2026 Miriade Srl <info@miriade.it> - 1.7-1
+- v1.7: Per-database KMS configuration (PGC_SUSET for all KMS GUCs)
+- pg_restore_tde: full decrypt-and-pipe restore loop completed
+- Updated documentation: GUC context tables, per-database KMS section
+
 * Wed Mar 04 2026 Miriade Srl <info@miriade.it> - 1.6-1
 - v1.6: Local PKCS#12 wallet KMS provider (offline, no external service)
 - Flexible passphrase sources: env, file, command, dev_mode

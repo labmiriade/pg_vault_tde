@@ -9,7 +9,7 @@ decrypted after it leaves. Encryption keys are managed by **HashiCorp Vault** /
 **OpenBao** or a **local PKCS#12 wallet** and cached in shared memory with
 automatic rotation.
 
-**Current release: v1.6** - 109 regression tests (52 v1.4 + 20 v1.5 + 37 v1.6), zero compiler warnings on PG 17 + PG 18.
+**Current release: v1.7** — 109 regression tests (52 v1.4 + 20 v1.5 + 37 v1.6), zero compiler warnings on PG 17 + PG 18.
 
 ### PostgreSQL Version Compatibility
 
@@ -243,6 +243,37 @@ pg_vault_tde.kms_provider = 'vault'   # HashiCorp Vault / OpenBao (default)
 # pg_vault_tde.kms_provider = 'kmip'   # KMIP 1.2 (v1.8)
 ```
 
+### Per-Database KMS Configuration
+
+Because all `pg_vault_tde` GUC parameters are declared `PGC_SUSET`, a superuser
+can assign **different KMS settings to individual databases** in the same cluster
+without restarting PostgreSQL.  Each connection picks up the effective GUC value
+for its own database, so `postgres` can use a central Vault instance while
+`tenant_a` uses a dedicated transit key and `tenant_b` uses a local wallet:
+
+```sql
+-- cluster-level default (postgresql.conf / ALTER SYSTEM)
+-- pg_vault_tde.kms_provider = 'vault'
+
+-- database "tenant_a" uses a dedicated Vault transit key
+ALTER DATABASE tenant_a SET pg_vault_tde.vault_key_name     = 'tde-dek-tenant-a';
+ALTER DATABASE tenant_a SET pg_vault_tde.vault_transit_mount = 'transit-tenants';
+
+-- database "tenant_b" uses a local wallet (no Vault dependency)
+ALTER DATABASE tenant_b SET pg_vault_tde.kms_provider = 'local';
+ALTER DATABASE tenant_b SET pg_vault_tde.wallet_passphrase_env = 'TDE_WALLET_B';
+
+-- verify effective settings for a database
+\connect tenant_b
+SHOW pg_vault_tde.kms_provider;        -- 'local'
+SELECT pg_vault_tde_health_check();
+```
+
+Settings applied with `ALTER DATABASE SET` take effect for **new connections**
+to that database and do not require a server restart.  The cluster-level defaults
+in `postgresql.conf` (or `ALTER SYSTEM`) act as the fallback for any database
+that does not override a parameter.
+
 ### Local Wallet Provider (v1.6 — Offline, No External Service)
 
 A PKCS#12-based encrypted file at
@@ -319,50 +350,64 @@ SELECT pg_vault_tde_rotate_online(tablename, batch_size);
 
 All parameters are in the `pg_vault_tde` namespace.
 
+Most parameters have context `suset` (superuser-settable), meaning a superuser
+can change them without restarting PostgreSQL and can scope them per-database
+with `ALTER DATABASE SET`.  The only exception is `max_encrypted_relations`,
+which has context `postmaster` because it controls shared memory allocation at
+startup.
+
+**Context summary:**
+- `suset` — superuser can `SET` at session level or via `ALTER DATABASE SET` /
+  `ALTER ROLE SET`; takes effect for new connections with no restart required.
+- `postmaster` — requires a server restart; set in `postgresql.conf` or via
+  `ALTER SYSTEM`.
+
 ### KMS Provider (v1.5+)
 
 | Parameter | Type | Default | Context | Description |
 |---|---|---|---|---|
-| `kms_provider` | string | `vault` | postmaster | Active KMS backend: `vault`, `local` (v1.6), `pkcs11` (v1.7), `kmip` (v1.8) |
+| `kms_provider` | string | `vault` | suset | Active KMS backend: `vault`, `local` (v1.6), `pkcs11` (v1.7), `kmip` (v1.8). Settable per-database via `ALTER DATABASE SET`. |
 | `wallet_path` | string | `$PGDATA/base/<DB_OID>/pg_vault_tde/wallet.p12` | suset | Local wallet PKCS#12 file path (`kms_provider = 'local'`). Default computed at runtime — `SHOW` returns the effective path even when not set in `postgresql.conf`. |
-| `wallet_passphrase_env` | string | `''` | postmaster | Env var name holding wallet passphrase — env var NAME only, never the value |
-| `wallet_passphrase_file` | string | `''` | postmaster | File path containing wallet passphrase (trimmed; `0400` permission enforced) **(v1.6)** |
-| `wallet_passphrase_command` | string | `''` | postmaster | Shell command to retrieve passphrase (analogous to PG's `ssl_passphrase_command`) **(v1.6)** |
-| `wallet_dev_mode_passphrase` | string | `''` | userset | Convenience passphrase for dev/CI (only honoured when `dev_mode = on`) **(v1.6)** |
-| `dev_mode` | boolean | `off` | postmaster | Enable development mode features (wallet_dev_mode_passphrase) **(v1.6)** |
-| `wallet_auto_open` | boolean | `on` | postmaster | Auto-open wallet on startup if passphrase env var is set |
-| `max_encrypted_relations` | integer | `1024` | postmaster | Maximum number of per-table DEK entries in shmem (64–65536) |
-| `toast_encryption` | boolean | `on` | postmaster | Encrypt TOAST chunks with the parent relation's DEK (v1.5) |
+| `wallet_passphrase_env` | string | `''` | suset | Env var name holding wallet passphrase — env var NAME only, never the value |
+| `wallet_passphrase_file` | string | `''` | suset | File path containing wallet passphrase (trimmed; `0400` permission enforced) **(v1.6)** |
+| `wallet_passphrase_command` | string | `''` | suset | Shell command to retrieve passphrase (analogous to PG's `ssl_passphrase_command`) **(v1.6)** |
+| `wallet_dev_mode_passphrase` | string | `''` | suset | Convenience passphrase for dev/CI (only honoured when `dev_mode = on`) **(v1.6)** |
+| `dev_mode` | boolean | `off` | suset | Enable development mode features (wallet_dev_mode_passphrase) **(v1.6)** |
+| `wallet_auto_open` | boolean | `on` | suset | Auto-open wallet on startup if passphrase env var is set |
+| `max_encrypted_relations` | integer | `1024` | postmaster | Maximum number of per-table DEK entries in shmem (64–65536). Requires restart — affects shared memory sizing. |
+| `toast_encryption` | boolean | `on` | suset | Encrypt TOAST chunks with the parent relation's DEK (v1.5) |
 
 ### Vault / OpenBao (`kms_provider = 'vault'`)
 
+All parameters are `suset` — settable per-database with `ALTER DATABASE SET`.
+
 | Parameter | Type | Default | Context | Description |
 |---|---|---|---|---|
-| `vault_url` | string | `''` | postmaster | Vault / OpenBao base URL |
-| `vault_namespace` | string | `''` | postmaster | Vault namespace (enterprise; empty for community) |
-| `vault_token` | string | `''` | postmaster | Auth token — hidden from `pg_settings` (superuser only) |
-| `vault_role_id` | string | `''` | postmaster | AppRole role_id UUID |
-| `vault_secret_id` | string | `''` | postmaster | AppRole secret_id — hidden from `pg_settings` (superuser only) |
-| `vault_role_name` | string | `''` | postmaster | AppRole role name for secret_id rotation after login **(v1.4)** |
-| `vault_k8s_role` | string | `''` | postmaster | Kubernetes JWT auth role name |
-| `vault_transit_mount` | string | `transit` | postmaster | Transit secrets engine mount path |
-| `vault_key_name` | string | `pg-tde-dek` | postmaster | Transit key name for DEK wrapping |
-| `vault_ca_cert` | string | `''` | postmaster | Path to CA bundle for Vault TLS verification |
-| `vault_timeout_ms` | integer | `5000` | postmaster | Vault HTTP timeout in ms (0 = no timeout) |
-| `vault_response_wrapping` | boolean | `off` | postmaster | Use Vault response-wrapping for AppRole secret_id (v1.5) |
+| `vault_url` | string | `''` | suset | Vault / OpenBao base URL |
+| `vault_namespace` | string | `''` | suset | Vault namespace (enterprise; empty for community) |
+| `vault_token` | string | `''` | suset | Auth token — hidden from `pg_settings` (superuser only) |
+| `vault_role_id` | string | `''` | suset | AppRole role_id UUID |
+| `vault_secret_id` | string | `''` | suset | AppRole secret_id — hidden from `pg_settings` (superuser only) |
+| `vault_role_name` | string | `''` | suset | AppRole role name for secret_id rotation after login **(v1.4)** |
+| `vault_k8s_role` | string | `''` | suset | Kubernetes JWT auth role name |
+| `vault_transit_mount` | string | `transit` | suset | Transit secrets engine mount path |
+| `vault_key_name` | string | `pg-tde-dek` | suset | Transit key name for DEK wrapping. Override per-database to isolate tenant keys. |
+| `vault_ca_cert` | string | `''` | suset | Path to CA bundle for Vault TLS verification |
+| `vault_timeout_ms` | integer | `5000` | suset | Vault HTTP timeout in ms (0 = no timeout) |
+| `vault_response_wrapping` | boolean | `off` | suset | Use Vault response-wrapping for AppRole secret_id (v1.5) |
 
 ### Background Worker
 
 | Parameter | Type | Default | Context | Description |
 |---|---|---|---|---|
-| `bgw_enabled` | boolean | `off` | postmaster | Enable background worker for automatic token renewal |
-| `token_renewal_interval` | integer | `3600` | postmaster | Token renewal interval in seconds (60–86400) |
+| `bgw_enabled` | boolean | `off` | suset | Enable background worker for automatic token renewal |
+| `token_renewal_interval` | integer | `3600` | suset | Token renewal interval in seconds (60–86400) |
 
 ### General
 
 | Parameter | Type | Default | Context | Description |
 |---|---|---|---|---|
-| `enabled` | boolean | `on` | superuser | Master switch — set `off` to measure TAM overhead without crypto |
+| `enabled` | boolean | `on` | suset | Master switch — set `off` to measure TAM overhead without crypto. Settable per-database. |
 | `dump_plaintext_warning` | boolean | `on` | sighup | Emit WARNING when `pg_dump`/`COPY TO` reads from an encrypted table (v1.7) |
 | `encrypt_statistics` | boolean | `off` | sighup | Encrypt `pg_statistic` MCVs/histograms for encrypted columns (v1.8) |
 | `audit_enabled` | boolean | `on` | sighup | Enable audit event logging to `pg_vault_tde_audit_log` (v1.7) |
@@ -740,7 +785,7 @@ number of **pages**, not rows).
 
 ---
 
-## Limitations (v1.6)
+## Limitations (v1.7)
 
 See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
 
