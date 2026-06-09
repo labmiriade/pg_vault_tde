@@ -223,12 +223,15 @@ tde_object_access_hook(ObjectAccessType access, Oid classId, Oid objectId,
 
     table_close(rel, NoLock);
 
-    /* Only handle plain heap tables; skip TOAST, indexes, sequences, etc. */
-    if (relkind != RELKIND_RELATION || !OidIsValid(relam))
+    /* Only handle plain heap and index tables; skip TOAST, sequences, etc. */
+    if ((relkind != RELKIND_RELATION && relkind != RELKIND_INDEX))
+        return;
+
+    if(!OidIsValid(relam))
         return;
 
     amname = get_am_name(relam);
-    if (amname == NULL || strcmp(amname, "encrypted_heap") != 0)
+    if (amname == NULL || (strcmp(amname, "encrypted_heap") != 0 && strcmp(amname, "tde_btree") != 0))
         return;
 
     /*

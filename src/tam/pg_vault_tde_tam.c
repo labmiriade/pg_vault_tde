@@ -743,11 +743,22 @@ pg_vault_tde_index_build_range_scan(Relation heap_rel,
                 {
                     if (!enc_isnull[kcol])
                     {
-                        Form_pg_attribute att = TupleDescAttr(index_rel->rd_att, kcol);
-                        enc_values[kcol] = tde_iam_encrypt_index_datum(
-                                               enc_values[kcol],
-                                               att->attbyval,
-                                               att->attlen);
+                        if (TDE_IS_ENC_OPS_COL(index_rel, kcol))
+                        {
+                            enc_values[kcol] = tde_iam_encrypt_fixed_type_datum(
+                                                   index_rel,
+                                                   enc_values[kcol],
+                                                   index_rel->rd_opcintype[kcol]);
+                        }
+                        else
+                        {
+                            Form_pg_attribute att = TupleDescAttr(index_rel->rd_att, kcol);
+                            enc_values[kcol] = tde_iam_encrypt_index_datum(
+                                                    index_rel,
+                                                   enc_values[kcol],
+                                                   att->attbyval,
+                                                   att->attlen);
+                        }
                     }
                 }
                 MemoryContextSwitchTo(oldcxt);
