@@ -132,6 +132,10 @@ typedef struct TdeKmsProvider
     bool (*rewrap_dek)(const unsigned char *old_wrapped, int old_len,
                        unsigned char *new_wrapped, int *new_len);
 
+    /* Arms the provider for a rewrap cycle; must be called before pg_vault_tde_catalog_rewrap_all(). */
+    bool (*prepare_kek_rotation)(void);
+    void (*commit_kek_rotation)(void);
+
     /*
      * health_check — probe provider availability.
      *

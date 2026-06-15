@@ -885,12 +885,11 @@ pg_vault_tde_amrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 
                 if (TDE_IS_ENC_OPS_COL(scan->indexRelation, col))
                 {
-                    Oid typoid = (keys[i].sk_subtype != InvalidOid && keys[i].sk_subtype != BYTEAOID)
-                                     ? keys[i].sk_subtype
-                                     : scan->indexRelation->rd_opcintype[col]; //Real type of the Index Key
-
                     keys[i].sk_argument =
-                        tde_iam_encrypt_fixed_type_datum(scan->indexRelation, keys[i].sk_argument, typoid);
+                        tde_iam_encrypt_fixed_type_datum(scan->indexRelation, keys[i].sk_argument, scan->indexRelation->rd_opcintype[col]);
+
+                    /* Set the sk_func (boolean cmp function for rd_opcintype) to the bytea one*/
+                    fmgr_info(F_BYTEAEQ, &keys[i].sk_func); 
                 }
                 else
                 {
@@ -1013,6 +1012,10 @@ tde_iam_init(void)
     tde_btree_methods.ambeginscan = pg_vault_tde_ambeginscan;
     tde_btree_methods.amrescan    = pg_vault_tde_amrescan;
     tde_btree_methods.amvalidate  = pg_vault_tde_amvalidate;
+
+
+    /* Encrypted tuples are unencryptable only if they comes from the table */
+    tde_btree_methods.amcanreturn = NULL;
 
     /*
      * Allow STORAGE type ≠ opcintype for tde_*_enc_ops operator classes.

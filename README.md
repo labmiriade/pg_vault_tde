@@ -9,7 +9,7 @@ decrypted after it leaves. Encryption keys are managed by **HashiCorp Vault** /
 **OpenBao** or a **local PKCS#12 wallet** and cached in shared memory with
 automatic rotation.
 
-**Current release: v1.7** — 109 regression tests (52 v1.4 + 20 v1.5 + 37 v1.6), zero compiler warnings on PG 17 + PG 18.
+**Current release: v1.7** — 118 regression tests (52 v1.4 + 20 v1.5 + 37 v1.6), zero compiler warnings on PG 17 + PG 18.
 
 ### PostgreSQL Version Compatibility
 
@@ -124,13 +124,6 @@ SELECT pg_vault_tde_wallet_lock();
 
 > **Tip:** You can also use `wallet_passphrase_file` or `wallet_passphrase_command` instead of an environment variable. See the [GUC Parameters](#guc-parameters) section for details.
 
-For development and testing (no Vault or wallet required):
-
-```sql
--- Inject a random ephemeral DEK (test/dev only — lost on restart)
-SELECT pg_vault_tde_set_test_dek();
-```
-
 ### 4. Create an Encrypted Table
 
 ```sql
@@ -156,7 +149,7 @@ SELECT email, ssn FROM users WHERE id = 1;
 |---|---|---|
 | Tuple user data | ✅ **Yes** — AES-256-GCM | All column values in `encrypted_heap` tables |
 | HeapTupleHeader | ✗ No | xmin, xmax, ctid, infomask — required for MVCC |
-| Index keys (B-Tree) | ⚠️ Optional — `tde_btree` | AES-256-SIV — equality only; `bytea` only in v1.4; native types in v1.5 |
+| Index keys (B-Tree) | ⚠️ Optional — `tde_btree` | AES-256-SIV — equality only; all types encrypted (v1.7); index-only scans not supported |
 | Index keys (GIN, Hash) | 🔜 v1.8 | GIN for jsonb/arrays; Hash for equality hashing |
 | Index keys (GiST equality) | 🔜 v1.8 | Equality-only GiST (`inet_ops`); range/geometric GiST permanently deferred |
 | TOAST values | ✅ **Yes** | Heap-level round-trips functional; per-chunk storage encryption |
@@ -199,9 +192,9 @@ Crypto Layer — AES-256-GCM (OpenSSL 3.x EVP)           src/crypto/
    │  IV batch generation: 256 IVs per pg_strong_random() call
    │
    ▼
-KMS Layer — shared-memory DEK cache                    src/kms/
-   │  ┌─ dek_cache (shmem, LWLock-protected, generation epoch)
-   │  └─ local_dek_cache (per-backend TopMemCtx, generation mismatch → reload)
+KMS Layer — per-relation DEK cache                     src/kms/
+   │  ┌─ TdeRelDekCache (shmem, LWLock-protected, per-relation generation)
+   │  └─ pg_vault_tde_catalog (on-disk wrapped DEKs, one row per relation)
    │
    ▼
 HashiCorp Vault / OpenBao (GUC-configurable endpoint)
@@ -298,8 +291,8 @@ SELECT * FROM pg_vault_tde_wallet_status();
 SELECT pg_vault_tde_wallet_unlock('my_passphrase');
 -- Lock wallet (evict DEKs from shmem):
 SELECT pg_vault_tde_wallet_lock();
--- Rotate KEK (re-wrap all DEKs) — requires the new passphrase:
-SELECT pg_vault_tde_wallet_rotate_kek('my-strong-wallet-passphrase');
+-- Rotate KEK: generates a new KEK and re-wraps all per-table DEKs (works for both providers):
+SELECT pg_vault_tde_rotate_kek();
 -- Export wallet backup bundle:
 SELECT pg_vault_tde_wallet_export_bundle('/backup/wallet_bundle.bin', 'daily-backup');
 ```
@@ -325,25 +318,45 @@ and timeout are all configurable via GUC parameters registered at startup
 ### DEK Cache (Shared Memory)
 
 ```
-pg_vault_tde_dek_cache (shmem, 1 LWLock)
- ├─ dek[32]        : AES-256 key bytes (OPENSSL_cleanse'd on rotation)
- ├─ generation     : uint64 monotonic counter
- └─ valid          : bool
+TdeRelDekCache (shmem, capacity = pg_vault_tde.max_encrypted_relations, default 1024)
+ ├─ lock           : LWLock (embedded by value)
+ ├─ capacity       : int
+ ├─ used           : int
+ └─ entries[]      : TdeRelDekEntry per relation
+     ├─ relid          : Oid  (InvalidOid = empty slot)
+     ├─ dek[32]        : AES-256 key bytes (OPENSSL_cleanse'd on rotation)
+     ├─ prev_dek[32]   : previous DEK (rotation window fallback)
+     ├─ generation     : uint64 per-relation counter
+     └─ dek_valid / prev_dek_valid : bool
 ```
 
-Each backend maintains a local copy. On every encrypt/decrypt:
-1. Acquire shared lock
-2. Compare `local.generation == shmem.generation`
-3. If mismatch: reload DEK under shared lock (bounded staleness)
+DEK access via `pg_vault_tde_kms_get_rel_dek(relid)`:
+1. **Fast path**: linear scan under `LW_SHARED` — cache hit returns immediately.
+2. **Slow path** (cache miss): catalog read (`pg_vault_tde_catalog`) -> KMS unwrap -> insert under `LW_EXCLUSIVE`.
 
 ### Key Rotation
 
+**Per-table DEK rotation** (re-encrypts all tuples with a new DEK, no exclusive lock):
+
 ```sql
--- Step 1: wipe current DEK from shared memory (all new ops block until step 2)
-SELECT pg_vault_tde_rotate_online(tablename, batch_size);
+SELECT pg_vault_tde_rotate_online('mytable', 1000);
+-- Monitor progress:
+SELECT * FROM pg_vault_tde_rotation_status('mytable');
 ```
 
->**Production**: trigger Vault re-key and inject via pg_vault_tde_kms_set_dek()
+**KEK rotation** (re-wraps all per-table DEKs under a new KEK — tuple data untouched):
+
+```sql
+-- Unified function — works for both local wallet and Vault Transit providers:
+SELECT pg_vault_tde_rotate_kek();
+```
+
+> **Note on `pg_vault_tde_wallet_change_passphrase(old, new)`**: this function
+> automatically rotates the KEK as part of the passphrase change. A separate
+> `pg_vault_tde_rotate_kek()` call is unnecessary afterwards. The rationale: if an
+> attacker already holds the old passphrase, they already have the old KEK — changing
+> the passphrase without rotating the KEK provides no additional protection.
+
 ---
 
 ## GUC Parameters
@@ -418,22 +431,17 @@ All parameters are `suset` — settable per-database with `ALTER DATABASE SET`.
 
 | Function | Returns | Description |
 |---|---|---|
-| `pg_vault_tde_set_test_dek()` | void | Inject a random ephemeral DEK (**dev/test only**) |
-|  `pg_vault_tde_rotate_key()` **deprecated** | void | Wipe DEK from shared cache, bump generation |
-| `pg_vault_tde_key_generation()` | bigint | Current generation counter |
-| `pg_vault_tde_encrypt_test(text)` | bytea | Encrypt text via GCM (**test only**) |
-| `pg_vault_tde_decrypt_test(bytea)` | text | Decrypt bytea via GCM (**test only**) |
 | `pg_vault_tde_health_check()` | composite | KMS, DEK, crypto, and wallet status (15 columns) |
 | `pg_vault_tde_verify_integrity(regclass)` | void | GCM tag audit scan of all tuples |
 | `pg_vault_tde_reencrypt_table(regclass, int)` | bigint | Batch re-encrypt with current DEK (locks table) |
 | `pg_vault_tde_rotate_online(regclass, int)` | void | BGW-based online rotation, no exclusive lock **(v1.5)** |
 | `pg_vault_tde_rotation_status(regclass)` | composite | Online rotation progress **(v1.5)** |
 | `pg_vault_tde_wallet_init(text)` | void | Create local wallet and generate KEK **(v1.5)** |
-| `pg_vault_tde_wallet_change_passphrase(text, text)` | void | Re-protect wallet with new passphrase **(v1.6)** |
+| `pg_vault_tde_wallet_change_passphrase(text, text)` | void | Re-protect wallet with new passphrase and automatically rotate the KEK (`local` provider only); no separate `rotate_kek()` needed **(v1.6)** |
 | `pg_vault_tde_wallet_status()` | composite | Wallet existence, open state, algorithm, DEK count, last opened, file perms (6 cols) **(v1.6)** |
 | `pg_vault_tde_wallet_unlock(text)` | void | Interactive wallet unlock without PG restart **(v1.6)** |
 | `pg_vault_tde_wallet_lock()` | void | Evict all DEKs from shmem, mark wallet closed **(v1.6)** |
-| `pg_vault_tde_wallet_rotate_kek(new_passphrase text)` | void | Generate new KEK protected by `new_passphrase`, re-wrap all DEKs atomically **(v1.6)** |
+| `pg_vault_tde_rotate_kek()` | void | Rotate the KEK and re-wrap all per-table DEKs under a new key; works for both `local` and `vault` providers; no tuple data re-encrypted **(v1.7)** |
 | `pg_vault_tde_wallet_export_bundle(text, text)` | void | Export HMAC-signed wallet backup bundle **(v1.6)** |
 | `pg_vault_tde_wallet_import_bundle(text, text)` | void | Import and verify wallet backup bundle **(v1.6)** |
 | `pg_vault_tde_migrate_vault_to_wallet(text)` | void | Online Vault→local wallet migration **(v1.6)** |
@@ -789,10 +797,10 @@ number of **pages**, not rows).
 
 See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
 
-1. **tde_btree fixed-size type index key encryption** (→ v1.7): `int4`, `int8`, `uuid`,
-   `date`, `timestamptz` columns using `tde_btree` store the **index key in plaintext**.
-   Only varlena types (`text`, `bytea`, `numeric`) have encrypted index keys. The heap
-   tuple is fully encrypted regardless.
+1. **tde_btree fixed-size type index key encryption** — ✅ **Resolved in v1.7**: `int4`,
+   `int8`, `uuid`, `date`, `timestamptz` columns now have their btree index keys encrypted
+   with AES-256-SIV, identical to varlena types. **Index-only scans are not supported**
+   (by design, for security — see `doc/pg_vault_tde.md` § Index-Only Scans).
 
 2. **Range scans on TDE indexes** (by design — permanent): The `tde_btree` AM uses
    AES-256-SIV (equality-preserving, NOT order-preserving). `WHERE col > 'x'` on a

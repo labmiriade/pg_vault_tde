@@ -51,6 +51,7 @@ services:
     command: >
       postgres
         -c shared_preload_libraries=pg_vault_tde
+        -c pg_vault_tde.kms_provider=vault
         -c pg_vault_tde.dev_mode=on
         -c pg_vault_tde.vault_url=http://vault:${VAULT_MOCK_PORT:-8200}
         -c pg_vault_tde.vault_token=test-token

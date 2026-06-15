@@ -7,7 +7,7 @@
 ## Module Responsibility
 
 Manages the Data Encryption Key (DEK) lifecycle:
-1. **Shared-memory cache** — single DEK + generation epoch, `LWLock`-protected
+1. **Shared-memory cache** — per-relation DEK cache (`TdeRelDekCache`), `LWLock`-protected
 2. **Per-backend local cache** — `TopMemoryContext` copy, lazy refresh on generation mismatch
 3. **Vault HTTP connector** — `libcurl`-based async request to HashiCorp Vault / OpenBao
 4. **Key rotation** — wipe DEK, bump generation, invalidate all backends lazily
@@ -16,20 +16,17 @@ Manages the Data Encryption Key (DEK) lifecycle:
 
 ## Shared Memory Layout
 
-```c
-typedef struct TdeKmsSharedState {
-    LWLock      lock;             /* embedded by VALUE (not pointer) */
-    uint64      generation;       /* monotonically incremented on rotate */
-    bool        dek_valid;        /* false until first key injection */
-    char        dek[TDE_DEK_LEN]; /* 32-byte AES-256 key */
-} TdeKmsSharedState;
-```
+### v1.5+ — Per-Relation DEK Cache (current)
+
+See `src/kms/kms.instructions.md` § Per-Table DEK Cache (v1.5+) below for the
+`TdeRelDekCache` / `TdeRelDekEntry` layout. This is the structure used for all
+newly created encrypted relations.
 
 ### Critical: Shared Memory Initialization Sequence
 
 ```
 shmem_request_hook:
-  └── RequestAddinShmemSpace(sizeof(TdeKmsSharedState))
+  └── RequestAddinShmemSpace(sizeof(TdeRelDekCache) + capacity * sizeof(TdeRelDekEntry))
       ⚠ Do NOT call RequestNamedLWLockTranche() here
       ⚠ Do NOT call LWLockNewTrancheId() here
 
@@ -49,57 +46,36 @@ shared memory doesn't exist yet → segfault.
 
 ## DEK Access Pattern (Hot Path)
 
+`pg_vault_tde_kms_get_rel_dek(relid, dek_out, len)` — per-relation accessor:
+
 ```c
-bool pg_vault_tde_kms_get_dek(unsigned char *dek_out, int len)
-{
-    /* 1. Fast path: local cache hit (no lock) */
-    if (local_valid && local_generation == shmem->generation) {
-        memcpy(dek_out, local_dek, TDE_DEK_LEN);
-        return true;
-    }
-
-    /* 2. Slow path: acquire LW_SHARED, copy from shmem */
-    LWLockAcquire(&shmem->lock, LW_SHARED);
-    if (!shmem->dek_valid) {
-        LWLockRelease(&shmem->lock);
-        return false;  /* no key set yet */
-    }
-    memcpy(dek_out, shmem->dek, TDE_DEK_LEN);
-    local_generation = shmem->generation;
-    LWLockRelease(&shmem->lock);
-
-    /* 3. Update local cache */
-    memcpy(local_dek, dek_out, TDE_DEK_LEN);
-    local_valid = true;
+/* 1. Fast path: shmem cache hit (LW_SHARED) */
+LWLockAcquire(&cache->lock, LW_SHARED);
+entry = find_entry(cache, relid);
+if (entry && entry->dek_valid) {
+    memcpy(dek_out, entry->dek, TDE_DEK_LEN);
+    LWLockRelease(&cache->lock);
     return true;
 }
+LWLockRelease(&cache->lock);
+
+/* 2. Slow path: catalog read + KMS unwrap + cache insert (LW_EXCLUSIVE) */
+unwrap_from_catalog(relid, dek_out);
+insert_into_cache(relid, dek_out);  /* LW_EXCLUSIVE */
+return true;
 ```
 
 ### Performance Rules
 - Local cache avoids shmem lock on generation match → O(1) per tuple
 - Maximum one `LW_SHARED` acquisition per generation mismatch
-- `LW_EXCLUSIVE` only during `rotate_key()` or `set_dek()`
+- `LW_EXCLUSIVE` only during key rotation or `set_dek()`
 - NEVER upgrade shared→exclusive inline — release first, re-acquire exclusive
 
 ---
 
 ## Key Rotation Protocol
 
-```c
-void pg_vault_tde_rotate_key(void)
-{
-    LWLockAcquire(&shmem->lock, LW_EXCLUSIVE);
-    OPENSSL_cleanse(shmem->dek, TDE_DEK_LEN);
-    shmem->generation++;
-    shmem->dek_valid = false;
-    LWLockRelease(&shmem->lock);
-}
-```
-
-- Each backend detects the mismatch lazily on next `get_dek()` call
-- No SIGUSR1/SIGHUP needed — generation epoch is self-detecting
-- Old-generation rows become permanently unreadable (by design)
-- Re-encryption utility is a v1.2 roadmap item
+Per-relation rotation is handled via `pg_vault_tde_catalog_update_rel_dek(relid)` — see `pg_vault_tde_catalog.h`.
 
 ---
 
@@ -257,13 +233,15 @@ derivation from MAC verification.  Use it instead of
 `local_wrap_dek_with_pass()` whenever the wallet file's MAC does not yet
 match the target passphrase.
 
-### `rotate_kek` / `export_bundle` dual-source KEK (v1.6 patch)
+### `rotate_kek` / `export_bundle` dual-source KEK (v1.6 patch, unified in v1.7)
 
-For `pg_vault_tde_wallet_rotate_kek(new_pass)`: the function now prefers
+`pg_vault_tde_rotate_kek()` (v1.7, unified; replaced the local-wallet-only
+`pg_vault_tde_wallet_rotate_kek()` from v1.6) prefers
 `local_wallet_state->kek` (set by a prior `wallet_unlock`) over
-`local_get_passphrase()`.  This means tests that already called
-`wallet_unlock` no longer need to configure
-`pg_vault_tde.wallet_passphrase_env` to call `rotate_kek`.
+`local_get_passphrase()` when running under the `local` provider.  This means
+tests that already called `wallet_unlock` no longer need to configure
+`pg_vault_tde.wallet_passphrase_env` to call `rotate_kek`.  Under the `vault`
+provider the function calls Vault Transit key rotation and re-wraps all DEKs.
 
 `pg_vault_tde_wallet_export_bundle()` deliberately keeps the
 GUC-passphrase requirement: the bundle's HMAC key is derived via PBKDF2
@@ -298,7 +276,7 @@ else if (strcmp(guc_kms_provider, "kmip") == 0)
 | File | Provider | Available Since |
 |------|----------|-----------------|
 | `src/kms/pg_vault_tde_kms_vault.c` | `vault` | v1.0 (refactored in v1.5) |
-| `src/kms/pg_vault_tde_kms_local.c` | `local` | v1.5 (v1.6 patch: wrap_dek capacity-init bug fixed in `change_passphrase` + `rotate_kek`) |
+| `src/kms/pg_vault_tde_kms_local.c` | `local` | v1.5 (v1.6 patch: wrap_dek capacity-init bug fixed in `change_passphrase` + `rotate_kek`; v1.7: `wallet_rotate_kek` renamed to unified `pg_vault_tde_rotate_kek`) |
 | `src/kms/pg_vault_tde_catalog.c` | dispatch / catalog access | v1.5 (v1.6 patch: wrap_dek capacity-init bug fixed at line 488 — was blocking `CREATE TABLE` under Vault provider) |
 | `src/kms/pg_vault_tde_kms_pkcs11.c` | `pkcs11` | v1.7 |
 | `src/kms/pg_vault_tde_kms_kmip.c` | `kmip` | v1.8 |
@@ -357,7 +335,6 @@ the very first `wrap_dek` call after `wallet_init`.  Always use `PKCS12_DEFAULT_
 
 ```c
 /*
- * TdeRelDekCache replaces the single TdeShmemData.dek[32] field.
  * Each encrypted relation has its own DEK entry in a fixed-size shmem array.
  * Keyed by Oid (relfilenode).
  */
@@ -377,8 +354,8 @@ typedef struct TdeRelDekCache {
 } TdeRelDekCache;
 ```
 
-Backward compatibility: relations with no `pg_vault_tde_catalog` row use the v1.4
-legacy single-DEK (sentinel `relid = 0`).
+The v1.4 global DEK (`TdeShmemData`, `relid = 0` sentinel) was removed in v1.7.
+All relations must have a `pg_vault_tde_catalog` entry.
 
 ---
 
@@ -404,10 +381,9 @@ When Vault is unreachable (network error, timeout, HTTP 5xx):
 3. If still fail → log WARNING and set shmem state to DEK_NOT_SET
 4. PostgreSQL starts normally — encrypted_heap tables will ereport(ERROR)
    on first access ("no DEK available")
-5. User can call pg_vault_tde_set_test_dek() for dev/test, or fix Vault
 ```
 
-### Runtime (pg_vault_tde_kms_get_dek)
+### Runtime (pg_vault_tde_kms_get_rel_dek)
 
 ```
 1. Check shmem cache (LW_SHARED) — if DEK set, return it (fast path)

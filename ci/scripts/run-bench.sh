@@ -54,6 +54,8 @@ $RT run --rm -d \
     "${PG_TEST_IMAGE:-pg-tde-test}:latest" \
     postgres \
     -c "shared_preload_libraries=pg_vault_tde" \
+    -c "pg_vault_tde.kms_provider=local" \
+    -c "pg_vault_tde.wallet_passphrase_command=echo tde_bench_test" \
     -c "pg_vault_tde.dev_mode=on" \
     -c "log_min_messages=warning"
 

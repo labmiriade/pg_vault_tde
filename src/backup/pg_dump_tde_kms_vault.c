@@ -601,7 +601,7 @@ vault_config_load(PGconn *conn, PdeVaultConfig *config)
 static bool
 vault_generate_dek(unsigned char *out, int len)
 {
-    if (RAND_bytes(out, len) != 1)
+    if (!pg_strong_random(out, len))
     {
         pg_log_error("vault: RAND_bytes failed to generate %d-byte DEK", len);
         return false;

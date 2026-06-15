@@ -220,7 +220,7 @@ tde_gcm_encrypt_core(const unsigned char* dek, int dek_len, Oid relid,
         ((unsigned char *) out_buf)[0] = OidIsValid(relid) ? TDE_V3_VERSION_BYTE : TDE_V2_VERSION_BYTE;
         
         /*Write generation*/
-        gen = pg_vault_tde_kms_get_generation();
+        gen = pg_vault_tde_catalog_get_rel_generation(relid);
         memcpy(out_buf + 1, &gen, TDE_V2_GEN_LEN);
     }
 
@@ -248,8 +248,10 @@ tde_gcm_encrypt_core(const unsigned char* dek, int dek_len, Oid relid,
         {
             OPENSSL_cleanse(out_buf, total);
             pfree(out_buf);
-            ereport(ERROR, 
+            ereport(WARNING, 
                     errmsg("[CRYPTO] Failed to allocate GCM encrypt context"));
+
+            return NULL;
         }
     }
     else
@@ -322,7 +324,6 @@ gcm_error:
     ctx = NULL;
     OPENSSL_cleanse(out_buf, total);
     pfree(out_buf);
-    ereport(ERROR, errmsg("[CRYPTO] AES-256-GCM encryption failed"));
     return NULL;
 }
 
@@ -345,8 +346,6 @@ tde_gcm_encrypt(Oid relid, const char *plaintext, Size plaintext_len, Size *out_
                             plaintext, plaintext_len, &enc_len)))
     {
         OPENSSL_cleanse(dek, TDE_DEK_LEN);
-        OPENSSL_cleanse(encrypted, sizeof(encrypted));
-        pfree(encrypted);
         ereport(ERROR, 
                 errmsg("[CRYPTO] AES-256-GCM encryption failed"));
     }
@@ -537,13 +536,8 @@ tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len, Size *ou
     if (auth_ok != 1)
     {
         /*
-         * GCM authentication failed with the current DEK.  This may indicate
-         * data corruption, tampering, or a key rotation: the tuple might have
-         * been encrypted with the previous DEK.  Try the prev_dek if available.
-         *
-         * This fallback is the key mechanism that enables graceful key rotation:
-         * after rotate_key() + set_test_dek()/vault_fetch_dek(), rows encrypted
-         * with the old key remain readable during the re-encryption window.
+         * GCM tag mismatch: tuple may have been encrypted with the previous
+         * DEK (key rotation in progress).  Try prev_dek if available.
          */
         char prev_dek[TDE_DEK_LEN];
 
@@ -684,69 +678,3 @@ gcm_dec_error:
     return NULL; /* unreachable */
 }
 
-/* ----------------------------------------------------------------
- * SQL-callable test wrappers for integration testing.
- * These expose the raw crypto primitives so we can verify that
- * AES-256-GCM encrypt → decrypt round-trips correctly, and that
- * ciphertext does NOT contain plaintext.
- * ----------------------------------------------------------------
- */
-#include "fmgr.h"
-#include "utils/builtins.h"
-#include "varatt.h"
-
-/*
- * pg_vault_tde_encrypt_test(text) → bytea
- *
- * Encrypts the input text and returns the ciphertext as bytea.
- * Requires a DEK to be set (via pg_vault_tde_set_test_dek first).
- */
-PG_FUNCTION_INFO_V1(pg_vault_tde_encrypt_test);
-PGDLLEXPORT Datum
-pg_vault_tde_encrypt_test(PG_FUNCTION_ARGS)
-{
-    text   *input   = PG_GETARG_TEXT_PP(0);
-    char   *plain   = VARDATA_ANY(input);
-    Size    plen    = VARSIZE_ANY_EXHDR(input);
-    Size    enc_len = 0;
-    char   *encrypted;
-    bytea  *result;
-
-    encrypted = tde_gcm_encrypt(InvalidOid, plain, plen, &enc_len);
-
-    result = (bytea *) palloc(VARHDRSZ + enc_len);
-    SET_VARSIZE(result, VARHDRSZ + enc_len);
-    memcpy(VARDATA(result), encrypted, enc_len);
-
-    OPENSSL_cleanse(encrypted, enc_len);
-    pfree(encrypted);
-
-    PG_RETURN_BYTEA_P(result);
-}
-
-/*
- * pg_vault_tde_decrypt_test(bytea) → text
- *
- * Decrypts a ciphertext produced by pg_vault_tde_encrypt_test.
- * Verifies GCM authentication tag — fails if tampered.
- */
-PG_FUNCTION_INFO_V1(pg_vault_tde_decrypt_test);
-PGDLLEXPORT Datum
-pg_vault_tde_decrypt_test(PG_FUNCTION_ARGS)
-{
-    bytea  *input   = PG_GETARG_BYTEA_PP(0);
-    char   *ct      = VARDATA_ANY(input);
-    Size    ct_len  = VARSIZE_ANY_EXHDR(input);
-    Size    pt_len  = 0;
-    char   *decrypted;
-    text   *result;
-
-    decrypted = tde_gcm_decrypt(InvalidOid, ct, ct_len, &pt_len);
-
-    result = cstring_to_text_with_len(decrypted, pt_len);
-
-    OPENSSL_cleanse(decrypted, pt_len);
-    pfree(decrypted);
-
-    PG_RETURN_TEXT_P(result);
-}

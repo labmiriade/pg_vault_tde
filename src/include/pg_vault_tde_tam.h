@@ -48,7 +48,6 @@ HeapTuple tde_encrypt_heap_tuple(HeapTuple plain, Oid relid);
  * plugin calls this to produce plaintext before emitting changes.
  *
  * relid: the OID of the source relation (used for per-table DEK lookup).
- *        Pass InvalidOid to fall back to the v1.4 global DEK.
  *
  * Returns a palloc'd HeapTuple (caller must pfree after use).
  * Raises ERROR on GCM authentication failure.

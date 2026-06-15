@@ -278,6 +278,28 @@ COMMENT ON FUNCTION pg_vault_tde_check_plaintext_index_keys() IS
 'Restricted to pg_monitor and superuser.';
 
 -- ============================================================================
+-- §10.8 — Replace pg_vault_tde_wallet_rotate_kek() with unified pg_vault_tde_rotate_kek()
+-- ============================================================================
+-- The v1.6 function was local-wallet-only.  v1.7 introduces a provider-agnostic
+-- entry point that works with both the local wallet and the Vault Transit provider.
+
+ALTER EXTENSION pg_vault_tde DROP FUNCTION pg_vault_tde_wallet_rotate_kek();
+DROP FUNCTION IF EXISTS pg_vault_tde_wallet_rotate_kek();
+
+CREATE FUNCTION pg_vault_tde_rotate_kek()
+    RETURNS void
+    LANGUAGE C STRICT SECURITY DEFINER
+    AS 'MODULE_PATHNAME', 'pg_vault_tde_rotate_kek_sql';
+
+REVOKE ALL ON FUNCTION pg_vault_tde_rotate_kek() FROM PUBLIC;
+
+COMMENT ON FUNCTION pg_vault_tde_rotate_kek() IS
+'Re-wrap all per-table DEKs under a new KEK without touching encrypted tuple data. '
+'For the local wallet provider: generates a fresh random KEK and rewrites the wallet file. '
+'For the Vault provider: rotates the Transit key and re-wraps all DEKs. '
+'Requires superuser. Flushes the shared-memory DEK cache after completion.';
+
+-- ============================================================================
 -- §10.7 — Replace pg_vault_tde_health_check() with v1.7 version
 -- ============================================================================
 -- The v1.5 / v1.6 version returned 7 columns:

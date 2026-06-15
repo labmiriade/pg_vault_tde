@@ -14,7 +14,7 @@ use PostgreSQL::Test::Utils;
 my $vault_addr = $ENV{VAULT_ADDR}
     or plan skip_all => 'VAULT_ADDR not set — skipping Vault integration test';
 
-plan tests => 7;
+plan tests => 8;
 
 my $node = PostgreSQL::Test::Cluster->new('backup_vault_node');
 $node->init;
@@ -28,15 +28,28 @@ $node->append_conf('postgresql.conf',
     "pg_vault_tde.vault_key_name='pg-tde-dek'\n");
 $node->start;
 
-ok($node->psql('postgres', 'CREATE EXTENSION pg_vault_tde;') == 0,
-   'CREATE EXTENSION succeeds');
+my ($ret, $stdout, $stderr);
 
-$node->safe_psql('postgres',
-    "CREATE TABLE secret_data (id serial, payload text) USING encrypted_heap;");
-$node->safe_psql('postgres',
-    "INSERT INTO secret_data (payload) VALUES ('top_secret_value');");
+$ret = $node->psql('postgres', 'CREATE EXTENSION pg_vault_tde;',
+    stdout => \$stdout, stderr => \$stderr);
+diag("CREATE EXTENSION stdout: $stdout") if $stdout;
+diag("CREATE EXTENSION stderr: $stderr") if $stderr;
+ok($ret == 0, 'CREATE EXTENSION succeeds');
 
-ok(1, 'TDE table created and populated');
+$ret = $node->psql('postgres',
+    "CREATE TABLE secret_data (id serial, payload text) USING encrypted_heap;",
+    stdout => \$stdout, stderr => \$stderr);
+diag("CREATE TABLE stdout: $stdout") if $stdout;
+diag("CREATE TABLE stderr: $stderr") if $stderr;
+diag("CREATE TABLE server log:\n" . $node->log_content) if $ret != 0;
+ok($ret == 0, 'CREATE TABLE succeeds');
+
+$ret = $node->psql('postgres',
+    "INSERT INTO secret_data (payload) VALUES ('top_secret_value');",
+    stdout => \$stdout, stderr => \$stderr);
+diag("INSERT stdout: $stdout") if $stdout;
+diag("INSERT stderr: $stderr") if $stderr;
+ok($ret == 0, 'INSERT succeeds');
 
 # --- Run pg_dump_tde and verify output is ciphertext ---
 my $dump_file = $node->data_dir . '/test_backup.dump';

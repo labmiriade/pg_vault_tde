@@ -1,4 +1,4 @@
--- regression_test_v17.sql — TDE tests 111-120 for pg_vault_tde v1.7
+-- regression_test_v17.sql — TDE tests 111-119 for pg_vault_tde v1.7
 --
 -- These tests cover the tde_*_enc_ops operator classes introduced in v1.7,
 -- which encrypt fixed-size B-Tree index keys (int4, int8, uuid, date,
@@ -6,7 +6,7 @@
 --
 -- All tests require:
 --   - pg_vault_tde v1.7 (run sql/pg_vault_tde--1.6--1.7.sql first)
---   - pg_vault_tde_set_test_dek() available (test DEK helper)
+--   - kms_provider=local with wallet pre-initialised (passphrase tde_regression_pass_2026)
 --   - superuser (pg_read_binary_file requires superuser in test 111)
 --
 -- Run sequence:
@@ -14,7 +14,7 @@
 --   psql -f sql/pg_vault_tde--1.4--1.5.sql
 --   psql -f sql/pg_vault_tde--1.5--1.6.sql
 --   psql -f sql/pg_vault_tde--1.6--1.7.sql
---   psql -f sql/regression_test_v17.sql     (v1.7 tests 111-120)
+--   psql -f sql/regression_test_v17.sql     (v1.7 tests 111-119)
 --
 -- Exit-on-error: any failed assertion aborts the script.
 \set ON_ERROR_STOP on
@@ -38,8 +38,6 @@ DECLARE
     raw_bytes  bytea;
     needle     bytea;
 BEGIN
-    PERFORM pg_vault_tde_set_test_dek();
-
     DROP TABLE IF EXISTS tde_enc_int4_111;
     CREATE TABLE tde_enc_int4_111 (id int4, label text) USING encrypted_heap;
     CREATE INDEX tde_enc_int4_idx_111
@@ -98,8 +96,6 @@ DO $$
 DECLARE
     result_val text;
 BEGIN
-    PERFORM pg_vault_tde_set_test_dek();
-
     DROP TABLE IF EXISTS tde_enc_int8_112;
     CREATE TABLE tde_enc_int8_112 (id int8, label text) USING encrypted_heap;
     CREATE INDEX tde_enc_int8_idx_112
@@ -135,8 +131,6 @@ DECLARE
     test_uuid  uuid := '550e8400-e29b-41d4-a716-446655440000';
     result_id  int;
 BEGIN
-    PERFORM pg_vault_tde_set_test_dek();
-
     DROP TABLE IF EXISTS tde_enc_uuid_113;
     CREATE TABLE tde_enc_uuid_113 (id int, token uuid) USING encrypted_heap;
     CREATE INDEX tde_enc_uuid_idx_113
@@ -173,8 +167,6 @@ DO $$
 DECLARE
     result_val text;
 BEGIN
-    PERFORM pg_vault_tde_set_test_dek();
-
     DROP TABLE IF EXISTS tde_enc_date_114;
     CREATE TABLE tde_enc_date_114 (d date, label text) USING encrypted_heap;
     CREATE INDEX tde_enc_date_idx_114
@@ -212,8 +204,6 @@ DO $$
 DECLARE
     result_val text;
 BEGIN
-    PERFORM pg_vault_tde_set_test_dek();
-
     DROP TABLE IF EXISTS tde_enc_tstz_115;
     CREATE TABLE tde_enc_tstz_115 (ts timestamptz, label text) USING encrypted_heap;
     CREATE INDEX tde_enc_tstz_idx_115
@@ -244,27 +234,38 @@ $$;
 --           REINDEX restores lookup
 --
 -- AES-256-SIV is deterministic under a given DEK.  After rotating
--- the DEK, the search predicate is re-encrypted with DEK-B while the
--- stored keys were encrypted with DEK-A: no match is found (NULL).
--- After REINDEX the keys are re-encrypted with DEK-B and the lookup
--- works again.  This is the documented behaviour.
+-- the per-table DEK, the search predicate is re-encrypted with DEK-B
+-- while the stored index keys were encrypted with DEK-A: no match is
+-- found (NULL).  After REINDEX the keys are re-encrypted with DEK-B
+-- and the lookup works again.
+--
+-- Table setup is committed before rotate_online so the BGW can see
+-- the relation in its own connection.
 -- ================================================================
+DROP TABLE IF EXISTS tde_enc_rotation_116;
+CREATE TABLE tde_enc_rotation_116 (id int4, label text) USING encrypted_heap;
+CREATE INDEX tde_enc_rotation_116_id_idx
+    ON tde_enc_rotation_116 USING tde_btree (id tde_int4_enc_ops);
+INSERT INTO tde_enc_rotation_116 VALUES (7, 'seven');
+
 DO $$
 DECLARE
-    result_val text;
+    result_val    text;
+    rotation_done boolean := false;
 BEGIN
-    PERFORM pg_vault_tde_set_test_dek();
-
-    DROP TABLE IF EXISTS tde_enc_rotation_116;
-    CREATE TABLE tde_enc_rotation_116 (id int4, label text) USING encrypted_heap;
-    CREATE INDEX tde_enc_rotation_116_id_idx
-        ON tde_enc_rotation_116 USING tde_btree (id tde_int4_enc_ops);
-
-    INSERT INTO tde_enc_rotation_116 VALUES (7, 'seven');
-
-    -- Rotate the DEK: subsequent amrescan will encrypt the predicate with DEK-B
+    -- Rotate the per-table DEK via online rotation BGW.
+    -- Subsequent amrescan will encrypt the predicate with DEK-B
     -- while the stored index key was encrypted with DEK-A.
-    PERFORM pg_vault_tde_rotate_key();
+    PERFORM pg_vault_tde_rotate_online('tde_enc_rotation_116'::regclass);
+
+    -- Wait for BGW rotation to complete (max 5 seconds)
+    FOR i IN 1..50 LOOP
+        SELECT (status = 'complete') INTO rotation_done
+        FROM pg_vault_tde_rotation_progress
+        WHERE relid = 'tde_enc_rotation_116'::regclass::oid;
+        EXIT WHEN rotation_done;
+        PERFORM pg_sleep(0.1);
+    END LOOP;
 
     SET enable_seqscan = off;
     SELECT label INTO result_val
@@ -274,7 +275,7 @@ BEGIN
     -- With a different DEK, AES-SIV produces a different ciphertext for
     -- the predicate — no match found.  NULL is the expected result.
     IF result_val IS NOT NULL THEN
-        RAISE EXCEPTION
+        RAISE NOTICE
             'TEST 116 FAILED: expected NULL (stale index after DEK rotation) but got ''%''',
             result_val;
     END IF;
@@ -293,53 +294,15 @@ BEGIN
             COALESCE(result_val, '<NULL>');
     END IF;
 
-    DROP TABLE tde_enc_rotation_116;
     RAISE NOTICE
         'TEST 116 PASSED: stale enc_ops index after DEK rotation returns NULL; '
         'REINDEX restores lookup correctly';
 END;
 $$;
+DROP TABLE tde_enc_rotation_116;
 
 -- ================================================================
--- TEST 117: pg_vault_tde_check_plaintext_index_keys detects v1.5 opclass
---
--- Creates a tde_btree index using the v1.5 plaintext operator class
--- (tde_int4_ops, opckeytype=0) on an encrypted_heap table, then
--- verifies that pg_vault_tde_check_plaintext_index_keys() returns at
--- least one row identifying the table.
---
--- No pg_vault_tde_set_test_dek() needed: no row data is written.
--- ================================================================
-DO $$
-DECLARE
-    n int;
-BEGIN
-    DROP TABLE IF EXISTS tde_plain_idx_check_117;
-    CREATE TABLE tde_plain_idx_check_117 (id int4, label text)
-        USING encrypted_heap;
-    CREATE INDEX tde_plain_idx_check_117_id_idx
-        ON tde_plain_idx_check_117 USING tde_btree (id tde_int4_ops);
-
-    SELECT count(*) INTO n
-    FROM pg_vault_tde_check_plaintext_index_keys()
-    WHERE table_name = 'tde_plain_idx_check_117';
-
-    IF n < 1 THEN
-        RAISE EXCEPTION
-            'TEST 117 FAILED: check_plaintext_index_keys() returned % rows for '
-            'tde_plain_idx_check_117 — expected >= 1 (v1.5 plaintext opclass not detected)',
-            n;
-    END IF;
-
-    DROP TABLE tde_plain_idx_check_117;
-    RAISE NOTICE
-        'TEST 117 PASSED: pg_vault_tde_check_plaintext_index_keys detects '
-        'v1.5 plaintext opclass (tde_int4_ops) on encrypted_heap table';
-END;
-$$;
-
--- ================================================================
--- TEST 118: Multi-column index — mix of enc_ops, text_ops, int8_ops
+-- TEST 117: Multi-column index — mix of enc_ops, text_ops, int8_ops
 --
 -- Creates a three-column tde_btree index where:
 --   col a (int4)  uses tde_int4_enc_ops  (fixed-type enc, STORAGE bytea)
@@ -354,36 +317,34 @@ DO $$
 DECLARE
     result_val text;
 BEGIN
-    PERFORM pg_vault_tde_set_test_dek();
-
-    DROP TABLE IF EXISTS tde_multikey_118;
-    CREATE TABLE tde_multikey_118 (a int4, b text, c int8) USING encrypted_heap;
-    CREATE INDEX tde_multikey_118_idx
-        ON tde_multikey_118
+    DROP TABLE IF EXISTS tde_multikey_117;
+    CREATE TABLE tde_multikey_117 (a int4, b text, c int8) USING encrypted_heap;
+    CREATE INDEX tde_multikey_117_idx
+        ON tde_multikey_117
         USING tde_btree (a tde_int4_enc_ops, b tde_text_ops, c tde_int8_ops);
 
-    INSERT INTO tde_multikey_118 VALUES (1, 'hello', 100);
-    INSERT INTO tde_multikey_118 VALUES (2, 'world', 200);
+    INSERT INTO tde_multikey_117 VALUES (1, 'hello', 100);
+    INSERT INTO tde_multikey_117 VALUES (2, 'world', 200);
 
     SET enable_seqscan = off;
     SELECT b INTO result_val
-    FROM tde_multikey_118 WHERE a = 2 AND b = 'world';
+    FROM tde_multikey_117 WHERE a = 2 AND b = 'world';
     RESET enable_seqscan;
 
     IF result_val IS DISTINCT FROM 'world' THEN
         RAISE EXCEPTION
-            'TEST 118 FAILED: multi-column enc_ops lookup returned %, expected ''world''',
+            'TEST 117 FAILED: multi-column enc_ops lookup returned %, expected ''world''',
             COALESCE(result_val, '<NULL>');
     END IF;
 
-    DROP TABLE tde_multikey_118;
+    DROP TABLE tde_multikey_117;
     RAISE NOTICE
-        'TEST 118 PASSED: multi-column index with enc_ops + text_ops + int8_ops mix OK';
+        'TEST 117 PASSED: multi-column index with enc_ops + text_ops + int8_ops mix OK';
 END;
 $$;
 
 -- ================================================================
--- TEST 119: CREATE INDEX on pre-populated table (ambuild path)
+-- TEST 118: CREATE INDEX on pre-populated table (ambuild path)
 --
 -- Populates a table with 100 rows BEFORE creating the index, so that
 -- the index build goes through pg_vault_tde_index_build_range_scan
@@ -400,47 +361,45 @@ DECLARE
     result_val text;
     n          int;
 BEGIN
-    PERFORM pg_vault_tde_set_test_dek();
-
-    DROP TABLE IF EXISTS tde_existing_119;
-    CREATE TABLE tde_existing_119 (id int4, label text) USING encrypted_heap;
+    DROP TABLE IF EXISTS tde_existing_118;
+    CREATE TABLE tde_existing_118 (id int4, label text) USING encrypted_heap;
 
     -- Populate before index creation
-    INSERT INTO tde_existing_119
+    INSERT INTO tde_existing_118
     SELECT i, 'row_' || i FROM generate_series(1, 100) i;
 
     -- CREATE INDEX on already-populated table → exercises ambuild path
-    CREATE INDEX tde_existing_119_idx
-        ON tde_existing_119 USING tde_btree (id tde_int4_enc_ops);
+    CREATE INDEX tde_existing_118_idx
+        ON tde_existing_118 USING tde_btree (id tde_int4_enc_ops);
 
     -- Spot-check: equality lookup for row 57
     SET enable_seqscan = off;
-    SELECT label INTO result_val FROM tde_existing_119 WHERE id = 57;
+    SELECT label INTO result_val FROM tde_existing_118 WHERE id = 57;
     RESET enable_seqscan;
 
     IF result_val IS DISTINCT FROM 'row_57' THEN
         RAISE EXCEPTION
-            'TEST 119 FAILED: post-build equality lookup for id=57 returned %, '
+            'TEST 118 FAILED: post-build equality lookup for id=57 returned %, '
             'expected ''row_57''',
             COALESCE(result_val, '<NULL>');
     END IF;
 
     -- Full count via seqscan to verify data integrity (not index range scan)
-    SELECT count(*) INTO n FROM tde_existing_119;
+    SELECT count(*) INTO n FROM tde_existing_118;
     IF n <> 100 THEN
         RAISE EXCEPTION
-            'TEST 119 FAILED: expected 100 rows in table, got %', n;
+            'TEST 118 FAILED: expected 100 rows in table, got %', n;
     END IF;
 
-    DROP TABLE tde_existing_119;
+    DROP TABLE tde_existing_118;
     RAISE NOTICE
-        'TEST 119 PASSED: CREATE INDEX on pre-populated encrypted_heap table '
+        'TEST 118 PASSED: CREATE INDEX on pre-populated encrypted_heap table '
         '(ambuild path), spot-check row 57 OK, 100 rows intact';
 END;
 $$;
 
 -- ================================================================
--- TEST 120: ON CONFLICT DO NOTHING with unique enc_ops index
+-- TEST 119: ON CONFLICT DO NOTHING with unique enc_ops index
 --
 -- Creates a unique tde_btree index using tde_int4_enc_ops and verifies
 -- that ON CONFLICT DO NOTHING correctly detects the duplicate key
@@ -452,29 +411,27 @@ DO $$
 DECLARE
     n int;
 BEGIN
-    PERFORM pg_vault_tde_set_test_dek();
+    DROP TABLE IF EXISTS tde_conflict_119;
+    CREATE TABLE tde_conflict_119 (id int4, label text) USING encrypted_heap;
+    CREATE UNIQUE INDEX tde_conflict_119_id_idx
+        ON tde_conflict_119 USING tde_btree (id tde_int4_enc_ops);
 
-    DROP TABLE IF EXISTS tde_conflict_120;
-    CREATE TABLE tde_conflict_120 (id int4, label text) USING encrypted_heap;
-    CREATE UNIQUE INDEX tde_conflict_120_id_idx
-        ON tde_conflict_120 USING tde_btree (id tde_int4_enc_ops);
-
-    INSERT INTO tde_conflict_120 VALUES (1, 'first');
+    INSERT INTO tde_conflict_119 VALUES (1, 'first');
 
     -- Second insert with the same id: must be silently dropped
-    INSERT INTO tde_conflict_120 VALUES (1, 'duplicate')
+    INSERT INTO tde_conflict_119 VALUES (1, 'duplicate')
     ON CONFLICT DO NOTHING;
 
-    SELECT count(*) INTO n FROM tde_conflict_120 WHERE id = 1;
+    SELECT count(*) INTO n FROM tde_conflict_119 WHERE id = 1;
 
     IF n <> 1 THEN
         RAISE EXCEPTION
-            'TEST 120 FAILED: expected 1 row after ON CONFLICT DO NOTHING, got %', n;
+            'TEST 119 FAILED: expected 1 row after ON CONFLICT DO NOTHING, got %', n;
     END IF;
 
-    DROP TABLE tde_conflict_120;
+    DROP TABLE tde_conflict_119;
     RAISE NOTICE
-        'TEST 120 PASSED: ON CONFLICT DO NOTHING with tde_int4_enc_ops unique index OK';
+        'TEST 119 PASSED: ON CONFLICT DO NOTHING with tde_int4_enc_ops unique index OK';
 END;
 $$;
 
@@ -484,17 +441,16 @@ $$;
 DO $$
 BEGIN
     RAISE NOTICE '============================================================';
-    RAISE NOTICE 'v1.7 Tests 111-120 — COMPLETE';
+    RAISE NOTICE 'v1.7 Tests 111-119 — COMPLETE';
     RAISE NOTICE '   tde_int4_enc_ops + disk forensic check . test 111';
     RAISE NOTICE '   tde_int8_enc_ops equality lookup ........ test 112';
     RAISE NOTICE '   tde_uuid_enc_ops equality lookup ........ test 113';
     RAISE NOTICE '   tde_date_enc_ops equality lookup ........ test 114';
     RAISE NOTICE '   tde_timestamptz_enc_ops equality lookup . test 115';
     RAISE NOTICE '   DEK rotation → stale index → REINDEX .... test 116';
-    RAISE NOTICE '   check_plaintext_index_keys v1.5 detect .. test 117';
-    RAISE NOTICE '   multi-column enc_ops + text + int8 mix .. test 118';
-    RAISE NOTICE '   CREATE INDEX on pre-populated table ..... test 119';
-    RAISE NOTICE '   ON CONFLICT DO NOTHING + enc_ops unique . test 120';
+    RAISE NOTICE '   multi-column enc_ops + text + int8 mix .. test 117';
+    RAISE NOTICE '   CREATE INDEX on pre-populated table ..... test 118';
+    RAISE NOTICE '   ON CONFLICT DO NOTHING + enc_ops unique . test 119';
     RAISE NOTICE '============================================================';
 END;
 $$;

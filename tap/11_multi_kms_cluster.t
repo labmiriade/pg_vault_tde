@@ -26,6 +26,8 @@ $node->safe_psql('local_kms', q{
     ALTER DATABASE local_kms SET pg_vault_tde.wallet_passphrase_command = 'echo test-password';
 });
 
+$node->restart;
+
 $node->safe_psql('local_kms', "SELECT pg_vault_tde_wallet_init('test-password');");
 
 my $local_oid = $node->safe_psql('postgres',

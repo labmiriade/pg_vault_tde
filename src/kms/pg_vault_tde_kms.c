@@ -55,37 +55,7 @@
 typedef struct
 {
     LWLock       lock;               /* embedded — valid across all backends */
-    char         dek[TDE_DEK_LEN];  /* raw AES-256 DEK, zeroed before rotation */
-    uint64       generation;         /* monotonically increasing rotation epoch */
-    bool         valid;              /* true iff dek[] holds a live key */
-
-    /*
-     * Previous DEK: saved during rotation to provide a grace period for
-     * re-encryption.  After rotate_key() wipes the current DEK and a new
-     * DEK is set, the decrypt path tries the current DEK first and falls
-     * back to prev_dek if GCM authentication fails.  This allows rows
-     * encrypted with the old DEK to remain readable until re-encrypted.
-     *
-     * Call pg_vault_tde_clear_prev_dek() after re-encryption is complete
-     * to wipe the old key material from shared memory.
-     */
-    char         prev_dek[TDE_DEK_LEN];
-    bool         prev_dek_valid;
-
-    /*
-     * Vault Transit KEK wrapping (v1.3):
-     *
-     * The "ciphertext" field from Vault's datakey/plaintext response is the
-     * DEK encrypted (wrapped) with the Vault Transit master key (KEK).
-     * Persisted to $PGDATA/pg_vault_tde/wrapped_dek on successful fetch.
-     * On restart, we send this to POST /v1/<mount>/decrypt/<key> to unwrap
-     * the DEK without generating a new one — solving the "DEK lost on restart"
-     * problem.
-     *
-     * wrapped_dek is the Vault base64-encoded ciphertext string, NOT raw bytes.
-     */
-    char         wrapped_dek[512];
-    bool         wrapped_dek_valid;
+   
 
     /*
      * Background worker shared token state (v1.3):
@@ -99,25 +69,9 @@ typedef struct
     bool         shared_token_valid;
     TimestampTz  token_renewed_at;
     int          token_ttl_seconds;     /* reported TTL from Vault */
-} pg_vault_tde_dek_cache;
+} pg_vault_tde_kms_cache;
 
-static pg_vault_tde_dek_cache *dek_cache = NULL;
-
-/*
- * Per-backend local cache: holds a copy of the DEK and the generation it
- * was loaded from.  We use palloc'd memory in TopMemoryContext so it
- * survives transaction boundaries within the same backend session.
- * This struct is never shared — it is strictly per-process.
- */
-typedef struct
-{
-    char          dek[TDE_DEK_LEN];
-    uint64        generation;
-    bool          valid;
-    TimestampTz   loaded_at;     /* when this DEK was loaded (for TTL) */
-} pg_vault_tde_local_dek;
-
-static pg_vault_tde_local_dek *local_dek_cache = NULL;
+static pg_vault_tde_kms_cache *kms_cache = NULL;
 
 /*
  * pg_vault_tde_kms_shmem_request
@@ -128,7 +82,7 @@ static pg_vault_tde_local_dek *local_dek_cache = NULL;
 void
 pg_vault_tde_kms_shmem_request(void)
 {
-    RequestAddinShmemSpace(sizeof(pg_vault_tde_dek_cache));
+    RequestAddinShmemSpace(sizeof(pg_vault_tde_kms_cache));
 }
 
 /*
@@ -149,8 +103,8 @@ pg_vault_tde_kms_shmem_init(void)
      * ShmemInitStruct maps (or creates) the shared struct and sets |found|.
      * Must be called first so we know whether initialisation is needed.
      */
-    dek_cache = ShmemInitStruct("pg_vault_tde_dek_cache",
-                                sizeof(pg_vault_tde_dek_cache),
+    kms_cache = ShmemInitStruct("pg_vault_tde_kms_cache",
+                                sizeof(pg_vault_tde_kms_cache),
                                 &found);
 
     if (!found)
@@ -164,23 +118,16 @@ pg_vault_tde_kms_shmem_init(void)
          * from shmem_startup_hook — never from _PG_init.
          */
         tranche_id = LWLockNewTrancheId();
-        LWLockInitialize(&dek_cache->lock, tranche_id);
-        dek_cache->valid      = false;
-        dek_cache->generation = 0;
-        OPENSSL_cleanse(dek_cache->dek, TDE_DEK_LEN);
-        dek_cache->prev_dek_valid = false;
-        OPENSSL_cleanse(dek_cache->prev_dek, TDE_DEK_LEN);
-        dek_cache->wrapped_dek_valid = false;
-        memset(dek_cache->wrapped_dek, 0, sizeof(dek_cache->wrapped_dek));
-        dek_cache->shared_token_valid = false;
-        memset(dek_cache->shared_token, 0, sizeof(dek_cache->shared_token));
-        dek_cache->token_renewed_at = 0;
-        dek_cache->token_ttl_seconds = 0;
+        LWLockInitialize(&kms_cache->lock, tranche_id);
+        kms_cache->shared_token_valid = false;
+        memset(kms_cache->shared_token, 0, sizeof(kms_cache->shared_token));
+        kms_cache->token_renewed_at = 0;
+        kms_cache->token_ttl_seconds = 0;
     }
     else
     {
         /* Backend attaching to an already-initialised segment: recover ID. */
-        tranche_id = dek_cache->lock.tranche;
+        tranche_id = kms_cache->lock.tranche;
     }
 
     /*
@@ -189,65 +136,6 @@ pg_vault_tde_kms_shmem_init(void)
      * and wait-event LWLOCK displays for that process.
      */
     LWLockRegisterTranche(tranche_id, "pg_vault_tde_kms");
-
-    /*
-     * On first postmaster startup (!found), attempt to restore the DEK.
-     * Strategy (in order of preference):
-     *   1. Try to unwrap a persisted wrapped DEK via Vault Transit decrypt
-     *      (preserves the same DEK across restarts — data continuity)
-     *   2. If no wrapped DEK exists, fetch a NEW DEK from Vault Transit
-     *      (first-time provisioning — creates a new wrapped DEK)
-     *   3. If Vault is not configured, fall back to pg_vault_tde_set_test_dek
-     *
-     * Failure is non-fatal: the extension loads but encrypted tables will
-     * ereport(ERROR) on first access until a DEK is available.
-     */
-    if (!found &&
-        pg_vault_tde_vault_url != NULL &&
-        pg_vault_tde_vault_url[0] != '\0')
-    {
-        /* Try unwrap first (data continuity across restarts) */
-        if (pg_vault_tde_try_unwrap_on_startup())
-        {
-            ereport(LOG,
-                    (errmsg("pg_vault_tde: DEK restored via Vault Transit unwrap")));
-        }
-        else
-        {
-            /* No wrapped DEK or unwrap failed — provision a new DEK */
-            ereport(LOG,
-                    (errmsg("pg_vault_tde: attempting initial DEK fetch from Vault")));
-
-            if (!pg_vault_tde_vault_fetch_dek())
-            {
-                ereport(WARNING,
-                        (errmsg("pg_vault_tde: initial Vault DEK fetch failed — "
-                                "use pg_vault_tde_set_test_dek() or fix Vault connectivity"),
-                         errhint("Encrypted tables will be inaccessible until a DEK is set")));
-            }
-        }
-    }
-}
-
-/*
- * pg_vault_tde_kms_init_local_cache
- *
- * Allocates the per-backend local DEK struct in TopMemoryContext.
- * Called once per backend on first use (lazy init).  Using palloc0 so that
- * all fields start zeroed: valid=false, generation=0.
- */
-static void
-pg_vault_tde_kms_init_local_cache(void)
-{
-    MemoryContext old_ctx;
-
-    if (local_dek_cache != NULL)
-        return;
-
-    /* Allocate in TopMemoryContext so it survives transaction rollbacks. */
-    old_ctx = MemoryContextSwitchTo(TopMemoryContext);
-    local_dek_cache = (pg_vault_tde_local_dek *) palloc0(sizeof(pg_vault_tde_local_dek));
-    MemoryContextSwitchTo(old_ctx);
 }
 
 /*
@@ -262,6 +150,34 @@ typedef struct
     size_t  len;
     size_t  alloc;
 } vault_response_buf;
+
+/* --- forward declarations --- */
+static size_t           vault_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata);
+static char            *vault_json_extract_string(const char *json, const char *key);
+static int              vault_base64_decode(const char *b64_input, unsigned char *output, int output_maxlen);
+static char            *vault_perform_login(void);
+static const char      *vault_get_effective_token(void);
+static bool             vault_refresh_token_internal(void);
+static bool             vault_provider_rewrap_dek(const unsigned char *old_wrapped, int old_len,
+                                                   unsigned char *new_wrapped, int *new_len);
+static bool             vault_probe_health(void);
+static bool             detect_aes_ni(void);
+static bool             vault_resp_init(vault_response_buf *buf);
+static void             vault_resp_free(vault_response_buf *buf);
+static CURL            *vault_make_curl(vault_response_buf *resp);
+static struct curl_slist *vault_add_namespace_header(struct curl_slist *headers);
+static bool             vault_transit_request(const char *operation, const char *body,
+                                               vault_response_buf *response);
+static bool             vault_provider_init(void);
+static bool             vault_provider_generate_dek(unsigned char *dek_out, int dek_len);
+static bool             vault_provider_wrap_dek(const unsigned char *dek, int dek_len,
+                                                 unsigned char *wrapped_out, int *out_len);
+static bool             vault_provider_unwrap_dek(const unsigned char *wrapped, int wrapped_len,
+                                                   unsigned char *dek_out, int dek_len);
+static bool             vault_provider_health_check(void);
+static void             vault_provider_shutdown(void);
+static bool             vault_prepare_kek_rotation(void);
+static void             vault_commit_kek_rotation(void);
 
 /*
  * vault_write_cb — libcurl CURLOPT_WRITEFUNCTION callback.
@@ -693,16 +609,16 @@ vault_get_effective_token(void)
      * token in shmem, use it instead of doing a per-backend login.
      * This eliminates N × login overhead when many backends need Vault access.
      */
-    if (vault_active_token == NULL && dek_cache != NULL)
+    if (vault_active_token == NULL && kms_cache != NULL)
     {
-        LWLockAcquire(&dek_cache->lock, LW_SHARED);
-        if (dek_cache->shared_token_valid && dek_cache->shared_token[0] != '\0')
+        LWLockAcquire(&kms_cache->lock, LW_SHARED);
+        if (kms_cache->shared_token_valid && kms_cache->shared_token[0] != '\0')
         {
             MemoryContext old_ctx = MemoryContextSwitchTo(TopMemoryContext);
-            vault_active_token = pstrdup(dek_cache->shared_token);
+            vault_active_token = pstrdup(kms_cache->shared_token);
             MemoryContextSwitchTo(old_ctx);
         }
-        LWLockRelease(&dek_cache->lock);
+        LWLockRelease(&kms_cache->lock);
     }
 
     /* AppRole or Kubernetes: login if needed */
@@ -827,11 +743,11 @@ vault_refresh_token_internal(void)
             if (ttl > 0)
             {
                 /* Store TTL in shmem for health_check() reporting */
-                if (dek_cache != NULL)
+                if (kms_cache != NULL)
                 {
-                    LWLockAcquire(&dek_cache->lock, LW_EXCLUSIVE);
-                    dek_cache->token_ttl_seconds = ttl;
-                    LWLockRelease(&dek_cache->lock);
+                    LWLockAcquire(&kms_cache->lock, LW_EXCLUSIVE);
+                    kms_cache->token_ttl_seconds = ttl;
+                    LWLockRelease(&kms_cache->lock);
                 }
 
                 ereport(LOG,
@@ -887,429 +803,54 @@ pg_vault_tde_refresh_token(PG_FUNCTION_ARGS)
 /* ================================================================
  * Vault Transit KEK Wrapping (v1.3)
  *
- * The DEK is wrapped (encrypted) by Vault's Transit master key (KEK).
- * We persist the wrapped DEK to $PGDATA/pg_vault_tde/wrapped_dek so
- * that on PostgreSQL restart we can unwrap it via the Transit decrypt
- * endpoint — without generating a new DEK (data continuity).
+ * The DEKs are wrapped (encrypted) by Vault's Transit master key (KEK).
  *
- * File location: $PGDATA/pg_vault_tde/wrapped_dek
- *
- * On KEK rotation in Vault (vault write -f transit/keys/<key>/rotate),
- * call pg_vault_tde_vault_rewrap_dek() to re-wrap the stored ciphertext
- * with the new KEK version — the plaintext DEK does not change.
  * ================================================================ */
 
 #include "miscadmin.h"              /* DataDir */
 #include <sys/stat.h>               /* mkdir */
 
-/*
- * vault_wrapped_dek_path — build the file path for the persisted wrapped DEK.
- * Returns a palloc'd string: "$PGDATA/pg_vault_tde/wrapped_dek".
- */
-static char *
-vault_wrapped_dek_path(void)
+
+static bool 
+vault_provider_rewrap_dek(const unsigned char *old_wrapped, int old_len,
+                           unsigned char *new_wrapped, int *new_len)
 {
-    char *path = palloc(MAXPGPATH);
+    vault_response_buf   resp;
+    char                 *post_body  = NULL;
+    bool                 success     = false;
+    char                 *wrapped    = NULL;
 
-    snprintf(path, MAXPGPATH, "%s/pg_vault_tde/wrapped_dek", DataDir);
-    return path;
-}
+    post_body = palloc(old_len + 64);
 
-/*
- * vault_persist_wrapped_dek — write the base64-encoded wrapped DEK to disk.
- *
- * Creates $PGDATA/pg_vault_tde/ directory if it doesn't exist.
- * File permissions: 0600 (owner-only, analogous to server.key).
- */
-static void
-vault_persist_wrapped_dek(const char *wrapped_b64)
-{
-    char   *path;
-    char    dir[MAXPGPATH];
-    FILE   *fp;
-
-    snprintf(dir, MAXPGPATH, "%s/pg_vault_tde", DataDir);
-    (void) mkdir(dir, 0700);   /* ignore if already exists */
-
-    path = vault_wrapped_dek_path();
-    fp = fopen(path, "w");
-    if (fp == NULL)
+    snprintf(post_body, old_len + 64, "{\"ciphertext\": \"%.*s\"}",
+             (int) old_len, (const char *) old_wrapped);
+    if(vault_transit_request("rewrap", post_body, &resp))
     {
-        ereport(WARNING,
-                (errmsg("pg_vault_tde: cannot write wrapped DEK to %s: %m", path)));
-        pfree(path);
-        return;
-    }
+        wrapped = vault_json_extract_string(resp.data, "ciphertext");
+        if(wrapped != NULL)
+        {   
+            memcpy(new_wrapped, wrapped, strlen(wrapped));
+            *new_len = strlen(wrapped); 
 
-    if (fputs(wrapped_b64, fp) == EOF)
-    {
-        ereport(WARNING,
-                (errmsg("pg_vault_tde: failed writing wrapped DEK to %s: %m", path)));
-    }
-    else
-    {
-        ereport(LOG,
-                (errmsg("pg_vault_tde: wrapped DEK persisted to %s", path)));
-    }
+            OPENSSL_cleanse(wrapped, strlen(wrapped));
+            pfree(wrapped);
+            wrapped = NULL;
 
-    fclose(fp);
-    (void) chmod(path, 0600);
-    pfree(path);
-}
-
-/*
- * vault_load_wrapped_dek — read the persisted wrapped DEK from disk.
- *
- * Returns a palloc'd base64 string, or NULL if the file doesn't exist
- * or is unreadable.  Caller must pfree.
- */
-static char *
-vault_load_wrapped_dek(void)
-{
-    char   *path;
-    FILE   *fp;
-    char    buf[512];
-    size_t  len;
-
-    path = vault_wrapped_dek_path();
-    fp = fopen(path, "r");
-    if (fp == NULL)
-    {
-        pfree(path);
-        return NULL;   /* file not found is normal on first run */
-    }
-
-    len = fread(buf, 1, sizeof(buf) - 1, fp);
-    fclose(fp);
-    pfree(path);
-
-    if (len == 0)
-        return NULL;
-
-    buf[len] = '\0';
-
-    /* Trim trailing whitespace */
-    while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r' || buf[len-1] == ' '))
-        buf[--len] = '\0';
-
-    if (len == 0)
-        return NULL;
-
-    return pstrdup(buf);
-}
-
-/*
- * vault_unwrap_dek — decrypt a wrapped DEK via Vault Transit decrypt API.
- *
- * Calls POST /v1/<mount>/decrypt/<key_name> with {"ciphertext": "<wrapped>"}
- * and extracts the base64-encoded plaintext from the response.
- *
- * On success: decodes the plaintext and stores it in shared memory via
- * pg_vault_tde_kms_set_dek(), then returns true.
- * On failure: returns false.
- */
-static bool
-vault_unwrap_dek(const char *wrapped_b64)
-{
-    CURL               *curl;
-    CURLcode            res;
-    struct curl_slist   *headers = NULL;
-    vault_response_buf   response;
-    char                url[1024];
-    char                auth_header[512];
-    char               *post_body;
-    char               *plaintext_b64 = NULL;
-    unsigned char       raw_dek[TDE_DEK_LEN];
-    int                 decoded_len;
-    long                http_code = 0;
-    bool                success = false;
-    const char         *effective_token;
-
-    effective_token = vault_get_effective_token();
-    if (effective_token == NULL || effective_token[0] == '\0')
-        return false;
-
-    /* URL: /v1/<mount>/decrypt/<key_name> */
-    snprintf(url, sizeof(url), "%s/v1/%s/decrypt/%s",
-             pg_vault_tde_vault_url,
-             pg_vault_tde_vault_transit_mount,
-             pg_vault_tde_vault_key_name);
-
-    /* POST body: {"ciphertext": "<wrapped_b64>"} */
-    post_body = palloc(strlen(wrapped_b64) + 64);
-    sprintf(post_body, "{\"ciphertext\": \"%s\"}", wrapped_b64);
-
-    response.alloc = 1024;
-    response.len = 0;
-    response.data = palloc(response.alloc);
-    response.data[0] = '\0';
-
-    curl = curl_easy_init();
-    if (curl == NULL)
-    {
-        pfree(post_body);
-        pfree(response.data);
-        return false;
-    }
-
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_POST, 1L);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_body);
-
-    snprintf(auth_header, sizeof(auth_header),
-             "X-Vault-Token: %s", effective_token);
-    headers = curl_slist_append(headers, auth_header);
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-
-    if (pg_vault_tde_vault_namespace != NULL &&
-        pg_vault_tde_vault_namespace[0] != '\0')
-    {
-        char ns_header[512];
-        snprintf(ns_header, sizeof(ns_header),
-                 "X-Vault-Namespace: %s", pg_vault_tde_vault_namespace);
-        headers = curl_slist_append(headers, ns_header);
-    }
-
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-    if (pg_vault_tde_vault_ca_cert != NULL &&
-        pg_vault_tde_vault_ca_cert[0] != '\0')
-        curl_easy_setopt(curl, CURLOPT_CAINFO, pg_vault_tde_vault_ca_cert);
-
-    if (pg_vault_tde_vault_timeout_ms > 0)
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS,
-                         (long) pg_vault_tde_vault_timeout_ms);
-
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, vault_write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-
-    res = curl_easy_perform(curl);
-
-    if (res == CURLE_OK)
-    {
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-        if (http_code == 200)
-        {
-            plaintext_b64 = vault_json_extract_string(response.data, "plaintext");
-            if (plaintext_b64 != NULL)
-            {
-                decoded_len = vault_base64_decode(plaintext_b64, raw_dek,
-                                                  TDE_DEK_LEN);
-                if (decoded_len == TDE_DEK_LEN)
-                {
-                    pg_vault_tde_kms_set_dek((char *) raw_dek, TDE_DEK_LEN);
-
-                    /* Also store the wrapped DEK in shmem */
-                    LWLockAcquire(&dek_cache->lock, LW_EXCLUSIVE);
-                    strlcpy(dek_cache->wrapped_dek, wrapped_b64,
-                            sizeof(dek_cache->wrapped_dek));
-                    dek_cache->wrapped_dek_valid = true;
-                    LWLockRelease(&dek_cache->lock);
-
-                    success = true;
-                    ereport(LOG,
-                            (errmsg("pg_vault_tde: DEK unwrapped from Vault Transit (generation=%lu)",
-                                    (unsigned long) pg_vault_tde_kms_get_generation())));
-                }
-                OPENSSL_cleanse(raw_dek, TDE_DEK_LEN);
-                OPENSSL_cleanse(plaintext_b64, strlen(plaintext_b64));
-                pfree(plaintext_b64);
-            }
-        }
-        else
-        {
-            ereport(WARNING,
-                    (errmsg("pg_vault_tde: Vault Transit decrypt returned HTTP %ld",
-                            http_code),
-                     errdetail("Response: %.256s", response.data)));
+            success = true;
         }
     }
     else
     {
-        ereport(WARNING,
-                (errmsg("pg_vault_tde: Vault Transit decrypt HTTP failed: %s",
-                        curl_easy_strerror(res))));
+        ereport(ERROR, 
+                errmsg("pg_vault_tde: kms vault: can't rewrap DEK"));
     }
 
-    OPENSSL_cleanse(auth_header, sizeof(auth_header));
-    OPENSSL_cleanse(response.data, response.len);
-    pfree(response.data);
+    OPENSSL_cleanse(resp.data, resp.len);
+    pfree(resp.data);
+    OPENSSL_cleanse(post_body, strlen(post_body));
     pfree(post_body);
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
 
     return success;
-}
-
-/*
- * pg_vault_tde_try_unwrap_on_startup — called from shmem_init when a
- * wrapped DEK file exists but no vault_fetch_dek is attempted.
- *
- * Checks for $PGDATA/pg_vault_tde/wrapped_dek and, if present, attempts
- * to unwrap it via Vault Transit decrypt.  This restores the same DEK
- * across PostgreSQL restarts without generating a new key.
- */
-bool
-pg_vault_tde_try_unwrap_on_startup(void)
-{
-    char *wrapped_b64;
-    bool  success;
-
-    wrapped_b64 = vault_load_wrapped_dek();
-    if (wrapped_b64 == NULL)
-        return false;
-
-    ereport(LOG,
-            (errmsg("pg_vault_tde: found wrapped DEK file, attempting Vault Transit unwrap")));
-
-    success = vault_unwrap_dek(wrapped_b64);
-    pfree(wrapped_b64);
-
-    return success;
-}
-
-/*
- * pg_vault_tde_vault_rewrap_dek — SQL-callable KEK rotation helper.
- *
- * Sends the persisted wrapped DEK to POST /v1/<mount>/rewrap/<key_name>
- * which re-encrypts it with the latest KEK version in Vault.  The plaintext
- * DEK does not change — only the wrapping key version.
- *
- * Returns true on success.  After rewrap, the wrapped_dek file and shmem
- * are updated with the new ciphertext.
- */
-PG_FUNCTION_INFO_V1(pg_vault_tde_vault_rewrap_dek);
-PGDLLEXPORT Datum
-pg_vault_tde_vault_rewrap_dek(PG_FUNCTION_ARGS)
-{
-    CURL               *curl;
-    CURLcode            res;
-    struct curl_slist   *headers = NULL;
-    vault_response_buf   response;
-    char                url[1024];
-    char                auth_header[512];
-    char               *post_body;
-    char               *old_wrapped;
-    char               *new_wrapped = NULL;
-    long                http_code = 0;
-    bool                success = false;
-    const char         *effective_token;
-
-    /* Load the current wrapped DEK from file */
-    old_wrapped = vault_load_wrapped_dek();
-    if (old_wrapped == NULL)
-        ereport(ERROR,
-                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                 errmsg("pg_vault_tde: no wrapped DEK file found — "
-                        "run vault_fetch_dek() first to generate one")));
-
-    effective_token = vault_get_effective_token();
-    if (effective_token == NULL || effective_token[0] == '\0')
-    {
-        pfree(old_wrapped);
-        ereport(ERROR,
-                (errcode(ERRCODE_CONNECTION_FAILURE),
-                 errmsg("pg_vault_tde: no Vault token available for rewrap")));
-    }
-
-    /* URL: /v1/<mount>/rewrap/<key_name> */
-    snprintf(url, sizeof(url), "%s/v1/%s/rewrap/%s",
-             pg_vault_tde_vault_url,
-             pg_vault_tde_vault_transit_mount,
-             pg_vault_tde_vault_key_name);
-
-    post_body = palloc(strlen(old_wrapped) + 64);
-    sprintf(post_body, "{\"ciphertext\": \"%s\"}", old_wrapped);
-
-    response.alloc = 1024;
-    response.len = 0;
-    response.data = palloc(response.alloc);
-    response.data[0] = '\0';
-
-    curl = curl_easy_init();
-    if (curl == NULL)
-    {
-        pfree(post_body);
-        pfree(old_wrapped);
-        pfree(response.data);
-        ereport(ERROR, (errmsg("pg_vault_tde: curl_easy_init() failed")));
-    }
-
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_POST, 1L);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_body);
-
-    snprintf(auth_header, sizeof(auth_header),
-             "X-Vault-Token: %s", effective_token);
-    headers = curl_slist_append(headers, auth_header);
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-
-    if (pg_vault_tde_vault_namespace != NULL &&
-        pg_vault_tde_vault_namespace[0] != '\0')
-    {
-        char ns_header[512];
-        snprintf(ns_header, sizeof(ns_header),
-                 "X-Vault-Namespace: %s", pg_vault_tde_vault_namespace);
-        headers = curl_slist_append(headers, ns_header);
-    }
-
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-    if (pg_vault_tde_vault_ca_cert != NULL &&
-        pg_vault_tde_vault_ca_cert[0] != '\0')
-        curl_easy_setopt(curl, CURLOPT_CAINFO, pg_vault_tde_vault_ca_cert);
-
-    if (pg_vault_tde_vault_timeout_ms > 0)
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS,
-                         (long) pg_vault_tde_vault_timeout_ms);
-
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, vault_write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-
-    res = curl_easy_perform(curl);
-
-    if (res == CURLE_OK)
-    {
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-        if (http_code == 200)
-        {
-            new_wrapped = vault_json_extract_string(response.data, "ciphertext");
-            if (new_wrapped != NULL)
-            {
-                /* Persist the new wrapped DEK */
-                vault_persist_wrapped_dek(new_wrapped);
-
-                /* Update shmem */
-                LWLockAcquire(&dek_cache->lock, LW_EXCLUSIVE);
-                strlcpy(dek_cache->wrapped_dek, new_wrapped,
-                        sizeof(dek_cache->wrapped_dek));
-                dek_cache->wrapped_dek_valid = true;
-                LWLockRelease(&dek_cache->lock);
-
-                pfree(new_wrapped);
-                success = true;
-
-                ereport(LOG,
-                        (errmsg("pg_vault_tde: wrapped DEK re-wrapped with latest KEK version")));
-            }
-        }
-        else
-        {
-            ereport(WARNING,
-                    (errmsg("pg_vault_tde: Vault rewrap returned HTTP %ld", http_code),
-                     errdetail("Response: %.256s", response.data)));
-        }
-    }
-
-    OPENSSL_cleanse(auth_header, sizeof(auth_header));
-    OPENSSL_cleanse(response.data, response.len);
-    pfree(response.data);
-    pfree(post_body);
-    pfree(old_wrapped);
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-
-    PG_RETURN_BOOL(success);
 }
 
 /*
@@ -1320,8 +861,9 @@ pg_vault_tde_vault_rewrap_dek(PG_FUNCTION_ARGS)
  * both the plaintext DEK (for immediate use) and the ciphertext (for
  * backup/recovery).
  *
- * On success: stores the DEK in shared memory via pg_vault_tde_kms_set_dek()
- * and returns true.
+ * On success: persists the wrapped DEK to shmem/disk and returns true.
+ * NOTE: the plaintext DEK is NOT stored globally; per-relation DEKs in
+ * TdeRelDekCache are the authoritative in-memory key store (v1.5+).
  *
  * On failure: logs a WARNING and returns false.  The caller decides whether
  * to ereport(ERROR) or allow degraded startup.
@@ -1330,7 +872,7 @@ pg_vault_tde_vault_rewrap_dek(PG_FUNCTION_ARGS)
  * uses processes, not threads -- each backend has its own curl handle.
  */
 bool
-pg_vault_tde_vault_fetch_dek(void)
+pg_vault_tde_vault_fetch_dek(void)  /* TODO: coverts it's usage to generate DEK */
 {
     CURL               *curl = NULL;
     CURLcode            res;
@@ -1494,43 +1036,10 @@ pg_vault_tde_vault_fetch_dek(void)
                     }
                     else
                     {
-                        /* Store in shared memory */
-                        pg_vault_tde_kms_set_dek((char *) raw_dek, TDE_DEK_LEN);
                         success = true;
 
-                        /*
-                         * KEK wrapping (v1.3): capture the "ciphertext" field —
-                         * this is the DEK wrapped by Vault's Transit KEK.
-                         * We persist it to $PGDATA/pg_vault_tde/wrapped_dek
-                         * so that on restart we can unwrap without generating
-                         * a new DEK (data continuity across restarts).
-                         */
-                        {
-                            char *wrapped_b64 = vault_json_extract_string(
-                                                    response.data, "ciphertext");
-                            if (wrapped_b64 != NULL)
-                            {
-                                vault_persist_wrapped_dek(wrapped_b64);
-
-                                /* Also store in shmem for health_check visibility */
-                                LWLockAcquire(&dek_cache->lock, LW_EXCLUSIVE);
-                                strlcpy(dek_cache->wrapped_dek, wrapped_b64,
-                                        sizeof(dek_cache->wrapped_dek));
-                                dek_cache->wrapped_dek_valid = true;
-                                LWLockRelease(&dek_cache->lock);
-
-                                pfree(wrapped_b64);
-                            }
-                            else
-                            {
-                                ereport(WARNING,
-                                        (errmsg("pg_vault_tde: no 'ciphertext' field in Vault response — wrapped DEK not persisted")));
-                            }
-                        }
-
                         ereport(LOG,
-                                (errmsg("pg_vault_tde: DEK fetched from Vault (generation=%lu)",
-                                        (unsigned long) pg_vault_tde_kms_get_generation())));
+                                (errmsg("pg_vault_tde: DEK fetched from Vault")));
                     }
 
                     /* Cleanse the raw DEK from stack */
@@ -1578,277 +1087,6 @@ pg_vault_tde_vault_fetch_dek(void)
 }
 
 /*
- * pg_vault_tde_kms_get_dek
- *
- * Returns a pointer to the per-backend LOCAL DEK copy, reloading from
- * shared memory if the generation counter has changed (key rotation).
- *
- * IMPORTANT: The caller receives a pointer to local_dek_cache->dek,
- * which is valid only within the current backend process.  The caller
- * MUST NOT cache this pointer beyond a single encrypt/decrypt operation,
- * and MUST call OPENSSL_cleanse on any local copy.
- *
- * Flow:
- *   1. Acquire shared lock on dek_cache.
- *   2. Compare dek_cache->generation with local_dek_cache->generation.
- *   3. If equal and local valid AND not TTL-expired: return local (fast path).
- *   4. If different or expired: copy new DEK to local, update generation + timestamp.
- *   5. Release shared lock.
- */
-bool
-pg_vault_tde_kms_get_dek(char *out_dek, Size dek_len)
-{
-    bool result = false;
-    bool needs_refresh = false;
-
-    if (dek_cache == NULL)
-    {
-        ereport(WARNING, (errmsg("[KMS] DEK cache not initialised")));
-        return false;
-    }
-
-    /* Lazy-init per-backend local cache */
-    pg_vault_tde_kms_init_local_cache();
-
-    LWLockAcquire(&dek_cache->lock, LW_SHARED);
-
-    if (dek_cache->valid)
-    {
-        /*
-         * Generation check: local copy is stale if generation differs.
-         * TTL check (v1.1): even if generation matches, expire the local
-         * copy after dek_cache_ttl seconds to guarantee periodic refresh.
-         */
-        needs_refresh = !local_dek_cache->valid ||
-                        local_dek_cache->generation != dek_cache->generation;
-
-        if (!needs_refresh && pg_vault_tde_dek_cache_ttl > 0)
-        {
-            TimestampTz now = GetCurrentTimestamp();
-            long        elapsed_secs;
-
-            elapsed_secs = (now - local_dek_cache->loaded_at) / USECS_PER_SEC;
-            if (elapsed_secs >= pg_vault_tde_dek_cache_ttl)
-                needs_refresh = true;
-        }
-
-        if (needs_refresh)
-        {
-            memcpy(local_dek_cache->dek, dek_cache->dek, TDE_DEK_LEN);
-            local_dek_cache->generation = dek_cache->generation;
-            local_dek_cache->valid = true;
-            local_dek_cache->loaded_at = GetCurrentTimestamp();
-            ereport(DEBUG1,
-                    (errmsg("[KMS] Local DEK refreshed (generation=%lu)",
-                            (unsigned long) dek_cache->generation)));
-        }
-        memcpy(out_dek, local_dek_cache->dek, Min(dek_len, TDE_DEK_LEN));
-        result = true;
-    }
-
-    LWLockRelease(&dek_cache->lock);
-    return result;
-}
-
-/*
- * pg_vault_tde_kms_set_dek
- *
- * Atomically replaces the cached DEK and increments the generation counter.
- * Existing readers see the old DEK for their current operation, then pick up
- * the new one on their next call to pg_vault_tde_kms_get_dek.
- */
-void
-pg_vault_tde_kms_set_dek(const char *new_dek, Size dek_len)
-{
-    if (dek_cache == NULL)
-        ereport(ERROR, (errmsg("[KMS] DEK cache not initialised")));
-
-    LWLockAcquire(&dek_cache->lock, LW_EXCLUSIVE);
-    OPENSSL_cleanse(dek_cache->dek, TDE_DEK_LEN);
-    memcpy(dek_cache->dek, new_dek, Min(dek_len, TDE_DEK_LEN));
-    dek_cache->generation++;   /* signal all backends to reload */
-    dek_cache->valid = true;
-    LWLockRelease(&dek_cache->lock);
-
-    /*
-     * Also invalidate this backend's local copy so it reloads on the
-     * very next call, rather than serving the old DEK one more time.
-     */
-    if (local_dek_cache != NULL)
-    {
-        OPENSSL_cleanse(local_dek_cache->dek, TDE_DEK_LEN);
-        local_dek_cache->valid = false;
-    }
-
-    ereport(LOG,
-            (errmsg("[KMS] DEK rotated (new generation=%lu)",
-                    (unsigned long) dek_cache->generation)));
-}
-
-/*
- * pg_vault_tde_kms_zero_dek
- *
- * Wipes the cached DEK from shared memory and increments the generation so
- * all backends immediately detect the rotation on their next operation.
- * Called on key rotation completion or controlled shutdown.
- */
-void
-pg_vault_tde_kms_zero_dek(void)
-{
-    if (dek_cache == NULL)
-        return;
-
-    LWLockAcquire(&dek_cache->lock, LW_EXCLUSIVE);
-
-    /*
-     * Preserve the current DEK as prev_dek before wiping.  This provides a
-     * grace period during which rows encrypted with the old DEK remain
-     * readable via fallback decryption.  The prev_dek must be explicitly
-     * cleared after re-encryption via pg_vault_tde_clear_prev_dek().
-     */
-    if (dek_cache->valid)
-    {
-        memcpy(dek_cache->prev_dek, dek_cache->dek, TDE_DEK_LEN);
-        dek_cache->prev_dek_valid = true;
-    }
-
-    OPENSSL_cleanse(dek_cache->dek, TDE_DEK_LEN);
-    dek_cache->valid = false;
-    dek_cache->generation++;
-    LWLockRelease(&dek_cache->lock);
-
-    /* Also wipe local backend copy immediately */
-    if (local_dek_cache != NULL)
-    {
-        OPENSSL_cleanse(local_dek_cache->dek, TDE_DEK_LEN);
-        local_dek_cache->valid = false;
-    }
-
-    ereport(LOG, (errmsg("[KMS] DEK wiped from shared cache (prev_dek preserved)")));
-}
-
-/*
- * pg_vault_tde_kms_get_prev_dek
- *
- * Copies the previous DEK (saved at last rotation) into out_dek.
- * Returns true if a previous DEK is available, false otherwise.
- * Caller MUST OPENSSL_cleanse the buffer after use.
- */
-bool
-pg_vault_tde_kms_get_prev_dek(char *out_dek, Size dek_len)
-{
-    bool result = false;
-
-    if (dek_cache == NULL)
-        return false;
-
-    LWLockAcquire(&dek_cache->lock, LW_SHARED);
-    if (dek_cache->prev_dek_valid)
-    {
-        memcpy(out_dek, dek_cache->prev_dek, Min(dek_len, TDE_DEK_LEN));
-        result = true;
-    }
-    LWLockRelease(&dek_cache->lock);
-    return result;
-}
-
-/*
- * pg_vault_tde_kms_clear_prev_dek
- *
- * Wipes the previous DEK from shared memory.  Should be called after
- * re-encryption is complete to remove old key material.
- */
-void
-pg_vault_tde_kms_clear_prev_dek(void)
-{
-    if (dek_cache == NULL)
-        return;
-
-    LWLockAcquire(&dek_cache->lock, LW_EXCLUSIVE);
-    OPENSSL_cleanse(dek_cache->prev_dek, TDE_DEK_LEN);
-    dek_cache->prev_dek_valid = false;
-    LWLockRelease(&dek_cache->lock);
-
-    ereport(LOG, (errmsg("[KMS] Previous DEK wiped from shared cache")));
-}
-
-/*
- * SQL-callable wrapper: clear the previous DEK after re-encryption.
- */
-PG_FUNCTION_INFO_V1(pg_vault_tde_clear_prev_dek);
-PGDLLEXPORT Datum
-pg_vault_tde_clear_prev_dek(PG_FUNCTION_ARGS)
-{
-    pg_vault_tde_kms_clear_prev_dek();
-    PG_RETURN_VOID();
-}
-
-/*
- * pg_vault_tde_kms_get_generation
- *
- * Returns the current DEK generation counter.  Useful for monitoring and
- * for TAP tests to assert that a rotation actually incremented the counter.
- */
-uint64
-pg_vault_tde_kms_get_generation(void)
-{
-    uint64 gen = 0;
-
-    if (dek_cache == NULL)
-        return 0;
-
-    LWLockAcquire(&dek_cache->lock, LW_SHARED);
-    gen = dek_cache->generation;
-    LWLockRelease(&dek_cache->lock);
-    return gen;
-}
-
-/*
- * SQL-callable wrapper: triggers a DEK rotation (wipes shared cache,
- * increments generation counter).  The next encrypt/decrypt operation
- * will fetch a fresh DEK from the KMS.
- */
-PG_FUNCTION_INFO_V1(pg_vault_tde_rotate_key);
-PGDLLEXPORT Datum
-pg_vault_tde_rotate_key(PG_FUNCTION_ARGS)
-{
-    pg_vault_tde_kms_zero_dek();
-    PG_RETURN_VOID();
-}
-
-/*
- * SQL-callable wrapper: returns the current DEK generation counter.
- * Useful for monitoring and TAP tests to verify rotation occurred.
- */
-PG_FUNCTION_INFO_V1(pg_vault_tde_key_generation);
-PGDLLEXPORT Datum
-pg_vault_tde_key_generation(PG_FUNCTION_ARGS)
-{
-    PG_RETURN_INT64((int64) pg_vault_tde_kms_get_generation());
-}
-
-/*
- * SQL-callable: inject a deterministic test DEK without Vault.
- * SECURITY: this function exists ONLY for testing purposes.
- * In production, the DEK must come from Vault/OpenBao transit engine.
- * Generates a deterministic 32-byte key from pg_strong_random.
- */
-PG_FUNCTION_INFO_V1(pg_vault_tde_set_test_dek);
-PGDLLEXPORT Datum
-pg_vault_tde_set_test_dek(PG_FUNCTION_ARGS)
-{
-    char test_dek[TDE_DEK_LEN];
-
-    if (!pg_strong_random(test_dek, TDE_DEK_LEN))
-        ereport(ERROR, (errmsg("[KMS] Failed to generate test DEK")));
-
-    pg_vault_tde_kms_set_dek(test_dek, TDE_DEK_LEN);
-    OPENSSL_cleanse(test_dek, TDE_DEK_LEN);
-
-    PG_RETURN_VOID();
-}
-
-/*
  * pg_vault_tde_kms_status
  *
  * SQL-callable monitoring function: returns a single-row TEXT value
@@ -1872,14 +1110,6 @@ pg_vault_tde_kms_status(PG_FUNCTION_ARGS)
     bool     vault_configured = false;
 
     initStringInfo(&buf);
-
-    if (dek_cache != NULL)
-    {
-        LWLockAcquire(&dek_cache->lock, LW_SHARED);
-        dek_valid = dek_cache->valid;
-        gen = dek_cache->generation;
-        LWLockRelease(&dek_cache->lock);
-    }
 
     vault_configured = (pg_vault_tde_vault_url != NULL &&
                         pg_vault_tde_vault_url[0] != '\0');
@@ -2040,16 +1270,6 @@ pg_vault_tde_health_check(PG_FUNCTION_ARGS)
 
     memset(nulls, 0, sizeof(nulls));
 
-    /* --- Gather DEK state from shmem --- */
-    if (dek_cache != NULL)
-    {
-        LWLockAcquire(&dek_cache->lock, LW_SHARED);
-        dek_valid           = dek_cache->valid;
-        gen                 = dek_cache->generation;
-        prev_dek_valid_flag = dek_cache->prev_dek_valid;
-        LWLockRelease(&dek_cache->lock);
-    }
-
     /* --- Vault state --- */
     vault_configured = (pg_vault_tde_vault_url != NULL &&
                         pg_vault_tde_vault_url[0] != '\0');
@@ -2118,7 +1338,7 @@ pg_vault_tde_health_check(PG_FUNCTION_ARGS)
      * not yet exist (first boot, or Vault never reached).
      */
     {
-        char   *dek_path = vault_wrapped_dek_path();
+        char   *dek_path = NULL;
         struct stat st;
 
         if (dek_path != NULL && dek_path[0] != '\0' &&
@@ -2228,14 +1448,14 @@ pg_vault_tde_bgw_main(Datum main_arg)
              * vault_active_token in this process was updated by the
              * vault_refresh_token_internal → vault_get_effective_token chain.
              */
-            if (vault_active_token != NULL && dek_cache != NULL)
+            if (vault_active_token != NULL && kms_cache != NULL)
             {
-                LWLockAcquire(&dek_cache->lock, LW_EXCLUSIVE);
-                strlcpy(dek_cache->shared_token, vault_active_token,
-                        sizeof(dek_cache->shared_token));
-                dek_cache->shared_token_valid = true;
-                dek_cache->token_renewed_at = GetCurrentTimestamp();
-                LWLockRelease(&dek_cache->lock);
+                LWLockAcquire(&kms_cache->lock, LW_EXCLUSIVE);
+                strlcpy(kms_cache->shared_token, vault_active_token,
+                        sizeof(kms_cache->shared_token));
+                kms_cache->shared_token_valid = true;
+                kms_cache->token_renewed_at = GetCurrentTimestamp();
+                LWLockRelease(&kms_cache->lock);
             }
 
             ereport(DEBUG1,
@@ -2264,14 +1484,14 @@ pg_vault_tde_bgw_main(Datum main_arg)
                     pfree(new_token);
 
                     /* Store in shmem */
-                    if (dek_cache != NULL)
+                    if (kms_cache != NULL)
                     {
-                        LWLockAcquire(&dek_cache->lock, LW_EXCLUSIVE);
-                        strlcpy(dek_cache->shared_token, vault_active_token,
-                                sizeof(dek_cache->shared_token));
-                        dek_cache->shared_token_valid = true;
-                        dek_cache->token_renewed_at = GetCurrentTimestamp();
-                        LWLockRelease(&dek_cache->lock);
+                        LWLockAcquire(&kms_cache->lock, LW_EXCLUSIVE);
+                        strlcpy(kms_cache->shared_token, vault_active_token,
+                                sizeof(kms_cache->shared_token));
+                        kms_cache->shared_token_valid = true;
+                        kms_cache->token_renewed_at = GetCurrentTimestamp();
+                        LWLockRelease(&kms_cache->lock);
                     }
 
                     ereport(LOG,
@@ -2334,32 +1554,207 @@ pg_vault_tde_register_bgw(void)
  * v1.5: KMS Provider vtable for the Vault/OpenBao backend
  *
  * Wraps the existing Vault-specific functions (pg_vault_tde_vault_fetch_dek,
- * pg_vault_tde_kms_get_dek, pg_vault_tde_kms_set_dek, etc.) into the
+ * etc.) into the
  * TdeKmsProvider interface so that pg_vault_tde.c can select providers
  * by name at startup.
  *
  * The vault provider's init(), generate_dek(), wrap_dek(), and unwrap_dek()
- * are thin shims that call the existing Vault connector code already in this
- * file.  No functional change — only the dispatch layer is new.
+ * are thin actual function performing operations.  
  * =========================================================================*/
 
 #include "src/kms/pg_vault_tde_kms_provider.h"
 
+/*
+ * vault_resp_init / vault_resp_free — lifecycle helpers for vault_resp_buf.
+ */
+static bool
+vault_resp_init(vault_response_buf *buf)
+{
+    buf->alloc  = 2048;
+    buf->len    = 0;
+    buf->data   = palloc(buf->alloc);
+    buf->data[0] = '\0';
+    return true;
+}
+
+static void
+vault_resp_free(vault_response_buf *buf)
+{
+    if (buf->data)
+    {
+        OPENSSL_cleanse(buf->data, buf->len);
+        pfree(buf->data);
+        buf->data = NULL;
+        buf->len  = 0;
+    }
+}
+
+/*
+ * vault_make_curl — create and configure a CURL handle with common options.
+ *
+ * Sets the CA cert and timeout from config if provided.
+ * Caller must curl_easy_cleanup() the returned handle.
+ */
+static CURL *
+vault_make_curl(vault_response_buf *resp)
+{
+    CURL   *curl = curl_easy_init();
+
+    if (curl == NULL)
+        return NULL;
+
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, vault_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, resp);
+
+    if (pg_vault_tde_vault_ca_cert && pg_vault_tde_vault_ca_cert[0] != '\0')
+        curl_easy_setopt(curl, CURLOPT_CAINFO, pg_vault_tde_vault_ca_cert);
+
+    if(pg_vault_tde_vault_timeout_ms > 0)
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, (long) pg_vault_tde_vault_timeout_ms);
+
+    return curl;
+}
+
+/*
+ * vault_add_namespace_header — append X-Vault-Namespace header if set.
+ */
+static struct curl_slist *
+vault_add_namespace_header(struct curl_slist *headers)
+{
+    char hdr[288];
+
+    if (pg_vault_tde_vault_namespace && pg_vault_tde_vault_namespace[0] != '\0')
+    {
+        snprintf(hdr, sizeof(hdr), "X-Vault-Namespace: %s",
+                pg_vault_tde_vault_namespace);
+        headers = curl_slist_append(headers, hdr);
+    }
+    return headers;
+}
+
+/*
+ * vault_transit_request -- utility used by both vault_wrap_dek 
+ * and vault_unwrap_dek to make a request to the transit endpoints.
+ * 
+ */
+
+static bool vault_transit_request(const char* operation, 
+                                    const char* body, vault_response_buf *response)
+{
+    const char          *vault_token  = NULL;
+    char                url[1024];
+    CURL                *curl          = NULL;
+    char                auth_hdr[512];
+    struct curl_slist   *headers       = NULL;
+    CURLcode            res; 
+    long                http_code;
+    bool volatile       success = false;
+
+    Assert(operation != NULL);
+    Assert(body != NULL);
+    Assert(response != NULL);
+
+    if(pg_vault_tde_vault_url == NULL || pg_vault_tde_vault_url[0] == '\0')
+    {
+        ereport(ERROR,
+            errmsg("pg_vault_tde: vault_url is not set"));
+    }
+
+    if((vault_token = vault_get_effective_token()) == NULL)
+    {
+        ereport(ERROR,
+            errmsg("pg_vault_tde: authentication failed"));
+    }
+
+    /* POST /v1/<mount>/<operation>/<key_name> {"ciphertext": "<wrapped_b64>"} */
+    snprintf(url, sizeof(url), "%s/v1/%s/%s/%s",
+            pg_vault_tde_vault_url,
+            pg_vault_tde_vault_transit_mount, 
+            operation,
+            pg_vault_tde_vault_key_name);
+
+    
+    PG_TRY();
+    {
+        if(!vault_resp_init(response)) 
+        {
+            ereport(ERROR, 
+                errmsg("pg_vault_tde: buffer allocation for response failed"));
+        }
+
+        curl = vault_make_curl(response);   
+        if(curl == NULL)
+        {
+            ereport(ERROR,
+                errmsg("pg_vault_tde: curl init failed"));
+        }
+
+        snprintf(auth_hdr, sizeof(auth_hdr), 
+                "X-Vault-Token: %s", vault_token);
+
+        headers = curl_slist_append(headers, auth_hdr);
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+        headers = vault_add_namespace_header(headers);
+
+        curl_easy_setopt(curl, CURLOPT_URL, url);
+        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+        res = curl_easy_perform(curl);
+
+        if(res == CURLE_OK)
+        {
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+            if(http_code == 200)
+                success = true;
+            else 
+            {
+                ereport(ERROR,
+                    errmsg("pg_vault_tde: %s returned HTTP %ld (response %.256s)", 
+                            operation, http_code, response->data));
+            }
+        }
+        else
+            ereport(ERROR,
+                errmsg("pg_vault_tde: HTTP request failed"));
+    }
+    PG_CATCH();
+    {
+        if(curl)
+        {
+            curl_slist_free_all(headers);
+            curl_easy_cleanup(curl);
+        }
+
+        if(vault_token)
+        {
+            OPENSSL_cleanse(auth_hdr, sizeof(auth_hdr));
+        }
+
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+
+    if(curl)
+    {
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+    }
+
+    if(vault_token)
+    {
+        OPENSSL_cleanse(auth_hdr, sizeof(auth_hdr));
+    }
+
+    return success;
+}
+
+
 static bool
 vault_provider_init(void)
-{
-    /*
-     * Attempt to restore DEK from the wrapped_dek file persisted by v1.3+.
-     * If the file does not exist or Vault is unreachable, we start in
-     * "no DEK" mode and wait for pg_vault_tde_vault_fetch_dek() to be called.
-     */
-    bool ok = pg_vault_tde_try_unwrap_on_startup();
-    if (!ok)
-        ereport(LOG,
-                errmsg("pg_vault_tde: vault provider: could not restore DEK "
-                       "from wrapped_dek file at startup; will fetch from "
-                       "Vault on first access"));
-    return true;    /* non-fatal: degraded start is acceptable */
+{  
+    return true;
 }
 
 static bool
@@ -2382,75 +1777,128 @@ static bool
 vault_provider_wrap_dek(const unsigned char *dek, int dek_len,
                         unsigned char *wrapped_out, int *out_len)
 {
-    /*
-     * Vault Transit wrap: POST /v1/<mount>/encrypt/<key> with the base64-
-     * encoded plaintext DEK.  The ciphertext string is returned in the
-     * "ciphertext" field of the JSON response.
-     *
-     * Full implementation in v1.5 RTM; this stub writes the DEK to the
-     * wrapped_dek file directly (matching v1.3 behaviour) so that existing
-     * tests continue to pass while the Vault transit wrapping is refined.
-     *
-     * Out-parameter: the opaque wrapped bytes are the base64-encoded
-     * ciphertext, stored in pg_vault_tde_catalog.wrapped_dek.
-     */
-    if (*out_len < dek_len)
+    vault_response_buf  resp;
+    char               *ciphertext     = NULL;
+    char               *post_body      = NULL;
+    bool volatile       success        = false;
+
+    /* Base64-encode the DEK for the Vault Transit request body. */
+    size_t b64_len = ((dek_len + 2) / 3) * 4 + 1;
+    char *b64_dek = palloc(b64_len);
+
+    EVP_EncodeBlock((unsigned char *) b64_dek, dek, dek_len);
+
+    post_body = palloc(b64_len + 32);
+    snprintf(post_body, b64_len + 32, "{\"plaintext\": \"%s\"}", b64_dek);
+
+    OPENSSL_cleanse(b64_dek, b64_len);
+    pfree(b64_dek);
+    b64_dek = NULL;
+
+    if(vault_transit_request("encrypt", post_body, &resp))
     {
-        ereport(WARNING,
-                errmsg("pg_vault_tde: vault_provider_wrap_dek: "
-                       "output buffer too small"));
-        return false;
+        ciphertext = vault_json_extract_string(resp.data, "ciphertext");
+        
+        if(ciphertext != NULL)
+        {
+            size_t new_len = strlen(ciphertext);
+
+            if(new_len > (size_t)*out_len)
+                ereport(ERROR, errmsg("pg_vault_tde: Buffer Overflow on ciphertext"));
+            else{
+                memcpy(wrapped_out, ciphertext, new_len);
+                *out_len = new_len;
+                success = true;
+            }
+            
+        }
     }
-    /* Placeholder: identity wrap (plaintext stored) until Transit is wired */
-    memcpy(wrapped_out, dek, dek_len);
-    *out_len = dek_len;
-    return true;
+    else    
+        ereport(ERROR, errmsg("pg_vault_tde: HTTP request failed"));
+
+    if(b64_dek)
+    {
+        OPENSSL_cleanse(b64_dek, b64_len);
+        pfree(b64_dek);
+    }
+    if(post_body)
+    {
+        OPENSSL_cleanse(post_body, strlen(post_body));
+        pfree(post_body);
+    }
+    vault_resp_free(&resp);
+
+    if(ciphertext)
+    {
+        OPENSSL_cleanse(ciphertext, strlen(ciphertext));
+        pfree(ciphertext);
+    }
+    return success;
 }
 
 static bool
 vault_provider_unwrap_dek(const unsigned char *wrapped, int wrapped_len,
                            unsigned char *dek_out, int dek_len)
 {
-    if (wrapped_len != dek_len)
+    vault_response_buf  resp;
+    char                *plaintext_b64  = NULL;
+    char                *post_body      = NULL;
+    bool                success         = false;
+    unsigned char       raw_dek[TDE_DEK_LEN];
+    int                 decoded_len;
+
+    Size body_len = wrapped_len + 64 + 1;
+    post_body = palloc(body_len);
+
+    snprintf(post_body, body_len, "{\"ciphertext\": \"%.*s\"}",
+             (int) wrapped_len, (const char *) wrapped);
+
+    if(vault_transit_request("decrypt", post_body, &resp))
     {
-        /* Wrapped form from vault transit would be a base64 string;
-         * for now accept direct copy during identity-wrap period */
-        ereport(WARNING,
-                errmsg("pg_vault_tde: vault_provider_unwrap_dek: "
-                       "unexpected wrapped_len=%d, dek_len=%d",
-                       wrapped_len, dek_len));
-        return false;
+        plaintext_b64 = vault_json_extract_string(resp.data, "plaintext");
+        if(plaintext_b64 != NULL)
+        {
+            decoded_len = vault_base64_decode(plaintext_b64, raw_dek, TDE_DEK_LEN);
+            if(decoded_len == TDE_DEK_LEN)
+            {
+                memcpy(dek_out, raw_dek, dek_len);
+                success = true;
+            }
+
+            OPENSSL_cleanse(raw_dek, TDE_DEK_LEN);
+            OPENSSL_cleanse(plaintext_b64, strlen(plaintext_b64));
+            pfree(plaintext_b64);
+            plaintext_b64 = NULL;
+        }
     }
-    memcpy(dek_out, wrapped, dek_len);
-    return true;
-}
+    else
+    {
+        ereport(ERROR, 
+                errmsg("pg_vault_tde: Vault Transit decrypt HTTP failed"));
+    }
+    if(post_body)
+    {
+        OPENSSL_cleanse(post_body, strlen(post_body));
+        pfree(post_body);
+    }
+    vault_resp_free(&resp);
 
-static bool
-vault_provider_rewrap_dek(const unsigned char *old_wrapped, int old_len,
-                           unsigned char *new_wrapped, int *new_len)
-{
-    unsigned char dek_temp[TDE_DEK_LEN];
-    bool ok;
-
-    ok = vault_provider_unwrap_dek(old_wrapped, old_len, dek_temp, TDE_DEK_LEN);
-    if (ok)
-        ok = vault_provider_wrap_dek(dek_temp, TDE_DEK_LEN, new_wrapped, new_len);
-
-    OPENSSL_cleanse(dek_temp, TDE_DEK_LEN);
-    return ok;
+    if(plaintext_b64)
+    {
+        OPENSSL_cleanse(plaintext_b64, strlen(plaintext_b64));
+        pfree(plaintext_b64);
+    }
+    return success;
 }
 
 static bool
 vault_provider_health_check(void)
 {
-    /*
-     * Check that the shmem DEK is valid — connectivity to Vault is verified
-     * by pg_vault_tde_kms_status() which is a separate diagnostic function.
-     */
-    char dek_probe[TDE_DEK_LEN];
-    bool ok = pg_vault_tde_kms_get_dek(dek_probe, TDE_DEK_LEN);
-    OPENSSL_cleanse(dek_probe, TDE_DEK_LEN);
-    return ok;
+    const char *tok = vault_get_effective_token();
+
+    if (tok == NULL || tok[0] == '\0')
+        return false;
+    return vault_probe_health();
 }
 
 static void
@@ -2459,15 +1907,97 @@ vault_provider_shutdown(void)
     /* Nothing to do: curl handles cleaned up in tde_backend_cleanup() */
 }
 
+/* -------------------------------------------------------------------------
+ * vault_prepare_kek_rotation — POST /v1/<mount>/keys/<key>/rotate to Vault.
+ *
+ * After this call Vault uses a new key version for encrypt; old versions
+ * remain available for decrypt (ciphertext is version-tagged as vault:vN:…).
+ * vault_provider_rewrap_dek (unwrap + wrap) automatically re-wraps under the
+ * new version because wrap always uses the latest key.
+ * -------------------------------------------------------------------------*/
+static bool
+vault_prepare_kek_rotation(void)
+{
+    CURL              *curl;
+    CURLcode           res;
+    struct curl_slist *headers = NULL;
+    vault_response_buf response;
+    char               url[1024];
+    char               auth_header[512];
+    long               http_code = 0;
+    bool               success   = false;
+    const char        *token;
+
+    token = vault_get_effective_token();
+    if (token == NULL || token[0] == '\0')
+        ereport(ERROR,
+                errcode(ERRCODE_CONNECTION_FAILURE),
+                errmsg("pg_vault_tde: no Vault token available for KEK rotation"));
+
+    snprintf(url, sizeof(url), "%s/v1/%s/keys/%s/rotate",
+             pg_vault_tde_vault_url,
+             pg_vault_tde_vault_transit_mount,
+             pg_vault_tde_vault_key_name);
+
+    snprintf(auth_header, sizeof(auth_header), "X-Vault-Token: %s", token);
+
+    response.alloc   = 256;
+    response.len     = 0;
+    response.data    = palloc(response.alloc);
+    response.data[0] = '\0';
+
+    curl = curl_easy_init();
+    if (!curl)
+        ereport(ERROR, errmsg("pg_vault_tde: curl_easy_init failed"));
+
+    headers = curl_slist_append(headers, auth_header);
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    if (pg_vault_tde_vault_ca_cert && pg_vault_tde_vault_ca_cert[0])
+        curl_easy_setopt(curl, CURLOPT_CAINFO, pg_vault_tde_vault_ca_cert);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, vault_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+
+    res = curl_easy_perform(curl);
+    if (res == CURLE_OK)
+    {
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+        success = (http_code == 204 || http_code == 200);
+    }
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    pfree(response.data);
+
+    if (!success)
+        ereport(ERROR,
+                errcode(ERRCODE_CONNECTION_FAILURE),
+                errmsg("pg_vault_tde: Vault KEK rotate failed (HTTP %ld, curl %d)",
+                       http_code, (int) res));
+    return true;
+}
+
+static void
+vault_commit_kek_rotation(void)
+{
+    /* Vault manages key versions server-side — nothing to do locally. */
+}
+
 static const TdeKmsProvider vault_provider_impl = {
-    .name          = "vault",
-    .init          = vault_provider_init,
-    .generate_dek  = vault_provider_generate_dek,
-    .wrap_dek      = vault_provider_wrap_dek,
-    .unwrap_dek    = vault_provider_unwrap_dek,
-    .rewrap_dek    = vault_provider_rewrap_dek,
-    .health_check  = vault_provider_health_check,
-    .shutdown      = vault_provider_shutdown,
+    .name                 = "vault",
+    .init                 = vault_provider_init,
+    .generate_dek         = vault_provider_generate_dek,
+    .wrap_dek             = vault_provider_wrap_dek,
+    .unwrap_dek           = vault_provider_unwrap_dek,
+    .rewrap_dek           = vault_provider_rewrap_dek,
+    .prepare_kek_rotation = vault_prepare_kek_rotation,
+    .commit_kek_rotation  = vault_commit_kek_rotation,
+    .health_check         = vault_provider_health_check,
+    .shutdown             = vault_provider_shutdown,
 };
 
 const TdeKmsProvider *

@@ -236,7 +236,7 @@ PG_DUMP_TDE_CFLAGS = \
 PG_DUMP_TDE_LDFLAGS = \
     -L$(shell $(PG_CONFIG) --libdir) \
     -L$(shell $(PG_CONFIG) --pkglibdir) \
-    -lpq -lpgfeutils -lpgcommon -lpgport \
+    -lpq -lpgcommon -lpgport \
     $(OPENSSL_LIBS) \
     $(LIBCURL_LIBS)
 

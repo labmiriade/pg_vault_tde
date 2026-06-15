@@ -6,20 +6,16 @@
  *
  * WHY THIS EXISTS:
  * ----------------
- * v1.4 stored a single global DEK in shared memory (TdeKmsSharedState.dek).
- * v1.5 introduces per-table key isolation: each encrypted_heap relation has
- * its own DEK, fetched from the active KMS provider and cached in a fixed-size
- * shared memory array (TdeRelDekCache).
+ * Each encrypted_heap relation has its own DEK (v1.5+), fetched from the
+ * active KMS provider and cached in a fixed-size shmem array (TdeRelDekCache).
  *
  * On-disk persistence: pg_vault_tde_catalog(relid, vault_key_name, generation,
  * wrapped_dek, created_at).  The in-memory cache is authoritative at runtime;
  * the catalog is the authoritative source for DEK wrapping/unwrapping at
  * startup and after a server restart.
  *
- * Backward compatibility sentinel:
- *   relid = 0 (InvalidOid) is reserved for the v1.4 single-DEK path.
- *   Tables created before v1.5 that have no catalog entry are implicitly
- *   associated with the global DEK from the v1.4 shmem layout.
+ * Note: the v1.4 global DEK (TdeShmemData, relid=0 sentinel) was removed
+ * in v1.7.  All relations must have a pg_vault_tde_catalog entry.
  *
  * OWNERSHIP: @SecurityKMS (shmem + KMS APIs) and @Architect (catalog SQL
  * and ProcessUtility_hook for DROP TABLE cleanup) share this header.
@@ -42,6 +38,7 @@
  * size is derived from the GUC at shmem_request time.
  */
 #define TDE_REL_DEK_CACHE_DEFAULT  1024
+#define TDE_WRAPPED_DEK_MAX_LEN    256
 
 
 /*
@@ -84,8 +81,7 @@ typedef struct TdeRelDekCache
 } TdeRelDekCache;
 
 /*
- * Shared memory management.
- * Follows the same two-phase protocol as the global DEK shmem:
+ * Shared memory management (two-phase protocol):
  *   pg_vault_tde_catalog_shmem_request() from shmem_request_hook
  *   pg_vault_tde_catalog_shmem_init()    from shmem_startup_hook
  */
@@ -104,9 +100,8 @@ void pg_vault_tde_catalog_shmem_init(void);
  *   Returns true on success, false if the relation has no catalog entry
  *   (caller decides error policy).
  *
- * This function REPLACES pg_vault_tde_kms_get_dek() for all table-level
- * encrypt/decrypt paths.  The old function is kept as a compatibility shim
- * that calls get_rel_dek(InvalidOid, ...) for v1.4 tables.
+ * This is the authoritative DEK accessor for all table-level encrypt/decrypt
+ * paths (v1.5+).
  *
  * CALLER RESPONSIBILITY: OPENSSL_cleanse(dek_out, dek_len) after use.
  */
@@ -183,5 +178,16 @@ void pg_vault_tde_catalog_evict_all(void);
 int  pg_vault_tde_catalog_get_dek_count(void);
 
 void pg_vault_tde_catalog_zero_rel_dek(Oid relid);
+
+/*
+ * pg_vault_tde_catalog_get_rel_generation:
+ *   Return the current rotation epoch for relid from the shmem cache.
+ *   Returns 1 for the first (unrotated) generation, higher values after
+ *   key rotations.  Returns 0 for InvalidOid (backup path, v2 wire format).
+ *   Safe to call from any backend; acquires LW_SHARED briefly.
+ */
+uint64 pg_vault_tde_catalog_get_rel_generation(Oid relid);
+
+bool pg_vault_tde_catalog_rewrap_all(void);
 
 #endif /* PG_VAULT_TDE_CATALOG_H */

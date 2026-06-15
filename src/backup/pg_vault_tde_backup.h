@@ -96,6 +96,18 @@ char *tde_backup_decrypt_block(const TdeBackupContext* ctx,
                                 uint64 block_seq, Size* out_len);
     
 
+/*
+ * Minimal connection parameters; mirrors fe_utils/connect_utils.h ConnParams
+ * without requiring libpgfeutils (not shipped by all distro packages).
+ */
+typedef struct ConnParams
+{
+    const char *dbname;
+    const char *pghost;
+    const char *pgport;
+    const char *pguser;
+} ConnParams;
+
 bool tde_backup_init(ConnParams* params);
 
 #endif /* PG_VAULT_TDE_BACKUP_H */

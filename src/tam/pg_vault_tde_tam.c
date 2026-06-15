@@ -341,7 +341,6 @@ pg_vault_tde_decode_slot(TupleTableSlot *slot)
      * slots during a heap scan, so this is valid here (buffer still pinned
      * when heap_copytuple runs above).
      * For tuples from index scans, t_tableOid is also set by heap_hot_search_buffer.
-     * Fall back to InvalidOid for legacy v1.4 global-DEK tables.
      */
     plain = tde_decrypt_heap_tuple(enc_copy, enc_copy->t_tableOid);
     pfree(enc_copy);
@@ -1827,12 +1826,11 @@ pg_vault_tde_get_tableam_routine(void)
  * path (re-encrypt with current DEK), without changing any column values.
  *
  * When used after key rotation with prev_dek fallback:
- *   1. rotate_key() saves old DEK → prev_dek
- *   2. set_test_dek() / vault_fetch_dek() sets new DEK
- *   3. reencrypt_table() reads old rows (fallback to prev_dek),
+ *   1. KMS provider replaces current DEK → prev_dek retained
+ *   2. reencrypt_table() reads old rows (fallback to prev_dek),
  *      writes new tuples (encrypted with current DEK), and
  *      rebuilds any tde_btree indexes (SIV keys are DEK-bound)
- *   4. clear_prev_dek() wipes old key material
+ *   3. KMS provider wipes prev_dek after re-encryption completes
  *
  * Why tde_btree indexes must be rebuilt:
  *   AES-256-SIV is deterministic under a fixed DEK: same plaintext + same DEK

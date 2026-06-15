@@ -44,7 +44,7 @@
  * at the block level, not only at EOF.
  */
 #include "postgres_fe.h"
-#include "fe_utils/connect_utils.h"
+#include "libpq-fe.h"
 #include "common/logging.h"
 #include "port/pg_bswap.h"
 
@@ -217,15 +217,16 @@ bool tde_backup_header_validate(tde_backup_header *hdr, TdeBackupContext* ctx)
 /** Open a libpq connection; returns NULL and logs on failure. */
 static PGconn* init_db_conn(ConnParams* params)
 {
-    PGconn* conn = connectDatabase(params, "pg_dump_tde", false, true, false);
+    PGconn* conn = PQsetdbLogin(params->pghost, params->pgport, NULL, NULL,
+                                params->dbname, params->pguser, NULL);
 
-    if(PQstatus(conn) != CONNECTION_OK)
+    if (PQstatus(conn) != CONNECTION_OK)
     {
         fprintf(stderr, "pg_dump_tde: can't connect to the database: %s", PQerrorMessage(conn));
         PQfinish(conn);
         return NULL;
     }
-    
+
     return conn;
 }
 

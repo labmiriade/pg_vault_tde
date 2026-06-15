@@ -104,14 +104,14 @@ COMMENT ON FUNCTION pg_vault_tde_wallet_lock() IS
 -- ============================================================================
 -- 5. wallet_rotate_kek(new_passphrase text)
 -- ============================================================================
-CREATE FUNCTION pg_vault_tde_wallet_rotate_kek(new_passphrase text)
+CREATE FUNCTION pg_vault_tde_wallet_rotate_kek()
     RETURNS void
     LANGUAGE C STRICT SECURITY DEFINER
     AS 'MODULE_PATHNAME', 'pg_vault_tde_wallet_rotate_kek_sql';
 
-REVOKE ALL ON FUNCTION pg_vault_tde_wallet_rotate_kek(text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_vault_tde_wallet_rotate_kek() FROM PUBLIC;
 
-COMMENT ON FUNCTION pg_vault_tde_wallet_rotate_kek(text) IS
+COMMENT ON FUNCTION pg_vault_tde_wallet_rotate_kek() IS
 'Re-wrap all per-table DEKs under a new passphrase-protected KEK without '
 'touching encrypted tuple data.  Writes a new wallet file and flushes the '
 'shmem cache.  Use for scheduled KEK rotation.';
@@ -223,14 +223,6 @@ GRANT EXECUTE ON FUNCTION pg_vault_tde_reencrypt_table(text, int) TO pg_monitor;
 
 REVOKE ALL ON FUNCTION pg_vault_tde_reencrypt_table(regclass, int) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION pg_vault_tde_reencrypt_table(regclass, int) TO pg_monitor;
-
-REVOKE ALL   ON FUNCTION pg_vault_tde_rotate_key() FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION pg_vault_tde_rotate_key() TO pg_monitor;
-
-REVOKE ALL   ON FUNCTION pg_vault_tde_set_test_dek() FROM PUBLIC;
-
-REVOKE ALL ON FUNCTION pg_vault_tde_clear_prev_dek() FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION pg_vault_tde_clear_prev_dek() TO pg_monitor;
 
 REVOKE ALL ON FUNCTION pg_vault_tde_vault_fetch_dek() FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION pg_vault_tde_vault_fetch_dek() to pg_monitor;

@@ -83,7 +83,7 @@ if $RT exec -u postgres "$CONTAINER" bash -c '
     export PERL5LIB="/usr/lib/postgresql/18/lib/pgxs/src/test/perl${PERL5LIB:+:$PERL5LIB}"
     export PG_REGRESS="/usr/lib/postgresql/18/lib/pgxs/src/test/regress/pg_regress"
     cd /test
-    prove -v tap/*.t 
+    prove -v --failures tap/*.t 
 '; then
     ELAPSED=$(timer_elapsed "$START")
     log_ok "TAP: ALL TESTS PASSED ($(timer_fmt "$ELAPSED"))"

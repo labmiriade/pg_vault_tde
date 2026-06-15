@@ -110,12 +110,21 @@ Disk: [HeapTupleHeader | IV(12) | Ciphertext | GCM-TAG(16)]
 ### Shared Memory Layout
 
 ```c
-typedef struct TdeKmsSharedState {
-    LWLock      lock;               /* protects dek + generation */
-    uint64      generation;         /* bumped on each rotate_key() */
-    bool        dek_valid;          /* false until first key injection */
-    char        dek[TDE_DEK_LEN];   /* 32-byte AES-256 key */
-} TdeKmsSharedState;
+/* Per-relation DEK entry in shared memory (v1.5+) */
+typedef struct TdeRelDekEntry {
+    Oid     relid;                   /* InvalidOid = empty slot */
+    LWLock  lock;                    /* embedded by VALUE */
+    uint64  generation;
+    bool    dek_valid;
+    bool    prev_dek_valid;
+    char    dek[TDE_DEK_LEN];        /* current AES-256 DEK */
+    char    prev_dek[TDE_DEK_LEN];   /* rotation window fallback */
+} TdeRelDekEntry;
+
+typedef struct TdeRelDekCache {
+    int             capacity;        /* pg_vault_tde.max_encrypted_relations */
+    TdeRelDekEntry  entries[FLEXIBLE_ARRAY_MEMBER];
+} TdeRelDekCache;
 ```
 
 - `TDE_DEK_LEN` is defined **only** in `src/include/pg_vault_tde_kms.h`.
@@ -436,19 +445,26 @@ overhead (no crypto) from actual encryption cost.
 
 ```
 ┌───────────────────────────────────────────────────┐
-│  Shared Memory  (pg_vault_tde_dek_cache)           │
+│  Shared memory (TdeRelDekCache)                    │
 │  ─────────────────────────────────────────────────│
 │  LWLock (embedded by value)                        │
-│  generation: uint64                                │
-│  dek_valid: bool                                   │
-│  dek[32]: char  (AES-256 raw key)                  │
+│  capacity: int  (pg_vault_tde.max_encrypted_rels)  │
+│  used: int                                         │
+│  entries[capacity]: TdeRelDekEntry                 │
+│    ├─ relid: Oid                                   │
+│    ├─ dek[32]: char      (current DEK)             │
+│    ├─ prev_dek[32]: char (rotation window)         │
+│    ├─ generation: uint64                           │
+│    └─ dek_valid / prev_dek_valid: bool             │
 └───────────────────────────────────────────────────┘
-               ▲ LW_SHARED copy on miss
+               ▲ pg_vault_tde_kms_get_rel_dek(relid)
+               │  fast path:  LW_SHARED cache hit
+               │  slow path:  catalog read → KMS unwrap → cache insert
 ┌───────────────────────────────────────────────────┐
-│  Per-backend  (TopMemoryContext)                   │
+│  pg_vault_tde_catalog  (on-disk system table)      │
 │  ─────────────────────────────────────────────────│
-│  local_generation: uint64                          │
-│  local_dek[32]: char                               │
+│  relid, vault_key_name, generation,                │
+│  wrapped_dek, kms_provider, created_at, updated_at │
 └───────────────────────────────────────────────────┘
 ```
 
@@ -460,16 +476,17 @@ overhead (no crypto) from actual encryption cost.
 
 ### Generation-Epoch Rotation
 
-`pg_vault_tde_rotate_key()`:
-1. Acquires `LW_EXCLUSIVE` on the shmem lock.
-2. `OPENSSL_cleanse`s `dek[32]`.
-3. Increments `generation`.
-4. Sets `dek_valid = false`.
+Key rotation is now **per-relation** via `pg_vault_tde_rotate_online(relname, batch_size)`.
+For each encrypted relation the operation:
+1. Acquires `LW_EXCLUSIVE` on the relation's `TdeRelDekEntry` lock.
+2. `OPENSSL_cleanse`s `dek[32]` (promotes current DEK to `prev_dek` for the rotation window).
+3. Increments the per-relation `generation` counter.
+4. Sets `dek_valid = false` (triggers a catalog read + KMS unwrap on next access).
 5. Releases lock.
 
-Each backend detects the mismatch lazily on the next encrypt/decrypt call.
-Old-generation rows encrypted with DEK-A are permanently unreadable after the
-key is wiped. A re-encryption utility is on the roadmap.
+Each backend detects the mismatch lazily on the next encrypt/decrypt call for that
+relation. Old-generation rows can still be read via `prev_dek` during the rotation
+window; after `pg_vault_tde_reencrypt_table()` completes the window closes.
 
 - **Bounded staleness**: At most one LWLock pair per encrypt/decrypt call.
 - **No signals**: Generation mismatch is detected lazily; no SIGUSR1/SIGHUP needed.
@@ -552,17 +569,48 @@ CREATE OPERATOR CLASS tde_bytea_ops DEFAULT FOR TYPE bytea USING tde_btree AS
     FUNCTION 1 byteacmp(bytea, bytea);
 ```
 
-### IAM Limitations (v1.7)
+### Index-Only Scans
 
-`tde_btree` now supports native operator classes for `text`, `int4`, `int8`, `uuid`,
-`numeric`, `date`, `timestamptz` (added v1.5). **Caveat**: varlena types (`text`,
-`bytea`, `numeric`) have their index key encrypted with AES-256-SIV. Fixed-size
-pass-by-value types (`int4`, `uuid`, `date`, `timestamptz`) store the **index key in
-plaintext** — the heap tuple remains fully encrypted but the btree page entry is not.
-This requires a custom btree page format to fix; planned for v1.7.
+Index-only scans are **not supported** on `tde_btree` indexes by design. PostgreSQL
+index-only scans return column values directly from the index pages without visiting
+the heap. Since `tde_btree` stores AES-256-SIV ciphertexts as index keys, returning
+those values directly would expose raw ciphertext to the client with no decryption.
 
-Range scans on `tde_btree` columns return empty results by design (ordering not
-preserved by AES-SIV, regardless of type).
+All decryption happens in the TAM layer (`decode_slot`) when the heap tuple is
+fetched. The planner is prevented from choosing an index-only scan path on
+`tde_btree` indexes; it always fetches the tuple from the `encrypted_heap` table.
+
+Range scans on `tde_btree` columns return empty results by design — AES-256-SIV
+does not preserve ordering regardless of column type.
+
+### Usage Example
+
+```sql
+-- Create an encrypted table
+CREATE TABLE employees (
+    id        int4,
+    username  text,
+    salary    numeric
+) USING encrypted_heap;
+
+-- Create tde_btree indexes on multiple column types
+-- (all types now have encrypted index keys, including fixed-size int4)
+CREATE INDEX employees_id_idx       ON employees USING tde_btree (id tde_int4_ops);
+CREATE INDEX employees_username_idx ON employees USING tde_btree (username tde_text_ops);
+
+-- Equality lookups use the encrypted index
+INSERT INTO employees VALUES (1, 'alice', 90000);
+INSERT INTO employees VALUES (2, 'bob',   85000);
+
+SELECT salary FROM employees WHERE id = 1;       -- uses index
+SELECT id     FROM employees WHERE username = 'alice';  -- uses index
+
+-- Range predicates fall back to sequential scan (index returns empty by design)
+SELECT * FROM employees WHERE id > 1;            -- seq scan, not index scan
+
+-- Index-only scans are not supported and never chosen by the planner;
+-- the heap tuple is always fetched to decrypt column values.
+```
 
 ---
 
@@ -573,7 +621,7 @@ preserved by AES-SIV, regardless of type).
 | # | Limitation | Fix Version |
 |---|-----------|-------------|
 | 1 | **TOAST chunk-level storage encryption** — ✅ **Resolved in v1.6**: large values round-trip fully encrypted via `pg_vault_tde_toast_am` returning `encrypted_heap` AM. Disable with `pg_vault_tde.toast_encryption = off` for legacy behaviour. | v1.6 ✅ |
-| 2 | **tde_btree fixed-size types plaintext index keys** — `int4`, `int8`, `uuid`, `date`, `timestamptz` btree index entries are plaintext (heap fully encrypted); only varlena types have encrypted index keys | v1.7 |
+| 2 | **tde_btree fixed-size types plaintext index keys** — ✅ **Resolved in v1.7**: `int4`, `int8`, `uuid`, `date`, `timestamptz` btree index keys are now encrypted with AES-256-SIV, matching varlena type behaviour. | v1.7 ✅ |
 | 3 | **Logical replication TOAST gap** — tables with externally-TOAST'd columns not supported for logical decoding | v1.7 |
 | 4 | **WAL unencrypted** — requires `XLogInsert()` hook unavailable in extension API | Permanently deferred |
 | 5 | **All-or-nothing table encryption** — no per-column granularity | v1.8 |
@@ -597,9 +645,6 @@ preserved by AES-SIV, regardless of type).
 3. **Vault HTTP connector** (ticket #3)  
    The libcurl-based async KMS integration is scaffolded in
    `src/kms/pg_vault_tde_kms.c` (`pg_vault_tde_kms_request_async()`).
-   Production use currently requires injecting the DEK via
-   `pg_vault_tde_set_test_dek()` (development only) or directly via
-   `pg_vault_tde_kms_set_dek()` in C.
 
 4. **multi_insert / COPY throughput** (ticket #4)
    The `multi_insert` callback encrypts per-slot and calls `heap_insert`
@@ -662,7 +707,7 @@ access control but do not replace it.
 |---|---|
 | Backend start | Local DEK copy in `TopMemoryContext` |
 | Query end | DEK remains in `TopMemoryContext` (not wiped per-query) |
-| `rotate_key()` | Shmem DEK `OPENSSL_cleanse`d; generation incremented |
+| `pg_vault_tde_rotate_online()` | Per-relation shmem DEK `OPENSSL_cleanse`d; generation incremented |
 | Backend exit | `on_proc_exit` hook calls `OPENSSL_cleanse` on local copy |
 | OS crash | Shmem lost; DEK must be re-injected from Vault on restart |
 
@@ -715,20 +760,6 @@ CREATE TABLE t (...) USING encrypted_heap;
 
 -- Index AM: deterministic AES-SIV for B-Tree key equality
 CREATE INDEX ON t USING tde_btree (col);
-```
-
-### Functions
-
-```sql
--- Key management
-SELECT pg_vault_tde_set_test_dek();     -- inject random ephemeral DEK (DEV/TEST ONLY)
-SELECT pg_vault_tde_rotate_key();       -- wipe DEK from shmem, bump generation
-SELECT pg_vault_tde_key_generation();   -- → bigint: current epoch counter
-
-
--- Test / diagnostic (require DEK set; never use in production)
-SELECT pg_vault_tde_encrypt_test('text');   -- → bytea: [IV(12)|CT|TAG(16)]
-SELECT pg_vault_tde_decrypt_test(bytes);    -- → text: plaintext (verifies GCM tag)
 ```
 
 ### GUC Parameters
