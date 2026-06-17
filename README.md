@@ -154,7 +154,7 @@ SELECT email, ssn FROM users WHERE id = 1;
 | Index keys (GiST equality) | 🔜 v1.8 | Equality-only GiST (`inet_ops`); range/geometric GiST permanently deferred |
 | TOAST values | ✅ **Yes** | Heap-level round-trips functional; per-chunk storage encryption |
 | Column-level granularity | 🔜 v1.8 | Per-column `ENABLE COLUMN ENCRYPTION` DDL |
-| WAL / redo log | ✗ Permanently deferred | Requires core hook in `XLogInsert()` — not possible as extension |
+| WAL / redo log | ✅ **Yes** | Data encrypted before `heap_insert()` |
 | pg_statistic | 🔜 v1.8 | Statistics stored plaintext; MCVs/histograms expose value distribution |
 
 > **Column-level**: Only tables created with `USING encrypted_heap` are
@@ -762,8 +762,9 @@ rpmbuild -ba packaging/rpm/pg_vault_tde-arm.spec        # ARM CE optimised
 
 ---
 
-## Encrypted Backups (`pg_dump_tde` / `pg_restore_tde`)
+## Encrypted Backups
 
+### `pg_dump_tde` / `pg_restore_tde`
 Plain `pg_dump` decrypts rows at read time (via the TAM), so the dump file is
 **plaintext**.  `pg_dump_tde` closes this gap by piping the dump through
 AES-256-GCM before touching disk:
@@ -777,6 +778,17 @@ pg_restore_tde -h localhost -U postgres -d mydb -i /backup/mydb.tde
 ```
 
 >All other `pg_dump` options are fed directly to it.
+
+### `pg_basebackup`
+It's possible to use `pg_basebackup` to create a base backup of the cluster and use it for a standby creation.
+
+#### Primary configuration
+
+Configure like it's not encrypted 
+
+#### Standby configuration
+Need the same `wallet.p12` of the primary if the KMS provider used is `local` and the same configuration (basebackup does it already) if the `Vault` is used as KMS provider.
+
 
 ### How it works
 
@@ -869,10 +881,7 @@ See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
 4. **All-or-nothing table encryption** (→ v1.8): All columns in an `encrypted_heap`
    table are encrypted. Per-column `ENABLE COLUMN ENCRYPTION` DDL is planned for v1.8.
 
-5. **WAL unencrypted** (permanently deferred): Full WAL encryption requires a hook in
-   `XLogInsert()` / `XLogWrite()` — not achievable as a PostgreSQL extension.
-
-6. **`WITH HOLD` cursor temporary file is unencrypted** (→ v1.7): When a `CURSOR WITH HOLD`
+5 **`WITH HOLD` cursor temporary file is unencrypted** (→ v1.7): When a `CURSOR WITH HOLD`
    spills its result set to a temporary file on disk (e.g. when `work_mem` is exhausted),
    the file is written in **plaintext**. PostgreSQL writes the materialized tuples directly
    through the executor's tuplestore layer, bypassing the TAM write path, so
