@@ -71,13 +71,8 @@ OBJS = \
 	src/iam/pg_vault_tde_iam.o \
 	src/logical/pg_vault_tde_pgoutput.o
 
-# SQL scripts installed as part of the extension
-# Always list the base install AND every upgrade path.
-DATA = sql/pg_vault_tde--1.0.sql \
-       sql/pg_vault_tde--1.0--1.4.sql \
-       sql/pg_vault_tde--1.4--1.5.sql \
-       sql/pg_vault_tde--1.5--1.6.sql \
-       sql/pg_vault_tde--1.6--1.7.sql
+# SQL scripts installed as part of the extension.
+DATA = sql/pg_vault_tde--1.7.sql 
 
 # pg_regress test targets (filenames without .sql suffix)
 REGRESS = pg_vault_tde_init

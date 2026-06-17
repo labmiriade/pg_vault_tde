@@ -87,7 +87,7 @@ AppRole response-wrapping. Wallet SQL stubs registered (not functional). Tests 5
 | Feature | Status |
 |---------|--------|
 | `pg_vault_tde_wallet_change_passphrase(old, new)` — re-wraps all DEKs atomically via SPI | ✅ Done |
-| `pg_vault_tde_wallet_rotate_kek()` — new random KEK, re-wrap all DEKs, atomic wallet file write | ✅ Done |
+| `pg_vault_tde_rotate_kek()` — new random KEK, re-wrap all DEKs, atomic wallet file write | ✅ Done |
 
 #### 5. Wallet Export/Import Ceremony
 
@@ -247,10 +247,10 @@ Covered by tests 81, 84, and 85.
   `SPI_tuptable`, invalidating the next iteration and crashing the backend
   on the second tuple (segfault, signal 11).  Solved by snapshotting the
   read set into caller-owned arrays before issuing any UPDATE.
-  Same dual fix applied to `pg_vault_tde_wallet_rotate_kek()`.
+  Same dual fix applied to `pg_vault_tde_rotate_kek()`.
   Tests 78–79 now PASS under `make ci-wallet`.
 
-- `pg_vault_tde_wallet_rotate_kek()` — extended with a dual-source KEK
+- `pg_vault_tde_wallet_kek()` — extended with a dual-source KEK
   policy: prefers the in-memory cached KEK from `wallet_unlock` when
   available (so tests don't need GUC config), falls back to the GUC
   passphrase source otherwise.

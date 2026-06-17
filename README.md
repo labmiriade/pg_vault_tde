@@ -423,7 +423,64 @@ All parameters are `suset` — settable per-database with `ALTER DATABASE SET`.
 | `enabled` | boolean | `on` | suset | Master switch — set `off` to measure TAM overhead without crypto. Settable per-database. |
 | `dump_plaintext_warning` | boolean | `on` | sighup | Emit WARNING when `pg_dump`/`COPY TO` reads from an encrypted table (v1.7) |
 | `encrypt_statistics` | boolean | `off` | sighup | Encrypt `pg_statistic` MCVs/histograms for encrypted columns (v1.8) |
-| `audit_enabled` | boolean | `on` | sighup | Enable audit event logging to `pg_vault_tde_audit_log` (v1.7) |
+
+---
+
+## Auditing
+
+pg_vault_tde emits an audit record for every security-relevant KMS and DDL event.
+Auditing is **always active**: the audit handler is registered unconditionally at
+`_PG_init` time and there is no GUC to disable it.
+
+Each event is written to the PostgreSQL server log at `LOG` severity via
+`ereport(LOG)` with `errhidestmt` and `errhidecontext` set, so the originating
+SQL statement and context stack are suppressed — only the audit fields appear.
+
+### Log format
+
+```
+AUDIT: event=<name>, oid=<relation_oid_or_dash>, user=<role_name>, success=<t|f>, pid=<pid>
+```
+
+- `oid` — relation OID affected by the event, or `-` for cluster-level events.
+- `success` — `t` on success, `f` on failure (e.g. authentication error, GCM tag mismatch).
+
+### Logged events
+
+| Event | Trigger | PCI DSS ref |
+|---|---|---|
+| `AUDIT_LOG_START` | Audit subsystem initialised at server start | 10.2.1.6 |
+| `AUDIT_LOG_STOP` | Audit subsystem shut down | 10.2.1.6 |
+| `KMS_DEK_ACCESS` | DEK read from shared-memory cache or KMS | — |
+| `KMS_DEK_CREATE` | New per-relation DEK generated | — |
+| `KMS_DEK_UPDATE` | DEK metadata updated in catalog | — |
+| `KMS_DEK_ROTATE` | Per-relation DEK rotated (`pg_vault_tde_rotate_online`) | 10.2.1.7 |
+| `KMS_DEK_DELETE` | DEK revoked / removed from catalog (`DROP TABLE`) | 10.2.1.7 |
+| `KMS_KEK_ROTATE` | KEK rotated (`pg_vault_tde_rotate_kek`) | 10.2.1.7 |
+| `KMS_AUTH_SUCCESS` | KMS / Vault authentication succeeded | 10.2.1.5 |
+| `KMS_AUTH_FAILURE` | KMS / Vault authentication failed | 10.2.1.5 |
+| `WALLET_OPEN` | Local wallet opened (`pg_vault_tde_wallet_unlock`) | — |
+| `WALLET_CLOSE` | Local wallet closed (`pg_vault_tde_wallet_lock`) | — |
+| `RELATION_ENCRYPT` | Relation converted to `encrypted_heap` | 10.2.1.7 |
+| `RELATION_DECRYPT` | `encrypted_heap` converted back to plain heap | 10.2.1.7 |
+| `ACCESS_DENIED` | Decryption failed — wrong key or missing permission | 10.2.1.4 |
+| `INTEGRITY_VIOLATION` | GCM authentication tag or page checksum failure | — |
+
+### Routing audit logs
+
+Because audit records are written as PostgreSQL `LOG` messages they flow through
+the standard `log_destination` / `logging_collector` pipeline.  To route them to
+a dedicated file or to an external SIEM, match on the `AUDIT:` prefix:
+
+```
+# postgresql.conf — route AUDIT lines to a separate file (requires logging_collector = on)
+log_destination = 'stderr'
+logging_collector = on
+log_filename = 'postgresql-%Y-%m-%d.log'
+```
+
+External sinks (syslog, Splunk, Datadog) can filter on `AUDIT:` from the standard
+log stream without any extension-level configuration.
 
 ---
 

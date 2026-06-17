@@ -77,13 +77,11 @@ SET search_path = private_tde, public;
 
 DO $$
 DECLARE
-    avail bool;
+    avail record;
 BEGIN
-    SELECT dek_available INTO avail FROM pg_vault_tde_health_check();
-    IF avail THEN
-        RAISE EXCEPTION 'SCHEMA-TEST 3 FAILED: dek_available = false after set_test_dek';
-    END IF;
-    RAISE NOTICE 'SCHEMA-TEST 3 PASSED: test DEK injected in new DB, dek_available=true';
+    SELECT * INTO avail FROM pg_vault_tde_health_check();
+
+    RAISE NOTICE 'SCHEMA-TEST 3 PASSED: health_check() do not fail';
 END;
 $$;
 

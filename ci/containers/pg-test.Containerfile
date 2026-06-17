@@ -63,6 +63,7 @@ RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends \
         libssl3 \
         libcurl4 \
+        postgresql-${PG_MAJOR}-pgaudit \ 
         # TAP test dependencies
         perl \
         libipc-run-perl \
@@ -104,6 +105,13 @@ COPY bench_tde.sh            /test/bench_tde.sh
 RUN chmod -R a+r /test && \
     mkdir -p /test/log && \
     chown -R postgres:postgres /test
+
+# Create wallet base directory outside PGDATA.
+# In production this is done by the package installer (postinst / %pre scriptlet).
+# Here we replicate that step for the container image.
+RUN mkdir -p /var/lib/pg_vault_tde && \
+    chown postgres:postgres /var/lib/pg_vault_tde && \
+    chmod 0700 /var/lib/pg_vault_tde
 
 EXPOSE 5432
 

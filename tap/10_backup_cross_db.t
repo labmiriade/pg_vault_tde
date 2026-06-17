@@ -5,6 +5,7 @@ use Test::More tests => 8;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use IPC::Run qw(run);
+END { system('/bin/sh', '-c', 'rm -rf /var/lib/pg_vault_tde/*') }
 
 my $node = PostgreSQL::Test::Cluster->new('cross_db_node');
 $node->init;
@@ -15,6 +16,7 @@ $node->append_conf('postgresql.conf',
 $node->start;
 
 $node->safe_psql('postgres', 'CREATE EXTENSION pg_vault_tde;');
+system('/bin/sh', '-c', 'rm -rf /var/lib/pg_vault_tde/*');
 $node->safe_psql('postgres', "SELECT pg_vault_tde_wallet_init('test-password')");
 
 # Source database: 'source_db'
@@ -31,8 +33,8 @@ ok(1, 'source_db created with TDE table and data');
 my $souce_oid = $node->safe_psql('postgres',
     "SELECT oid FROM pg_database WHERE datname = 'source_db'"
 );
-my $source_db_dir = $node->data_dir . "/base/$souce_oid/pg_vault_tde";
-my $source_wallet = $source_db_dir . "/wallet.p12";
+$souce_oid =~ s/^\s+|\s+$//g;
+my $source_wallet = "/var/lib/pg_vault_tde/$souce_oid/wallet.p12";
 
 my $dump_file = $node->data_dir . '/cross_db.dump';
 $node->command_ok(
@@ -54,10 +56,11 @@ $node->safe_psql('restore_db', "SELECT pg_vault_tde_wallet_init('test-password')
 my $restore_oid = $node->safe_psql('postgres',
     "SELECT oid FROM pg_database WHERE datname = 'restore_db'"
 );
-my $restore_db_dir = $node->data_dir . "/base/$restore_oid/pg_vault_tde";
+$restore_oid =~ s/^\s+|\s+$//g;
+my $restore_wallet = "/var/lib/pg_vault_tde/$restore_oid/wallet.p12";
 
 $node->command_ok(
-   ['cp', $source_wallet, $restore_db_dir,], 
+   ['cp', $source_wallet, $restore_wallet],
    "Copy of the source wallet into the restore wallet path"
 );
 

@@ -436,12 +436,420 @@ END;
 $$;
 
 -- ================================================================
+-- PARTITIONING (tests 120-127)
+-- ================================================================
+
+-- ================================================================
+-- TEST 120: all-encrypted partition tree — routing + round-trip
+--
+-- Parent partitioned by RANGE(id); two encrypted leaves.  INSERT into the
+-- parent must route each row to the correct leaf's encrypted_heap
+-- tuple_insert, and SELECT from the parent must decrypt every leaf.
+-- ================================================================
+DO $$
+DECLARE
+    n_lo   bigint;
+    n_hi   bigint;
+    v_read text;
+BEGIN
+    DROP TABLE IF EXISTS tde_part_120;
+
+    CREATE TABLE tde_part_120 (id int, val text) PARTITION BY RANGE (id);
+    CREATE TABLE tde_part_120_lo PARTITION OF tde_part_120
+        FOR VALUES FROM (1) TO (100)   USING encrypted_heap;
+    CREATE TABLE tde_part_120_hi PARTITION OF tde_part_120
+        FOR VALUES FROM (100) TO (200) USING encrypted_heap;
+
+    -- Route across both leaves through the parent.
+    INSERT INTO tde_part_120 VALUES
+        (10,  'low_partition_value'),
+        (50,  'low_partition_value_2'),
+        (150, 'high_partition_value');
+
+    SELECT count(*) INTO n_lo FROM tde_part_120_lo;
+    SELECT count(*) INTO n_hi FROM tde_part_120_hi;
+    IF n_lo <> 2 OR n_hi <> 1 THEN
+        RAISE EXCEPTION 'TEST 120 FAILED: routing wrong (lo=%, hi=% — expected 2,1)',
+            n_lo, n_hi;
+    END IF;
+
+    -- Round-trip via the parent (scans both leaves, decrypts each).
+    SELECT val INTO v_read FROM tde_part_120 WHERE id = 150;
+    IF v_read IS DISTINCT FROM 'high_partition_value' THEN
+        RAISE EXCEPTION 'TEST 120 FAILED: parent SELECT mismatch (got %)',
+            COALESCE(v_read, '<NULL>');
+    END IF;
+
+    DROP TABLE tde_part_120;
+    RAISE NOTICE 'TEST 120 PASSED: tuple routing + round-trip across encrypted leaves OK';
+END;
+$$;
+
+-- ================================================================
+-- TEST 121: per-relation DEK isolation across the partition tree
+--
+-- When the parent is created WITH USING encrypted_heap, every relation in
+-- the tree — the partitioned parent AND each leaf — gets its own catalog
+-- row with its own distinct wrapped_dek.  (The parent's DEK is unused, as
+-- it has no storage, but it is registered by the ProcessUtility hook.)
+-- All three wrapped DEKs must be present and mutually distinct.
+-- ================================================================
+DO $$
+DECLARE
+    v_parent   oid;
+    v_lo       oid;
+    v_hi       oid;
+    wdek_parent bytea;
+    wdek_lo    bytea;
+    wdek_hi    bytea;
+BEGIN
+    DROP TABLE IF EXISTS tde_part_121;
+
+    CREATE TABLE tde_part_121 (id int, val text)
+        PARTITION BY RANGE (id) USING encrypted_heap;
+    CREATE TABLE tde_part_121_lo PARTITION OF tde_part_121
+        FOR VALUES FROM (1) TO (100)   USING encrypted_heap;
+    CREATE TABLE tde_part_121_hi PARTITION OF tde_part_121
+        FOR VALUES FROM (100) TO (200) USING encrypted_heap;
+
+    v_parent := 'tde_part_121'::regclass::oid;
+    v_lo     := 'tde_part_121_lo'::regclass::oid;
+    v_hi     := 'tde_part_121_hi'::regclass::oid;
+
+    -- Parent (created WITH USING) is registered too.
+    SELECT wrapped_dek INTO wdek_parent FROM pg_vault_tde_catalog WHERE relid = v_parent;
+    SELECT wrapped_dek INTO wdek_lo     FROM pg_vault_tde_catalog WHERE relid = v_lo;
+    SELECT wrapped_dek INTO wdek_hi     FROM pg_vault_tde_catalog WHERE relid = v_hi;
+
+    IF wdek_parent IS NULL OR wdek_lo IS NULL OR wdek_hi IS NULL THEN
+        RAISE EXCEPTION 'TEST 121 FAILED: missing wrapped_dek (parent null=%, lo null=%, hi null=%)',
+            (wdek_parent IS NULL), (wdek_lo IS NULL), (wdek_hi IS NULL);
+    END IF;
+
+    -- All three DEKs are independent: every wrapped value must differ.
+    IF wdek_lo = wdek_hi OR wdek_parent = wdek_lo OR wdek_parent = wdek_hi THEN
+        RAISE EXCEPTION 'TEST 121 FAILED: relations share an identical wrapped_dek '
+                        '(no per-relation isolation)';
+    END IF;
+
+    DROP TABLE tde_part_121;
+    RAISE NOTICE 'TEST 121 PASSED: per-relation DEK isolation OK '
+                 '(parent + both leaves each own a distinct wrapped_dek)';
+END;
+$$;
+
+-- ================================================================
+-- TEST 122: AM inheritance from a USING-bearing parent (PG 17+)
+--
+-- Since PG17 a partitioned table may carry an access method that new
+-- partitions inherit when created without an explicit USING.  This is the
+-- recommended way to guarantee every future partition is encrypted.
+-- ================================================================
+DO $$
+DECLARE
+    v_leaf_am text;
+    v_read    text;
+BEGIN
+    DROP TABLE IF EXISTS tde_part_122;
+
+    -- Parent carries the AM; the leaf inherits it (no USING on the leaf).
+    CREATE TABLE tde_part_122 (id int, val text)
+        PARTITION BY RANGE (id) USING encrypted_heap;
+    CREATE TABLE tde_part_122_inh PARTITION OF tde_part_122
+        FOR VALUES FROM (1) TO (100);
+
+    SELECT am.amname INTO v_leaf_am
+    FROM pg_class c JOIN pg_am am ON am.oid = c.relam
+    WHERE c.oid = 'tde_part_122_inh'::regclass;
+
+    IF v_leaf_am IS DISTINCT FROM 'encrypted_heap' THEN
+        RAISE EXCEPTION 'TEST 122 FAILED: leaf did not inherit encrypted_heap (got %)',
+            COALESCE(v_leaf_am, '<NULL>');
+    END IF;
+
+    -- And it actually behaves as encrypted (catalog row + round-trip).
+    INSERT INTO tde_part_122 VALUES (5, 'inherited_am_value');
+    SELECT val INTO v_read FROM tde_part_122 WHERE id = 5;
+    IF v_read IS DISTINCT FROM 'inherited_am_value' THEN
+        RAISE EXCEPTION 'TEST 122 FAILED: inherited-AM leaf round-trip mismatch (got %)',
+            COALESCE(v_read, '<NULL>');
+    END IF;
+
+    PERFORM 1 FROM pg_vault_tde_catalog WHERE relid = 'tde_part_122_inh'::regclass::oid;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'TEST 122 FAILED: inherited-AM leaf has no DEK catalog row';
+    END IF;
+
+    DROP TABLE tde_part_122;
+    RAISE NOTICE 'TEST 122 PASSED: PARTITION OF inherits parent''s encrypted_heap AM and is encrypted';
+END;
+$$;
+
+-- ================================================================
+-- TEST 123: on-disk forensic — encrypted leaf has no plaintext
+--
+-- Insert a distinctive marker into an encrypted leaf, CHECKPOINT to flush,
+-- and confirm the marker is absent from the leaf's raw file (pattern from
+-- tests 87/88).  Requires superuser for pg_read_binary_file.
+-- ================================================================
+DO $$
+DECLARE
+    needle    bytea;
+    leaf_file text;
+    leaf_bytes bytea;
+BEGIN
+    DROP TABLE IF EXISTS tde_part_123;
+
+    CREATE TABLE tde_part_123 (id int, val text) PARTITION BY RANGE (id);
+    CREATE TABLE tde_part_123_p1 PARTITION OF tde_part_123
+        FOR VALUES FROM (1) TO (100) USING encrypted_heap;
+
+    INSERT INTO tde_part_123 VALUES
+        (1, repeat('PARTITION_PLAINTEXT_MARKER_123_', 8));
+
+    CHECKPOINT;
+
+    leaf_file  := pg_relation_filepath('tde_part_123_p1'::regclass);
+    leaf_bytes := pg_read_binary_file(leaf_file);
+    needle     := convert_to('PARTITION_PLAINTEXT_MARKER_123_PARTITION_PLAINTEXT_MARKER_123_', 'UTF8');
+
+    IF position(needle IN leaf_bytes) > 0 THEN
+        RAISE EXCEPTION 'TEST 123 FAILED: plaintext marker found in encrypted leaf file';
+    END IF;
+
+    DROP TABLE tde_part_123;
+    RAISE NOTICE 'TEST 123 PASSED: encrypted leaf carries no plaintext on disk';
+END;
+$$;
+
+-- ================================================================
+-- TEST 124: cross-partition UPDATE (row movement) between encrypted leaves
+--
+-- Updating the partition key moves the row: PG runs tuple_delete on the
+-- source leaf and tuple_insert on the destination leaf — both encrypted_heap.
+-- The moved row must land in the right leaf and decrypt correctly.
+-- ================================================================
+DO $$
+DECLARE
+    v_where  text;
+    v_read   text;
+    n_lo     bigint;
+    n_hi     bigint;
+BEGIN
+    DROP TABLE IF EXISTS tde_part_124;
+
+    CREATE TABLE tde_part_124 (id int, val text) PARTITION BY RANGE (id);
+    CREATE TABLE tde_part_124_lo PARTITION OF tde_part_124
+        FOR VALUES FROM (1) TO (100)   USING encrypted_heap;
+    CREATE TABLE tde_part_124_hi PARTITION OF tde_part_124
+        FOR VALUES FROM (100) TO (200) USING encrypted_heap;
+
+    INSERT INTO tde_part_124 VALUES (5, 'row_movement_value');
+
+    -- Cross-partition move: id 5 (lo) → id 150 (hi).
+    UPDATE tde_part_124 SET id = 150 WHERE id = 5;
+
+    SELECT tableoid::regclass::text INTO v_where FROM tde_part_124 WHERE id = 150;
+    IF v_where IS DISTINCT FROM 'tde_part_124_hi' THEN
+        RAISE EXCEPTION 'TEST 124 FAILED: row did not move to hi leaf (found in %)',
+            COALESCE(v_where, '<NULL>');
+    END IF;
+
+    SELECT count(*) INTO n_lo FROM tde_part_124_lo;
+    SELECT count(*) INTO n_hi FROM tde_part_124_hi;
+    IF n_lo <> 0 OR n_hi <> 1 THEN
+        RAISE EXCEPTION 'TEST 124 FAILED: post-move counts lo=%, hi=% (expected 0,1)',
+            n_lo, n_hi;
+    END IF;
+
+    SELECT val INTO v_read FROM tde_part_124 WHERE id = 150;
+    IF v_read IS DISTINCT FROM 'row_movement_value' THEN
+        RAISE EXCEPTION 'TEST 124 FAILED: moved row decrypt mismatch (got %)',
+            COALESCE(v_read, '<NULL>');
+    END IF;
+
+    DROP TABLE tde_part_124;
+    RAISE NOTICE 'TEST 124 PASSED: cross-partition row movement between encrypted leaves OK';
+END;
+$$;
+
+-- ================================================================
+-- TEST 125: ATTACH PARTITION of a pre-existing encrypted_heap table
+--
+-- ATTACH does not rewrite data or change the AM.  Attaching an already-
+-- encrypted standalone table must preserve its data (relid stable → DEK
+-- stable), keep it encrypted on disk, and make it readable via the parent.
+-- ================================================================
+DO $$
+DECLARE
+    v_oid_pre  oid;
+    v_oid_post oid;
+    v_read     text;
+    needle     bytea;
+    leaf_file  text;
+    leaf_bytes bytea;
+BEGIN
+    DROP TABLE IF EXISTS tde_part_125;
+    DROP TABLE IF EXISTS tde_part_125_std;
+
+    -- Standalone encrypted table, populated before it becomes a partition.
+    CREATE TABLE tde_part_125_std (id int, val text) USING encrypted_heap;
+    INSERT INTO tde_part_125_std VALUES (42, repeat('ATTACH_MARKER_125_', 8));
+    v_oid_pre := 'tde_part_125_std'::regclass::oid;
+
+    CREATE TABLE tde_part_125 (id int, val text) PARTITION BY RANGE (id);
+    ALTER TABLE tde_part_125
+        ATTACH PARTITION tde_part_125_std FOR VALUES FROM (1) TO (100);
+
+    -- relid is unchanged by ATTACH → the existing DEK still applies.
+    v_oid_post := 'tde_part_125_std'::regclass::oid;
+    IF v_oid_pre <> v_oid_post THEN
+        RAISE EXCEPTION 'TEST 125 FAILED: relid changed across ATTACH (% → %)',
+            v_oid_pre, v_oid_post;
+    END IF;
+
+    -- Readable through the parent after attach.
+    SELECT val INTO v_read FROM tde_part_125 WHERE id = 42;
+    IF v_read IS DISTINCT FROM repeat('ATTACH_MARKER_125_', 8) THEN
+        RAISE EXCEPTION 'TEST 125 FAILED: attached partition unreadable via parent';
+    END IF;
+
+    -- Still encrypted at rest.
+    CHECKPOINT;
+    leaf_file  := pg_relation_filepath('tde_part_125_std'::regclass);
+    leaf_bytes := pg_read_binary_file(leaf_file);
+    needle     := convert_to('ATTACH_MARKER_125_ATTACH_MARKER_125_', 'UTF8');
+    IF position(needle IN leaf_bytes) > 0 THEN
+        RAISE EXCEPTION 'TEST 125 FAILED: plaintext found in attached encrypted partition file';
+    END IF;
+
+    DROP TABLE tde_part_125;   -- drops the attached partition too
+    RAISE NOTICE 'TEST 125 PASSED: ATTACH of pre-existing encrypted table preserves data + encryption';
+END;
+$$;
+
+-- ================================================================
+-- TEST 126: DETACH PARTITION — detached leaf stays readable standalone
+--
+-- DETACH keeps the leaf's relid, so its catalog DEK row survives and the
+-- now-standalone table must still decrypt.
+-- ================================================================
+DO $$
+DECLARE
+    v_read   text;
+    n_cat    bigint;
+BEGIN
+    DROP TABLE IF EXISTS tde_part_126;
+    DROP TABLE IF EXISTS tde_part_126_lo;
+
+    CREATE TABLE tde_part_126 (id int, val text) PARTITION BY RANGE (id);
+    CREATE TABLE tde_part_126_lo PARTITION OF tde_part_126
+        FOR VALUES FROM (1) TO (100) USING encrypted_heap;
+
+    INSERT INTO tde_part_126 VALUES (7, 'detach_survivor_value');
+
+    ALTER TABLE tde_part_126 DETACH PARTITION tde_part_126_lo;
+
+    -- Catalog DEK row must survive the detach (relid unchanged).
+    SELECT count(*) INTO n_cat
+    FROM pg_vault_tde_catalog WHERE relid = 'tde_part_126_lo'::regclass::oid;
+    IF n_cat <> 1 THEN
+        RAISE EXCEPTION 'TEST 126 FAILED: detached leaf lost its catalog DEK row (count=%)', n_cat;
+    END IF;
+
+    -- Standalone read must still decrypt.
+    SELECT val INTO v_read FROM tde_part_126_lo WHERE id = 7;
+    IF v_read IS DISTINCT FROM 'detach_survivor_value' THEN
+        RAISE EXCEPTION 'TEST 126 FAILED: detached leaf unreadable (got %)',
+            COALESCE(v_read, '<NULL>');
+    END IF;
+
+    DROP TABLE tde_part_126_lo;
+    DROP TABLE tde_part_126;
+    RAISE NOTICE 'TEST 126 PASSED: detached encrypted leaf remains readable standalone';
+END;
+$$;
+
+-- ================================================================
+-- TEST 127: MIXED tree — DOCUMENTS the per-leaf encryption limitation
+--
+-- Encryption is NOT a tree-wide property: a plain `heap` leaf attached to
+-- the same parent stores its rows in PLAINTEXT on disk, with no error and
+-- no warning.  This test asserts that exact gap so any future change that
+-- starts enforcing tree-wide encryption is flagged here.
+--
+--   encrypted leaf  → no plaintext on disk + catalog DEK row present
+--   plain heap leaf → plaintext present on disk + NO catalog row
+-- ================================================================
+DO $$
+DECLARE
+    enc_file   text;
+    plain_file text;
+    enc_bytes  bytea;
+    plain_bytes bytea;
+    needle     bytea;
+    n_enc_cat  bigint;
+    n_pln_cat  bigint;
+BEGIN
+    DROP TABLE IF EXISTS tde_part_127;
+
+    CREATE TABLE tde_part_127 (id int, val text) PARTITION BY RANGE (id) USING encrypted_heap;
+    CREATE TABLE tde_part_127_enc PARTITION OF tde_part_127
+        FOR VALUES FROM (1) TO (100)   USING encrypted_heap;
+    CREATE TABLE tde_part_127_plain PARTITION OF tde_part_127
+        FOR VALUES FROM (100) TO (200) USING heap;
+
+    INSERT INTO tde_part_127 VALUES
+        (1,   repeat('MIXED_ENC_MARKER_127_',   8)),
+        (150, repeat('MIXED_PLAIN_MARKER_127_', 8));
+
+    CHECKPOINT;
+
+    enc_file    := pg_relation_filepath('tde_part_127_enc'::regclass);
+    plain_file  := pg_relation_filepath('tde_part_127_plain'::regclass);
+    enc_bytes   := pg_read_binary_file(enc_file);
+    plain_bytes := pg_read_binary_file(plain_file);
+
+    -- Encrypted leaf: marker absent.
+    needle := convert_to('MIXED_ENC_MARKER_127_MIXED_ENC_MARKER_127_', 'UTF8');
+    IF position(needle IN enc_bytes) > 0 THEN
+        RAISE EXCEPTION 'TEST 127 FAILED: plaintext found in the encrypted leaf';
+    END IF;
+
+    -- Plain leaf: marker present on disk (the documented leak).
+    needle := convert_to('MIXED_PLAIN_MARKER_127_MIXED_PLAIN_MARKER_127_', 'UTF8');
+    IF position(needle IN plain_bytes) = 0 THEN
+        RAISE EXCEPTION 'TEST 127 FAILED: expected plaintext in the plain heap leaf but none found '
+                        '(behaviour changed — mixed-tree encryption may now be enforced; revisit doc)';
+    END IF;
+
+    -- Catalog: encrypted leaf has a DEK row, plain leaf does not.
+    SELECT count(*) INTO n_enc_cat
+    FROM pg_vault_tde_catalog WHERE relid = 'tde_part_127_enc'::regclass::oid;
+    SELECT count(*) INTO n_pln_cat
+    FROM pg_vault_tde_catalog WHERE relid = 'tde_part_127_plain'::regclass::oid;
+
+    IF n_enc_cat <> 1 THEN
+        RAISE EXCEPTION 'TEST 127 FAILED: encrypted leaf missing catalog DEK row (count=%)', n_enc_cat;
+    END IF;
+    IF n_pln_cat <> 0 THEN
+        RAISE EXCEPTION 'TEST 127 FAILED: plain heap leaf unexpectedly has a catalog DEK row (count=%)', n_pln_cat;
+    END IF;
+
+    DROP TABLE tde_part_127;
+    RAISE WARNING 'TEST 127: mixed encrypted/plain partition tree stores plaintext in the plain '
+                  'leaf';
+END;
+$$;
+
+
+-- ================================================================
 -- PHASE SUMMARY
 -- ================================================================
 DO $$
 BEGIN
     RAISE NOTICE '============================================================';
-    RAISE NOTICE 'v1.7 Tests 111-119 — COMPLETE';
+    RAISE NOTICE 'v1.7 Tests 111-127 — COMPLETE';
     RAISE NOTICE '   tde_int4_enc_ops + disk forensic check . test 111';
     RAISE NOTICE '   tde_int8_enc_ops equality lookup ........ test 112';
     RAISE NOTICE '   tde_uuid_enc_ops equality lookup ........ test 113';
@@ -451,6 +859,14 @@ BEGIN
     RAISE NOTICE '   multi-column enc_ops + text + int8 mix .. test 117';
     RAISE NOTICE '   CREATE INDEX on pre-populated table ..... test 118';
     RAISE NOTICE '   ON CONFLICT DO NOTHING + enc_ops unique . test 119';
+    RAISE NOTICE '   partition routing + round-trip .......... test 120';
+    RAISE NOTICE '   per-leaf DEK isolation .................. test 121';
+    RAISE NOTICE '   AM inheritance (PARTITION OF) ........... test 122';
+    RAISE NOTICE '   encrypted leaf on-disk forensic ......... test 123';
+    RAISE NOTICE '   cross-partition row movement ............ test 124';
+    RAISE NOTICE '   ATTACH pre-existing encrypted table ..... test 125';
+    RAISE NOTICE '   DETACH keeps leaf readable .............. test 126';
+    RAISE NOTICE '   MIXED tree limitation (doc) ............. test 127';
     RAISE NOTICE '============================================================';
 END;
 $$;

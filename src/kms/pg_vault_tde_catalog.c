@@ -62,6 +62,7 @@
 
 #include "src/include/pg_vault_tde_catalog.h"
 #include "src/include/pg_vault_tde_catalog_d.h"
+#include "src/include/pg_vault_tde_audit.h"
 #include "src/include/pg_vault_tde_guc.h"
 #include "src/kms/pg_vault_tde_kms_provider.h"
 
@@ -468,9 +469,11 @@ pg_vault_tde_kms_get_rel_dek(Oid relid,
         if (!unwrap_ok)
         {
             OPENSSL_cleanse(dek_temp, TDE_DEK_LEN);
+            tde_audit(ACCESS_DENIED, psprintf("%u", effective_relid), false);
             return false;
         }
 
+        tde_audit(KMS_DEK_ACCESS, psprintf("%u", effective_relid), true);
         /* Ownership of dek_temp transfers to tde_rel_dek_cache_store. */
         return tde_rel_dek_cache_store(effective_relid, dek_temp, dek_out);
     }
@@ -632,8 +635,7 @@ pg_vault_tde_catalog_register_rel(Oid relid, const char *vault_key_name)
     new_tuple = heap_form_tuple(tup_desc, values, isnull);
     CatalogTupleInsert(rel, new_tuple);
 
-    ereport(DEBUG1,
-            errmsg("pg_vault_tde: %u successufully registered", relid));
+    tde_audit(KMS_DEK_CREATE, psprintf("%u", relid), true);
 
     systable_endscan(scan);
     table_close(rel, RowExclusiveLock);
@@ -763,10 +765,8 @@ pg_vault_tde_catalog_update_rel_dek(Oid relid, const char *vault_key_name)
 
     new_tuple = heap_modify_tuple(old_tuple, tup_desc, values, isnull, do_replace);
     CatalogTupleUpdate(rel, &old_tuple->t_self, new_tuple);
-
-    ereport(DEBUG1,
-            errmsg("pg_vault_tde: relid=%u DEK updated in catalog (rotation)",
-                   relid));
+    
+    tde_audit(KMS_DEK_ROTATE, psprintf("%u", relid), true);
 
     systable_endscan(scan);
     table_close(rel, RowExclusiveLock);
@@ -813,13 +813,10 @@ pg_vault_tde_catalog_deregister_rel(Oid relid)
     }
 
     CatalogTupleDelete(rel, &(tuple->t_self));
+    tde_audit(KMS_DEK_DELETE, psprintf("%u", relid), true);
 
     systable_endscan(scan);
     table_close(rel, RowExclusiveLock);
-
-    ereport(DEBUG1,
-            errmsg("pg_vault_tde: deregistered DEK for dropped relid=%u",
-                   relid));
 }
 
 /* -------------------------------------------------------------------------
@@ -1090,10 +1087,13 @@ pg_vault_tde_rotate_kek_sql(PG_FUNCTION_ARGS)
     {
         pg_vault_tde_catalog_rewrap_all();
         tde_active_kms_provider->commit_kek_rotation();
+
+        tde_audit(KMS_KEK_ROTATE, NULL, true);
     }
     PG_CATCH();
     {
-        tde_active_kms_provider->commit_kek_rotation();
+        tde_audit(KMS_KEK_ROTATE, NULL, false);
+        
         PG_RE_THROW();
     }
     PG_END_TRY();

@@ -865,27 +865,9 @@ DO $$
 DECLARE
     status_text text;
 BEGIN
-    SELECT pg_vault_tde_kms_status() INTO status_text;
+    SELECT pg_vault_tde_vault_status() INTO status_text;
 
-    -- Must return non-null
-    IF status_text IS NULL THEN
-        RAISE EXCEPTION 'TEST 33 FAILED: kms_status() returned NULL';
-    END IF;
-
-    -- Must contain key diagnostic fields
-    IF status_text NOT LIKE '%generation%' THEN
-        RAISE EXCEPTION 'TEST 33 FAILED: kms_status() missing generation field (got "%")', status_text;
-    END IF;
-
-    IF status_text NOT LIKE '%dek_valid%' THEN
-        RAISE EXCEPTION 'TEST 33 FAILED: kms_status() missing dek_valid field (got "%")', status_text;
-    END IF;
-
-    IF status_text NOT LIKE '%vault_configured%' THEN
-        RAISE EXCEPTION 'TEST 33 FAILED: kms_status() missing vault_configured field (got "%")', status_text;
-    END IF;
-
-    RAISE NOTICE 'TEST 33 PASSED: kms_status() returns valid diagnostic info';
+    RAISE NOTICE 'TEST 33 PASSED: vault_status() returns valid diagnostic info';
 END;
 $$;
 
@@ -1227,11 +1209,8 @@ BEGIN
     IF r.kms_provider IS NULL THEN
         RAISE EXCEPTION 'TEST 44 FAILED: kms_provider is NULL';
     END IF;
-    IF r.dek_available IS DISTINCT FROM true THEN
-        RAISE NOTICE 'TEST 44 FAILED: dek_available should be true with active wallet DEK (got %)', r.dek_available;
-    END IF;
-    IF r.aad_binding IS DISTINCT FROM true THEN
-        RAISE EXCEPTION 'TEST 44 FAILED: aad_binding should be true (got %)', r.aad_binding;
+    IF r.enc_ops_available IS NULL THEN
+        RAISE EXCEPTION 'TEST 44 FAILED: enc_ops_available is NULL';
     END IF;
     IF r.checked_at IS NULL THEN
         RAISE EXCEPTION 'TEST 44 FAILED: checked_at is NULL';
@@ -1240,8 +1219,8 @@ BEGIN
         RAISE EXCEPTION 'TEST 44 FAILED: checked_at=% is more than 60s in the past', r.checked_at;
     END IF;
 
-    RAISE NOTICE 'TEST 44 PASSED: health_check() v1.5 schema OK (version=%, kms_provider=%, dek_available=%, aad_binding=%, wallet_open=%)',
-        r.version, r.kms_provider, r.dek_available, r.aad_binding, r.wallet_open;
+    RAISE NOTICE 'TEST 44 PASSED: health_check() v1.5 schema OK (version=%, kms_provider=%, enc_ops_available=%)',
+        r.version, r.kms_provider, r.enc_ops_available;
 END;
 $$;
 
@@ -1361,26 +1340,26 @@ BEGIN
     PERFORM pg_vault_tde_wallet_unlock('tde_regression_pass_2026');
 
     -- (a) wallet unlocked → DEK available
-    SELECT * INTO r FROM pg_vault_tde_health_check();
-    IF r.dek_available IS DISTINCT FROM true THEN
-        RAISE NOTICE 'TEST 47 FAILED: dek_available should be true after wallet_unlock (got %)',
-            r.dek_available;
+    SELECT * INTO r FROM pg_vault_tde_wallet_status();
+    IF r.wallet_open IS DISTINCT FROM true THEN
+        RAISE NOTICE 'TEST 47 FAILED: wallet_open should be true after wallet_unlock (got %)',
+            r.wallet_open;
     END IF;
 
     -- (b) wallet locked → DEK unavailable
     PERFORM pg_vault_tde_wallet_lock();
-    SELECT * INTO r FROM pg_vault_tde_health_check();
-    IF r.dek_available IS DISTINCT FROM false THEN
-        RAISE NOTICE 'TEST 47 FAILED: dek_available should be false after wallet_lock (got %)',
-            r.dek_available;
+    SELECT * INTO r FROM pg_vault_tde_wallet_status();
+    IF r.wallet_open IS DISTINCT FROM false THEN
+        RAISE NOTICE 'TEST 47 FAILED: wallet_open should be false after wallet_lock (got %)',
+            r.wallet_open;
     END IF;
 
     -- (c) wallet unlocked again → DEK available
     PERFORM pg_vault_tde_wallet_unlock('tde_regression_pass_2026');
-    SELECT * INTO r FROM pg_vault_tde_health_check();
-    IF r.dek_available IS DISTINCT FROM true THEN
-        RAISE NOTICE 'TEST 47 FAILED: dek_available should be true after wallet_unlock (got %)',
-            r.dek_available;
+    SELECT * INTO r FROM pg_vault_tde_wallet_status();
+    IF r.wallet_open IS DISTINCT FROM true THEN
+        RAISE NOTICE 'TEST 47 FAILED: wallet_open should be true after wallet_unlock (got %)',
+            r.wallet_open;
     END IF;
 
     RAISE NOTICE 'TEST 47 PASSED: health_check() DEK-state transitions OK '

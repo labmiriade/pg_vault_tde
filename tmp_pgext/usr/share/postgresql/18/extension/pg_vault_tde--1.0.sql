@@ -33,12 +33,6 @@ CREATE ACCESS METHOD tde_btree
     TYPE INDEX
     HANDLER pg_vault_tde_iam_handler;
 
--- KMS diagnostic status (v1.1): returns a text summary of DEK cache state
-CREATE FUNCTION pg_vault_tde_kms_status()
-    RETURNS text
-    LANGUAGE C STRICT
-    AS 'MODULE_PATHNAME', 'pg_vault_tde_kms_status';
-
 -- Token refresh (v1.1): manually renew the current Vault token lease
 CREATE FUNCTION pg_vault_tde_refresh_token()
     RETURNS boolean

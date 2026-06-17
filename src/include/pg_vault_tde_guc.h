@@ -108,7 +108,7 @@ extern char       *pg_vault_tde_kms_provider;
 /*
  * Local wallet path (PGC_SUSET).
  * Absolute path to the PKCS#12 wallet file.
- * Default: $PGDATA/base/<DB_OID>/pg_vault_tde/wallet.p12 (resolved at runtime).
+ * Default: /var/lib/pg_vault_tde/<DB_OID>/wallet.p12 (resolved at runtime).
  * Used only when kms_provider = 'local'.
  */
 extern char       *pg_vault_tde_wallet_path;

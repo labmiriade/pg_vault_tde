@@ -97,7 +97,7 @@ log_stage()  { echo -e "\n${BOLD}═══════════════�
 SMOKE_SQL='
 \set ON_ERROR_STOP on
 
--- §1 ─ CREATE EXTENSION (traverses the full 1.0→1.4→1.5→1.6→1.7 chain)
+-- §1 ─ CREATE EXTENSION (installs directly from pg_vault_tde--1.7.sql)
 CREATE EXTENSION pg_vault_tde;
 
 -- §2 ─ version
@@ -134,7 +134,6 @@ DECLARE
         '"'"'pg_vault_tde_wallet_change_passphrase(text,text)'"'"',
         '"'"'pg_vault_tde_wallet_unlock(text)'"'"',
         '"'"'pg_vault_tde_wallet_lock()'"'"',
-        '"'"'pg_vault_tde_wallet_rotate_kek()'"'"',
         '"'"'pg_vault_tde_wallet_export_bundle(text,text)'"'"',
         '"'"'pg_vault_tde_wallet_import_bundle(text,text)'"'"',
         '"'"'pg_vault_tde_migrate_vault_to_wallet(text)'"'"'
@@ -260,6 +259,11 @@ echo '--- Installing DEB ---'
 dpkg -i \"\$DEB\"
 apt-get install -f -y -q 2>/dev/null || true   # resolve any deps
 
+# ── Create wallet base directory ──────────────────────────────────────
+mkdir -p /var/lib/pg_vault_tde
+chown postgres:postgres /var/lib/pg_vault_tde
+chmod 0700 /var/lib/pg_vault_tde
+
 # ── Configure PostgreSQL ───────────────────────────────────────────────
 echo '--- Configuring PostgreSQL ---'
 pg_ctlcluster ${pg} main start 2>/dev/null || true
@@ -318,6 +322,11 @@ echo \"Built: \$(basename \$RPM)\"
 # ── Install RPM ────────────────────────────────────────────────────────
 echo '--- Installing RPM ---'
 dnf install -y -q \"\$RPM\"
+
+# ── Create wallet base directory ──────────────────────────────────────
+mkdir -p /var/lib/pg_vault_tde
+chown postgres:postgres /var/lib/pg_vault_tde
+chmod 0700 /var/lib/pg_vault_tde
 
 # ── Initialize and configure PostgreSQL ──────────────────────────────
 echo '--- Initializing PostgreSQL cluster ---'

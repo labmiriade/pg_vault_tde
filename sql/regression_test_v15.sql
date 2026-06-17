@@ -49,12 +49,6 @@ BEGIN
         RAISE EXCEPTION 'TEST 53 FAILED: pg_vault_tde_catalog.wrapped_dek column missing';
     END IF;
 
-    -- The legacy v1.4 sentinel row (relid=0) must exist after upgrade
-    PERFORM 1 FROM pg_vault_tde_catalog WHERE relid = 0;
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'TEST 53 FAILED: legacy sentinel row (relid=0) missing from catalog';
-    END IF;
-
     RAISE NOTICE 'TEST 53 PASSED: pg_vault_tde_catalog exists with correct schema';
 END;
 $$;

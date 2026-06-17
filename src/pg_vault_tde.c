@@ -37,6 +37,7 @@
 #include "src/include/pg_vault_tde_hw_accel.h"
 #include "src/include/pg_vault_tde_guc.h"
 #include "src/include/pg_vault_tde_catalog.h"
+#include "src/include/pg_vault_tde_audit.h"
 #include "src/kms/pg_vault_tde_kms_provider.h"
 
 #ifdef PG_MODULE_MAGIC
@@ -109,6 +110,10 @@ static shmem_request_hook_type    prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type    prev_shmem_startup_hook = NULL;
 static ProcessUtility_hook_type   prev_process_utility_hook = NULL;
 static object_access_hook_type    prev_object_access_hook = NULL;
+
+/* Audit hook — NULL unless an external audit module installs one. */
+tde_audit_hook audit_hook_ptr = NULL;
+
 /*
  * tde_backend_cleanup -- on_proc_exit callback.
  *
@@ -119,6 +124,7 @@ static object_access_hook_type    prev_object_access_hook = NULL;
 static void
 tde_backend_cleanup(int code, Datum arg)
 {
+    tde_audit(AUDIT_LOG_STOP, NULL, true);
     tde_crypto_ctx_cleanup();
     tde_iam_siv_ctx_cleanup();
     tde_hw_accel_cleanup();
@@ -470,6 +476,7 @@ tde_process_utility_hook(PlannedStmt *pstmt,
         }
 
         pg_vault_tde_catalog_register_rel(relid, pg_vault_tde_vault_key_name);
+        tde_audit(RELATION_ENCRYPT, psprintf("%u", relid), true);
 
         ereport(DEBUG1,
                 (errmsg("pg_vault_tde: registered relid=%u in DEK catalog",
@@ -533,6 +540,7 @@ tde_process_utility_hook(PlannedStmt *pstmt,
          * and calls OPENSSL_cleanse() on the plaintext DEK after wrapping.
          */
         pg_vault_tde_catalog_register_rel(relid, pg_vault_tde_vault_key_name);
+        tde_audit(RELATION_ENCRYPT, psprintf("%u", relid), true);
 
         ereport(DEBUG1,
                 (errmsg("pg_vault_tde: registered relid=%u in DEK catalog",
@@ -637,6 +645,7 @@ tde_process_utility_hook(PlannedStmt *pstmt,
         }
 
         pg_vault_tde_catalog_deregister_rel(relid);
+        tde_audit(RELATION_DECRYPT, psprintf("%u", relid), true);
 
         ereport(DEBUG1,
                 (errmsg("pg_vault_tde: deregistered relid=%u in DEK catalog",
@@ -644,6 +653,48 @@ tde_process_utility_hook(PlannedStmt *pstmt,
     }
 }
 
+static const char *
+tde_event_string(TdeAuditEvent event)
+{
+    switch (event)
+    {
+        case KMS_DEK_ACCESS:        return "DEK_ACCESS";
+        case KMS_DEK_CREATE:        return "DEK_CREATE";
+        case KMS_DEK_UPDATE:        return "DEK_UPDATE";
+        case KMS_DEK_ROTATE:        return "DEK_ROTATE";
+        case KMS_DEK_DELETE:        return "DEK_DELETE";
+        case KMS_KEK_ROTATE:        return "KEK_ROTATE";
+        case KMS_AUTH_SUCCESS:      return "KMS_AUTH_SUCCESS";
+        case KMS_AUTH_FAILURE:      return "KMS_AUTH_FAILURE";
+        case WALLET_OPEN:           return "WALLET_OPEN";
+        case WALLET_CLOSE:          return "WALLET_CLOSE";
+        case RELATION_ENCRYPT:      return "RELATION_ENCRYPT";
+        case RELATION_DECRYPT:      return "RELATION_DECRYPT";
+        case ACCESS_DENIED:         return "ACCESS_DENIED";
+        case AUDIT_LOG_START:       return "AUDIT_LOG_START";
+        case AUDIT_LOG_STOP:        return "AUDIT_LOG_STOP";
+        case INTEGRITY_VIOLATION:   return "INTEGRITY_VIOLATION";
+        default:                    return "UNKNOWN";
+    }
+}
+
+static void tde_audit_handler(TdeAuditEvent event, const char* reloid, bool success)
+{
+    const char *rolname = OidIsValid(GetUserId())
+                          ? GetUserNameFromId(GetUserId(), true)
+                          : "(system)";
+    ereport(LOG,
+        (errmsg("AUDIT: event=%s, oid=%s, user=%s, success=%s, pid=%d",
+                tde_event_string(event),
+                reloid != NULL ? reloid : "-",
+                rolname != NULL ? rolname : "(unknown)",
+                success ? "t" : "f",
+                MyProcPid),
+            errhidestmt(true),
+            errhidecontext(true)
+        )
+    );
+}
 /*
  * pg_vault_tde_shmem_request
  *
@@ -920,7 +971,7 @@ _PG_init(void)
     DefineCustomStringVariable("pg_vault_tde.wallet_path",
         "Absolute path to the PKCS#12 local wallet file",
         "Used only when pg_vault_tde.kms_provider = 'local'.  "
-        "Default: $PGDATA/base/<DB_OID>/pg_vault_tde/wallet.p12",
+        "Default: /var/lib/pg_vault_tde/<DB_OID>/wallet.p12",
         &pg_vault_tde_wallet_path, "", PGC_SUSET,
         GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
@@ -1041,6 +1092,9 @@ _PG_init(void)
      */
     prev_object_access_hook = object_access_hook;
     object_access_hook = tde_object_access_hook;
+
+    audit_hook_ptr = tde_audit_handler;
+    tde_audit(AUDIT_LOG_START, NULL, true);
 
     /*
      * Wire the mutable tde_methods copy: copy heapam's TableAmRoutine and

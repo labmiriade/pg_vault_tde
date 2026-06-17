@@ -7,7 +7,7 @@
  * OVERVIEW:
  * ---------
  * This module implements the `local` KMS provider using a PKCS#12-based
- * encrypted wallet stored at $PGDATA/base/<DB_OID>/pg_vault_tde/wallet.p12.
+ * encrypted wallet stored at /var/lib/pg_vault_tde/<DB_OID>/wallet.p12.
  *
  * KEY HIERARCHY:
  *   passphrase (env var) → PBKDF2-SHA256 → KEK (AES-256-CBC-MAC, PKCS#12)
@@ -63,6 +63,7 @@
 #include "src/kms/pg_vault_tde_kms_provider.h"
 #include "src/include/pg_vault_tde_kms.h"
 #include "src/include/pg_vault_tde_guc.h"
+#include "src/include/pg_vault_tde_audit.h"
 #include "src/include/pg_vault_tde_catalog.h" /* pg_vault_tde_catalog_evict_all */
 #include "src/include/pg_vault_tde_catalog_d.h"
 
@@ -184,6 +185,7 @@ static bool local_get_passphrase(char *pass_out, Size pass_max);
 static bool local_passphrase_from_env(char *pass_out, Size pass_max);
 static bool local_passphrase_from_file(char *pass_out, Size pass_max);
 static bool local_passphrase_from_command(char *pass_out, Size pass_max);
+static void local_kek_rotation_ctx_free(void);
 /* v1.6 SQL-callable wallet management functions */
 PG_FUNCTION_INFO_V1(pg_vault_tde_wallet_unlock_sql);
 PG_FUNCTION_INFO_V1(pg_vault_tde_migrate_vault_to_wallet_sql);
@@ -286,8 +288,7 @@ local_init(void)
     local_wallet_state->wallet_open = true;
     local_wallet_state->last_opened = GetCurrentTimestamp();
 
-    ereport(LOG, errmsg("pg_vault_tde: local wallet opened at \"%s\"",
-                        local_wallet_state->wallet_path));
+    tde_audit(WALLET_OPEN, NULL, true);
     return true;
 }
 
@@ -665,13 +666,24 @@ local_rewrap_dek(const unsigned char *old_wrapped, int old_len,
 
     if (local_kek_rotation_ctx != NULL)
     {
-        ok = local_unwrap_dek_with_kek(old_wrapped, old_len,
-                                       dek_temp, TDE_DEK_LEN,
-                                       local_kek_rotation_ctx->old_kek);
-        if (ok)
-            ok = local_wrap_dek_with_kek(dek_temp, TDE_DEK_LEN,
-                                         new_wrapped, new_len,
-                                         local_kek_rotation_ctx->new_kek);
+        PG_TRY();
+        {
+            ok = local_unwrap_dek_with_kek(old_wrapped, old_len,
+                                           dek_temp, TDE_DEK_LEN,
+                                           local_kek_rotation_ctx->old_kek);
+            if (ok)
+                ok = local_wrap_dek_with_kek(dek_temp, TDE_DEK_LEN,
+                                             new_wrapped, new_len,
+                                             local_kek_rotation_ctx->new_kek);
+        }
+        PG_CATCH();
+        {
+            local_kek_rotation_ctx_free();
+            OPENSSL_cleanse(dek_temp, TDE_DEK_LEN);
+
+            PG_RE_THROW();
+        }
+        PG_END_TRY();
     }
     else
     {
@@ -741,16 +753,6 @@ local_prepare_kek_rotation(void)
         return false;
     }
 
-    /* Write new wallet file before the rewrap loop (durability first). */
-    if (!local_get_passphrase(pass, sizeof(pass)))
-    {
-        OPENSSL_cleanse(old_kek, TDE_DEK_LEN);
-        OPENSSL_cleanse(new_kek, TDE_DEK_LEN);
-        return false;
-    }
-    local_create_wallet_file(path, pass, new_kek, TDE_DEK_LEN);
-    OPENSSL_cleanse(pass, sizeof(pass));
-
     /* Allocate rotation context in TopMemoryContext (survives query boundary). */
     local_kek_rotation_ctx = (LocalKekRotationCtx *)
         MemoryContextAllocZero(TopMemoryContext, sizeof(LocalKekRotationCtx));
@@ -772,8 +774,20 @@ local_prepare_kek_rotation(void)
 static void
 local_commit_kek_rotation(void)
 {
+    const char   *path = local_get_wallet_path();
+    char          pass[1024];
+
     if (local_kek_rotation_ctx == NULL)
         return;
+
+     /* Write new wallet file before the rewrap loop (durability first). */
+    if (!local_get_passphrase(pass, sizeof(pass)))
+    {
+        ereport(ERROR, 
+                errmsg("pg_vault_tde: can't get wallet passphrase"));
+    }
+    local_create_wallet_file(path, pass, local_kek_rotation_ctx->new_kek, TDE_DEK_LEN);
+    OPENSSL_cleanse(pass, sizeof(pass));
 
     if (local_wallet_state)
     {
@@ -786,7 +800,6 @@ local_commit_kek_rotation(void)
 
     local_kek_rotation_ctx_free();
 }
-
 /* -------------------------------------------------------------------------
  * local_health_check — verify wallet is openable (non-blocking)
  * -------------------------------------------------------------------------*/
@@ -834,6 +847,7 @@ local_shutdown(void)
     if (local_wallet_state->kek_loaded)
         OPENSSL_cleanse(local_wallet_state->kek, TDE_DEK_LEN);
 
+    tde_audit(WALLET_CLOSE, NULL, true);
     local_wallet_state->wallet_open  = false;
     local_wallet_state->kek_loaded   = false;
 }
@@ -857,16 +871,12 @@ local_get_wallet_path(void)
     if (pg_vault_tde_wallet_path && pg_vault_tde_wallet_path[0] != '\0')
         return pg_vault_tde_wallet_path;
 
-    /*
-     * DataDir is set during postmaster startup; MyDatabaseId is valid only
-     * after the backend has attached to a database.  Both can be absent when
-     * this function is called from _PG_init or early GUC-show hooks.
-     */
-    if (!DataDir || !OidIsValid(MyDatabaseId))
+    /* MyDatabaseId is only valid after the backend has attached to a database. */
+    if (!OidIsValid(MyDatabaseId))
         return "";
 
     snprintf(path_buf, sizeof(path_buf),
-             "%s/base/%u/pg_vault_tde/wallet.p12", DataDir, MyDatabaseId);
+             "/var/lib/pg_vault_tde/%u/wallet.p12", MyDatabaseId);
 
     return path_buf;
 }
@@ -1238,59 +1248,69 @@ pg_vault_tde_wallet_init_sql(PG_FUNCTION_ARGS)
         ereport(ERROR,
                 errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
                 errmsg("pg_vault_tde_wallet_init requires superuser"));
+    if(pg_vault_tde_kms_provider == NULL ||
+        strcmp(pg_vault_tde_kms_provider, "local") != 0)
+        ereport(ERROR, 
+                errmsg("pg_vault_tde_wallet_init requires KMS local"));
 
     passphrase = text_to_cstring(passphrase_t);
     path       = local_get_wallet_path();
 
     /* Refuse to overwrite an existing wallet without explicit delete */
     if (stat(path, &st) == 0)
-        ereport(ERROR,
+        ereport(WARNING,
                 errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
                 errmsg("pg_vault_tde: wallet already exists at \"%s\"; "
                        "use pg_vault_tde_wallet_change_passphrase() to "
                        "rotate the passphrase, or remove the file manually "
                        "to re-initialize", path));
 
+
     /*
-     * Ensure the wallet parent directory exists.
+     * Ensure the per-database wallet directory exists inside the base dir.
      *
-     * We derive the parent dir from the configured wallet path, NOT from
-     * DataDir + "/pg_vault_tde".  The GUC pg_vault_tde.wallet_path may
-     * point anywhere (e.g. a separate filesystem); using DataDir here
-     * would create the directory in the wrong location and then fail when
-     * opening the file at the GUC path.
+     * /var/lib/pg_vault_tde/          ← created by the package installer (root)
+     * /var/lib/pg_vault_tde/<db_oid>/ ← created here by the postgres process
      *
-     * We create exactly one directory level.  If the parent's own parent
-     * does not exist, mkdir returns ENOENT and the admin must create it.
+     * If the base directory is missing the admin has not completed the
+     * installation; fail with an actionable message rather than trying to
+     * create it (the postgres process must not own /var/lib directories).
      */
     {
-        char    dir[MAXPGPATH];
-        const char *slash = strrchr(path, '/');
+        char        dir[MAXPGPATH];
+        const char *last_slash = strrchr(path, '/');
+        size_t      dlen;
 
-        if (slash && slash > path)
+        if (last_slash && last_slash > path)
         {
-            size_t  dlen = (size_t) (slash - path);
-
+            dlen = (size_t)(last_slash - path);
             if (dlen >= sizeof(dir))
             {
                 OPENSSL_cleanse(passphrase, strlen(passphrase));
                 pfree(passphrase);
-                ereport(ERROR,
-                        errmsg("pg_vault_tde: wallet path too long"));
+                ereport(ERROR, errmsg("pg_vault_tde: wallet path too long"));
             }
             memcpy(dir, path, dlen);
             dir[dlen] = '\0';
-        }
-        else
-            strlcpy(dir, ".", sizeof(dir));
 
-        if (mkdir(dir, 0700) != 0 && errno != EEXIST)
-        {
-            OPENSSL_cleanse(passphrase, strlen(passphrase));
-            pfree(passphrase);
-            ereport(ERROR,
-                    errmsg("pg_vault_tde: could not create directory \"%s\": %m",
-                           dir));
+            if (mkdir(dir, 0700) != 0 && errno != EEXIST)
+            {
+                int saved_errno = errno;
+                OPENSSL_cleanse(passphrase, strlen(passphrase));
+                pfree(passphrase);
+                if (saved_errno == ENOENT)
+                    ereport(ERROR,
+                            errmsg("pg_vault_tde: wallet base directory does not exist"),
+                            errdetail("Attempted to create \"%s\" but its parent is missing.",
+                                      dir),
+                            errhint("Run as root: mkdir -p /var/lib/pg_vault_tde && "
+                                    "chown postgres:postgres /var/lib/pg_vault_tde && "
+                                    "chmod 0700 /var/lib/pg_vault_tde"));
+                else
+                    ereport(ERROR,
+                            errmsg("pg_vault_tde: could not create directory \"%s\": %m",
+                                   dir));
+            }
         }
     }
 
@@ -1521,11 +1541,10 @@ pg_vault_tde_wallet_status_sql(PG_FUNCTION_ARGS)
     struct stat         st;
     bool                wallet_exists;
     bool                wallet_open;
-    int                 dek_count;
     TimestampTz         last_opened_ts;
     char                perms_str[8];
-    Datum               vals[6];
-    bool                nulls[6];
+    Datum               vals[5];
+    bool                nulls[5];
 
     /* Prepare the result set */
     if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
@@ -1553,7 +1572,6 @@ pg_vault_tde_wallet_status_sql(PG_FUNCTION_ARGS)
     path          = local_get_wallet_path();
     wallet_exists = (stat(path, &st) == 0);
     wallet_open   = (local_wallet_state && local_wallet_state->wallet_open);
-    dek_count     = pg_vault_tde_catalog_get_dek_count();
     last_opened_ts = (local_wallet_state)
                      ? local_wallet_state->last_opened
                      : (TimestampTz) 0;
@@ -1569,17 +1587,16 @@ pg_vault_tde_wallet_status_sql(PG_FUNCTION_ARGS)
     vals[0] = BoolGetDatum(wallet_exists);
     vals[1] = BoolGetDatum(wallet_open);
     vals[2] = CStringGetTextDatum("AES-256-WRAP/PBKDF2-SHA256");
-    vals[3] = Int32GetDatum(dek_count);
 
     if (last_opened_ts != (TimestampTz) 0)
-        vals[4] = TimestampTzGetDatum(last_opened_ts);
+        vals[3] = TimestampTzGetDatum(last_opened_ts);
     else
-        nulls[4] = true;
+        nulls[3] = true;
 
     if (wallet_exists)
-        vals[5] = CStringGetTextDatum(perms_str);
+        vals[4] = CStringGetTextDatum(perms_str);
     else
-        nulls[5] = true;
+        nulls[4] = true;
 
     tuplestore_putvalues(tupstore, tupdesc, vals, nulls);
 
@@ -1832,40 +1849,6 @@ pg_vault_tde_wallet_lock_sql(PG_FUNCTION_ARGS)
 
     PG_RETURN_VOID();
 }
-/* -------------------------------------------------------------------------
- * pg_vault_tde_wallet_rotate_kek_sql — backward-compat wrapper.
- *
- * Delegates to the unified provider-agnostic KEK rotation path.
- * -------------------------------------------------------------------------*/
-PG_FUNCTION_INFO_V1(pg_vault_tde_wallet_rotate_kek_sql);
-PGDLLEXPORT Datum
-pg_vault_tde_wallet_rotate_kek_sql(PG_FUNCTION_ARGS)
-{
-    if (!superuser())
-        ereport(ERROR,
-                errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-                errmsg("pg_vault_tde_wallet_rotate_kek requires superuser"));
-
-    if (!tde_active_kms_provider->prepare_kek_rotation())
-        ereport(ERROR,
-                errmsg("pg_vault_tde: prepare_kek_rotation failed"));
-
-    PG_TRY();
-    {
-        pg_vault_tde_catalog_rewrap_all();
-        tde_active_kms_provider->commit_kek_rotation();
-    }
-    PG_CATCH();
-    {
-        tde_active_kms_provider->commit_kek_rotation();
-        PG_RE_THROW();
-    }
-    PG_END_TRY();
-
-    pg_vault_tde_catalog_evict_all();
-    PG_RETURN_VOID();
-}
-
 /* -------------------------------------------------------------------------
  * pg_vault_tde_wallet_export_bundle — write HMAC-signed backup bundle
  *

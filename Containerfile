@@ -31,6 +31,13 @@ RUN make && make install
 RUN mkdir -p /docker-entrypoint-initdb.d && \
     cp sql/pg_vault_tde_init.sql /docker-entrypoint-initdb.d/
 
+# Create wallet base directory outside PGDATA.
+# In production this is done by the package installer (postinst / %pre scriptlet).
+# Here we replicate that step for the container image.
+RUN mkdir -p /var/lib/pg_vault_tde && \
+    chown postgres:postgres /var/lib/pg_vault_tde && \
+    chmod 0700 /var/lib/pg_vault_tde
+
 # Set environment for PostgreSQL to find the extension
 ENV LD_LIBRARY_PATH=/usr/lib/postgresql/${PG_MAJOR}/lib:$LD_LIBRARY_PATH
 

@@ -283,7 +283,7 @@ else if (strcmp(guc_kms_provider, "kmip") == 0)
 
 ### Local Wallet Provider Rules (`local`)
 
-- Wallet file: `$PGDATA/base/<DB_OID>/pg_vault_tde/wallet.p12` (default; GUC `pg_vault_tde.wallet_path`)
+- Wallet file: `/var/lib/pg_vault_tde/<DB_OID>/wallet.p12` (default; GUC `pg_vault_tde.wallet_path`)
 - Format: PKCS#12 with `NID_aes_256_cbc` encryption (OpenSSL 3.x `PKCS12_create_ex2()`)
 - Passphrase: from environment variable ONLY — GUC `pg_vault_tde.wallet_passphrase_env`
   holds the env var NAME, never the value. Never read from `postgresql.conf`.
@@ -315,12 +315,12 @@ The only parameters that remain `PGC_POSTMASTER` are `max_encrypted_relations`
 
 A `show_hook` (`wallet_path_show_hook`, implemented in `pg_vault_tde_kms_local.c`) is
 registered so that `SHOW pg_vault_tde.wallet_path` returns the **computed** default path
-(`$PGDATA/base/<DB_OID>/pg_vault_tde/wallet.p12`) even when the GUC is not explicitly
+(`/var/lib/pg_vault_tde/<DB_OID>/wallet.p12`) even when the GUC is not explicitly
 set in `postgresql.conf`.  Without the hook, `SHOW` returns the empty string stored in
 the GUC variable.
 
-`local_get_wallet_path()` guards against early calls (before `DataDir` is set or before
-the backend has connected to a database) by returning `""` when `DataDir == NULL` or
+`local_get_wallet_path()` guards against early calls (before the backend has connected
+to a database) by returning `""` when
 `!OidIsValid(MyDatabaseId)`.
 
 #### `PKCS12_create` maciter parameter (v1.6 patch)

@@ -4,6 +4,7 @@ use warnings;
 use Test::More tests => 9;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
+END { system('/bin/sh', '-c', 'rm -rf /var/lib/pg_vault_tde/*') }
 
 my $node = PostgreSQL::Test::Cluster->new('wrong_key_node');
 $node->init;
@@ -14,6 +15,7 @@ $node->append_conf('postgresql.conf',
 $node->start;
 
 $node->safe_psql('postgres', 'CREATE EXTENSION pg_vault_tde;');
+system('/bin/sh', '-c', 'rm -rf /var/lib/pg_vault_tde/*');
 $node->safe_psql('postgres', "SELECT pg_vault_tde_wallet_init('correct-password')");
 
 $node->safe_psql('postgres', q{

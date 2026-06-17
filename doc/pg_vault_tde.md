@@ -817,7 +817,7 @@ value; no shared state is changed.
 | `vault_key_name` | string | `pg-tde-dek` | suset | Transit key name for DEK wrapping. Override per-database to isolate tenant keys. |
 | `vault_ca_cert` | string | `''` | suset | Path to CA bundle for Vault TLS (`CURLOPT_CAINFO`) |
 | `vault_timeout_ms` | integer | `5000` | suset | Vault HTTP timeout in ms (0 = no timeout; range 0–300000) |
-| `wallet_path` | string | `$PGDATA/base/<OID>/pg_vault_tde/wallet.p12` | suset | Local wallet PKCS#12 path (`kms_provider = 'local'`) |
+| `wallet_path` | string | `/var/lib/pg_vault_tde/<OID>/wallet.p12` | suset | Local wallet PKCS#12 path (`kms_provider = 'local'`) |
 | `wallet_passphrase_env` | string | `''` | suset | Env var NAME holding the wallet passphrase |
 | `wallet_passphrase_file` | string | `''` | suset | File path containing the wallet passphrase (mode 0400 enforced) |
 | `wallet_passphrase_command` | string | `''` | suset | Shell command whose stdout is the passphrase (highest priority) |
@@ -949,13 +949,34 @@ Verifies:
 
 ## Packaging
 
+### Pre-installation requirement: wallet base directory
+
+Before the extension can initialise a local wallet, the base directory
+`/var/lib/pg_vault_tde/` must exist and be owned by the OS user that runs
+PostgreSQL (typically `postgres`).  The directory must **not** be inside
+`PGDATA` — see [Security Considerations](#security-considerations).
+
+The package installers (postinst / %pre) create it automatically.  For
+bare source builds or container images, run once as root:
+
+```bash
+mkdir -p /var/lib/pg_vault_tde
+chown postgres:postgres /var/lib/pg_vault_tde
+chmod 0700 /var/lib/pg_vault_tde
+```
+
+`pg_vault_tde_wallet_init()` creates the per-database subdirectory
+(`/var/lib/pg_vault_tde/<db_oid>/`) at runtime; it does **not** create
+the base directory.  If the base directory is missing the function fails
+with an actionable error and hint.
+
 ### DEB (Debian / Ubuntu)
 
 ```bash
 # Build
 bash packaging/build_deb.sh --no-sign
 
-# Install
+# Install (creates /var/lib/pg_vault_tde via postinst)
 dpkg -i ../postgresql-18-pg-vault-tde_1.0-1_amd64.deb
 
 # Verify
@@ -968,7 +989,7 @@ dpkg -l | grep pg-vault-tde
 # Build
 bash packaging/build_rpm.sh
 
-# Install
+# Install (creates /var/lib/pg_vault_tde via %pre scriptlet)
 dnf install ~/rpmbuild/RPMS/x86_64/postgresql18-pg_vault_tde-1.0-1.*.rpm
 
 # Verify

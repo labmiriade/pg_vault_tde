@@ -21,6 +21,7 @@
 
 #include "src/include/pg_vault_tde_kms.h"
 #include "src/include/pg_vault_tde_guc.h"  /* Vault GUC variables */
+#include "src/include/pg_vault_tde_audit.h"
 #include "common/base64.h"                  /* pg_b64_decode */
 #include "utils/timestamp.h"                /* GetCurrentTimestamp */
 
@@ -166,7 +167,7 @@ static bool             vault_resp_init(vault_response_buf *buf);
 static void             vault_resp_free(vault_response_buf *buf);
 static CURL            *vault_make_curl(vault_response_buf *resp);
 static struct curl_slist *vault_add_namespace_header(struct curl_slist *headers);
-static bool             vault_transit_request(const char *operation, const char *body,
+static bool             vault_transit_request(const char *path, const char *body,
                                                vault_response_buf *response);
 static bool             vault_provider_init(void);
 static bool             vault_provider_generate_dek(unsigned char *dek_out, int dek_len);
@@ -178,6 +179,8 @@ static bool             vault_provider_health_check(void);
 static void             vault_provider_shutdown(void);
 static bool             vault_prepare_kek_rotation(void);
 static void             vault_commit_kek_rotation(void);
+
+PG_FUNCTION_INFO_V1(pg_vault_tde_vault_status);
 
 /*
  * vault_write_cb — libcurl CURLOPT_WRITEFUNCTION callback.
@@ -440,12 +443,14 @@ vault_perform_login(void)
             token = vault_json_extract_string(response.data, "client_token");
             if (token != NULL)
             {
+                tde_audit(KMS_AUTH_SUCCESS, NULL, true);
                 ereport(LOG,
                         (errmsg("pg_vault_tde: Vault %s login successful",
                                 pg_vault_tde_vault_auth_method)));
             }
             else
             {
+                tde_audit(KMS_AUTH_FAILURE, NULL, false);
                 ereport(WARNING,
                         (errmsg("pg_vault_tde: Vault login response missing client_token"),
                          errdetail("Response: %.256s", response.data)));
@@ -453,6 +458,7 @@ vault_perform_login(void)
         }
         else
         {
+            tde_audit(KMS_AUTH_FAILURE, NULL, false);
             ereport(WARNING,
                     (errmsg("pg_vault_tde: Vault login returned HTTP %ld", http_code),
                      errdetail("Response: %.256s", response.data)));
@@ -460,6 +466,7 @@ vault_perform_login(void)
     }
     else
     {
+        tde_audit(KMS_AUTH_FAILURE, NULL, false);
         ereport(WARNING,
                 (errmsg("pg_vault_tde: Vault login HTTP request failed: %s",
                         curl_easy_strerror(res))));
@@ -811,42 +818,54 @@ pg_vault_tde_refresh_token(PG_FUNCTION_ARGS)
 #include <sys/stat.h>               /* mkdir */
 
 
-static bool 
+static bool
 vault_provider_rewrap_dek(const unsigned char *old_wrapped, int old_len,
                            unsigned char *new_wrapped, int *new_len)
 {
-    vault_response_buf   resp;
-    char                 *post_body  = NULL;
-    bool                 success     = false;
-    char                 *wrapped    = NULL;
+    vault_response_buf  resp;
+    char               *post_body = NULL;
+    char               *wrapped   = NULL;
+    char                path[512];
+    bool                success   = false;
 
     post_body = palloc(old_len + 64);
-
     snprintf(post_body, old_len + 64, "{\"ciphertext\": \"%.*s\"}",
              (int) old_len, (const char *) old_wrapped);
-    if(vault_transit_request("rewrap", post_body, &resp))
+
+    snprintf(path, sizeof(path), "/v1/%s/rewrap/%s",
+             pg_vault_tde_vault_transit_mount,
+             pg_vault_tde_vault_key_name);
+
+    if (vault_transit_request(path, post_body, &resp))
     {
         wrapped = vault_json_extract_string(resp.data, "ciphertext");
-        if(wrapped != NULL)
-        {   
-            memcpy(new_wrapped, wrapped, strlen(wrapped));
-            *new_len = strlen(wrapped); 
+        if (wrapped != NULL)
+        {
+            size_t wrapped_len = strlen(wrapped);
 
-            OPENSSL_cleanse(wrapped, strlen(wrapped));
+            if ((int) wrapped_len > *new_len)
+            {
+                OPENSSL_cleanse(wrapped, wrapped_len);
+                pfree(wrapped);
+                ereport(ERROR,
+                        errmsg("pg_vault_tde: rewrapped DEK (%zu) exceeds buffer (%d)",
+                                wrapped_len, *new_len));
+            }
+
+            memcpy(new_wrapped, wrapped, wrapped_len);
+            *new_len = (int) wrapped_len;
+
+            OPENSSL_cleanse(wrapped, wrapped_len);
             pfree(wrapped);
             wrapped = NULL;
-
             success = true;
         }
     }
     else
-    {
-        ereport(ERROR, 
+        ereport(ERROR,
                 errmsg("pg_vault_tde: kms vault: can't rewrap DEK"));
-    }
 
-    OPENSSL_cleanse(resp.data, resp.len);
-    pfree(resp.data);
+    vault_resp_free(&resp);
     OPENSSL_cleanse(post_body, strlen(post_body));
     pfree(post_body);
 
@@ -1084,46 +1103,6 @@ pg_vault_tde_vault_fetch_dek(void)  /* TODO: coverts it's usage to generate DEK 
     curl_easy_cleanup(curl);
 
     return success;
-}
-
-/*
- * pg_vault_tde_kms_status
- *
- * SQL-callable monitoring function: returns a single-row TEXT value
- * containing KMS diagnostic information.  Format is key=value pairs
- * separated by commas, suitable for monitoring dashboards and CI logs.
- *
- * Fields:
- *   dek_valid       — true if a DEK is loaded and ready for encrypt/decrypt
- *   generation      — current rotation epoch counter
- *   vault_configured — true if pg_vault_tde.vault_url is set
- *   dek_cache_ttl   — configured TTL in seconds (0 = disabled)
- *   auth_method     — configured auth method (token/approle/kubernetes)
- */
-PG_FUNCTION_INFO_V1(pg_vault_tde_kms_status);
-PGDLLEXPORT Datum
-pg_vault_tde_kms_status(PG_FUNCTION_ARGS)
-{
-    StringInfoData buf;
-    bool     dek_valid = false;
-    uint64   gen = 0;
-    bool     vault_configured = false;
-
-    initStringInfo(&buf);
-
-    vault_configured = (pg_vault_tde_vault_url != NULL &&
-                        pg_vault_tde_vault_url[0] != '\0');
-
-    appendStringInfo(&buf,
-                     "dek_valid=%s, generation=%lu, vault_configured=%s"
-                     ", dek_cache_ttl=%d, auth_method=%s",
-                     dek_valid ? "true" : "false",
-                     (unsigned long) gen,
-                     vault_configured ? "true" : "false",
-                     pg_vault_tde_dek_cache_ttl,
-                     pg_vault_tde_vault_auth_method ? pg_vault_tde_vault_auth_method : "token");
-
-    PG_RETURN_TEXT_P(cstring_to_text(buf.data));
 }
 
 /*
@@ -1638,58 +1617,55 @@ vault_add_namespace_header(struct curl_slist *headers)
  * 
  */
 
-static bool vault_transit_request(const char* operation, 
-                                    const char* body, vault_response_buf *response)
+/*
+ * vault_transit_request -- POST to a Vault Transit endpoint.
+ *
+ * path   : URL path starting with '/', e.g. "/v1/transit/encrypt/mykey".
+ *          The base URL (pg_vault_tde_vault_url) is prepended here; callers
+ *          only supply the path so the base GUC is read in exactly one place.
+ * body   : JSON request body; NULL or "" for operations that need no body
+ *          (e.g. rotate).
+ * response: caller-allocated struct; vault_resp_init is called internally.
+ *           Caller must call vault_resp_free() after use.
+ */
+static bool vault_transit_request(const char *path,
+                                   const char *body, vault_response_buf *response)
 {
     const char          *vault_token  = NULL;
     char                url[1024];
     CURL                *curl          = NULL;
     char                auth_hdr[512];
     struct curl_slist   *headers       = NULL;
-    CURLcode            res; 
+    CURLcode            res;
     long                http_code;
     bool volatile       success = false;
 
-    Assert(operation != NULL);
-    Assert(body != NULL);
+    Assert(path != NULL);
     Assert(response != NULL);
 
-    if(pg_vault_tde_vault_url == NULL || pg_vault_tde_vault_url[0] == '\0')
-    {
+    if (pg_vault_tde_vault_url == NULL || pg_vault_tde_vault_url[0] == '\0')
         ereport(ERROR,
             errmsg("pg_vault_tde: vault_url is not set"));
-    }
 
-    if((vault_token = vault_get_effective_token()) == NULL)
-    {
+    if ((vault_token = vault_get_effective_token()) == NULL)
         ereport(ERROR,
             errmsg("pg_vault_tde: authentication failed"));
-    }
 
-    /* POST /v1/<mount>/<operation>/<key_name> {"ciphertext": "<wrapped_b64>"} */
-    snprintf(url, sizeof(url), "%s/v1/%s/%s/%s",
-            pg_vault_tde_vault_url,
-            pg_vault_tde_vault_transit_mount, 
-            operation,
-            pg_vault_tde_vault_key_name);
+    /* Base URL is read only here; callers supply the path. */
+    snprintf(url, sizeof(url), "%s%s", pg_vault_tde_vault_url, path);
 
-    
     PG_TRY();
     {
-        if(!vault_resp_init(response)) 
-        {
-            ereport(ERROR, 
+        if (!vault_resp_init(response))
+            ereport(ERROR,
                 errmsg("pg_vault_tde: buffer allocation for response failed"));
-        }
 
-        curl = vault_make_curl(response);   
-        if(curl == NULL)
-        {
+        curl = vault_make_curl(response);
+        if (curl == NULL)
             ereport(ERROR,
                 errmsg("pg_vault_tde: curl init failed"));
-        }
 
-        snprintf(auth_hdr, sizeof(auth_hdr), 
+        snprintf(auth_hdr, sizeof(auth_hdr),
                 "X-Vault-Token: %s", vault_token);
 
         headers = curl_slist_append(headers, auth_hdr);
@@ -1698,54 +1674,41 @@ static bool vault_transit_request(const char* operation,
 
         curl_easy_setopt(curl, CURLOPT_URL, url);
         curl_easy_setopt(curl, CURLOPT_POST, 1L);
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body != NULL ? body : "");
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
         res = curl_easy_perform(curl);
 
-        if(res == CURLE_OK)
+        if (res == CURLE_OK)
         {
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-            if(http_code == 200)
+            if (http_code == 200)
                 success = true;
-            else 
-            {
+            else
                 ereport(ERROR,
-                    errmsg("pg_vault_tde: %s returned HTTP %ld (response %.256s)", 
-                            operation, http_code, response->data));
-            }
+                    errmsg("pg_vault_tde: Vault %s returned HTTP %ld (response %.256s)",
+                            path, http_code, response->data));
         }
         else
             ereport(ERROR,
-                errmsg("pg_vault_tde: HTTP request failed"));
+                errmsg("pg_vault_tde: HTTP request to %s failed: %s",
+                        path, curl_easy_strerror(res)));
     }
     PG_CATCH();
     {
-        if(curl)
+        if (curl)
         {
             curl_slist_free_all(headers);
             curl_easy_cleanup(curl);
         }
-
-        if(vault_token)
-        {
-            OPENSSL_cleanse(auth_hdr, sizeof(auth_hdr));
-        }
-
+        OPENSSL_cleanse(auth_hdr, sizeof(auth_hdr));
         PG_RE_THROW();
     }
     PG_END_TRY();
 
-    if(curl)
-    {
-        curl_slist_free_all(headers);
-        curl_easy_cleanup(curl);
-    }
-
-    if(vault_token)
-    {
-        OPENSSL_cleanse(auth_hdr, sizeof(auth_hdr));
-    }
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    OPENSSL_cleanse(auth_hdr, sizeof(auth_hdr));
 
     return success;
 }
@@ -1778,13 +1741,12 @@ vault_provider_wrap_dek(const unsigned char *dek, int dek_len,
                         unsigned char *wrapped_out, int *out_len)
 {
     vault_response_buf  resp;
-    char               *ciphertext     = NULL;
-    char               *post_body      = NULL;
-    bool volatile       success        = false;
-
-    /* Base64-encode the DEK for the Vault Transit request body. */
-    size_t b64_len = ((dek_len + 2) / 3) * 4 + 1;
-    char *b64_dek = palloc(b64_len);
+    char               *ciphertext = NULL;
+    char               *post_body  = NULL;
+    char                path[512];
+    bool                success    = false;
+    size_t              b64_len    = ((dek_len + 2) / 3) * 4 + 1;
+    char               *b64_dek   = palloc(b64_len);
 
     EVP_EncodeBlock((unsigned char *) b64_dek, dek, dek_len);
 
@@ -1793,42 +1755,34 @@ vault_provider_wrap_dek(const unsigned char *dek, int dek_len,
 
     OPENSSL_cleanse(b64_dek, b64_len);
     pfree(b64_dek);
-    b64_dek = NULL;
 
-    if(vault_transit_request("encrypt", post_body, &resp))
+    snprintf(path, sizeof(path), "/v1/%s/encrypt/%s",
+             pg_vault_tde_vault_transit_mount,
+             pg_vault_tde_vault_key_name);
+
+    if (vault_transit_request(path, post_body, &resp))
     {
         ciphertext = vault_json_extract_string(resp.data, "ciphertext");
-        
-        if(ciphertext != NULL)
+        if (ciphertext != NULL)
         {
-            size_t new_len = strlen(ciphertext);
+            size_t ct_len = strlen(ciphertext);
 
-            if(new_len > (size_t)*out_len)
-                ereport(ERROR, errmsg("pg_vault_tde: Buffer Overflow on ciphertext"));
-            else{
-                memcpy(wrapped_out, ciphertext, new_len);
-                *out_len = new_len;
-                success = true;
-            }
-            
+            if (ct_len > (size_t) *out_len)
+                ereport(ERROR, errmsg("pg_vault_tde: wrapped DEK (%zu) exceeds buffer (%d)",
+                                      ct_len, *out_len));
+            memcpy(wrapped_out, ciphertext, ct_len);
+            *out_len = (int) ct_len;
+            success = true;
         }
     }
-    else    
-        ereport(ERROR, errmsg("pg_vault_tde: HTTP request failed"));
 
-    if(b64_dek)
-    {
-        OPENSSL_cleanse(b64_dek, b64_len);
-        pfree(b64_dek);
-    }
-    if(post_body)
+    if (post_body)
     {
         OPENSSL_cleanse(post_body, strlen(post_body));
         pfree(post_body);
     }
     vault_resp_free(&resp);
-
-    if(ciphertext)
+    if (ciphertext)
     {
         OPENSSL_cleanse(ciphertext, strlen(ciphertext));
         pfree(ciphertext);
@@ -1841,49 +1795,47 @@ vault_provider_unwrap_dek(const unsigned char *wrapped, int wrapped_len,
                            unsigned char *dek_out, int dek_len)
 {
     vault_response_buf  resp;
-    char                *plaintext_b64  = NULL;
-    char                *post_body      = NULL;
-    bool                success         = false;
+    char               *plaintext_b64 = NULL;
+    char               *post_body     = NULL;
+    char                path[512];
+    bool                success       = false;
     unsigned char       raw_dek[TDE_DEK_LEN];
     int                 decoded_len;
+    Size                body_len      = wrapped_len + 64 + 1;
 
-    Size body_len = wrapped_len + 64 + 1;
     post_body = palloc(body_len);
-
     snprintf(post_body, body_len, "{\"ciphertext\": \"%.*s\"}",
              (int) wrapped_len, (const char *) wrapped);
 
-    if(vault_transit_request("decrypt", post_body, &resp))
+    snprintf(path, sizeof(path), "/v1/%s/decrypt/%s",
+             pg_vault_tde_vault_transit_mount,
+             pg_vault_tde_vault_key_name);
+
+    if (vault_transit_request(path, post_body, &resp))
     {
         plaintext_b64 = vault_json_extract_string(resp.data, "plaintext");
-        if(plaintext_b64 != NULL)
+        if (plaintext_b64 != NULL)
         {
             decoded_len = vault_base64_decode(plaintext_b64, raw_dek, TDE_DEK_LEN);
-            if(decoded_len == TDE_DEK_LEN)
+            if (decoded_len == TDE_DEK_LEN)
             {
                 memcpy(dek_out, raw_dek, dek_len);
                 success = true;
             }
-
             OPENSSL_cleanse(raw_dek, TDE_DEK_LEN);
             OPENSSL_cleanse(plaintext_b64, strlen(plaintext_b64));
             pfree(plaintext_b64);
             plaintext_b64 = NULL;
         }
     }
-    else
-    {
-        ereport(ERROR, 
-                errmsg("pg_vault_tde: Vault Transit decrypt HTTP failed"));
-    }
-    if(post_body)
+
+    if (post_body)
     {
         OPENSSL_cleanse(post_body, strlen(post_body));
         pfree(post_body);
     }
     vault_resp_free(&resp);
-
-    if(plaintext_b64)
+    if (plaintext_b64)
     {
         OPENSSL_cleanse(plaintext_b64, strlen(plaintext_b64));
         pfree(plaintext_b64);
@@ -1918,67 +1870,63 @@ vault_provider_shutdown(void)
 static bool
 vault_prepare_kek_rotation(void)
 {
-    CURL              *curl;
-    CURLcode           res;
-    struct curl_slist *headers = NULL;
-    vault_response_buf response;
-    char               url[1024];
-    char               auth_header[512];
-    long               http_code = 0;
-    bool               success   = false;
-    const char        *token;
+    vault_response_buf  response;
+    char                path[512];
 
-    token = vault_get_effective_token();
-    if (token == NULL || token[0] == '\0')
-        ereport(ERROR,
-                errcode(ERRCODE_CONNECTION_FAILURE),
-                errmsg("pg_vault_tde: no Vault token available for KEK rotation"));
-
-    snprintf(url, sizeof(url), "%s/v1/%s/keys/%s/rotate",
-             pg_vault_tde_vault_url,
+    /* Vault Transit rotate endpoint: POST /v1/<mount>/keys/<key>/rotate */
+    snprintf(path, sizeof(path), "/v1/%s/keys/%s/rotate",
              pg_vault_tde_vault_transit_mount,
              pg_vault_tde_vault_key_name);
 
-    snprintf(auth_header, sizeof(auth_header), "X-Vault-Token: %s", token);
-
-    response.alloc   = 256;
-    response.len     = 0;
-    response.data    = palloc(response.alloc);
-    response.data[0] = '\0';
-
-    curl = curl_easy_init();
-    if (!curl)
-        ereport(ERROR, errmsg("pg_vault_tde: curl_easy_init failed"));
-
-    headers = curl_slist_append(headers, auth_header);
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_POST, 1L);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    if (pg_vault_tde_vault_ca_cert && pg_vault_tde_vault_ca_cert[0])
-        curl_easy_setopt(curl, CURLOPT_CAINFO, pg_vault_tde_vault_ca_cert);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, vault_write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-
-    res = curl_easy_perform(curl);
-    if (res == CURLE_OK)
+    if (!vault_transit_request(path, NULL, &response))
     {
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-        success = (http_code == 204 || http_code == 200);
+        vault_resp_free(&response);
+        ereport(ERROR,
+                errmsg("pg_vault_tde: Vault KEK rotate failed"));
     }
 
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    pfree(response.data);
-
-    if (!success)
-        ereport(ERROR,
-                errcode(ERRCODE_CONNECTION_FAILURE),
-                errmsg("pg_vault_tde: Vault KEK rotate failed (HTTP %ld, curl %d)",
-                       http_code, (int) res));
+    vault_resp_free(&response);
     return true;
+}
+
+PGDLLEXPORT Datum
+pg_vault_tde_vault_status(PG_FUNCTION_ARGS)
+{
+    TupleDesc   tupdesc;
+    Datum       values[3];
+    bool        nulls[3];
+    HeapTuple   result_tuple;
+
+    /* State variables */
+    bool    vault_configured    = false;
+    bool    reachable   = false;
+
+    if(get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("function returning record called in context "
+                        "that cannot accept type record")));
+    
+    tupdesc = BlessTupleDesc(tupdesc);
+
+    memset(nulls, 0, sizeof(nulls));
+
+    vault_configured = (pg_vault_tde_vault_url != NULL &&
+                        pg_vault_tde_vault_url[0] != '\0');
+    
+    vault_configured = vault_configured &&
+                    (pg_vault_tde_kms_provider != NULL &&
+                    strcmp(pg_vault_tde_kms_provider, "vault") == 0);
+
+    if(vault_configured)
+        reachable = vault_probe_health();
+
+    values[0] = BoolGetDatum(vault_configured);
+    values[1] = CStringGetTextDatum(pg_vault_tde_vault_auth_method ? pg_vault_tde_vault_auth_method : "Not configured");
+    values[2] = BoolGetDatum(reachable);
+
+    result_tuple = heap_form_tuple(tupdesc, values, nulls);
+    PG_RETURN_DATUM(HeapTupleGetDatum(result_tuple));
 }
 
 static void
