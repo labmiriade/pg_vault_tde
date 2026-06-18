@@ -174,7 +174,7 @@ static bool             vault_provider_generate_dek(unsigned char *dek_out, int 
 static bool             vault_provider_wrap_dek(const unsigned char *dek, int dek_len,
                                                  unsigned char *wrapped_out, int *out_len);
 static bool             vault_provider_unwrap_dek(const unsigned char *wrapped, int wrapped_len,
-                                                   unsigned char *dek_out, int dek_len);
+                                                   unsigned char *dek_out, int *dek_len);
 static bool             vault_provider_health_check(void);
 static void             vault_provider_shutdown(void);
 static bool             vault_prepare_kek_rotation(void);
@@ -1792,7 +1792,7 @@ vault_provider_wrap_dek(const unsigned char *dek, int dek_len,
 
 static bool
 vault_provider_unwrap_dek(const unsigned char *wrapped, int wrapped_len,
-                           unsigned char *dek_out, int dek_len)
+                           unsigned char *dek_out, int *dek_len)
 {
     vault_response_buf  resp;
     char               *plaintext_b64 = NULL;
@@ -1802,6 +1802,8 @@ vault_provider_unwrap_dek(const unsigned char *wrapped, int wrapped_len,
     unsigned char       raw_dek[TDE_DEK_LEN];
     int                 decoded_len;
     Size                body_len      = wrapped_len + 64 + 1;
+
+    Assert(dek_out != NULL && dek_len != NULL);
 
     post_body = palloc(body_len);
     snprintf(post_body, body_len, "{\"ciphertext\": \"%.*s\"}",
@@ -1819,7 +1821,8 @@ vault_provider_unwrap_dek(const unsigned char *wrapped, int wrapped_len,
             decoded_len = vault_base64_decode(plaintext_b64, raw_dek, TDE_DEK_LEN);
             if (decoded_len == TDE_DEK_LEN)
             {
-                memcpy(dek_out, raw_dek, dek_len);
+                memcpy(dek_out, raw_dek, TDE_DEK_LEN);
+                *dek_len = TDE_DEK_LEN;
                 success = true;
             }
             OPENSSL_cleanse(raw_dek, TDE_DEK_LEN);

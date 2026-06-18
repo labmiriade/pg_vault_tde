@@ -197,8 +197,8 @@ bool tde_backup_header_validate(tde_backup_header *hdr, TdeBackupContext* ctx)
     if(strcmp(hdr->magic, TDE_BACKUP_MAGIC) != 0) return false;
     if(hdr->format_version != TDE_BACKUP_FORMAT_VERSION) return false;
 
-    if(!dump_tde_active_provider->unwrap_dek(hdr->wrapped_dek, hdr->wrapped_dek_len, 
-                                             dek, dek_len))
+    if(!dump_tde_active_provider->unwrap_dek(hdr->wrapped_dek, hdr->wrapped_dek_len,
+                                             dek, &dek_len))
     {
         pg_log_error("pg_dump_tde: cant unwrap DEK: wrong passphrase or corrupted wrapped dek");
         return false;

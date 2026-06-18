@@ -263,25 +263,106 @@ resolve_effective_relid(Oid relid)
 }
 
 /* -------------------------------------------------------------------------
+ * tde_catalog_read_row — read one pg_vault_tde_catalog row by relid
+ *
+ * Resolves the catalog OIDs internally, opens AccessShareLock, scans on the
+ * pkey, copies out the needed fields, then closes. Returns false only if the
+ * catalog table itself is absent (pre-CREATE EXTENSION); out->found tells
+ * whether a matching row existed.
+ * -------------------------------------------------------------------------*/
+typedef struct TdeCatalogRow
+{
+    bool          found;
+    unsigned char wrapped_dek[512];
+    int           wrapped_len;        /* real length even if > buffer; 0 = NULL/absent */
+    uint64        generation;
+    bool          generation_isnull;
+} TdeCatalogRow;
+
+static bool
+tde_catalog_read_row(Oid relid, TdeCatalogRow *out)
+{
+    Oid          ext_ns;
+    Oid          catalog_oid;
+    Oid          catalog_idx;
+    Relation     catalog_rel;
+    TupleDesc    tupdesc;
+    ScanKeyData  scan_key;
+    SysScanDesc  scan;
+    HeapTuple    tuple;
+
+    memset(out, 0, sizeof(*out));
+
+    ext_ns = get_extension_schema(
+                 get_extension_oid(pg_vault_tde_extension_name, true));
+    if (!OidIsValid(ext_ns))
+        return false;
+
+    catalog_oid = get_relname_relid("pg_vault_tde_catalog", ext_ns);
+    if (!OidIsValid(catalog_oid))
+        return false;
+
+    catalog_idx = get_relname_relid("pg_vault_tde_catalog_pkey", ext_ns);
+
+    catalog_rel = table_open(catalog_oid, AccessShareLock);
+    tupdesc     = RelationGetDescr(catalog_rel);
+
+    ScanKeyInit(&scan_key, Anum_pg_vault_tde_relid, BTEqualStrategyNumber,
+                F_OIDEQ, ObjectIdGetDatum(relid));
+    scan = systable_beginscan(catalog_rel, catalog_idx, true,
+                              GetTransactionSnapshot(), 1, &scan_key);
+
+    if (HeapTupleIsValid(tuple = systable_getnext(scan)))
+    {
+        Datum d;
+        bool  wrapped_isnull;
+
+        out->found = true;
+
+        d = heap_getattr(tuple, Anum_pg_vault_tde_wrapped_dek,
+                         tupdesc, &wrapped_isnull);
+        if (!wrapped_isnull)
+        {
+            /* Copy while the buffer page is still pinned by the scan. */
+            bytea *b = DatumGetByteaPP(d);
+            out->wrapped_len = VARSIZE_ANY_EXHDR(b);
+            if (out->wrapped_len <= (int) sizeof(out->wrapped_dek))
+                memcpy(out->wrapped_dek, VARDATA_ANY(b), out->wrapped_len);
+        }
+
+        d = heap_getattr(tuple, Anum_pg_vault_tde_generation,
+                         tupdesc, &out->generation_isnull);
+        out->generation = out->generation_isnull ? 0 : DatumGetUInt64(d);
+    }
+
+    systable_endscan(scan);
+    table_close(catalog_rel, AccessShareLock);
+    return true;
+}
+
+/* -------------------------------------------------------------------------
  * tde_rel_dek_cache_store — insert an unwrapped DEK into the shmem cache
  *
  * Takes ownership of dek_temp: OPENSSL_cleanse'd before returning in all paths.
  * -------------------------------------------------------------------------*/
 static bool
-tde_rel_dek_cache_store(Oid effective_relid,
+tde_rel_dek_cache_store(Oid relid,
                         unsigned char *dek_temp,
-                        unsigned char *dek_out)
+                        unsigned char *dek_out,
+                        uint64 generation)
 {
     int             i;
     TdeRelDekEntry *empty_slot = NULL;
 
-    LWLockAcquire(&rel_dek_cache->lock, LW_EXCLUSIVE);
+    if(!rel_dek_cache) 
+        ereport (ERROR, errmsg("pg_vault_tde: error: shmem cache is null, the extension must be loaded via shared_preload_libraries"));
 
+    LWLockAcquire(&rel_dek_cache->lock, LW_EXCLUSIVE);
     for (i = 0; i < rel_dek_cache->capacity; i++)
     {
         TdeRelDekEntry *e = &rel_dek_cache->entries[i];
 
-        if (e->relid == effective_relid && e->dek_valid)
+        if (e->relid == relid && e->dek_valid)
         {
             /* Another backend loaded the DEK while we were in catalog scan. */
             memcpy(dek_out, e->dek, TDE_DEK_LEN);
@@ -290,7 +371,7 @@ tde_rel_dek_cache_store(Oid effective_relid,
             return true;
         }
 
-        if (e->relid == effective_relid && !e->dek_valid && e->prev_dek_valid)
+        if (e->relid == relid && !e->dek_valid && e->prev_dek_valid)
         {
             /* Rotation window: re-arm the entry with the new DEK. */
             memcpy(e->dek, dek_temp, TDE_DEK_LEN);
@@ -307,23 +388,19 @@ tde_rel_dek_cache_store(Oid effective_relid,
 
     if (!empty_slot)
     {
-        ereport(WARNING,
+        OPENSSL_cleanse(dek_temp, TDE_DEK_LEN);
+        ereport(ERROR,
                 errmsg("pg_vault_tde: DEK cache full (capacity=%d); "
-                       "evicting first entry to make room for relid=%u. "
                        "Consider increasing pg_vault_tde.max_encrypted_relations.",
-                       rel_dek_cache->capacity, effective_relid));
-        empty_slot = &rel_dek_cache->entries[0];
-        OPENSSL_cleanse(empty_slot->dek, TDE_DEK_LEN);
-        OPENSSL_cleanse(empty_slot->prev_dek, TDE_DEK_LEN);
-        rel_dek_cache->used--;
+                       rel_dek_cache->capacity));
     }
 
     memcpy(empty_slot->dek, dek_temp, TDE_DEK_LEN);
     OPENSSL_cleanse(dek_temp, TDE_DEK_LEN);
     memcpy(dek_out, empty_slot->dek, TDE_DEK_LEN);
-    empty_slot->relid      = effective_relid;
+    empty_slot->relid      = relid;
     empty_slot->dek_valid  = true;
-    empty_slot->generation = 1;
+    empty_slot->generation = generation;
     rel_dek_cache->used++;
 
     LWLockRelease(&rel_dek_cache->lock);
@@ -350,6 +427,9 @@ pg_vault_tde_kms_get_rel_dek(Oid relid,
     effective_relid = resolve_effective_relid(relid);
 
     /* ---- Fast path: LW_SHARED cache lookup ---- */
+    if(!rel_dek_cache) 
+        ereport (ERROR, errmsg("pg_vault_tde: error: shmem cache is null, the extension must be loaded via shared_preload_libraries"));
+
     LWLockAcquire(&rel_dek_cache->lock, LW_SHARED);
     for (i = 0; i < rel_dek_cache->capacity; i++)
     {
@@ -369,28 +449,12 @@ pg_vault_tde_kms_get_rel_dek(Oid relid,
 
     /* ---- Slow path: catalog scan + KMS unwrap ---- */
     {
-        TupleDesc     tupdesc;
-        HeapTuple     tuple;
-        bool          isnull = true;
-        bool          tuple_found = false;
-        Datum         wrapped_datum;
-        bytea        *wrapped_bytea;
-        unsigned char wrapped_buf[512];
-        int           wrapped_len = 0;
+        TdeCatalogRow row;
         unsigned char dek_temp[TDE_DEK_LEN];
         bool          unwrap_ok;
 
-        ScanKeyData scan_key;
-        SysScanDesc scan;
-        Relation    catalog_rel;
-        Oid         catalog_idx;
-
         /* Guard: catalog absent on fresh install before CREATE EXTENSION. */
-        Oid ext_ns = get_extension_schema(
-                         get_extension_oid(pg_vault_tde_extension_name, true));
-
-        if (!OidIsValid(ext_ns) ||
-            !OidIsValid(get_relname_relid("pg_vault_tde_catalog", ext_ns)))
+        if (!tde_catalog_read_row(effective_relid, &row))
         {
             ereport(WARNING,
                     errmsg("pg_vault_tde: catalog absent — "
@@ -398,38 +462,7 @@ pg_vault_tde_kms_get_rel_dek(Oid relid,
             return false;
         }
 
-        catalog_rel = table_open(
-                          get_relname_relid("pg_vault_tde_catalog", ext_ns),
-                          AccessShareLock);
-        tupdesc     = RelationGetDescr(catalog_rel);
-        catalog_idx = get_relname_relid("pg_vault_tde_catalog_pkey", ext_ns);
-
-        ScanKeyInit(&scan_key, Anum_pg_vault_tde_relid,
-                    BTEqualStrategyNumber, F_OIDEQ,
-                    ObjectIdGetDatum(effective_relid));
-        scan = systable_beginscan(catalog_rel, catalog_idx, true,
-                                  GetTransactionSnapshot(), 1, &scan_key);
-
-        if (HeapTupleIsValid(tuple = systable_getnext(scan)))
-        {
-            tuple_found  = true;
-            wrapped_datum = heap_getattr(tuple, Anum_pg_vault_tde_wrapped_dek,
-                                         tupdesc, &isnull);
-            if (!isnull)
-            {
-                /* Copy while buffer page is still pinned by the scan. */
-                wrapped_bytea = DatumGetByteaPP(wrapped_datum);
-                wrapped_len   = VARSIZE_ANY_EXHDR(wrapped_bytea);
-                if (wrapped_len <= (int) sizeof(wrapped_buf))
-                    memcpy(wrapped_buf, VARDATA_ANY(wrapped_bytea), wrapped_len);
-            }
-        }
-
-        /* Close before any early return to avoid ResourceOwner leaks. */
-        systable_endscan(scan);
-        table_close(catalog_rel, AccessShareLock);
-
-        if (!tuple_found)
+        if (!row.found)
         {
             ereport(WARNING,
                     errmsg("pg_vault_tde: no catalog entry for relid=%u",
@@ -437,7 +470,7 @@ pg_vault_tde_kms_get_rel_dek(Oid relid,
             return false;
         }
 
-        if (isnull)
+        if (row.wrapped_len == 0 || row.generation == 0)
         {
             ereport(WARNING,
                     errmsg("pg_vault_tde: wrapped_dek IS NULL for relid=%u",
@@ -445,11 +478,11 @@ pg_vault_tde_kms_get_rel_dek(Oid relid,
             return false;
         }
 
-        if (wrapped_len > (int) sizeof(wrapped_buf))
+        if (row.wrapped_len > (int) sizeof(row.wrapped_dek))
         {
             ereport(WARNING,
                     errmsg("pg_vault_tde: wrapped_dek too large (%d bytes) "
-                           "for relid=%u", wrapped_len, effective_relid));
+                           "for relid=%u", row.wrapped_len, effective_relid));
             return false;
         }
 
@@ -461,10 +494,13 @@ pg_vault_tde_kms_get_rel_dek(Oid relid,
             return false;
         }
 
-        unwrap_ok = tde_active_kms_provider->unwrap_dek(
-                        wrapped_buf, wrapped_len, dek_temp, TDE_DEK_LEN);
+        {
+            int dek_temp_len = TDE_DEK_LEN;
+            unwrap_ok = tde_active_kms_provider->unwrap_dek(
+                            row.wrapped_dek, row.wrapped_len, dek_temp, &dek_temp_len);
+        }
 
-        OPENSSL_cleanse(wrapped_buf, sizeof(wrapped_buf));
+        OPENSSL_cleanse(row.wrapped_dek, sizeof(row.wrapped_dek));
 
         if (!unwrap_ok)
         {
@@ -475,7 +511,8 @@ pg_vault_tde_kms_get_rel_dek(Oid relid,
 
         tde_audit(KMS_DEK_ACCESS, psprintf("%u", effective_relid), true);
         /* Ownership of dek_temp transfers to tde_rel_dek_cache_store. */
-        return tde_rel_dek_cache_store(effective_relid, dek_temp, dek_out);
+        return tde_rel_dek_cache_store(effective_relid, dek_temp, dek_out,
+                                       row.generation);
     }
 }
 
@@ -488,6 +525,7 @@ pg_vault_tde_kms_get_rel_prev_dek(Oid relid,
 {
     int  i;
     bool found = false;
+    Oid effective_relid = resolve_effective_relid(relid);
 
     Assert(prev_dek_out != NULL);
     Assert(dek_len == TDE_DEK_LEN);
@@ -499,7 +537,7 @@ pg_vault_tde_kms_get_rel_prev_dek(Oid relid,
     for (i = 0; i < rel_dek_cache->capacity; i++)
     {
         TdeRelDekEntry *e = &rel_dek_cache->entries[i];
-        if (e->relid == relid && e->prev_dek_valid)
+        if (e->relid == effective_relid && e->prev_dek_valid)
         {
             memcpy(prev_dek_out, e->prev_dek, TDE_DEK_LEN);
             found = true;
@@ -908,15 +946,18 @@ pg_vault_tde_catalog_get_rel_generation(Oid relid)
 {
     int    i;
     uint64 gen = 0;
+    Oid    effective_relid;
 
     if (!OidIsValid(relid) || !rel_dek_cache)
         return 0;
+
+    effective_relid = resolve_effective_relid(relid);
 
     LWLockAcquire(&rel_dek_cache->lock, LW_SHARED);
     for (i = 0; i < rel_dek_cache->capacity; i++)
     {
         TdeRelDekEntry *e = &rel_dek_cache->entries[i];
-        if (e->relid == relid)
+        if (e->relid == effective_relid)
         {
             gen = e->generation;
             break;
@@ -924,12 +965,25 @@ pg_vault_tde_catalog_get_rel_generation(Oid relid)
     }
     LWLockRelease(&rel_dek_cache->lock);
 
-    return gen > 0 ? gen : 1;   /* new entries start at generation 1 */
+    if (gen > 0)
+        return gen;
+
+    /* Cache miss (e.g. after restart): read generation from the catalog. */
+    {
+        TdeCatalogRow row;
+
+        if (tde_catalog_read_row(effective_relid, &row) &&
+            row.found && !row.generation_isnull && row.generation > 0)
+            return row.generation;
+    }
+
+    return 1;
 }
 
 void pg_vault_tde_catalog_zero_rel_dek(Oid relid)
 {
     int i;
+    Oid effective_relid = resolve_effective_relid(relid);
 
     if (!rel_dek_cache)
         return;
@@ -938,7 +992,7 @@ void pg_vault_tde_catalog_zero_rel_dek(Oid relid)
     for (i = 0; i < rel_dek_cache->capacity; i++)
     {
         TdeRelDekEntry *e = &rel_dek_cache->entries[i];
-        if (e->relid == relid)
+        if (e->relid == effective_relid)
         {
             memcpy(e->prev_dek, e->dek, TDE_DEK_LEN);
             OPENSSL_cleanse(e->dek, TDE_DEK_LEN);

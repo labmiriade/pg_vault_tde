@@ -146,7 +146,7 @@ static bool local_generate_dek(unsigned char *dek_out, int dek_len);
 static bool local_wrap_dek(const unsigned char *dek, int dek_len,
                            unsigned char *wrapped_out, int *out_len);
 static bool local_unwrap_dek(const unsigned char *wrapped, int wrapped_len,
-                              unsigned char *dek_out, int dek_len);
+                              unsigned char *dek_out, int *dek_len);
 static bool local_rewrap_dek(const unsigned char *old_wrapped, int old_len,
                               unsigned char *new_wrapped, int *new_len);
 static bool local_prepare_kek_rotation(void);
@@ -167,7 +167,7 @@ static bool local_wrap_dek_with_pass(const unsigned char *dek, int dek_len,
                                      const char *wallet_path);
 static bool local_unwrap_dek_with_pass(const unsigned char *wrapped,
                                        int wrapped_len,
-                                       unsigned char *dek_out, int dek_len,
+                                       unsigned char *dek_out, int *dek_len,
                                        const char *passphrase,
                                        const char *wallet_path);
 static bool local_wrap_dek_with_kek(const unsigned char *dek, int dek_len,
@@ -175,7 +175,7 @@ static bool local_wrap_dek_with_kek(const unsigned char *dek, int dek_len,
                                     const unsigned char *kek);
 static bool local_unwrap_dek_with_kek(const unsigned char *wrapped,
                                       int wrapped_len,
-                                      unsigned char *dek_out, int dek_len,
+                                      unsigned char *dek_out, int *dek_len,
                                       const unsigned char *kek);
 static bool local_derive_kek_from_pass(const char *passphrase,
                                        unsigned char *kek_out);
@@ -383,7 +383,7 @@ local_wrap_dek_with_pass(const unsigned char *dek, int dek_len,
  * -------------------------------------------------------------------------*/
 static bool
 local_unwrap_dek_with_pass(const unsigned char *wrapped, int wrapped_len,
-                           unsigned char *dek_out, int dek_len,
+                           unsigned char *dek_out, int *dek_len,
                            const char *passphrase, const char *wallet_path)
 {
     unsigned char   kek[TDE_DEK_LEN];
@@ -394,10 +394,11 @@ local_unwrap_dek_with_pass(const unsigned char *wrapped, int wrapped_len,
 
     Assert(wrapped != NULL);
     Assert(wrapped_len == LOCAL_WRAPPED_DEK_LEN);
-    Assert(dek_out != NULL);
-    Assert(dek_len == TDE_DEK_LEN);
+    Assert(dek_out != NULL && dek_len != NULL);
     Assert(passphrase != NULL);
     Assert(wallet_path != NULL);
+
+    if (wrapped_len != LOCAL_WRAPPED_DEK_LEN) return false;
 
     if (!local_open_wallet(wallet_path, passphrase, kek))
     {
@@ -420,6 +421,7 @@ local_unwrap_dek_with_pass(const unsigned char *wrapped, int wrapped_len,
         EVP_DecryptUpdate(ctx, dek_out, &update_len, wrapped, wrapped_len) == 1 &&
         EVP_DecryptFinal_ex(ctx, dek_out + update_len, &final_len) == 1)
     {
+        *dek_len = update_len + final_len;
         ok = true;
     }
     else
@@ -488,7 +490,7 @@ local_wrap_dek_with_kek(const unsigned char *dek, int dek_len,
  * -------------------------------------------------------------------------*/
 static bool
 local_unwrap_dek_with_kek(const unsigned char *wrapped, int wrapped_len,
-                          unsigned char *dek_out, int dek_len,
+                          unsigned char *dek_out, int *dek_len,
                           const unsigned char *kek)
 {
     EVP_CIPHER_CTX *ctx;
@@ -497,7 +499,7 @@ local_unwrap_dek_with_kek(const unsigned char *wrapped, int wrapped_len,
     bool            ok         = false;
 
     Assert(wrapped != NULL && wrapped_len == LOCAL_WRAPPED_DEK_LEN);
-    Assert(dek_out != NULL && dek_len == TDE_DEK_LEN);
+    Assert(dek_out != NULL && dek_len != NULL);
     Assert(kek != NULL);
 
     ctx = EVP_CIPHER_CTX_new();
@@ -510,7 +512,10 @@ local_unwrap_dek_with_kek(const unsigned char *wrapped, int wrapped_len,
     if (EVP_DecryptInit_ex2(ctx, EVP_aes_256_wrap(), kek, NULL, NULL) == 1 &&
         EVP_DecryptUpdate(ctx, dek_out, &update_len, wrapped, wrapped_len) == 1 &&
         EVP_DecryptFinal_ex(ctx, dek_out + update_len, &final_len) == 1)
+    {
+        *dek_len = update_len + final_len;
         ok = true;
+    }
     else
         ereport(WARNING,
                 errmsg("pg_vault_tde: AES-256-UNWRAP (cached KEK) failed: %s",
@@ -614,7 +619,7 @@ local_wrap_dek(const unsigned char *dek, int dek_len,
  * -------------------------------------------------------------------------*/
 static bool
 local_unwrap_dek(const unsigned char *wrapped, int wrapped_len,
-                 unsigned char *dek_out, int dek_len)
+                 unsigned char *dek_out, int *dek_len)
 {
     char        pass[1024];
     const char *path;
@@ -622,8 +627,7 @@ local_unwrap_dek(const unsigned char *wrapped, int wrapped_len,
 
     Assert(wrapped != NULL);
     Assert(wrapped_len == LOCAL_WRAPPED_DEK_LEN);
-    Assert(dek_out != NULL);
-    Assert(dek_len == TDE_DEK_LEN);
+    Assert(dek_out != NULL && dek_len != NULL);
 
     /* Fast path: cached KEK from wallet_unlock(). */
     if (local_wallet_state && local_wallet_state->kek_loaded)
@@ -662,14 +666,16 @@ local_rewrap_dek(const unsigned char *old_wrapped, int old_len,
                  unsigned char *new_wrapped, int *new_len)
 {
     unsigned char dek_temp[TDE_DEK_LEN];
+    int           dek_temp_len;
     bool          ok;
 
     if (local_kek_rotation_ctx != NULL)
     {
         PG_TRY();
         {
+            dek_temp_len = TDE_DEK_LEN;
             ok = local_unwrap_dek_with_kek(old_wrapped, old_len,
-                                           dek_temp, TDE_DEK_LEN,
+                                           dek_temp, &dek_temp_len,
                                            local_kek_rotation_ctx->old_kek);
             if (ok)
                 ok = local_wrap_dek_with_kek(dek_temp, TDE_DEK_LEN,
@@ -687,7 +693,8 @@ local_rewrap_dek(const unsigned char *old_wrapped, int old_len,
     }
     else
     {
-        ok = local_unwrap_dek(old_wrapped, old_len, dek_temp, TDE_DEK_LEN);
+        dek_temp_len = TDE_DEK_LEN;
+        ok = local_unwrap_dek(old_wrapped, old_len, dek_temp, &dek_temp_len);
         if (ok)
             ok = local_wrap_dek(dek_temp, TDE_DEK_LEN, new_wrapped, new_len);
     }
@@ -2503,14 +2510,17 @@ pg_vault_tde_migrate_vault_to_wallet_sql(PG_FUNCTION_ARGS)
              * Unwrap using the active (Vault) provider.  The scan filter on
              * kms_provider = 'vault' guarantees we only land here for vault rows.
              */
-            if (!tde_active_kms_provider ||
-                !tde_active_kms_provider->unwrap_dek(
-                    (unsigned char *) VARDATA_ANY(wdek_bytea), vault_wlen,
-                    plain_dek, TDE_DEK_LEN))
-            {
+            if (!tde_active_kms_provider)
                 ereport(ERROR,
-                        errmsg("pg_vault_tde: migrate_vault_to_wallet: vault unwrap "
-                               "failed for relid %u", DatumGetObjectId(values[Anum_pg_vault_tde_relid-1])));
+                        errmsg("pg_vault_tde: migrate_vault_to_wallet: no active KMS provider"));
+            {
+                int plain_dek_len = TDE_DEK_LEN;
+                if (!tde_active_kms_provider->unwrap_dek(
+                        (unsigned char *) VARDATA_ANY(wdek_bytea), vault_wlen,
+                        plain_dek, &plain_dek_len))
+                    ereport(ERROR,
+                            errmsg("pg_vault_tde: migrate_vault_to_wallet: vault unwrap "
+                                   "failed for relid %u", DatumGetObjectId(values[Anum_pg_vault_tde_relid-1])));
             }
 
             if (!local_wrap_dek_with_kek(plain_dek, TDE_DEK_LEN,

@@ -1066,8 +1066,8 @@ BEGIN
         RAISE EXCEPTION 'TEST 40 FAILED: expected 100 tuples, got %', result.total_tuples;
     END IF;
 
-    -- Each tuple has 28 bytes overhead (12 IV + 16 tag)
-    IF result.encryption_overhead_bytes != 100 * 28 THEN
+    -- Each tuple has 37 bytes overhead 
+    IF result.encryption_overhead_bytes != 100 * 37 THEN
         RAISE EXCEPTION 'TEST 40 FAILED: expected 2800 bytes overhead, got %', result.encryption_overhead_bytes;
     END IF;
 

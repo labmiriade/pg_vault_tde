@@ -10,7 +10,7 @@
  *   [HeapTupleHeader  (t_hoff bytes, PLAINTEXT - MVCC fields)]
  *   [VERSION(1) | GENERATION(8) | IV (12 B) | CIPHERTEXT (N B) | GCM TAG (16 B)]
  *
- * Total overhead vs. plain heap: TDE_V2_OVERHEAD (37) bytes per stored tuple.
+ * Total overhead vs. plain heap: TDE_V3_OVERHEAD (37) bytes per stored tuple.
  * (v3 uses the same wire bytes as v2 and adds AEAD AAD binding.)
  *
  * Copyright (c) 2026 Miriade Srl  
@@ -162,7 +162,7 @@ static bool tde_tuple_has_external_slow(HeapTuple tup, TupleDesc tupdesc);
  * Returns a palloc'd HeapTuple whose user-data region is replaced with the
  * v2/v3 wire format produced by tde_gcm_encrypt():
  *   [VERSION(1) | GENERATION(8) | IV(12) | CIPHERTEXT(N) | TAG(16)]
- * Total overhead: TDE_V2_OVERHEAD (37 bytes) per encrypted user-data region.
+ * Total overhead: TDE_V3_OVERHEAD (37 bytes) per encrypted user-data region.
  *
  * Header bytes [0 .. t_hoff) are copied verbatim (plaintext) because MVCC
  * fields (xmin, xmax, ctid, infomask, null bitmap) must remain readable by
@@ -198,7 +198,7 @@ tde_encrypt_heap_tuple(HeapTuple plain, Oid relid)
         return copy;
     }
     enc_buf = tde_gcm_encrypt(relid, user_data, user_len, &enc_len);
-    Assert(enc_len == user_len + TDE_V2_OVERHEAD);
+    Assert(enc_len == user_len + TDE_V3_OVERHEAD);
     enc = (HeapTuple) palloc0(HEAPTUPLESIZE + hdr_len + enc_len);
     enc->t_len      = (uint32) (hdr_len + enc_len);
     enc->t_self     = plain->t_self;
@@ -244,10 +244,10 @@ tde_decrypt_heap_tuple(HeapTuple enc, Oid relid)
     /*
      * Minimum size check: TDE_GCM_OVERHEAD (28) is the smallest possible
      * encrypted payload — a legacy v1 tuple with zero user bytes.  v2/v3
-     * tuples carry TDE_V2_OVERHEAD (37) bytes.  tde_gcm_decrypt detects
+     * tuples carry TDE_V3_OVERHEAD (37) bytes.  tde_gcm_decrypt detects
      * the wire-format version from the first byte and validates accordingly.
      */
-    if (enc_len < (Size) TDE_GCM_OVERHEAD)
+    if (hdr_len > enc->t_len || enc_len < (Size) TDE_V3_OVERHEAD)
         ereport(ERROR,
                 (errcode(ERRCODE_DATA_CORRUPTED),
                  errmsg("pg_vault_tde: encrypted tuple too short (%zu bytes)",
@@ -1212,15 +1212,17 @@ pg_vault_tde_tuple_update(Relation rel, ItemPointer otid,
      * chunks already inserted are rolled back by the transaction abort.
      */
     PG_TRY();
-    {
+    {   
         toasted = pg_vault_tde_toast_insert_or_update(rel, plain, old_tuple, 0);
         enc = tde_encrypt_heap_tuple(toasted, RelationGetRelid(rel));
         enc->t_tableOid = plain->t_tableOid;
         saved_toastrelid = rel->rd_rel->reltoastrelid;
         rel->rd_rel->reltoastrelid = InvalidOid;
         toastrelid_swapped = true;
+
         result = heap_update(rel, otid, enc, cid, crosscheck, wait,
                              tmfd, lockmode, update_indexes);
+
         rel->rd_rel->reltoastrelid = saved_toastrelid;
         toastrelid_swapped = false;
         if (result == TM_Ok)
@@ -2104,7 +2106,7 @@ pg_vault_tde_encrypted_size(PG_FUNCTION_ARGS)
     pfree(cmd.data);
     SPI_finish();
     values[0] = Int64GetDatum(total);
-    values[1] = Int64GetDatum(total * (int64) TDE_GCM_OVERHEAD);
+    values[1] = Int64GetDatum(total * (int64) TDE_V3_OVERHEAD);
     result_tup = heap_form_tuple(tupdesc, values, nulls);
     PG_RETURN_DATUM(HeapTupleGetDatum(result_tup));
 }

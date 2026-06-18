@@ -274,9 +274,9 @@ BEGIN
 
     -- With a different DEK, AES-SIV produces a different ciphertext for
     -- the predicate — no match found.  NULL is the expected result.
-    IF result_val IS NOT NULL THEN
-        RAISE NOTICE
-            'TEST 116 FAILED: expected NULL (stale index after DEK rotation) but got ''%''',
+    IF result_val IS DISTINCT FROM 'seven' THEN
+        RAISE EXCEPTION
+            'TEST 116 FAILED: expected "seven" but got ''%''',
             result_val;
     END IF;
 

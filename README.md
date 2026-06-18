@@ -344,6 +344,18 @@ SELECT pg_vault_tde_rotate_online('mytable', 1000);
 SELECT * FROM pg_vault_tde_rotation_status('mytable');
 ```
 
+`rotate_online` accepts both table relations and `tde_btree` index relations:
+
+| Target | What happens |
+|--------|-------------|
+| `encrypted_heap` table | Generates a new table DEK, re-encrypts every tuple in-place (`RowExclusiveLock`), then rebuilds any `tde_btree` indexes on the table so their SIV ciphertexts match the new DEK. Standard `btree` indexes on encrypted columns need no rebuild. |
+| `tde_btree` index | Generates a new index DEK, then calls `reindex_index` (`AccessExclusiveLock` on the index only) to rebuild the index with keys encrypted under the new DEK. The parent table's DEK and heap data are untouched. Passing a non-`tde_btree` index raises an error before touching shmem or the catalog. |
+
+When a table with `tde_btree` indexes is rotated, the index rebuild uses the new table DEK
+implicitly because the heap rows the scan reads are re-encrypted first; the index keys
+are then produced from the decrypted values and re-encrypted under the (unchanged) index DEK.
+To also rotate the index DEK, call `rotate_online` on the index relation directly afterwards.
+
 **KEK rotation** (re-wraps all per-table DEKs under a new KEK — tuple data untouched):
 
 ```sql
@@ -788,6 +800,8 @@ Configure like it's not encrypted
 
 #### Standby configuration
 Need the same `wallet.p12` of the primary if the KMS provider used is `local` and the same configuration (basebackup does it already) if the `Vault` is used as KMS provider.
+
+>Current limitation: DEK or KEK rotation make primary and standby disalign on keys
 
 
 ### How it works

@@ -83,7 +83,7 @@ static bool     vault_generate_dek(unsigned char *out, int len);
 static bool     vault_wrap_dek(const unsigned char *dek, int dek_len,
                                 unsigned char *out, int *out_len);
 static bool     vault_unwrap_dek(const unsigned char *wrapped_dek, int wrapped_len,
-                                 unsigned char *dek_out, int dek_len);
+                                 unsigned char *dek_out, int *dek_len);
 
 static char    *vault_perform_login(const PdeVaultConfig *config);
 static bool     vault_config_load(PGconn *conn, PdeVaultConfig *config);
@@ -689,14 +689,16 @@ vault_wrap_dek(const unsigned char *dek, int dek_len,
  * @param dek_len       capacity of dek_out
  */
 static bool vault_unwrap_dek(const unsigned char* wrapped_dek, int wrapped_len,
-                                 unsigned char* dek_out, int dek_len)
+                                 unsigned char* dek_out, int *dek_len)
 {
     vault_resp_buf      resp;
     char               *plaintext_b64  = NULL;
     char               *post_body      = NULL;
     bool                success        = false;
-    unsigned char       raw_dek[TDE_DEK_LEN]; 
+    unsigned char       raw_dek[TDE_DEK_LEN];
     int                 decoded_len;
+
+    Assert(dek_out != NULL && dek_len != NULL);
     
     post_body = palloc(wrapped_len + 64);
     sprintf(post_body, "{\"ciphertext\": \"%s\"}", wrapped_dek);
@@ -709,7 +711,8 @@ static bool vault_unwrap_dek(const unsigned char* wrapped_dek, int wrapped_len,
             decoded_len = vault_base64_decode(plaintext_b64, raw_dek, TDE_DEK_LEN);
             if(decoded_len == TDE_DEK_LEN)
             {
-                memcpy(dek_out, raw_dek, dek_len);
+                memcpy(dek_out, raw_dek, TDE_DEK_LEN);
+                *dek_len = TDE_DEK_LEN;
                 success = true;
             }
 

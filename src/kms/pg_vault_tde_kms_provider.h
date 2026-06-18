@@ -108,14 +108,16 @@ typedef struct TdeKmsProvider
      * unwrap_dek — decrypt a wrapped DEK back to plaintext.
      *
      * Input  : wrapped[wrapped_len]   — opaque ciphertext from wrap_dek
-     * Output : dek_out[dek_len]       — plaintext DEK; caller MUST
+     *          *dek_len               — capacity of dek_out (must be >= TDE_DEK_LEN)
+     * Output : dek_out[*dek_len]      — plaintext DEK; caller MUST
      *                                   OPENSSL_cleanse after use
+     *          *dek_len               — actual bytes written (always TDE_DEK_LEN on success)
      *
-     * Returns true on success, false if the KEK is unavailable or the
-     * wrapped ciphertext is corrupt.
+     * Returns true on success, false if the buffer is too small, the KEK is
+     * unavailable, or the wrapped ciphertext is corrupt.
      */
     bool (*unwrap_dek)(const unsigned char *wrapped, int wrapped_len,
-                       unsigned char *dek_out, int dek_len);
+                       unsigned char *dek_out, int *dek_len);
 
     /*
      * rewrap_dek — re-wrap an existing DEK under a new KEK version.
