@@ -77,18 +77,6 @@ typedef struct TdeKmsProvider
     bool (*init)(void);
 
     /*
-     * generate_dek — produce a fresh 32-byte AES-256 DEK.
-     *
-     * The provider generates entropy and fills dek_out[dek_len].
-     * For the Vault provider, `pg_strong_random` is the entropy source
-     * (server-side generation; Vault Transit is only used for wrapping).
-     * For the local wallet, same: `pg_strong_random`.
-     *
-     * Returns true on success.
-     */
-    bool (*generate_dek)(unsigned char *dek_out, int dek_len);
-
-    /*
      * wrap_dek — encrypt (wrap) a plaintext DEK using the KMS KEK.
      *
      * Input  : dek[dek_len]           — plaintext DEK (NEVER stored to disk)

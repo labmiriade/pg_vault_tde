@@ -64,12 +64,6 @@ CREATE FUNCTION pg_vault_tde_decrypt_test(bytea)
 -- v1.1: Vault DEK fetch, key rotation utilities, integrity checks
 -- ================================================================
 
--- Fetch DEK from Vault Transit API (returns true on success)
-CREATE FUNCTION pg_vault_tde_vault_fetch_dek()
-    RETURNS boolean
-    LANGUAGE C STRICT
-    AS 'MODULE_PATHNAME', 'pg_vault_tde_vault_fetch_dek_sql';
-
 -- Re-encrypt all rows in an encrypted_heap table with the current DEK.
 -- After key rotation, uses prev_dek fallback to read old-DEK rows.
 -- batch_size is accepted for API compat but currently unused.

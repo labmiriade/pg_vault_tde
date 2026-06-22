@@ -895,7 +895,7 @@ See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
 4. **All-or-nothing table encryption** (→ v1.8): All columns in an `encrypted_heap`
    table are encrypted. Per-column `ENABLE COLUMN ENCRYPTION` DDL is planned for v1.8.
 
-5 **`WITH HOLD` cursor temporary file is unencrypted** (→ v1.7): When a `CURSOR WITH HOLD`
+5. **`WITH HOLD` cursor temporary file is unencrypted** (→ v1.7): When a `CURSOR WITH HOLD`
    spills its result set to a temporary file on disk (e.g. when `work_mem` is exhausted),
    the file is written in **plaintext**. PostgreSQL writes the materialized tuples directly
    through the executor's tuplestore layer, bypassing the TAM write path, so
@@ -903,6 +903,45 @@ See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
 
    **Mitigation until v1.7:** set `work_mem` large enough to keep cursor data in memory,
    or avoid `WITH HOLD` cursors on encrypted tables in memory-constrained environments.
+
+6. **`UPDATE` of an indexed column does not update the index** (⚠️ known bug, → v1.8):
+   On an `encrypted_heap` table, updating a column that is covered by a `tde_btree`
+   (or any) index leaves the index pointing at the **old** key. Subsequent index scans
+   return stale or empty results:
+
+   ```sql
+   CREATE TABLE test (id serial, value text) USING encrypted_heap;
+   CREATE INDEX test_idx ON test USING tde_btree (id tde_int4_enc_ops);
+   INSERT INTO test SELECT i, 'test_' || i FROM generate_series(1, 5) AS i;
+   SET enable_seqscan = off;
+
+   UPDATE test SET id = 7 WHERE id = 3;
+   SELECT * FROM test WHERE id = 7;   -- BUG: 0 rows (index still points at id=3)
+   SELECT * FROM test WHERE id = 3;   -- BUG: returns the row, but with id=7
+
+   REINDEX TABLE test;                -- workaround: rebuilds the index correctly
+   SELECT * FROM test WHERE id = 7;   -- now returns the row
+   ```
+
+   **Cause:** `heap_update` decides whether an update is HOT (heap-only, no index
+   maintenance) by comparing the indexed columns byte-for-byte between the old and new
+   tuple. Because both tuples are encrypted, and the v3 wire format begins with a
+   constant `[VERSION(1) | GENERATION(8)]` prefix, an indexed column that lands in those
+   first 9 bytes looks unchanged to `heap_update` → it always picks a HOT update → the
+   index is never touched. See [doc/pg_vault_tde.md](doc/pg_vault_tde.md) § Known
+   Limitations for the full analysis and the planned fix.
+
+   **Workaround until v1.8:** `REINDEX` the table after updating indexed columns, or use
+   sequential scans (`SET enable_seqscan = on`) when querying recently-updated rows.
+
+   **Schema-level mitigation:** the blind spot is *only* the constant 9-byte
+   `[VERSION | GENERATION]` prefix — every byte from offset 9 onward (IV/ciphertext)
+   changes on each encryption. If the indexed column's datum falls **after the first 9
+   bytes** of the encrypted user-data region, `heap_update` detects the change, skips the
+   HOT path, and maintains the index correctly. Placing the indexed column later in the
+   tuple (so at least ~9 bytes of preceding columns sit before it) re-enables index
+   updates without a `REINDEX`. Putting an indexed fixed-width column (e.g. a leading
+   `int4`/`int8` primary key) first is the case that reliably triggers the bug.
 
 ---
 

@@ -170,7 +170,6 @@ static struct curl_slist *vault_add_namespace_header(struct curl_slist *headers)
 static bool             vault_transit_request(const char *path, const char *body,
                                                vault_response_buf *response);
 static bool             vault_provider_init(void);
-static bool             vault_provider_generate_dek(unsigned char *dek_out, int dek_len);
 static bool             vault_provider_wrap_dek(const unsigned char *dek, int dek_len,
                                                  unsigned char *wrapped_out, int *out_len);
 static bool             vault_provider_unwrap_dek(const unsigned char *wrapped, int wrapped_len,
@@ -871,254 +870,6 @@ vault_provider_rewrap_dek(const unsigned char *old_wrapped, int old_len,
 
     return success;
 }
-
-/*
- * pg_vault_tde_vault_fetch_dek -- fetch DEK from Vault Transit engine.
- *
- * Calls POST /v1/<mount>/datakey/plaintext/<key_name> to generate a new
- * data encryption key.  Vault wraps the key with its master key and returns
- * both the plaintext DEK (for immediate use) and the ciphertext (for
- * backup/recovery).
- *
- * On success: persists the wrapped DEK to shmem/disk and returns true.
- * NOTE: the plaintext DEK is NOT stored globally; per-relation DEKs in
- * TdeRelDekCache are the authoritative in-memory key store (v1.5+).
- *
- * On failure: logs a WARNING and returns false.  The caller decides whether
- * to ereport(ERROR) or allow degraded startup.
- *
- * Thread safety: libcurl easy interface is NOT thread-safe, but PostgreSQL
- * uses processes, not threads -- each backend has its own curl handle.
- */
-bool
-pg_vault_tde_vault_fetch_dek(void)  /* TODO: coverts it's usage to generate DEK */
-{
-    CURL               *curl = NULL;
-    CURLcode            res;
-    struct curl_slist   *headers = NULL;
-    vault_response_buf   response;
-    char                url[1024];
-    char                auth_header[512];
-    char               * volatile plaintext_b64 = NULL;
-    unsigned char       raw_dek[TDE_DEK_LEN];
-    int                 decoded_len;
-    long                http_code = 0;
-    volatile bool       success = false;
-    const char         *effective_token;
-
-    /* Validate GUC parameters */
-    if (pg_vault_tde_vault_url == NULL || pg_vault_tde_vault_url[0] == '\0')
-    {
-        ereport(WARNING,
-                (errmsg("pg_vault_tde: vault_url not configured, skipping Vault DEK fetch")));
-        return false;
-    }
-
-    /*
-     * Obtain the effective token: either the static GUC value (token auth)
-     * or a dynamic login token (AppRole/Kubernetes auth).
-     */
-    effective_token = vault_get_effective_token();
-    if (effective_token == NULL || effective_token[0] == '\0')
-    {
-        ereport(WARNING,
-                (errmsg("pg_vault_tde: no Vault token available (auth_method=%s)",
-                        pg_vault_tde_vault_auth_method ? pg_vault_tde_vault_auth_method : "token")));
-        return false;
-    }
-
-    /* Build URL: /v1/<mount>/datakey/plaintext/<key_name> */
-    snprintf(url, sizeof(url), "%s/v1/%s/datakey/plaintext/%s",
-             pg_vault_tde_vault_url,
-             pg_vault_tde_vault_transit_mount,
-             pg_vault_tde_vault_key_name);
-
-    /* Initialise response buffer */
-    response.alloc = 1024;
-    response.len = 0;
-    response.data = palloc(response.alloc);
-    response.data[0] = '\0';
-
-    curl = curl_easy_init();
-    if (curl == NULL)
-    {
-        ereport(WARNING,
-                (errmsg("pg_vault_tde: curl_easy_init() failed")));
-        pfree(response.data);
-        return false;
-    }
-
-    PG_TRY();
-    {
-        /* Set URL */
-        curl_easy_setopt(curl, CURLOPT_URL, url);
-        curl_easy_setopt(curl, CURLOPT_POST, 1L);
-
-        /*
-         * Request body: specify 256-bit key (32 bytes).
-         * Vault Transit datakey endpoint accepts {"bits": 256}.
-         */
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "{\"bits\": 256}");
-
-        /* Auth header: X-Vault-Token (uses effective_token from login or GUC) */
-        snprintf(auth_header, sizeof(auth_header),
-                 "X-Vault-Token: %s", effective_token);
-        headers = curl_slist_append(headers, auth_header);
-        headers = curl_slist_append(headers, "Content-Type: application/json");
-
-        /* Vault namespace header (enterprise only) */
-        if (pg_vault_tde_vault_namespace != NULL &&
-            pg_vault_tde_vault_namespace[0] != '\0')
-        {
-            char ns_header[512];
-            snprintf(ns_header, sizeof(ns_header),
-                     "X-Vault-Namespace: %s", pg_vault_tde_vault_namespace);
-            headers = curl_slist_append(headers, ns_header);
-        }
-
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-        /* TLS configuration */
-        if (pg_vault_tde_vault_ca_cert != NULL &&
-            pg_vault_tde_vault_ca_cert[0] != '\0')
-        {
-            curl_easy_setopt(curl, CURLOPT_CAINFO, pg_vault_tde_vault_ca_cert);
-        }
-
-        /* Timeout */
-        if (pg_vault_tde_vault_timeout_ms > 0)
-            curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS,
-                             (long) pg_vault_tde_vault_timeout_ms);
-
-        /* Response handler */
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, vault_write_cb);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-
-        /* Perform the request */
-        res = curl_easy_perform(curl);
-
-        if (res != CURLE_OK)
-        {
-            ereport(WARNING,
-                    (errmsg("pg_vault_tde: Vault HTTP request failed: %s",
-                            curl_easy_strerror(res)),
-                     errhint("Check pg_vault_tde.vault_url (%s) and network connectivity",
-                             pg_vault_tde_vault_url)));
-        }
-        else
-        {
-            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-
-            if (http_code != 200)
-            {
-                /*
-                 * HTTP 403 typically means the token has expired.
-                 * Clear cached token so the next attempt re-authenticates.
-                 */
-                if (http_code == 403 && vault_active_token != NULL)
-                {
-                    OPENSSL_cleanse(vault_active_token, strlen(vault_active_token));
-                    pfree(vault_active_token);
-                    vault_active_token = NULL;
-                    ereport(WARNING,
-                            (errmsg("pg_vault_tde: Vault returned 403 — token may be expired; will re-login on next attempt")));
-                }
-                else
-                {
-                    ereport(WARNING,
-                            (errmsg("pg_vault_tde: Vault returned HTTP %ld", http_code),
-                             errdetail("Response: %.256s", response.data)));
-                }
-            }
-            else
-            {
-                /* Extract base64-encoded plaintext DEK from JSON response */
-                plaintext_b64 = vault_json_extract_string(response.data, "plaintext");
-
-                if (plaintext_b64 == NULL)
-                {
-                    ereport(WARNING,
-                            (errmsg("pg_vault_tde: no 'plaintext' field in Vault response"),
-                             errdetail("Response: %.256s", response.data)));
-                }
-                else
-                {
-                    /* Decode base64 → raw 32 bytes */
-                    decoded_len = vault_base64_decode(plaintext_b64, raw_dek,
-                                                     TDE_DEK_LEN);
-
-                    if (decoded_len != TDE_DEK_LEN)
-                    {
-                        ereport(WARNING,
-                                (errmsg("pg_vault_tde: Vault DEK unexpected length: %d (expected %d)",
-                                        decoded_len, TDE_DEK_LEN)));
-                    }
-                    else
-                    {
-                        success = true;
-
-                        ereport(LOG,
-                                (errmsg("pg_vault_tde: DEK fetched from Vault")));
-                    }
-
-                    /* Cleanse the raw DEK from stack */
-                    OPENSSL_cleanse(raw_dek, TDE_DEK_LEN);
-                }
-            }
-        }
-    }
-    PG_CATCH();
-    {
-        /* Cleanse any key material on error path */
-        OPENSSL_cleanse(raw_dek, TDE_DEK_LEN);
-        if (plaintext_b64)
-        {
-            OPENSSL_cleanse(plaintext_b64, strlen(plaintext_b64));
-            pfree(plaintext_b64);
-        }
-        OPENSSL_cleanse(response.data, response.len);
-        pfree(response.data);
-        if (headers)
-            curl_slist_free_all(headers);
-        if (curl)
-            curl_easy_cleanup(curl);
-        PG_RE_THROW();
-    }
-    PG_END_TRY();
-
-    /* Normal cleanup */
-    if (plaintext_b64)
-    {
-        OPENSSL_cleanse(plaintext_b64, strlen(plaintext_b64));
-        pfree(plaintext_b64);
-    }
-    OPENSSL_cleanse(response.data, response.len);
-    pfree(response.data);
-
-    /* Cleanse the auth header which contains the token */
-    OPENSSL_cleanse(auth_header, sizeof(auth_header));
-
-    if (headers)
-        curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-
-    return success;
-}
-
-/*
- * SQL-callable wrapper for pg_vault_tde_vault_fetch_dek().
- *
- * Allows DBA to manually trigger a DEK fetch from Vault/OpenBao Transit.
- * This is useful after key rotation or when the DEK cache TTL expires.
- * Returns true on success, false if Vault is not configured or fetch fails.
- */
-PG_FUNCTION_INFO_V1(pg_vault_tde_vault_fetch_dek_sql);
-PGDLLEXPORT Datum
-pg_vault_tde_vault_fetch_dek_sql(PG_FUNCTION_ARGS)
-{
-    PG_RETURN_BOOL(pg_vault_tde_vault_fetch_dek());
-}
-
 /* ================================================================
  * pg_vault_tde_health_check — unified diagnostic composite (v1.3)
  *
@@ -1532,12 +1283,11 @@ pg_vault_tde_register_bgw(void)
 /* =========================================================================
  * v1.5: KMS Provider vtable for the Vault/OpenBao backend
  *
- * Wraps the existing Vault-specific functions (pg_vault_tde_vault_fetch_dek,
- * etc.) into the
+ * Wraps the existing Vault-specific function into the
  * TdeKmsProvider interface so that pg_vault_tde.c can select providers
  * by name at startup.
  *
- * The vault provider's init(), generate_dek(), wrap_dek(), and unwrap_dek()
+ * The vault provider's init(), wrap_dek(), and unwrap_dek()
  * are thin actual function performing operations.  
  * =========================================================================*/
 
@@ -1717,22 +1467,6 @@ static bool vault_transit_request(const char *path,
 static bool
 vault_provider_init(void)
 {  
-    return true;
-}
-
-static bool
-vault_provider_generate_dek(unsigned char *dek_out, int dek_len)
-{
-    /*
-     * Generate locally with pg_strong_random, then wrap via Vault Transit.
-     * The raw DEK never travels over the network; only the wrapped form does.
-     */
-    if (!pg_strong_random(dek_out, dek_len))
-    {
-        ereport(WARNING,
-                errmsg("pg_vault_tde: vault provider: pg_strong_random failed"));
-        return false;
-    }
     return true;
 }
 
@@ -1941,7 +1675,6 @@ vault_commit_kek_rotation(void)
 static const TdeKmsProvider vault_provider_impl = {
     .name                 = "vault",
     .init                 = vault_provider_init,
-    .generate_dek         = vault_provider_generate_dek,
     .wrap_dek             = vault_provider_wrap_dek,
     .unwrap_dek           = vault_provider_unwrap_dek,
     .rewrap_dek           = vault_provider_rewrap_dek,

@@ -34,7 +34,7 @@ source "$SCRIPT_DIR/lib.sh"
 # Parse arguments
 # ---------------------------------------------------------------------------
 SKIP_BENCH=0
-SKIP_OPENBAO=1
+SKIP_OPENBAO=0
 SKIP_WALLET=0
 SKIP_SCHEMA=0
 SKIP_INSTALL_TEST=0

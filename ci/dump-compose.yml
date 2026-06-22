@@ -55,7 +55,7 @@ services:
         -c pg_vault_tde.dev_mode=on
         -c pg_vault_tde.vault_url=http://vault:${VAULT_MOCK_PORT:-8200}
         -c pg_vault_tde.vault_token=test-token
-        -c pg_vault_tde.vault_mount=transit
+        -c pg_vault_tde.vault_transit_mount=transit
         -c pg_vault_tde.vault_key_name=pg-tde-dek
         -c log_min_messages=warning
     ports:

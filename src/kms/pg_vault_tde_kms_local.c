@@ -142,7 +142,6 @@ static LocalKekRotationCtx *local_kek_rotation_ctx = NULL;
 
 /* KMS provider vtable callbacks */
 static bool local_init(void);
-static bool local_generate_dek(unsigned char *dek_out, int dek_len);
 static bool local_wrap_dek(const unsigned char *dek, int dek_len,
                            unsigned char *wrapped_out, int *out_len);
 static bool local_unwrap_dek(const unsigned char *wrapped, int wrapped_len,
@@ -196,7 +195,6 @@ PG_FUNCTION_INFO_V1(pg_vault_tde_migrate_vault_to_wallet_sql);
 static const TdeKmsProvider local_provider_impl = {
     .name                 = "local",
     .init                 = local_init,
-    .generate_dek         = local_generate_dek,
     .wrap_dek             = local_wrap_dek,
     .unwrap_dek           = local_unwrap_dek,
     .rewrap_dek           = local_rewrap_dek,
@@ -289,24 +287,6 @@ local_init(void)
     local_wallet_state->last_opened = GetCurrentTimestamp();
 
     tde_audit(WALLET_OPEN, NULL, true);
-    return true;
-}
-
-/* -------------------------------------------------------------------------
- * local_generate_dek — use pg_strong_random (not RAND_bytes — fork-safe)
- * -------------------------------------------------------------------------*/
-static bool
-local_generate_dek(unsigned char *dek_out, int dek_len)
-{
-    Assert(dek_out != NULL);
-    Assert(dek_len == TDE_DEK_LEN);
-
-    if (!pg_strong_random(dek_out, dek_len))
-    {
-        ereport(WARNING,
-                errmsg("pg_vault_tde: local provider: pg_strong_random failed"));
-        return false;
-    }
     return true;
 }
 
@@ -1228,7 +1208,7 @@ local_open_wallet(const char *path, const char *passphrase,
  * passphrase.
  *
  * Steps:
- *   1. Generate a fresh 32-byte DEK via pg_strong_random.
+ *   1. Generate a fresh 32-byte KEK via pg_strong_random.
  *   2. Create a new PKCS#12 bag (no cert/key; passphrase-MAC only).
  *   3. Write to wallet_path with chmod 0600.
  *   4. Register the DEK in shmem and in pg_vault_tde_catalog.
@@ -2029,7 +2009,7 @@ pg_vault_tde_wallet_export_bundle_sql(PG_FUNCTION_ARGS)
         bool        isnull;
         Datum       relid_d = SPI_getbinval(tup, tdesc, 1, &isnull);
         Datum       gen_d   = SPI_getbinval(tup, tdesc, 2, &isnull);
-        Datum       wd_d    = SPI_getbinval(tup, tdesc, 4, &isnull);
+        Datum       wd_d    = SPI_getbinval(tup, tdesc, 3, &isnull);
         Oid         rel_oid = DatumGetObjectId(relid_d);
         uint64_t    gen     = (uint64_t) DatumGetInt64(gen_d);
         bytea      *wdek_b  = DatumGetByteaP(wd_d);
@@ -2322,12 +2302,12 @@ pg_vault_tde_wallet_import_bundle_sql(PG_FUNCTION_ARGS)
         SPI_execute_with_args(
             "INSERT INTO pg_vault_tde_catalog "
             "(relid, generation, wrapped_dek, kms_provider) "
-            "VALUES ($1, $2, $3, $4, 'local') "
+            "VALUES ($1, $2, $3, 'local') "
             "ON CONFLICT (relid) DO UPDATE "
             "SET generation = EXCLUDED.generation, "
             "    wrapped_dek = EXCLUDED.wrapped_dek, "
             "    kms_provider = 'local'",
-            4, upd_types, upd_vals, upd_nulls, false, 0);
+            3, upd_types, upd_vals, upd_nulls, false, 0);
     }
 
     SPI_finish();

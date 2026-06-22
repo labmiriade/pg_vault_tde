@@ -53,7 +53,7 @@
 
 #include "access/toast_compression.h" /* TOAST_PGLZ_COMPRESSION_ID */
 #include "src/include/pg_vault_tde_crypto.h"  /* tde_gcm_encrypt, tde_gcm_decrypt,
-                                                  TDE_GCM_OVERHEAD */
+                                                  TDE_V3_OVERHEAD */
 #include "src/include/pg_vault_tde_tam.h"
 #include "src/include/pg_vault_tde_guc.h"      /* pg_vault_tde_enabled */
 #include "src/include/pg_vault_tde_iam.h"      /* tde_iam_build_in_progress,
@@ -242,10 +242,9 @@ tde_decrypt_heap_tuple(HeapTuple enc, Oid relid)
         return copy;
     }
     /*
-     * Minimum size check: TDE_GCM_OVERHEAD (28) is the smallest possible
-     * encrypted payload — a legacy v1 tuple with zero user bytes.  v2/v3
-     * tuples carry TDE_V3_OVERHEAD (37) bytes.  tde_gcm_decrypt detects
-     * the wire-format version from the first byte and validates accordingly.
+     * Minimum size check: every v3 tuple carries TDE_V3_OVERHEAD (37) bytes
+     * (version + generation + IV + GCM tag), so anything shorter is corrupt.
+     * tde_gcm_decrypt rejects any buffer whose first byte is not 0x03.
      */
     if (hdr_len > enc->t_len || enc_len < (Size) TDE_V3_OVERHEAD)
         ereport(ERROR,
@@ -254,10 +253,8 @@ tde_decrypt_heap_tuple(HeapTuple enc, Oid relid)
                         enc_len)));
     pt_buf = tde_gcm_decrypt(relid, enc_data, enc_len, &pt_len);
     /*
-     * We cannot assert an exact overhead value here because the on-disk tuple
-     * may be v1 (28-byte overhead) or v2/v3 (37-byte overhead).
-     * tde_gcm_decrypt performs its own version-specific validation; if it
-     * returned a non-NULL result the plaintext length is correct.
+     * tde_gcm_decrypt validates the v3 wire format and verifies the GCM tag;
+     * a non-NULL result means the plaintext length is correct.
      */
     Assert(pt_buf != NULL);
     plain = (HeapTuple) palloc0(HEAPTUPLESIZE + hdr_len + pt_len);
@@ -2098,9 +2095,9 @@ pg_vault_tde_verify_integrity(PG_FUNCTION_ARGS)
  *   → (total_tuples bigint, encryption_overhead_bytes bigint)
  *
  * Reports the storage overhead imposed by TDE on the given table.
- * Each encrypted tuple carries TDE_GCM_OVERHEAD (28) bytes of overhead:
- * 12-byte IV + 16-byte GCM tag.  The total overhead is simply
- * total_tuples × 28.
+ * Each encrypted tuple carries TDE_V3_OVERHEAD (37) bytes of overhead:
+ * 1-byte version + 8-byte generation + 12-byte IV + 16-byte GCM tag.
+ * The total overhead is simply total_tuples × 37.
  *
  * Uses SPI to count live rows (which also validates readability).
  */

@@ -234,15 +234,6 @@ CREATE FUNCTION pg_vault_tde_refresh_token()
     LANGUAGE C STRICT
     AS 'MODULE_PATHNAME', 'pg_vault_tde_refresh_token';
 
--- Fetch DEK from Vault Transit API (returns true on success)
-CREATE FUNCTION pg_vault_tde_vault_fetch_dek()
-    RETURNS boolean
-    LANGUAGE C STRICT
-    AS 'MODULE_PATHNAME', 'pg_vault_tde_vault_fetch_dek_sql';
-
-REVOKE ALL ON FUNCTION pg_vault_tde_vault_fetch_dek() FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION pg_vault_tde_vault_fetch_dek() TO pg_monitor;
-
 -- ============================================================================
 -- C functions: table re-encryption
 -- ============================================================================

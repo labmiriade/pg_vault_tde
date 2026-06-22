@@ -98,7 +98,7 @@ char *
 tde_toast_decrypt_chunk(Oid parent_relid, const char *enc_data, Size enc_len, Size *out_len)
 {
     Assert(enc_data != NULL);
-    Assert(enc_len > TDE_GCM_OVERHEAD);
+    Assert(enc_len > TDE_V3_OVERHEAD);
 
     return tde_gcm_decrypt(parent_relid, enc_data, enc_len, out_len);
 }

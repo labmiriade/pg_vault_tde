@@ -47,7 +47,7 @@ static PdeLocalConfig* config = NULL;
 
 
 static bool     local_init(PGconn* conn);
-static bool     local_generate_dek(unsigned char* out, int len);
+static bool     pg_vault_tde_catalog_generate_dek(unsigned char* out, int len);
 static bool     local_wrap_dek(const unsigned char* dek, int dek_len,
                                 unsigned char* out, int* out_len);
 static bool     local_unwrap_dek(const unsigned char* wrapped_dek, int wrapped_len,
@@ -501,7 +501,7 @@ static bool local_config_load(PGconn* conn, PdeLocalConfig* config)
 
 /** PdeKmsProvider.generate_dek — fill @out with @len random bytes via pg_strong_random(). */
 static bool
-local_generate_dek(unsigned char *out, int len)
+pg_vault_tde_catalog_generate_dek(unsigned char *out, int len)
 {
     Assert(out != NULL);
     Assert(len == TDE_DEK_LEN);
@@ -567,7 +567,7 @@ static bool local_init(PGconn *conn)
 static const PdeKmsProvider local_provider_impl = {
     .name           = "local",
     .init           = local_init, 
-    .generate_dek   = local_generate_dek, 
+    .generate_dek   = pg_vault_tde_catalog_generate_dek, 
     .wrap_dek       = local_wrap_dek, 
     .unwrap_dek     = local_unwrap_dek,
     .shutdown       = local_shutdown, 

@@ -34,20 +34,6 @@ void pg_vault_tde_kms_shmem_request(void);
 void pg_vault_tde_kms_shmem_init(void);
 
 /*
- * Vault-provider DEK fetch: connects to HashiCorp Vault / OpenBao Transit,
- * generates a new DEK, and stores it in shared memory.
- *
- * This function is called ONLY by the Vault KMS provider (pg_vault_tde_kms_vault.c)
- * from its `init()` and `generate_dek()` vtable callbacks.  The general
- * cross-provider interface is tde_active_kms_provider->wrap_dek() /
- * ->unwrap_dek() (see pg_vault_tde_kms_provider.h).
- *
- * Returns true on success (DEK stored in shmem), false on Vault unreachable
- * or auth failure.  Non-fatal on failure — caller decides error policy.
- */
-bool pg_vault_tde_vault_fetch_dek(void);
-
-/*
  * Background worker registration (v1.3).
  * Registers the token renewal BGW if pg_vault_tde.bgw_enabled = true.
  * Must be called from _PG_init() before postmaster fork.

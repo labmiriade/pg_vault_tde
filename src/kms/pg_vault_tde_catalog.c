@@ -552,6 +552,21 @@ pg_vault_tde_kms_get_rel_prev_dek(Oid relid,
     return false;
 }
 
+/*
+ * generate_dek — produce a fresh 32-byte AES-256 DEK
+ * Returns true on success.
+ */
+static bool pg_vault_tde_catalog_generate_dek(unsigned char *dek_out, int dek_len)
+{
+    if (!pg_strong_random(dek_out, dek_len))
+    {
+        ereport(WARNING,
+                errmsg("pg_vault_tde: vault provider: pg_strong_random failed"));
+        return false;
+    }
+    return true;
+}
+
 /* -------------------------------------------------------------------------
  * pg_vault_tde_catalog_register_rel — called on CREATE TABLE
  * -------------------------------------------------------------------------*/
@@ -591,7 +606,7 @@ pg_vault_tde_catalog_register_rel(Oid relid)
                        "register DEK for relid=%u", relid));
 
     /* Generate a fresh DEK */
-    if (!tde_active_kms_provider->generate_dek(dek, TDE_DEK_LEN))
+    if (!pg_vault_tde_catalog_generate_dek(dek, TDE_DEK_LEN))
     {
         OPENSSL_cleanse(dek, TDE_DEK_LEN);
         ereport(ERROR,
@@ -710,7 +725,7 @@ pg_vault_tde_catalog_update_rel_dek(Oid relid)
                        "update DEK for relid=%u", relid));
 
     /* Generate a fresh DEK */
-    if (!tde_active_kms_provider->generate_dek(dek, TDE_DEK_LEN))
+    if (!pg_vault_tde_catalog_generate_dek(dek, TDE_DEK_LEN))
     {
         OPENSSL_cleanse(dek, TDE_DEK_LEN);
         ereport(ERROR,
