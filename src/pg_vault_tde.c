@@ -311,7 +311,7 @@ tde_object_access_hook(ObjectAccessType access, Oid classId, Oid objectId,
      * is idempotent: if the entry already exists it returns immediately
      * without overwriting the existing DEK.
      */
-    pg_vault_tde_catalog_register_rel(objectId, pg_vault_tde_vault_key_name);
+    pg_vault_tde_catalog_register_rel(objectId);
 
     ereport(DEBUG1,
             errmsg("pg_vault_tde: [object_access] registered DEK for new "
@@ -475,7 +475,7 @@ tde_process_utility_hook(PlannedStmt *pstmt,
             return;
         }
 
-        pg_vault_tde_catalog_register_rel(relid, pg_vault_tde_vault_key_name);
+        pg_vault_tde_catalog_register_rel(relid);
         tde_audit(RELATION_ENCRYPT, psprintf("%u", relid), true);
 
         ereport(DEBUG1,
@@ -496,9 +496,8 @@ tde_process_utility_hook(PlannedStmt *pstmt,
      * After the table is committed we can look it up by name and register
      * it in the catalog.
      *
-     * We use SPI to INSERT into pg_vault_tde_catalog.  The vault_key_name
-     * defaults to pg_vault_tde.vault_key_name GUC (or "local" for wallet
-     * provider).  The wrapped_dek column is populated lazily on first access
+     * We use SPI to INSERT into pg_vault_tde_catalog. 
+     * The wrapped_dek column is populated lazily on first access
      * by the catalog hot-path.
      */
     if (is_create_encrypted)
@@ -539,7 +538,7 @@ tde_process_utility_hook(PlannedStmt *pstmt,
          * pg_vault_tde_catalog_register_rel() manages its own SPI connection
          * and calls OPENSSL_cleanse() on the plaintext DEK after wrapping.
          */
-        pg_vault_tde_catalog_register_rel(relid, pg_vault_tde_vault_key_name);
+        pg_vault_tde_catalog_register_rel(relid);
         tde_audit(RELATION_ENCRYPT, psprintf("%u", relid), true);
 
         ereport(DEBUG1,

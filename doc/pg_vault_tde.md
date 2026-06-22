@@ -444,9 +444,9 @@ overhead percentages. Use `pg_vault_tde.enabled = off` to isolate pure TAM
 overhead (no crypto) from actual encryption cost.
 
 ```
-┌───────────────────────────────────────────────────┐
+┌────────────────────────────────────────────────────┐
 │  Shared memory (TdeRelDekCache)                    │
-│  ─────────────────────────────────────────────────│
+│  ──────────────────────────────────────────────────│
 │  LWLock (embedded by value)                        │
 │  capacity: int  (pg_vault_tde.max_encrypted_rels)  │
 │  used: int                                         │
@@ -456,16 +456,16 @@ overhead (no crypto) from actual encryption cost.
 │    ├─ prev_dek[32]: char (rotation window)         │
 │    ├─ generation: uint64                           │
 │    └─ dek_valid / prev_dek_valid: bool             │
-└───────────────────────────────────────────────────┘
+└────────────────────────────────────────────────────┘
                ▲ pg_vault_tde_kms_get_rel_dek(relid)
                │  fast path:  LW_SHARED cache hit
                │  slow path:  catalog read → KMS unwrap → cache insert
-┌───────────────────────────────────────────────────┐
+┌────────────────────────────────────────────────────┐
 │  pg_vault_tde_catalog  (on-disk system table)      │
-│  ─────────────────────────────────────────────────│
-│  relid, vault_key_name, generation,                │
+│  ──────────────────────────────────────────────────│
+│  relid, generation,                                │
 │  wrapped_dek, kms_provider, created_at, updated_at │
-└───────────────────────────────────────────────────┘
+└────────────────────────────────────────────────────┘
 ```
 
 1. On first encrypt/decrypt, backend copies DEK from shmem under `LW_SHARED`.

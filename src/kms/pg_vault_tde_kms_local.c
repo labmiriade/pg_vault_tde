@@ -90,7 +90,7 @@
  * Bundle layout:
  *   magic(8) + version(1) + label(63) + timestamp(8 BE) +
  *   wallet_size(4 BE) + wallet_bytes(N) +
- *   catalog_count(4 BE) + (relid(4) + gen(8) + kname_len(2) + kname +
+ *   catalog_count(4 BE) + (relid(4) + gen(8) +
  *                           wrapped_len(2) + wrapped_bytes) * N +
  *   HMAC-SHA256(32)
  */
@@ -1863,7 +1863,7 @@ pg_vault_tde_wallet_lock_sql(PG_FUNCTION_ARGS)
  *   magic(8)  + version(1) + label(63, NUL-padded)
  *   + timestamp(8) + wallet_size(4) + wallet_bytes(N)
  *   + catalog_count(4)
- *     FOR EACH: relid(4) + generation(8) + kname_len(2) + kname + wrapped_len(2) + wrapped_bytes
+ *     FOR EACH: relid(4) + generation(8) + wrapped_len(2) + wrapped_bytes
  *   + HMAC-SHA256(32)   key = PBKDF2(passphrase, BUNDLE_HMAC_SALT, 1, 32, SHA256)
  *
  * The bundle is written to `dest_path` with 0600 permissions.
@@ -1935,7 +1935,7 @@ pg_vault_tde_wallet_export_bundle_sql(PG_FUNCTION_ARGS)
     }
 
     spi_ret = SPI_execute(
-        "SELECT relid, generation, vault_key_name, wrapped_dek "
+        "SELECT relid, generation, wrapped_dek "
         "FROM pg_vault_tde_catalog WHERE kms_provider = 'local'",
         true, 0);
     if (spi_ret != SPI_OK_SELECT)
@@ -2029,18 +2029,14 @@ pg_vault_tde_wallet_export_bundle_sql(PG_FUNCTION_ARGS)
         bool        isnull;
         Datum       relid_d = SPI_getbinval(tup, tdesc, 1, &isnull);
         Datum       gen_d   = SPI_getbinval(tup, tdesc, 2, &isnull);
-        Datum       kn_d    = SPI_getbinval(tup, tdesc, 3, &isnull);
         Datum       wd_d    = SPI_getbinval(tup, tdesc, 4, &isnull);
         Oid         rel_oid = DatumGetObjectId(relid_d);
         uint64_t    gen     = (uint64_t) DatumGetInt64(gen_d);
-        char       *kname   = isnull ? "" : TextDatumGetCString(kn_d);
         bytea      *wdek_b  = DatumGetByteaP(wd_d);
         uint32_t    relid_be = htonl(rel_oid);
         uint64_t    gen_be;
         uint8_t     gen_bytes[8];
-        uint16_t    kname_len_be;
         uint16_t    wdek_len_be;
-        uint16_t    kname_len  = (uint16_t) strlen(kname);
         uint16_t    wdek_len   = (uint16_t) VARSIZE_ANY_EXHDR(wdek_b);
 
         /* relid 4-byte BE */
@@ -2057,12 +2053,6 @@ pg_vault_tde_wallet_export_bundle_sql(PG_FUNCTION_ARGS)
         gen_bytes[7] =  gen        & 0xFF;
         (void) gen_be;
         BW(gen_bytes, 8);
-
-        /* kname: 2-byte BE length + bytes */
-        kname_len_be = htons(kname_len);
-        BW(&kname_len_be, 2);
-        if (kname_len > 0)
-            BW(kname, kname_len);
 
         /* wrapped_dek: 2-byte BE length + bytes */
         wdek_len_be = htons(wdek_len);
@@ -2296,15 +2286,12 @@ pg_vault_tde_wallet_import_bundle_sql(PG_FUNCTION_ARGS)
         Oid       rel_oid;
         uint8_t   gen_bytes[8];
         uint64_t  gen;
-        uint16_t  kname_len_be;
-        uint16_t  kname_len;
-        char      kname_buf[256];
         uint16_t  wdek_len_be;
         uint16_t  wdek_len;
         bytea    *wdek_b;
-        Datum     upd_vals[4];
-        Oid       upd_types[4];
-        char      upd_nulls[4];
+        Datum     upd_vals[3];
+        Oid       upd_types[3];
+        char      upd_nulls[3];
         int       b;
 
         if (pos + 4 + 8 + 2 > (size_t)(fsize - BUNDLE_HMAC_LEN))
@@ -2314,10 +2301,6 @@ pg_vault_tde_wallet_import_bundle_sql(PG_FUNCTION_ARGS)
         memcpy(gen_bytes, buf + pos, 8); pos += 8;
         gen = 0;
         for (b = 0; b < 8; b++) gen = (gen << 8) | gen_bytes[b];
-
-        memcpy(&kname_len_be, buf + pos, 2); kname_len = ntohs(kname_len_be); pos += 2;
-        if (kname_len > 255) kname_len = 255;
-        memcpy(kname_buf, buf + pos, kname_len); kname_buf[kname_len] = '\0'; pos += kname_len;
 
         memcpy(&wdek_len_be, buf + pos, 2); wdek_len = ntohs(wdek_len_be); pos += 2;
         if (pos + wdek_len > (size_t)(fsize - BUNDLE_HMAC_LEN))
@@ -2330,21 +2313,18 @@ pg_vault_tde_wallet_import_bundle_sql(PG_FUNCTION_ARGS)
 
         upd_vals[0] = ObjectIdGetDatum(rel_oid);
         upd_vals[1] = Int64GetDatum((int64) gen);
-        upd_vals[2] = CStringGetTextDatum(kname_buf);
-        upd_vals[3] = PointerGetDatum(wdek_b);
+        upd_vals[2] = PointerGetDatum(wdek_b);
         upd_types[0] = OIDOID;
         upd_types[1] = INT8OID;
-        upd_types[2] = TEXTOID;
-        upd_types[3] = BYTEAOID;
-        memset(upd_nulls, ' ', 4);
+        upd_types[2] = BYTEAOID;
+        memset(upd_nulls, ' ', 3);
 
         SPI_execute_with_args(
             "INSERT INTO pg_vault_tde_catalog "
-            "(relid, generation, vault_key_name, wrapped_dek, kms_provider) "
+            "(relid, generation, wrapped_dek, kms_provider) "
             "VALUES ($1, $2, $3, $4, 'local') "
             "ON CONFLICT (relid) DO UPDATE "
             "SET generation = EXCLUDED.generation, "
-            "    vault_key_name = EXCLUDED.vault_key_name, "
             "    wrapped_dek = EXCLUDED.wrapped_dek, "
             "    kms_provider = 'local'",
             4, upd_types, upd_vals, upd_nulls, false, 0);

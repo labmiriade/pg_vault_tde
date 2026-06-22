@@ -556,13 +556,12 @@ pg_vault_tde_kms_get_rel_prev_dek(Oid relid,
  * pg_vault_tde_catalog_register_rel — called on CREATE TABLE
  * -------------------------------------------------------------------------*/
 void
-pg_vault_tde_catalog_register_rel(Oid relid, const char *vault_key_name)
+pg_vault_tde_catalog_register_rel(Oid relid)
 {
     unsigned char dek[TDE_DEK_LEN];
     unsigned char wrapped[512];
     int           wrapped_len = sizeof(wrapped);
-    char          generated_key_name[64];
-    const char   *effective_key_name;
+  
     bytea *wrapped_bytea;
 
     Relation  rel;
@@ -611,16 +610,6 @@ pg_vault_tde_catalog_register_rel(Oid relid, const char *vault_key_name)
 
     OPENSSL_cleanse(dek, TDE_DEK_LEN);
 
-    /* Construct key name if not provided */
-    if (vault_key_name && vault_key_name[0] != '\0')
-        effective_key_name = vault_key_name;
-    else
-    {
-        snprintf(generated_key_name, sizeof(generated_key_name),
-                 "pg-tde-rel-%u", relid);
-        effective_key_name = generated_key_name;
-    }
-
     catalog_oid = get_relname_relid("pg_vault_tde_catalog", ext_ns);
     if (!OidIsValid(catalog_oid))
         ereport(ERROR, (errmsg("catalog pg_vault_tde_catalog not found")));
@@ -631,7 +620,6 @@ pg_vault_tde_catalog_register_rel(Oid relid, const char *vault_key_name)
     memset(isnull, false, sizeof(isnull));
 
     values[Anum_pg_vault_tde_relid-1] = ObjectIdGetDatum(relid);
-    values[Anum_pg_vault_tde_key_name-1] = CStringGetTextDatum(effective_key_name);
     values[Anum_pg_vault_tde_generation-1] = Int64GetDatum(1);
 
     wrapped_bytea = (bytea *) palloc0(VARHDRSZ + wrapped_len);
@@ -691,13 +679,12 @@ pg_vault_tde_catalog_register_rel(Oid relid, const char *vault_key_name)
  * the new key from the catalog.
  * -------------------------------------------------------------------------*/
 void
-pg_vault_tde_catalog_update_rel_dek(Oid relid, const char *vault_key_name)
+pg_vault_tde_catalog_update_rel_dek(Oid relid)
 {
     unsigned char dek[TDE_DEK_LEN];
     unsigned char wrapped[512];
     int           wrapped_len = sizeof(wrapped);
-    char          generated_key_name[64];
-    const char   *effective_key_name;
+
     bytea        *wrapped_bytea;
 
     Relation    rel;
@@ -742,15 +729,6 @@ pg_vault_tde_catalog_update_rel_dek(Oid relid, const char *vault_key_name)
 
     OPENSSL_cleanse(dek, TDE_DEK_LEN);
 
-    if (vault_key_name && vault_key_name[0] != '\0')
-        effective_key_name = vault_key_name;
-    else
-    {
-        snprintf(generated_key_name, sizeof(generated_key_name),
-                 "pg-tde-rel-%u", relid);
-        effective_key_name = generated_key_name;
-    }
-
     catalog_oid = get_relname_relid("pg_vault_tde_catalog", ext_ns);
     if (!OidIsValid(catalog_oid))
         ereport(ERROR, (errmsg("pg_vault_tde_catalog not found")));
@@ -792,13 +770,11 @@ pg_vault_tde_catalog_update_rel_dek(Oid relid, const char *vault_key_name)
 
     values[Anum_pg_vault_tde_wrapped_dek-1]  = PointerGetDatum(wrapped_bytea);
     values[Anum_pg_vault_tde_kms_provider-1] = CStringGetTextDatum(pg_vault_tde_kms_provider);
-    values[Anum_pg_vault_tde_key_name-1]     = CStringGetTextDatum(effective_key_name);
     values[Anum_pg_vault_tde_updated_at-1]   = TimestampTzGetDatum(GetCurrentTransactionStartTimestamp());
 
     do_replace[Anum_pg_vault_tde_wrapped_dek-1]  = true;
     do_replace[Anum_pg_vault_tde_generation-1]   = true;
     do_replace[Anum_pg_vault_tde_kms_provider-1] = true;
-    do_replace[Anum_pg_vault_tde_key_name-1]     = true;
     do_replace[Anum_pg_vault_tde_updated_at-1]   = true;
 
     new_tuple = heap_modify_tuple(old_tuple, tup_desc, values, isnull, do_replace);

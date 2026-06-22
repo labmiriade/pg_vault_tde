@@ -737,7 +737,7 @@ pg_vault_tde_index_build_range_scan(Relation heap_rel,
             {
                 BlockNumber     blkno =  ItemPointerGetBlockNumber(&itid); 
                 OffsetNumber off;
-                
+
                 if(blkno != root_blkno)
                 {
                     Buffer buf = ReadBuffer(heap_rel, blkno);

@@ -317,7 +317,6 @@ CREATE FUNCTION pg_vault_tde_hw_accel_info(
 -- the source of truth for DEK restoration after server restart.
 CREATE TABLE IF NOT EXISTS pg_vault_tde_catalog (
     relid           oid          NOT NULL,          -- pg_class.oid
-    vault_key_name  text,                            -- KMS key name
     generation      bigint       NOT NULL DEFAULT 1, -- DEK rotation epoch
     wrapped_dek     bytea,                           -- provider-opaque wrapped DEK bytes
     kms_provider    text         NOT NULL DEFAULT 'vault',

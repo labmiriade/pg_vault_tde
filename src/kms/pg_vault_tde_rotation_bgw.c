@@ -380,7 +380,7 @@ pg_vault_tde_rotation_bgw_main(Datum main_arg)
                                 "have DEK entries", args.relid)));
 
             pg_vault_tde_catalog_zero_rel_dek(args.relid);
-            pg_vault_tde_catalog_update_rel_dek(args.relid, pg_vault_tde_vault_key_name);
+            pg_vault_tde_catalog_update_rel_dek(args.relid);
             CommandCounterIncrement();
 
             reindex_index(NULL, args.relid, false,
@@ -390,7 +390,7 @@ pg_vault_tde_rotation_bgw_main(Datum main_arg)
         else
         {
             pg_vault_tde_catalog_zero_rel_dek(args.relid);
-            pg_vault_tde_catalog_update_rel_dek(args.relid, pg_vault_tde_vault_key_name);
+            pg_vault_tde_catalog_update_rel_dek(args.relid);
             /* CommandCounterIncrement makes the new catalog row visible to kms_get_rel_dek's
              * slow path — without it, reencrypt_table re-encrypts with the old DEK. */
             CommandCounterIncrement();

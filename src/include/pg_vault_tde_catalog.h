@@ -9,7 +9,7 @@
  * Each encrypted_heap relation has its own DEK (v1.5+), fetched from the
  * active KMS provider and cached in a fixed-size shmem array (TdeRelDekCache).
  *
- * On-disk persistence: pg_vault_tde_catalog(relid, vault_key_name, generation,
+ * On-disk persistence: pg_vault_tde_catalog(relid, generation,
  * wrapped_dek, created_at).  The in-memory cache is authoritative at runtime;
  * the catalog is the authoritative source for DEK wrapping/unwrapping at
  * startup and after a server restart.
@@ -122,12 +122,8 @@ bool pg_vault_tde_kms_get_rel_prev_dek(Oid relid,
  *   and from the object_access_hook during CTAS.
  *   Idempotent: if a catalog entry for relid already exists, returns immediately
  *   without generating a new DEK (the existing key remains valid).
- *
- *   vault_key_name: for Vault provider, the named Transit key (e.g.
- *   "pg-tde-rel-<relfilenode>"). For local wallet, the slot label.
- *   May be NULL — provider generates a name from the relfilenode.
  */
-void pg_vault_tde_catalog_register_rel(Oid relid, const char *vault_key_name);
+void pg_vault_tde_catalog_register_rel(Oid relid);
 
 /*
  * pg_vault_tde_catalog_update_rel_dek:
@@ -138,7 +134,7 @@ void pg_vault_tde_catalog_register_rel(Oid relid, const char *vault_key_name);
  *   concurrent readers re-fetch the new key from the catalog.
  *   Raises ERROR if no catalog entry exists for relid.
  */
-void pg_vault_tde_catalog_update_rel_dek(Oid relid, const char *vault_key_name);
+void pg_vault_tde_catalog_update_rel_dek(Oid relid);
 
 /*
  * pg_vault_tde_catalog_deregister_rel:
