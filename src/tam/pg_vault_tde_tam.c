@@ -599,6 +599,8 @@ pg_vault_tde_index_build_range_scan(Relation heap_rel,
     double                  reltuples = 0;
     Datum                   values[INDEX_MAX_KEYS];
     bool                    isnull[INDEX_MAX_KEYS];
+    OffsetNumber            root_offsets[MaxHeapTuplesPerPage];
+    BlockNumber             root_blkno = InvalidBlockNumber;
     /*
      * TOAST relations: do NOT delegate to heapam's index_build_range_scan.
      * heapam's implementation calls heap_getnext, whose PG18 identity check
@@ -667,6 +669,8 @@ pg_vault_tde_index_build_range_scan(Relation heap_rel,
             HeapTuple       heapTuple;
             bool            tupleIsAlive = true;
             MemoryContext   oldcxt;
+            ItemPointerData itid;
+
             CHECK_FOR_INTERRUPTS();
             /*
              * Reset per-tuple memory from the previous iteration.  This
@@ -720,6 +724,40 @@ pg_vault_tde_index_build_range_scan(Relation heap_rel,
             oldcxt = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
             FormIndexDatum(index_info, slot, estate, values, isnull);
             heapTuple = ExecFetchSlotHeapTuple(slot, false, NULL);
+
+
+            /* 
+             * If HeapTuple is HeapOnly it can't have index to directly 
+             * point to it. The index should point to the root tuple (line pointer).
+             * This happen if a tuple has been update in HOT method.
+             */
+            itid = heapTuple->t_self;
+
+            if(HeapTupleIsHeapOnly(heapTuple))
+            {
+                BlockNumber     blkno =  ItemPointerGetBlockNumber(&itid); 
+                OffsetNumber off;
+                
+                if(blkno != root_blkno)
+                {
+                    Buffer buf = ReadBuffer(heap_rel, blkno);
+                    LockBuffer(buf, BUFFER_LOCK_SHARE);
+
+                    /* 
+                     * Populate a 1-based OffsetNumber array with values for the 
+                     * whole page. Select the correspondent to heapTuple below 
+                     * in the code with ItemPointerGetOffsetNumber
+                     */
+                    heap_get_root_tuples(BufferGetPage(buf), root_offsets);
+
+                    LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+                    ReleaseBuffer(buf);
+                    root_blkno = blkno;
+                }
+
+                off = ItemPointerGetOffsetNumber(&itid);
+                ItemPointerSet(&itid, blkno, root_offsets[off-1]);
+            }
             /*
              * If a tde_btree index is being built (signalled by IAM's
              * ambuild), encrypt each non-null index key value with
@@ -761,13 +799,13 @@ pg_vault_tde_index_build_range_scan(Relation heap_rel,
                     }
                 }
                 MemoryContextSwitchTo(oldcxt);
-                callback(index_rel, &heapTuple->t_self, enc_values, enc_isnull,
+                callback(index_rel, &itid, enc_values, enc_isnull,
                          tupleIsAlive, callback_state);
             }
             else
             {
                 MemoryContextSwitchTo(oldcxt);
-                callback(index_rel, &heapTuple->t_self, values, isnull,
+                callback(index_rel, &itid, values, isnull,
                          tupleIsAlive, callback_state);
             }
             reltuples += 1;
