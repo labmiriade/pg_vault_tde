@@ -15,19 +15,19 @@
  * We do NOT hardcode an ENGINE; the default provider handles this, meaning
  * the code benefits from AES-NI on modern x86/ARM without any extra work.
  *
- * Ciphertext wire format:
- *   [  IV  (12 bytes) ][ CIPHERTEXT (plaintext_len bytes) ][ GCM TAG (16 bytes) ]
+ * Ciphertext wire format (v4 IV-first trailer):
+ *   [ IV(12) ][ CIPHERTEXT(plaintext_len) ][ GCM TAG(16) ][ VERSION(1) ][ GEN(8) ]
  *
  * A 12-byte (96-bit) IV is the NIST-recommended size for GCM.
  * We generate it via PostgreSQL's pg_strong_random() which is /dev/urandom
  * backed on Linux \u2014 we do NOT use OpenSSL's RAND_bytes to stay within the
  * PostgreSQL memory/resource model.
  *
- * The GCM tag (16 bytes) is appended last, matching the common TLS layout
- * and simplifying audits against known implementations.
+ * IV-first so the blob differs from byte 0 every time: heap_update never sees
+ * a constant prefix, so HOT is never wrongly chosen and tde_btree stays coherent.
  */
 #include "postgres.h"
-#include "miscadmin.h"          /* MyDatabaseId — needed for v3 AAD binding */
+#include "miscadmin.h"          /* MyDatabaseId — needed for AAD binding */
 #include "utils/memutils.h"
 #include "common/pg_prng.h"
 #include <openssl/evp.h>
@@ -129,8 +129,7 @@ tde_crypto_ctx_cleanup(void)
 }
 
 /*
- * tde_compute_aad -- build the 16-byte AEAD Additional Authenticated Data
- *                    for the v3 wire format.
+ * tde_compute_aad -- build the 16-byte AEAD Additional Authenticated Data.
  *
  * AAD layout (all fields little-endian):
  *   [MyDatabaseId(4) | relid(4) | generation(8)]
@@ -147,7 +146,7 @@ tde_crypto_ctx_cleanup(void)
  * tag check after rotation (belt-and-suspenders on top of the prev_dek path).
  */
 static void
-tde_compute_aad(Oid relid, uint64 generation, unsigned char aad[TDE_V3_AAD_LEN])
+tde_compute_aad(Oid relid, uint64 generation, unsigned char aad[TDE_V4_AAD_LEN])
 {
     uint32 dboid = (uint32) MyDatabaseId;
     uint32 rel   = (uint32) relid;
@@ -161,27 +160,20 @@ tde_compute_aad(Oid relid, uint64 generation, unsigned char aad[TDE_V3_AAD_LEN])
  * tde_gcm_encrypt_core
  *
  * Encrypts @plaintext_len bytes at @plaintext using AES-256-GCM.
- * 
- * When relid is valid table OID, produces a v3 wire format: 
- *   [VERSION(1:0x03) | GENERATION(8) | IV(12) | CT(N) | TAG(16)]
- * 
- * where TAG is GCM tag that covers a 16-byte AAD (Additional Authenticated Data)
- * computed from (MyDatabaseId, relid, generation)
- * 
- * Where relid == InvalidOid (backup-path), falls back to the v2 wire 
- * format without AAD.
- * 
- * Returns a palloc'd buffer. The caller MUST class OPENSSL_cleanse + pfree
- * on the returned buffer when done.
+ *
+ * Produces the v4 wire format [IV(12) | CT(N) | TAG(16) | VERSION(1) | GEN(8)];
+ * the tag covers a 16-byte AAD from (MyDatabaseId, relid, generation).
+ *
+ * Returns a palloc'd buffer. The caller MUST OPENSSL_cleanse + pfree it.
  * 
  * @param dek           Data Encryption Key used for encryption
  * @param dek_len       Data Encryption Key length
- * @param relid         relation OID for AAD (InvalidOid = no AAD -> v2)
+ * @param relid         relation OID for AAD
  * @param plaintext     pointer to plaintext data
  * @param plaintext_len number of byte to be encrypted
  * @param out_len       on return, total buffer length
- * 
- * @returns             palloc'd [VERSION|GEN|IV|CT|TAG] buffer or die
+ *
+ * @returns             palloc'd [IV|CT|TAG|VERSION|GEN] buffer or die
  *  
  */
 
@@ -194,6 +186,8 @@ tde_gcm_encrypt_core(const unsigned char* dek, int dek_len, Oid relid,
     unsigned char*  iv_ptr;
     unsigned char*  ct_ptr;
     unsigned char*  tag_ptr;
+    unsigned char*  version_ptr; 
+    unsigned char*  gen_ptr;
     int             olen = 0;
     int             flen = 0;
     Size            total;
@@ -203,19 +197,23 @@ tde_gcm_encrypt_core(const unsigned char* dek, int dek_len, Oid relid,
     Assert(out_len != NULL);
     Assert(OidIsValid(relid));
 
-    /* Wire format: [VERSION(1) | GEN(8) | IV(12) | CT(N) | TAG(16)] */
-    total = plaintext_len + TDE_V3_OVERHEAD;
+    /* Wire format: [IV(12) | CT(N) | TAG(16) | VERSION(1) | GEN(8) |] */
+    total = plaintext_len + TDE_V4_OVERHEAD;
 
     out_buf = (char*) palloc0(total);
-    ((unsigned char *) out_buf)[0] = TDE_V3_VERSION_BYTE;
-
-    gen = pg_vault_tde_catalog_get_rel_generation(relid);
-    memcpy(out_buf + 1, &gen, TDE_V3_GEN_LEN);
-
+   
     /*Calculate ptr position for every component of the layout*/
-    iv_ptr = (unsigned char *) out_buf + 1 + TDE_V3_GEN_LEN;
+    iv_ptr = (unsigned char *) out_buf;
     ct_ptr = iv_ptr + TDE_GCM_IV_LEN;
     tag_ptr = ct_ptr + plaintext_len;
+    version_ptr = tag_ptr + TDE_GCM_TAG_LEN;
+    gen_ptr = version_ptr + 1;
+
+    version_ptr[0] = TDE_V4_VERSION_BYTE;
+
+    gen = pg_vault_tde_catalog_get_rel_generation(relid);
+    memcpy(gen_ptr, &gen, TDE_V4_GEN_LEN);
+
 
     /*
      * Fetch the next IV from per-backend batch (256 IVs per pg_strong_random call)
@@ -266,16 +264,16 @@ tde_gcm_encrypt_core(const unsigned char* dek, int dek_len, Oid relid,
      * cannot be replayed into a different table or database.
      */
     {
-        unsigned char aad[TDE_V3_AAD_LEN];
+        unsigned char aad[TDE_V4_AAD_LEN];
         int           aad_len = 0;
 
         tde_compute_aad(relid, gen, aad);
-        if(EVP_EncryptUpdate(ctx, NULL, &aad_len, aad, TDE_V3_AAD_LEN) != 1)
+        if(EVP_EncryptUpdate(ctx, NULL, &aad_len, aad, TDE_V4_AAD_LEN) != 1)
         {
-            OPENSSL_cleanse(aad, TDE_V3_AAD_LEN);
+            OPENSSL_cleanse(aad, TDE_V4_AAD_LEN);
             goto gcm_error;
         }
-        OPENSSL_cleanse(aad, TDE_V3_AAD_LEN);
+        OPENSSL_cleanse(aad, TDE_V4_AAD_LEN);
     }
 
     if(EVP_EncryptUpdate(ctx, ct_ptr, &olen,
@@ -346,7 +344,7 @@ tde_gcm_encrypt(Oid relid, const char *plaintext, Size plaintext_len, Size *out_
  * causes an ereport(ERROR) (not a WARNING) \u2014 we must never return
  * unauthenticated plaintext to the query executor.
  *
- * @param ciphertext      [IV|CIPHERTEXT|TAG] buffer
+ * @param ciphertext      [IV|CT|TAG|VERSION|GEN] buffer
  * @param ciphertext_len  total buffer length
  * @param out_len         on return, plaintext length
  * @returns               palloc'd plaintext buffer; caller cleans up
@@ -359,6 +357,9 @@ tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len, Size *ou
     const unsigned char *iv_ptr;
     const unsigned char *ct_ptr;
     const unsigned char *tag_ptr;
+    const unsigned char *version_ptr;
+    const unsigned char *gen_ptr;
+
     char               *out_buf;
     Size                pt_len;
     int                 olen = 0,
@@ -369,26 +370,27 @@ tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len, Size *ou
     Assert(ciphertext != NULL);
     Assert(out_len != NULL);
 
-    if (ciphertext_len <= (Size)(TDE_GCM_IV_LEN + TDE_GCM_TAG_LEN))
+    if (ciphertext_len <= (Size) TDE_V4_OVERHEAD)
         ereport(ERROR,
                 (errmsg("[CRYPTO] Ciphertext too short for AES-256-GCM")));
 
-    /* Wire format: [VERSION(1) | GENERATION(8) | IV(12) | CT(N) | TAG(16)] */
-    if ((unsigned char) ciphertext[0] != TDE_V3_VERSION_BYTE ||
-        ciphertext_len <= (Size) TDE_V3_OVERHEAD)
-        ereport(ERROR,
-                (errmsg("[CRYPTO] Unrecognized ciphertext version byte or buffer too short")));
-
-    pt_len  = ciphertext_len - TDE_V3_OVERHEAD;
-    iv_ptr  = (const unsigned char *) ciphertext + 1 + TDE_V3_GEN_LEN;
+    /* Wire format: [IV(12) | CT(N) | TAG(16) | VERSION(1) | GEN(8)] */
+    pt_len  = ciphertext_len - TDE_V4_OVERHEAD;
+    iv_ptr  = (const unsigned char *) ciphertext;
     ct_ptr  = iv_ptr + TDE_GCM_IV_LEN;
     tag_ptr = ct_ptr + pt_len;
+    version_ptr = tag_ptr + TDE_GCM_TAG_LEN;
+    gen_ptr = version_ptr + 1;
+
+    if ((unsigned char) version_ptr[0] != TDE_V4_VERSION_BYTE)
+        ereport(ERROR,
+                (errmsg("[CRYPTO] Unrecognized ciphertext version byte")));
 
     {
         uint64  current_gen = pg_vault_tde_catalog_get_rel_generation(relid);
         bool    found = false;            
 
-        memcpy(&stored_gen, ciphertext + 1, TDE_V3_GEN_LEN);
+        memcpy(&stored_gen, gen_ptr, TDE_V4_GEN_LEN);
 
         if(stored_gen == current_gen)
         {
@@ -438,16 +440,16 @@ tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len, Size *ou
      * live generation — they may differ after a key rotation.
      */
     {
-        unsigned char aad[TDE_V3_AAD_LEN];
+        unsigned char aad[TDE_V4_AAD_LEN];
         int           aad_len = 0;
 
         tde_compute_aad(relid, stored_gen, aad);
-        if (EVP_DecryptUpdate(ctx, NULL, &aad_len, aad, TDE_V3_AAD_LEN) != 1)
+        if (EVP_DecryptUpdate(ctx, NULL, &aad_len, aad, TDE_V4_AAD_LEN) != 1)
         {
-            OPENSSL_cleanse(aad, TDE_V3_AAD_LEN);
+            OPENSSL_cleanse(aad, TDE_V4_AAD_LEN);
             goto gcm_dec_error;
         }
-        OPENSSL_cleanse(aad, TDE_V3_AAD_LEN);
+        OPENSSL_cleanse(aad, TDE_V4_AAD_LEN);
     }
 
     if (EVP_DecryptUpdate(ctx, (unsigned char *) out_buf, &olen,

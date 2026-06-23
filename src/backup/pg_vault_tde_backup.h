@@ -17,11 +17,11 @@
  */
 #define TDE_GCM_IV_LEN   12
 #define TDE_GCM_TAG_LEN  16
-#define TDE_V3_GEN_LEN    8
-#define TDE_V3_OVERHEAD  (1 + TDE_V3_GEN_LEN + TDE_GCM_IV_LEN + TDE_GCM_TAG_LEN)
+#define TDE_V4_GEN_LEN    8
+#define TDE_V4_OVERHEAD  (1 + TDE_V4_GEN_LEN + TDE_GCM_IV_LEN + TDE_GCM_TAG_LEN)
 #else
 #include "pg_vault_tde_kms.h"     /* TDE_DEK_LEN */
-#include "pg_vault_tde_crypto.h"  /* TDE_GCM_IV_LEN, TDE_GCM_TAG_LEN, TDE_V3_OVERHEAD */
+#include "pg_vault_tde_crypto.h"  /* TDE_GCM_IV_LEN, TDE_GCM_TAG_LEN, TDE_V4_OVERHEAD */
 #endif
 
 #define TDE_BACKUP_MAGIC_LEN     10  /* strlen("PGVAULTTDE") */

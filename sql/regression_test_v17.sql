@@ -844,16 +844,13 @@ $$;
 
 
 -- ================================================================
--- TEST 128: REINDEX over a HOT chain remaps index entries to the root
+-- TEST 128: encrypted_heap intentionally DISABLES HOT updates
 --
--- An UPDATE that touches only a NON-indexed column on an encrypted_heap
--- table is eligible for a HOT update, producing a heap-only tuple. REINDEX
--- must index the ROOT of that HOT chain, not the internal heap-only TID;
--- otherwise the rebuilt entry is structurally invalid (marked dead) and
--- Index Scans miss the live row.
---
--- Build a HOT chain, REINDEX, then force an Index Scan and assert the
--- updated row is found with the correct count.
+-- The v4 IV-first wire format makes heapam see the indexed column as always
+-- "changed" (it inspects ciphertext, not plaintext), so no HOT update is
+-- chosen. This is deliberate: a HOT decision over ciphertext could skip a
+-- tde_btree index update and corrupt it. Assert HOT is off and that a normal
+-- UPDATE + REINDEX still leaves the row findable via Index Scan.
 -- ================================================================
 DROP TABLE IF EXISTS tde_hot_128;
 CREATE TABLE tde_hot_128 (id int4, val text) USING encrypted_heap;
@@ -862,7 +859,8 @@ CREATE INDEX tde_hot_idx_128
 
 INSERT INTO tde_hot_128 VALUES (1, 'before_update');
 
--- Only the non-indexed column changes → HOT update → heap-only tuple.
+-- Only the non-indexed column changes.  On a plain heap this would be a HOT
+-- update; on encrypted_heap the IV-first format forces a non-HOT update.
 UPDATE tde_hot_128 SET val = 'after_update' WHERE id = 1;
 
 -- Flush backend stats so the HOT-update counter is visible below.
@@ -874,17 +872,18 @@ DECLARE
     n_found    bigint;
     result_val text;
 BEGIN
-    -- Precondition: the UPDATE must have been HOT, otherwise the test
-    -- would not exercise the heap-only → root remapping branch.
+    -- HOT must be disabled on encrypted_heap: the IV-first wire format makes
+    -- the indexed column always look modified to heapam, so no heap-only
+    -- tuple is produced.
     SELECT n_tup_hot_upd INTO n_hot
     FROM pg_stat_user_tables WHERE relname = 'tde_hot_128';
-    IF n_hot IS NULL OR n_hot < 1 THEN
+    IF COALESCE(n_hot, 0) <> 0 THEN
         RAISE EXCEPTION
-            'TEST 128 PRECONDITION FAILED: expected a HOT update (n_tup_hot_upd=%)',
-            COALESCE(n_hot, -1);
+            'TEST 128 FAILED: expected NO HOT update on encrypted_heap (n_tup_hot_upd=%)',
+            n_hot;
     END IF;
 
-    -- Rebuild the index over the pre-existing HOT chain.
+    -- A non-HOT UPDATE plus REINDEX must still leave the live row findable.
     REINDEX INDEX tde_hot_idx_128;
 
     -- Force an Index Scan and confirm the live (updated) row is found.
@@ -895,13 +894,13 @@ BEGIN
 
     IF n_found <> 1 OR result_val IS DISTINCT FROM 'after_update' THEN
         RAISE EXCEPTION
-            'TEST 128 FAILED: Index Scan after REINDEX over HOT chain found % row(s) val=% (expected 1, ''after_update'')',
+            'TEST 128 FAILED: Index Scan after REINDEX found % row(s) val=% (expected 1, ''after_update'')',
             n_found, COALESCE(result_val, '<NULL>');
     END IF;
 
     DROP TABLE tde_hot_128;
     RAISE NOTICE
-        'TEST 128 PASSED: REINDEX remaps HOT-chain entries to the chain root; Index Scan finds updated row';
+        'TEST 128 PASSED: encrypted_heap disables HOT (IV-first); non-HOT UPDATE + REINDEX keeps row findable';
 END;
 $$;
 
@@ -930,7 +929,7 @@ BEGIN
     RAISE NOTICE '   ATTACH pre-existing encrypted table ..... test 125';
     RAISE NOTICE '   DETACH keeps leaf readable .............. test 126';
     RAISE NOTICE '   MIXED tree limitation (doc) ............. test 127';
-    RAISE NOTICE '   REINDEX over HOT chain → root remap ..... test 128';
+    RAISE NOTICE '   HOT disabled on encrypted_heap (IV-first) .. test 128';
     RAISE NOTICE '============================================================';
 END;
 $$;

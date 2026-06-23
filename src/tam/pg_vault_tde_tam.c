@@ -6,12 +6,12 @@
  * callbacks are overridden; every structural callback (VACUUM, ANALYZE, HOT,
  * CLUSTER, index build, truncate ...) delegates unchanged to heapam.
  *
- * Wire format on disk (per tuple):
- *   [HeapTupleHeader  (t_hoff bytes, PLAINTEXT - MVCC fields)]
- *   [VERSION(1) | GENERATION(8) | IV (12 B) | CIPHERTEXT (N B) | GCM TAG (16 B)]
+ * Wire format on disk (per tuple), v4 IV-first trailer:
+ *   [HeapTupleHeader (t_hoff bytes, PLAINTEXT - MVCC fields)]
+ *   [IV(12) | CIPHERTEXT(N) | GCM TAG(16) | VERSION(1) | GENERATION(8)]
  *
- * Total overhead vs. plain heap: TDE_V3_OVERHEAD (37) bytes per stored tuple.
- * (v3 uses the same wire bytes as v2 and adds AEAD AAD binding.)
+ * Overhead vs. plain heap: TDE_V4_OVERHEAD (37) bytes/tuple. IV-first disables
+ * HOT on encrypted tables but keeps tde_btree coherent.
  *
  * Copyright (c) 2026 Miriade Srl  
  * Licensed under the PostgreSQL License.
@@ -53,7 +53,7 @@
 
 #include "access/toast_compression.h" /* TOAST_PGLZ_COMPRESSION_ID */
 #include "src/include/pg_vault_tde_crypto.h"  /* tde_gcm_encrypt, tde_gcm_decrypt,
-                                                  TDE_V3_OVERHEAD */
+                                                  TDE_V4_OVERHEAD */
 #include "src/include/pg_vault_tde_tam.h"
 #include "src/include/pg_vault_tde_guc.h"      /* pg_vault_tde_enabled */
 #include "src/include/pg_vault_tde_iam.h"      /* tde_iam_build_in_progress,
@@ -160,9 +160,9 @@ static bool tde_tuple_has_external_slow(HeapTuple tup, TupleDesc tupdesc);
  * tde_encrypt_heap_tuple
  *
  * Returns a palloc'd HeapTuple whose user-data region is replaced with the
- * v2/v3 wire format produced by tde_gcm_encrypt():
- *   [VERSION(1) | GENERATION(8) | IV(12) | CIPHERTEXT(N) | TAG(16)]
- * Total overhead: TDE_V3_OVERHEAD (37 bytes) per encrypted user-data region.
+ * v4 wire format produced by tde_gcm_encrypt():
+ *   [IV(12) | CIPHERTEXT(N) | TAG(16) | VERSION(1) | GENERATION(8)]
+ * Total overhead: TDE_V4_OVERHEAD (37 bytes) per encrypted user-data region.
  *
  * Header bytes [0 .. t_hoff) are copied verbatim (plaintext) because MVCC
  * fields (xmin, xmax, ctid, infomask, null bitmap) must remain readable by
@@ -183,7 +183,7 @@ tde_encrypt_heap_tuple(HeapTuple plain, Oid relid)
     /*
      * user_len may be 0 for tuples with all-NULL columns (only the null
      * bitmap lives in the header, no column data follows).  AES-256-GCM
-     * handles zero-length plaintext correctly: output is [IV(12)|TAG(16)],
+     * handles zero-length plaintext correctly: output is [IV(12)|TAG(16)|VERSION(1)|GEN(8)],
      * giving us authenticated integrity protection even on null-only rows.
      * We must NOT Assert(user_len > 0) here.
      */
@@ -198,13 +198,19 @@ tde_encrypt_heap_tuple(HeapTuple plain, Oid relid)
         return copy;
     }
     enc_buf = tde_gcm_encrypt(relid, user_data, user_len, &enc_len);
-    Assert(enc_len == user_len + TDE_V3_OVERHEAD);
+    Assert(enc_len == user_len + TDE_V4_OVERHEAD);
     enc = (HeapTuple) palloc0(HEAPTUPLESIZE + hdr_len + enc_len);
     enc->t_len      = (uint32) (hdr_len + enc_len);
     enc->t_self     = plain->t_self;
     enc->t_tableOid = plain->t_tableOid;
     enc->t_data     = (HeapTupleHeader) ((char *) enc + HEAPTUPLESIZE);
     memcpy(enc->t_data, plain->t_data, hdr_len);                 /* header verbatim */
+    /*
+     * Clear HEAP_HASEXTERNAL: the user-data is opaque ciphertext, so heapam
+     * must not toast-deform it (garbage varlena lengths → OOB read → crash).
+     * External-ness is recovered on decrypt via tde_tuple_has_external_slow().
+     */
+    enc->t_data->t_infomask &= ~HEAP_HASEXTERNAL;
     memcpy((char *) enc->t_data + hdr_len, enc_buf, enc_len);    /* encrypted payload */
     pfree(enc_buf);  /* ciphertext - no need to cleanse */
     return enc;
@@ -242,18 +248,18 @@ tde_decrypt_heap_tuple(HeapTuple enc, Oid relid)
         return copy;
     }
     /*
-     * Minimum size check: every v3 tuple carries TDE_V3_OVERHEAD (37) bytes
-     * (version + generation + IV + GCM tag), so anything shorter is corrupt.
-     * tde_gcm_decrypt rejects any buffer whose first byte is not 0x03.
+     * Minimum size check: every v4 tuple carries TDE_V4_OVERHEAD (37) bytes
+     * (IV + GCM tag + version + generation), so anything shorter is corrupt.
+     * tde_gcm_decrypt rejects any buffer whose trailer version byte is not 0x04.
      */
-    if (hdr_len > enc->t_len || enc_len < (Size) TDE_V3_OVERHEAD)
+    if (hdr_len > enc->t_len || enc_len < (Size) TDE_V4_OVERHEAD)
         ereport(ERROR,
                 (errcode(ERRCODE_DATA_CORRUPTED),
                  errmsg("pg_vault_tde: encrypted tuple too short (%zu bytes)",
                         enc_len)));
     pt_buf = tde_gcm_decrypt(relid, enc_data, enc_len, &pt_len);
     /*
-     * tde_gcm_decrypt validates the v3 wire format and verifies the GCM tag;
+     * tde_gcm_decrypt validates the v4 wire format and verifies the GCM tag;
      * a non-NULL result means the plaintext length is correct.
      */
     Assert(pt_buf != NULL);
@@ -1237,7 +1243,10 @@ pg_vault_tde_tuple_update(Relation rel, ItemPointer otid,
     {
         /* Read old tuple metadata from slot storage (no materialized copy). */
         old_tuple = ExecFetchSlotHeapTuple(slot_old, false, NULL);
-        old_has_external = HeapTupleHasExternal(old_tuple);
+        /* Header bit is cleared on disk (see tde_encrypt_heap_tuple); scan the
+         * decrypted plaintext per-attribute instead. */
+        old_has_external = HeapTupleHasExternal(old_tuple) ||
+                           tde_tuple_has_external_slow(old_tuple, RelationGetDescr(rel));
     }
 
     /*
@@ -1612,7 +1621,11 @@ pg_vault_tde_relation_copy_for_cluster(Relation OldTable,
                 plain = tde_decrypt_heap_tuple(enc_copy, RelationGetRelid(OldTable));
                 plain_for_write = plain;
 
-                if (HeapTupleHasExternal(plain))
+                /* Header bit is cleared on disk (see tde_encrypt_heap_tuple);
+                 * scan the plaintext, else the re-TOAST migration below is
+                 * skipped and the rewrite keeps OldTable's TOAST pointers. */
+                if (HeapTupleHasExternal(plain) ||
+                    tde_tuple_has_external_slow(plain, tupdesc))
                 {
                     /*
                      * External TOAST pointers in the decrypted tuple reference
@@ -2095,7 +2108,7 @@ pg_vault_tde_verify_integrity(PG_FUNCTION_ARGS)
  *   → (total_tuples bigint, encryption_overhead_bytes bigint)
  *
  * Reports the storage overhead imposed by TDE on the given table.
- * Each encrypted tuple carries TDE_V3_OVERHEAD (37) bytes of overhead:
+ * Each encrypted tuple carries TDE_V4_OVERHEAD (37) bytes of overhead:
  * 1-byte version + 8-byte generation + 12-byte IV + 16-byte GCM tag.
  * The total overhead is simply total_tuples × 37.
  *
@@ -2141,7 +2154,7 @@ pg_vault_tde_encrypted_size(PG_FUNCTION_ARGS)
     pfree(cmd.data);
     SPI_finish();
     values[0] = Int64GetDatum(total);
-    values[1] = Int64GetDatum(total * (int64) TDE_V3_OVERHEAD);
+    values[1] = Int64GetDatum(total * (int64) TDE_V4_OVERHEAD);
     result_tup = heap_form_tuple(tupdesc, values, nulls);
     PG_RETURN_DATUM(HeapTupleGetDatum(result_tup));
 }

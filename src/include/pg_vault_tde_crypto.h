@@ -9,13 +9,16 @@
 
 #include "postgres.h"
 
-/* AES-256-GCM wire format: [VERSION(1=0x03) | GEN(8) | IV(12) | CT | TAG(16)] */
+/*
+ * AES-256-GCM per-tuple wire format (v4): [ IV(12) | CT(N) | TAG(16) | VERSION(1=0x04) | GEN(8) ]
+ * IV-first so the blob differs from byte 0 every time: keeps HOT off and tde_btree coherent.
+ */
 #define TDE_GCM_IV_LEN       12  /* 96-bit IV, NIST recommended for GCM */
 #define TDE_GCM_TAG_LEN      16  /* 128-bit authentication tag */
-#define TDE_V3_VERSION_BYTE  ((unsigned char) 0x03u)
-#define TDE_V3_AAD_LEN       16  /* 4 (dboid) + 4 (relid) + 8 (generation) */
-#define TDE_V3_GEN_LEN       8   /* sizeof(uint64): generation counter */
-#define TDE_V3_OVERHEAD      (1 + TDE_V3_GEN_LEN + TDE_GCM_IV_LEN + TDE_GCM_TAG_LEN)
+#define TDE_V4_VERSION_BYTE  ((unsigned char) 0x04u)
+#define TDE_V4_AAD_LEN       16  /* 4 (dboid) + 4 (relid) + 8 (generation) */
+#define TDE_V4_GEN_LEN       8   /* sizeof(uint64): generation counter */
+#define TDE_V4_OVERHEAD      (1 + TDE_V4_GEN_LEN + TDE_GCM_IV_LEN + TDE_GCM_TAG_LEN)
 
 /* Encrypt plaintext using the DEK for relid. Returns palloc'd buffer. */
 char *tde_gcm_encrypt(Oid relid, const char *plaintext, Size plaintext_len,
