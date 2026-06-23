@@ -187,7 +187,7 @@ Index Access Method (IAM) — tde_btree                  src/iam/
    │
    ▼
 Crypto Layer — AES-256-GCM (OpenSSL 3.x EVP)           src/crypto/
-   │  [IV(12) | CIPHERTEXT | GCM-TAG(16)] per tuple
+   │  [IV(12) | CIPHERTEXT | GCM-TAG(16) | VER(1) | GEN(8)] per tuple
    │  Per-backend EVP_CIPHER_CTX pool (reset, not reallocate)
    │  IV batch generation: 256 IVs per pg_strong_random() call
    │
@@ -202,23 +202,23 @@ HashiCorp Vault / OpenBao (GUC-configurable endpoint)
 
 ### Wire Format (on disk, per tuple)
 
-**v3 format** (all new tuples as of v1.5 — default for `encrypted_heap` tables):
+**v4 format** (default for `encrypted_heap` tables):
 
 ```
-┌─────────────────────────────────┬────────────────────────────────────────────────────────────────┐
-│  HeapTupleHeader (t_hoff bytes) │  VER(1) │ GEN(8) │ IV(12) │ Ciphertext │ GCM-Tag(16)      │
-│  PLAINTEXT — MVCC fields        │                       ENCRYPTED USER DATA                  │
-└─────────────────────────────────┴────────────────────────────────────────────────────────────────┘
-                                     ←────────── TDE_V2_OVERHEAD = 37 bytes ───────────→
+┌─────────────────────────────────┬───────────────────────────────────────────────────────┐
+│  HeapTupleHeader (t_hoff bytes) │   IV(12) │ Ciphertext │ GCM-Tag(16) | VER(1) │ GEN(8) | 
+│  PLAINTEXT — MVCC fields        │                                                       │
+└─────────────────────────────────┴───────────────────────────────────────────────────────┘
+                                   ←───────────── TDE_V4_OVERHEAD = 37 bytes ─────────────→
 ```
 
-v3 overhead: **37 bytes per tuple** (1-byte version `0x03` + 8-byte DEK generation
-counter + 12-byte IV + 16-byte GCM authentication tag).
-v3 also passes `[database_oid(4) | relfilenode(4) | generation(8)]` as AEAD Additional
+v4 overhead: **37 bytes per tuple** (12-byte IV + 16-byte GCM authentication tag +
+1-byte version `0x04` + 8-byte DEK generation counter).
+The IV-first layout keeps the version/generation bytes at the **end** so the blob has no
+byte-stable prefix — this is what structurally disables HOT updates (see
+[Limitations](#limitations-v17)).
+v4 also passes `[database_oid(4) | relfilenode(4) | generation(8)]` as AEAD Additional
 Authenticated Data (AAD) — zero wire overhead; prevents cross-table ciphertext smuggling.
-
-**v2 format** (written by pg_vault_tde 1.4) is **fully backward-compatible**: the
-decrypt path detects v1/v2/v3 from the first byte and applies the correct AAD.
 
 ---
 
@@ -904,44 +904,19 @@ See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
    **Mitigation until v1.7:** set `work_mem` large enough to keep cursor data in memory,
    or avoid `WITH HOLD` cursors on encrypted tables in memory-constrained environments.
 
-6. **`UPDATE` of an indexed column does not update the index** (⚠️ known bug, → v1.8):
-   On an `encrypted_heap` table, updating a column that is covered by a `tde_btree`
-   (or any) index leaves the index pointing at the **old** key. Subsequent index scans
-   return stale or empty results:
+6. **HOT updates are disabled by design** (so that updating an indexed column always
+   maintains the index): On an `encrypted_heap` table `heap_update` never chooses a HOT
+   (heap-only) update — every UPDATE writes new index entries, keeping `tde_btree` indexes
+   coherent without a `REINDEX`.
 
-   ```sql
-   CREATE TABLE test (id serial, value text) USING encrypted_heap;
-   CREATE INDEX test_idx ON test USING tde_btree (id tde_int4_enc_ops);
-   INSERT INTO test SELECT i, 'test_' || i FROM generate_series(1, 5) AS i;
-   SET enable_seqscan = off;
-
-   UPDATE test SET id = 7 WHERE id = 3;
-   SELECT * FROM test WHERE id = 7;   -- BUG: 0 rows (index still points at id=3)
-   SELECT * FROM test WHERE id = 3;   -- BUG: returns the row, but with id=7
-
-   REINDEX TABLE test;                -- workaround: rebuilds the index correctly
-   SELECT * FROM test WHERE id = 7;   -- now returns the row
-   ```
-
-   **Cause:** `heap_update` decides whether an update is HOT (heap-only, no index
-   maintenance) by comparing the indexed columns byte-for-byte between the old and new
-   tuple. Because both tuples are encrypted, and the v3 wire format begins with a
-   constant `[VERSION(1) | GENERATION(8)]` prefix, an indexed column that lands in those
-   first 9 bytes looks unchanged to `heap_update` → it always picks a HOT update → the
-   index is never touched. See [doc/pg_vault_tde.md](doc/pg_vault_tde.md) § Known
-   Limitations for the full analysis and the planned fix.
-
-   **Workaround until v1.8:** `REINDEX` the table after updating indexed columns, or use
-   sequential scans (`SET enable_seqscan = on`) when querying recently-updated rows.
-
-   **Schema-level mitigation:** the blind spot is *only* the constant 9-byte
-   `[VERSION | GENERATION]` prefix — every byte from offset 9 onward (IV/ciphertext)
-   changes on each encryption. If the indexed column's datum falls **after the first 9
-   bytes** of the encrypted user-data region, `heap_update` detects the change, skips the
-   HOT path, and maintains the index correctly. Placing the indexed column later in the
-   tuple (so at least ~9 bytes of preceding columns sit before it) re-enables index
-   updates without a `REINDEX`. Putting an indexed fixed-width column (e.g. a leading
-   `int4`/`int8` primary key) first is the case that reliably triggers the bug.
+   **How:** `heap_update` decides whether an update is HOT by comparing the indexed columns
+   byte-for-byte between the old and new tuple. Both tuples are encrypted, and the v4 wire
+   format is **IV-first**: it begins with the random GCM IV, which changes on every
+   encryption. The encrypted image therefore always differs, so `heap_update` sees the
+   indexed column as modified and skips the HOT path. The constant `[VERSION | GENERATION]`
+   bytes were moved to the **end** of the blob precisely so they fall outside the comparison
+   window. See [doc/pg_vault_tde.md](doc/pg_vault_tde.md) § Known Limitations for the full
+   analysis (including the v3 bug this resolved).
 
 ---
 

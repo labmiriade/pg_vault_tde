@@ -109,7 +109,7 @@ TdeRelDekCache (shmem)                 [per-relation entry, embedded LWLock,
 tde_gcm_encrypt() / tde_gcm_decrypt()  [src/crypto/pg_vault_tde_crypto.c]
         │
         ▼
-Disk: [HeapTupleHeader | VER(1) | GEN(8) | IV(12) | Ciphertext | GCM-TAG(16)]
+Disk: [HeapTupleHeader | IV(12) | Ciphertext | GCM-TAG(16) | VER(1) | GEN(8)]
 ```
 
 ### Shared Memory Layout
@@ -160,7 +160,7 @@ void pg_vault_tde_tam_init(void) {
 }
 ```
 
-All structural operations (VACUUM, HOT, CLUSTER, index build, truncate, scan
+All structural operations (VACUUM, CLUSTER, index build, truncate, scan
 state management) delegate to heapam unchanged. Only the four write paths,
 seven read paths, and one rewrite path are overridden.
 
@@ -347,35 +347,35 @@ or modifying this callback.
 
 ### Wire Format per Encrypted Region
 
-**Version 3** is the **only** on-disk tuple format. The legacy v1 (`[IV | CT | TAG]`)
-and v2 (`[0x02 | GEN | IV | CT | TAG]`, no AAD) formats were **removed** from the
-extension; `tde_gcm_decrypt()` now rejects any buffer whose first byte is not
-`TDE_V3_VERSION_BYTE` (`0x03`) with an `ERROR`. (The byte `0x02` still appears, but
-only in the independent `pg_dump_tde` *backup block* format — a separate code path,
-see [Backup](../README.md#encrypted-backups).)
+**Version 4** is the **only** on-disk tuple format. It is an **IV-first trailer**
+layout: the version byte and generation counter sit at the **end** of the blob, so
+the data differs from byte 0 on every encryption (this is what disables HOT — see
+[Known Limitations](#known-limitations)). The legacy v1/v2/v3 formats were **removed**.
+(The byte `0x02` still appears only in the `pg_dump_tde` *backup block* format — a
+separate code path, see [Backup](../README.md#encrypted-backups).)
 
 ```
-+-------+----------+----------+----------------------------+----------+
-| VER   | GEN      | IV       | CIPHERTEXT                 | GCM TAG  |
-| 1 byte| 8 bytes  | 12 bytes | N bytes (= plaintext len)  | 16 bytes |
-+-------+----------+----------+----------------------------+----------+
-  0x03   uint64 LE   random
++----------+----------------------------+----------+-------+----------+
+| IV       | CIPHERTEXT                 | GCM TAG  | VER   | GEN      |
+| 12 bytes | N bytes (= plaintext len)  | 16 bytes | 1 byte| 8 bytes  |
++----------+----------------------------+----------+-------+----------+
+  random                                            0x04   uint64 LE
 ```
 
-Total overhead: `TDE_V3_OVERHEAD = 37` bytes
-(`1` version byte + `TDE_V3_GEN_LEN=8` + `TDE_GCM_IV_LEN=12` + `TDE_GCM_TAG_LEN=16`).
+Total overhead: `TDE_V4_OVERHEAD = 37` bytes
+(`TDE_GCM_IV_LEN=12` + `TDE_GCM_TAG_LEN=16` + `1` version byte + `TDE_V4_GEN_LEN=8`).
 
-v3 binds each tuple to its location by passing
-`[MyDatabaseId(4) | relid(4) | generation(8)]` (little-endian, `TDE_V3_AAD_LEN = 16`
+v4 binds each tuple to its location by passing
+`[MyDatabaseId(4) | relid(4) | generation(8)]` (little-endian, `TDE_V4_AAD_LEN = 16`
 bytes) as GCM Additional Authenticated Data — zero wire overhead; prevents
 cross-table ciphertext smuggling. The AAD is reconstructed on decrypt from the
-**stored** generation in the wire header (not the current generation), so old-generation
+**stored** generation in the wire trailer (not the current generation), so old-generation
 rows still authenticate during the rotation window.
 
 When `user_len == 0` (all-NULL tuple, or tuple with only system columns),
-`tde_gcm_encrypt()` still produces a full `TDE_V3_OVERHEAD`-byte (37) block
-(version + generation + IV + empty payload + GCM tag). This exercises the GCM tag path
-on zero data; the decrypt path handles it symmetrically. Test 16 covers this edge case.
+`tde_gcm_encrypt()` still produces a full `TDE_V4_OVERHEAD`-byte (37) block. This
+exercises the GCM tag path on zero data; the decrypt path handles it symmetrically.
+Test 16 covers this edge case.
 
 ### Memory Security
 
@@ -648,58 +648,33 @@ SELECT * FROM employees WHERE id > 1;            -- seq scan, not index scan
 | 5 | **All-or-nothing table encryption** — no per-column granularity | v1.8 |
 | 6 | **Range scans on tde_btree** — `WHERE col > x` returns empty (AES-SIV not order-preserving) | By design, permanent |
 | 7 | **BRIN on encrypted columns** — min/max of AES-SIV ciphertexts is meaningless | By design, permanent |
-| 8 | **`UPDATE` of an indexed column does not update the index** — `heap_update` picks a HOT update because the constant 9-byte wire prefix hides the change; index scans return stale/empty results until `REINDEX` | v1.8 ⚠️ |
+| 8 | **HOT updates disabled** — `heap_update` reject to use HOT updates because the wire format portion considerd by TupDesc for the comparison between old and new tuple is non-deterministic aka changes at every encryption | v1.8 ⚠️ |
 
-### `UPDATE` of an indexed column does not maintain the index (⚠️ known bug, → v1.8)
+### HOT updates are disabled by design (v4 IV-first wire format)
 
-Updating a column that is covered by an index on an `encrypted_heap` table leaves the
-index pointing at the **old** key. Index scans on the new value return nothing; scans on
-the old value still match the (now-updated) row. A `REINDEX` rebuilds the index correctly
-and is the immediate workaround.
+On an `encrypted_heap` table, `heap_update` never chooses a HOT (heap-only tuple)
+update: every UPDATE writes new index entries. This is **intentional** and is what
+keeps `tde_btree` indexes coherent across UPDATEs of indexed columns — the index always
+follows the row to its new key, with no `REINDEX` needed.
 
-```sql
-CREATE TABLE test (id serial, value text) USING encrypted_heap;
-CREATE INDEX test_idx ON test USING tde_btree (id tde_int4_enc_ops);
-INSERT INTO test SELECT i, 'test_' || i FROM generate_series(1, 5) AS i;
-SET enable_seqscan = off;
+**Mechanism.** `heap_update` decides whether an update can be HOT by comparing the
+indexed columns byte-for-byte between the old and new tuple image. On an `encrypted_heap`
+table both images are the encrypted wire format. The v4 layout (see
+[Wire Format per Encrypted Region](#wire-format-per-encrypted-region)) is **IV-first**:
+it begins with the random GCM IV, which is freshly generated on every encryption. The
+encrypted image therefore differs from **byte 0** for any re-encryption — including when
+the plaintext is unchanged — so `heap_update` always sees the indexed column as modified
+and skips the HOT path. The constant `[VERSION | GENERATION]` bytes were moved to the
+**end** of the blob precisely so they fall outside the comparison window.
 
-SELECT * FROM test WHERE id = 3;   -- ok: returns (3, test_3)
-UPDATE test SET id = 7 WHERE id = 3;
-SELECT * FROM test WHERE id = 7;   -- BUG: 0 rows
-SELECT * FROM test WHERE id = 3;   -- BUG: returns (7, test_3)
-
-REINDEX TABLE test;                -- workaround
-SELECT * FROM test WHERE id = 7;   -- now returns (7, test_3)
-```
-
-**Root cause.** `heap_update` decides whether an update can be HOT (heap-only tuple — no
-new index entries) by comparing the indexed columns byte-for-byte between the old and new
-tuple image. On an `encrypted_heap` table both images are the encrypted wire format, and
-the v3 layout begins with a **constant** `[VERSION(1)=0x03 | GENERATION(8)]` prefix
-(`src/crypto/pg_vault_tde_crypto.c`). Bytes 0–8 are therefore identical for old and new
-tuples regardless of the plaintext. An indexed column whose datum lands inside that 9-byte
-prefix — e.g. a leading fixed-width `int4`/`int8` primary key — looks *unchanged* to
-`heap_update`, so it always chooses a HOT update and never touches the index.
-
-Everything from **byte 9 onward** (the random GCM IV and the ciphertext) differs on every
-encryption. The blind spot is *exclusively* the constant 9-byte prefix.
-
-**Schema-level mitigation: keep the indexed key past the first 9 bytes.** Because only the
-constant prefix is blind, an indexed column whose datum starts at offset ≥ 9 in the
-encrypted user-data region makes the old/new images differ, so `heap_update` detects the
-change, skips the HOT path, and maintains the index correctly *without* a `REINDEX`. In
-practice this means **not** placing an indexed fixed-width column first: arrange the table
-so at least ~9 bytes of preceding column data sit before the indexed column. The
-reliably-broken case is a leading `int4`/`int8` indexed column (it falls entirely within
-the prefix).
-
-**Planned fix (v1.8).** Remove the constant prefix from the per-tuple wire format so the
-encrypted image has no byte-stable region. The leading candidate is to bump to a v4 format
-that drops the per-tuple version byte (the decoder already coexists across v1/v2/v3 by
-selecting on the first byte, and the format is uniform per relation) and moves the
-`generation` out of the comparison window — so the encrypted region starts with the random
-IV and HOT detection works structurally for any column position. The multi-version decoder
-makes this migration-free: v3 tuples stay readable and each `UPDATE` rewrites them to v4.
+> **Historical note (v3 bug, fixed in v4).** The previous v3 format placed a constant
+> `[VERSION(1)=0x03 | GENERATION(8)]` prefix *first*. An indexed column whose datum landed
+> inside that 9-byte prefix — typically a leading fixed-width `int4`/`int8` key — looked
+> *unchanged* to `heap_update`, which then chose a HOT update and silently skipped the
+> index maintenance, leaving the index pointing at the old key. Moving the constant bytes
+> to the trailer removed the byte-stable region and resolved the bug structurally; the
+> workarounds that v3 required (`REINDEX`, or arranging the indexed column past the first
+> 9 bytes) are no longer needed.
 
 ### Historical Limitations (v1.0) — Many Resolved Since
 
@@ -802,11 +777,11 @@ access control but do not replace it.
 │  Free space                                                        │
 ├────────────────────────────────────────────────────────────────────┤
 │  ... tuples grow downward from end of page ...                     │
-│                                                                     │
-│  ┌─────────────────────────────┬──────────────────────────────┐   │
-│  │  HeapTupleHeaderData        │ VER(1)│GEN(8)│IV(12)│CT│TAG(16)│   │
-│  │  (t_hoff bytes, PLAINTEXT)  │      (user data, ENCRYPTED v3)│   │
-│  └─────────────────────────────┴──────────────────────────────┘   │
+│                                                                    │
+│  ┌─────────────────────────────┬─────────────────────────────────┐ │
+│  │  HeapTupleHeaderData        ││IV(12)│CT│TAG(16)│VER(1)│GEN(8)|| │
+│  │  (t_hoff bytes, PLAINTEXT)  │                                 │ │
+│  └─────────────────────────────┴─────────────────────────────────┘ │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -816,10 +791,10 @@ access control but do not replace it.
 |---|---|---|
 | `TDE_GCM_IV_LEN` | 12 | `pg_vault_tde_crypto.h` |
 | `TDE_GCM_TAG_LEN` | 16 | `pg_vault_tde_crypto.h` |
-| `TDE_V3_VERSION_BYTE` | `0x03` | `pg_vault_tde_crypto.h` |
-| `TDE_V3_GEN_LEN` | 8 | `pg_vault_tde_crypto.h` |
-| `TDE_V3_AAD_LEN` | 16 | `pg_vault_tde_crypto.h` (`dboid` + `relid` + `generation`) |
-| `TDE_V3_OVERHEAD` | 37 | `pg_vault_tde_crypto.h` (= 1 + 8 + 12 + 16) |
+| `TDE_V4_VERSION_BYTE` | `0x04` | `pg_vault_tde_crypto.h` |
+| `TDE_V4_GEN_LEN` | 8 | `pg_vault_tde_crypto.h` |
+| `TDE_V4_AAD_LEN` | 16 | `pg_vault_tde_crypto.h` (`dboid` + `relid` + `generation`) |
+| `TDE_V4_OVERHEAD` | 37 | `pg_vault_tde_crypto.h` (= 12 + 16 + 1 + 8) |
 | `TDE_DEK_LEN` | 32 | `pg_vault_tde_kms.h` **only** |
 
 `TDE_DEK_LEN` MUST NOT be redefined in any `.c` file or other header
