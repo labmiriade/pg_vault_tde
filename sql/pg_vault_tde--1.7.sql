@@ -507,22 +507,6 @@ $$;
 -- Health check (v1.7)
 -- ============================================================================
 
--- Helper: round-trip encrypt/decrypt probe to confirm DEK is live
-CREATE OR REPLACE FUNCTION pg_vault_tde_dek_available()
-    RETURNS bool
-    LANGUAGE plpgsql STABLE AS $$
-DECLARE
-    ct bytea;
-    pt text;
-BEGIN
-    ct := pg_vault_tde_encrypt_test('health_check_probe'::text);
-    pt := pg_vault_tde_decrypt_test(ct);
-    RETURN pt = 'health_check_probe';
-EXCEPTION WHEN OTHERS THEN
-    RETURN false;
-END;
-$$;
-
 CREATE FUNCTION pg_vault_tde_health_check()
     RETURNS TABLE (
         version           text,

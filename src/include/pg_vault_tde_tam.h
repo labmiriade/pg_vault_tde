@@ -9,6 +9,8 @@
 
 #include "access/tableam.h"
 
+#define MAX_STACK_ATTRS 64
+
 /*
  * pg_vault_tde_get_tableam_routine
  *

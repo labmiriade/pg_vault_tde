@@ -20,6 +20,15 @@
 #define TDE_V4_GEN_LEN       8   /* sizeof(uint64): generation counter */
 #define TDE_V4_OVERHEAD      (1 + TDE_V4_GEN_LEN + TDE_GCM_IV_LEN + TDE_GCM_TAG_LEN)
 
+
+typedef struct EncryptCtx
+{
+    EVP_CIPHER_CTX  *tde_gcm_ctx;
+    Oid             relid; 
+    uint64          generation;
+
+} EncryptCtx;
+
 /* Encrypt plaintext using the DEK for relid. Returns palloc'd buffer. */
 char *tde_gcm_encrypt(Oid relid, const char *plaintext, Size plaintext_len,
                       Size *out_len);

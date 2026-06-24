@@ -87,6 +87,8 @@ typedef struct TdeRelDekCache
  */
 void pg_vault_tde_catalog_shmem_request(void);
 void pg_vault_tde_catalog_shmem_init(void);
+TdeRelDekEntry* tde_catalog_cache_entry(Oid relid);
+Oid resolve_effective_relid(Oid relid);
 
 /*
  * Per-table DEK accessors.

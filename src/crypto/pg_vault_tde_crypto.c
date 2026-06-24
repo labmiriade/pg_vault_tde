@@ -234,10 +234,8 @@ tde_gcm_encrypt_core(const unsigned char* dek, int dek_len, Oid relid,
         {
             OPENSSL_cleanse(out_buf, total);
             pfree(out_buf);
-            ereport(WARNING, 
+            ereport(ERROR, 
                     errmsg("[CRYPTO] Failed to allocate GCM encrypt context"));
-
-            return NULL;
         }
     }
     else
@@ -354,6 +352,7 @@ tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len, Size *ou
 {
     EVP_CIPHER_CTX     *ctx;
     char                dek[TDE_DEK_LEN];
+
     const unsigned char *iv_ptr;
     const unsigned char *ct_ptr;
     const unsigned char *tag_ptr;
@@ -383,27 +382,48 @@ tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len, Size *ou
     gen_ptr = version_ptr + 1;
 
     if ((unsigned char) version_ptr[0] != TDE_V4_VERSION_BYTE)
-        ereport(ERROR,
-                (errmsg("[CRYPTO] Unrecognized ciphertext version byte")));
+        return NULL;
 
     {
-        uint64  current_gen = pg_vault_tde_catalog_get_rel_generation(relid);
-        bool    found = false;            
+
+        TdeRelDekEntry* cache_entry;
+        Oid dek_relid = resolve_effective_relid(relid);
+
+        cache_entry = tde_catalog_cache_entry(dek_relid);
 
         memcpy(&stored_gen, gen_ptr, TDE_V4_GEN_LEN);
+    
+        if(cache_entry == NULL)
+        {
+            uint64  current_gen = pg_vault_tde_catalog_get_rel_generation(dek_relid);
+            bool    found = false;       
 
-        if(stored_gen == current_gen)
-        {
-            found = pg_vault_tde_kms_get_rel_dek(relid, (unsigned char *) dek, TDE_DEK_LEN);
-        } 
-        else if(stored_gen == current_gen - 1)
-        {
-            found = pg_vault_tde_kms_get_rel_prev_dek(relid, (unsigned char *) dek, TDE_DEK_LEN);
+            if(stored_gen == current_gen)
+            {
+                found = pg_vault_tde_kms_get_rel_dek(dek_relid, (unsigned char *) dek, TDE_DEK_LEN);
+            } 
+            else if(stored_gen == current_gen - 1)
+            {
+                found = pg_vault_tde_kms_get_rel_prev_dek(dek_relid, (unsigned char *) dek, TDE_DEK_LEN);
+            }
+
+            if(!found)
+                return NULL;
         }
+        else 
+        {
+            uint64 current_gen = cache_entry->generation;       
 
-        if(!found)
-            ereport(ERROR,
-                        (errmsg("[CRYPTO] DEK got wrong generation for relid=%u; cannot decrypt data", relid)));
+            if(stored_gen == current_gen)
+            {
+                memcpy(dek, cache_entry->dek, TDE_DEK_LEN);
+            } 
+            else if(stored_gen == current_gen - 1)
+            {
+                memcpy(dek, cache_entry->prev_dek, TDE_DEK_LEN);
+            }
+        }
+       
     }
 
     out_buf = (char *) palloc0(pt_len + 1); /* +1: safe zero terminator */
@@ -425,6 +445,8 @@ tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len, Size *ou
     else
         EVP_CIPHER_CTX_reset(tde_gcm_dec_ctx);
     ctx = tde_gcm_dec_ctx;
+
+
 
     if (EVP_DecryptInit_ex2(ctx, tde_hw_accel_gcm_cipher(),
                             (unsigned char *) dek, iv_ptr, NULL) != 1)

@@ -110,6 +110,27 @@ pg_vault_tde_catalog_shmem_request(void)
     RequestNamedLWLockTranche("TdeRelDekCache", 1);
 }
 
+TdeRelDekEntry* tde_catalog_cache_entry(Oid relid)
+{
+    int i; 
+    bool found = false;
+
+    TdeRelDekEntry *e = NULL;
+    LWLockAcquire(&rel_dek_cache->lock, LW_SHARED);
+    for (i = 0; i < rel_dek_cache->capacity; i++)
+    {
+        e = &rel_dek_cache->entries[i];
+
+        if (e->relid == relid && e->dek_valid) {
+            found = true;
+            break;
+        }
+    }
+    LWLockRelease(&rel_dek_cache->lock);
+
+    return found ? e : NULL;
+}
+
 /* -------------------------------------------------------------------------
  * pg_vault_tde_catalog_shmem_init — map shmem and init LWLock
  * -------------------------------------------------------------------------*/
@@ -239,7 +260,7 @@ static Oid get_rel_rewrite(Oid relid)
  *
  * Applies: TOAST → parent, then relrewrite → base relation (VACUUM FULL).
  * -------------------------------------------------------------------------*/
-static Oid
+Oid
 resolve_effective_relid(Oid relid)
 {
     Oid effective_relid = relid;

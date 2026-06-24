@@ -138,8 +138,28 @@ static TM_Result pg_vault_tde_tuple_delete(Relation rel,
                                            TM_FailureData *tmfd,
                                            bool changingPart);
 
-static bool tde_tuple_has_external_slow(HeapTuple tup, TupleDesc tupdesc);
+static bool tde_tuple_has_external(HeapTuple tup, Relation rel);
 
+static HeapTuple tde_prepare_encrypt_tuple(Relation rel, HeapTuple plain, HeapTuple old, HeapTuple *toasted_out, int options);
+
+static inline void tde_release_plain(HeapTuple plain)
+{
+    Size hdr = plain->t_data->t_hoff;
+    OPENSSL_cleanse((char *) plain->t_data + hdr, plain->t_len - hdr);
+    pfree(plain);
+}
+
+static HeapTuple tde_prepare_encrypt_tuple(Relation rel, HeapTuple plain, HeapTuple old, HeapTuple *toasted_out, int options)
+{
+    HeapTuple toasted = pg_vault_tde_toast_insert_or_update(rel, plain, old, options);
+    HeapTuple enc = tde_encrypt_heap_tuple(toasted, RelationGetRelid(rel));
+
+    enc->t_data->t_infomask &= ~HEAP_HASEXTERNAL;
+    enc->t_tableOid = plain->t_tableOid;
+    *toasted_out = toasted;
+
+    return enc;
+}
 
 /*
  * index_build_range_scan: called by CREATE INDEX to scan the table and build
@@ -931,16 +951,7 @@ pg_vault_tde_tuple_insert(Relation rel, TupleTableSlot *slot,
      */
     PG_TRY();
     {
-        toasted = pg_vault_tde_toast_insert_or_update(rel, plain, NULL, options);
-        enc = tde_encrypt_heap_tuple(toasted, RelationGetRelid(rel));
-        enc->t_tableOid = plain->t_tableOid;
-       /*
-        * Clear HEAP_HASEXTERNAL: the user-data is opaque ciphertext, so heapam
-        * must not toast-deform it (garbage varlena lengths → OOB read → crash).
-        * External-ness is recovered on decrypt via tde_tuple_has_external_slow().
-        */
-        enc->t_data->t_infomask &= ~HEAP_HASEXTERNAL;
-    
+        enc = tde_prepare_encrypt_tuple(rel, plain, NULL, &toasted, options);
         heap_insert(rel, enc, cid, options, bistate);
 
         ItemPointerCopy(&enc->t_self, &slot->tts_tid);
@@ -950,9 +961,7 @@ pg_vault_tde_tuple_insert(Relation rel, TupleTableSlot *slot,
     {
         if (shouldFree && plain != NULL)
         {
-            Size hdr = plain->t_data->t_hoff;
-            OPENSSL_cleanse((char *) plain->t_data + hdr, plain->t_len - hdr);
-            pfree(plain);
+            tde_release_plain(plain);
         }
         if (toasted != NULL && toasted != plain)
             pfree(toasted);
@@ -963,9 +972,7 @@ pg_vault_tde_tuple_insert(Relation rel, TupleTableSlot *slot,
     PG_END_TRY();
     if (shouldFree)
     {
-        Size hdr = plain->t_data->t_hoff;
-        OPENSSL_cleanse((char *) plain->t_data + hdr, plain->t_len - hdr);
-        pfree(plain);
+        tde_release_plain(plain);
     }
     if (toasted != plain)
         pfree(toasted);
@@ -1005,11 +1012,7 @@ pg_vault_tde_tuple_insert_speculative(Relation rel, TupleTableSlot *slot,
     options |= HEAP_INSERT_SPECULATIVE;
     PG_TRY();
     {
-        toasted = pg_vault_tde_toast_insert_or_update(rel, plain, NULL, options);
-        enc = tde_encrypt_heap_tuple(toasted, RelationGetRelid(rel));
-        enc->t_tableOid = plain->t_tableOid;
-        enc->t_data->t_infomask &= ~HEAP_HASEXTERNAL;
-        
+        enc = tde_prepare_encrypt_tuple(rel, plain, NULL, &toasted, options);
         heap_insert(rel, enc, cid, options, bistate);
 
         ItemPointerCopy(&enc->t_self, &slot->tts_tid);
@@ -1018,11 +1021,7 @@ pg_vault_tde_tuple_insert_speculative(Relation rel, TupleTableSlot *slot,
     PG_CATCH();
     {
         if (shouldFree && plain != NULL)
-        {
-            Size hdr = plain->t_data->t_hoff;
-            OPENSSL_cleanse((char *) plain->t_data + hdr, plain->t_len - hdr);
-            pfree(plain);
-        }
+            tde_release_plain(plain);
         if (toasted != NULL && toasted != plain)
             pfree(toasted);
         if (enc != NULL)
@@ -1031,11 +1030,7 @@ pg_vault_tde_tuple_insert_speculative(Relation rel, TupleTableSlot *slot,
     }
     PG_END_TRY();
     if (shouldFree)
-    {
-        Size hdr = plain->t_data->t_hoff;
-        OPENSSL_cleanse((char *) plain->t_data + hdr, plain->t_len - hdr);
-        pfree(plain);
-    }
+        tde_release_plain(plain);
     if (toasted != plain)
         pfree(toasted);
     pfree(enc);
@@ -1106,11 +1101,10 @@ pg_vault_tde_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
             plain_inflight = plain;
             plain_inflight_owned = sf;
             toasted_inflight = NULL;
-            toasted = pg_vault_tde_toast_insert_or_update(rel, plain, NULL, options);
+            
+            enc_tuples[i] = tde_prepare_encrypt_tuple(rel, plain, NULL, &toasted, options);
+
             toasted_inflight = (toasted != plain) ? toasted : NULL;
-            enc_tuples[i] = tde_encrypt_heap_tuple(toasted, RelationGetRelid(rel));
-            enc_tuples[i]->t_tableOid = table_oid;
-            enc_tuples[i]->t_data->t_infomask &= ~HEAP_HASEXTERNAL;
             /* Create a temporary slot and store the encrypted tuple in it */
             enc_slots[i] = MakeSingleTupleTableSlot(tupdesc,
                                                      &TTSOpsHeapTuple);
@@ -1120,11 +1114,7 @@ pg_vault_tde_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
             if (toasted != plain)
                 pfree(toasted);
             if (sf)
-            {
-                Size hdr = plain->t_data->t_hoff;
-                OPENSSL_cleanse((char *) plain->t_data + hdr, plain->t_len - hdr);
-                pfree(plain);
-            }
+                tde_release_plain(plain);
             /* Iteration completed cleanly — clear in-flight tracking */
             plain_inflight = NULL;
             plain_inflight_owned = false;
@@ -1158,9 +1148,7 @@ pg_vault_tde_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
         if (plain_inflight != NULL && plain_inflight_owned)
         {
             HeapTuple p = plain_inflight;
-            Size hdr = p->t_data->t_hoff;
-            OPENSSL_cleanse((char *) p->t_data + hdr, p->t_len - hdr);
-            pfree(p);
+            tde_release_plain(p);
         }
         if (toasted_inflight != NULL)
             pfree(toasted_inflight);
@@ -1206,34 +1194,24 @@ pg_vault_tde_tuple_update(Relation rel, ItemPointer otid,
     HeapTuple  toasted = NULL;
     HeapTuple  enc = NULL;
     TM_Result  result;
-    bool       old_has_external = false;
+   
     TupleTableSlot *slot_old = NULL;
 
     plain = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
     plain->t_tableOid = RelationGetRelid(rel);
 
     slot_old = table_slot_create(rel, NULL);
-    if (pg_vault_tde_tuple_fetch_row_version(rel, otid, snapshot, slot_old))
-    {
-        /* Read old tuple metadata from slot storage (no materialized copy). */
-        old_tuple = ExecFetchSlotHeapTuple(slot_old, false, NULL);
-        /* Header bit is cleared on disk (see tde_encrypt_heap_tuple); scan the
-         * decrypted plaintext per-attribute instead. */
-        old_has_external = tde_tuple_has_external_slow(old_tuple, RelationGetDescr(rel));
-    }
 
-    /*
-     * The PG_TRY wraps the entire pre-TOAST → encrypt → heap_update pipeline.
-     * Errors from pre-TOAST handling or tde_encrypt_heap_tuple now
-     * also restore reltoastrelid and OPENSSL_cleanse the plaintext.  TOAST
-     * chunks already inserted are rolled back by the transaction abort.
-     */
     PG_TRY();
-    {   
-        toasted = pg_vault_tde_toast_insert_or_update(rel, plain, old_tuple, 0);
-        enc = tde_encrypt_heap_tuple(toasted, RelationGetRelid(rel));
-        enc->t_tableOid = plain->t_tableOid;
-        enc->t_data->t_infomask &= ~HEAP_HASEXTERNAL;
+    {
+        bool old_has_external = false;
+        if (pg_vault_tde_tuple_fetch_row_version(rel, otid, snapshot, slot_old))
+        {
+            old_tuple = ExecFetchSlotHeapTuple(slot_old, false, NULL);
+            old_has_external = tde_tuple_has_external(old_tuple, rel);
+        }
+
+        enc = tde_prepare_encrypt_tuple(rel, plain, old_tuple, &toasted, 0);
 
         result = heap_update(rel, otid, enc, cid, crosscheck, wait,
                              tmfd, lockmode, update_indexes);
@@ -1243,10 +1221,7 @@ pg_vault_tde_tuple_update(Relation rel, ItemPointer otid,
             ItemPointerCopy(&enc->t_self, &slot->tts_tid);
             slot->tts_tableOid = enc->t_tableOid;
 
-            /*
-             * If old row had external TOAST chunks but the updated row no longer
-             * does, proactively delete the old TOAST payload after TM_Ok.
-             */
+            /* Check toasted (plaintext): enc is ciphertext with HASEXTERNAL cleared. */
             if (old_tuple != NULL && old_has_external && !HeapTupleHasExternal(toasted))
                 heap_toast_delete(rel, old_tuple, false);
         }
@@ -1255,9 +1230,7 @@ pg_vault_tde_tuple_update(Relation rel, ItemPointer otid,
     {
         if (shouldFree && plain != NULL)
         {
-            Size hdr = plain->t_data->t_hoff;
-            OPENSSL_cleanse((char *) plain->t_data + hdr, plain->t_len - hdr);
-            pfree(plain);
+            tde_release_plain(plain);
         }
         if (toasted != NULL && toasted != plain)
             pfree(toasted);
@@ -1273,9 +1246,7 @@ pg_vault_tde_tuple_update(Relation rel, ItemPointer otid,
     PG_END_TRY();
     if (shouldFree)
     {
-        Size hdr = plain->t_data->t_hoff;
-        OPENSSL_cleanse((char *) plain->t_data + hdr, plain->t_len - hdr);
-        pfree(plain);
+        tde_release_plain(plain);
     }
     if (toasted != plain)
         pfree(toasted);
@@ -1288,37 +1259,66 @@ pg_vault_tde_tuple_update(Relation rel, ItemPointer otid,
 }
 
 /*
- * tde_tuple_has_external_slow
+ * tde_tuple_has_external
  *
  * Per-attribute scan for VARATT_IS_EXTERNAL varlenas on a decrypted heap
- * tuple.  Required as a fallback when HEAP_HASEXTERNAL may be cleared in
- * t_infomask — specifically for tuples written by VACUUM FULL, which clears
- * the flag on encrypted tuples to satisfy rewrite_heap_tuple's assertion
- * (see pg_vault_tde_relation_copy_for_cluster).
- *
- * Without this fallback, pg_vault_tde_tuple_delete would silently skip
- * heap_toast_delete for rows written during VACUUM FULL, orphaning TOAST
- * chunks until the next regular VACUUM.
- */
+ * tuple. This is necessary because flag HEAP_HASEXTERNAL is cleansed 
+ * in insert before calling heap_insert(), otherwise it will call
+ * heap_toast_insert_or_update.
+*/
 static bool
-tde_tuple_has_external_slow(HeapTuple tup, TupleDesc tupdesc)
+tde_tuple_has_external(HeapTuple tup, Relation rel)
 {
-    int natts = Min(tupdesc->natts, HeapTupleHeaderGetNatts(tup->t_data));
+    int natts;
+    TupleDesc tupdesc;
+    Datum stack_values[MAX_STACK_ATTRS];
+    bool  stack_isnull[MAX_STACK_ATTRS];
+    
+    Datum *values = stack_values;
+    bool  *isnull = stack_isnull;
+    bool  has_ext = false;
+
+    if(!OidIsValid(rel->rd_rel->reltoastrelid)) 
+        return false;
+    
+    tupdesc = RelationGetDescr(rel);
+    natts = Min(tupdesc->natts, HeapTupleHeaderGetNatts(tup->t_data));
+
+    if (unlikely(natts > MAX_STACK_ATTRS))
+    {
+        values = (Datum *) palloc(natts * sizeof(Datum));
+        isnull = (bool *) palloc(natts * sizeof(bool));
+    }
+
+    /* 
+     * Previous version was using heap_getattr (O(n)) in a for loop
+     * for every attr in heaptuple resulting in a O(n²). 
+     * In the current vesion: Deforming is O(n) so the total complexity 
+     * is O(n + n) = O(n).
+     */
+    heap_deform_tuple(tup, tupdesc, values, isnull); 
 
     for (int i = 0; i < natts; i++)
     {
         Form_pg_attribute att = TupleDescAttr(tupdesc, i);
-        bool    isnull;
-        Datum   d;
 
-        if (att->attlen != -1 || att->attisdropped)
-            continue;
-
-        d = heap_getattr(tup, i + 1, tupdesc, &isnull);
-        if (!isnull && VARATT_IS_EXTERNAL(DatumGetPointer(d)))
-            return true;
+        if (!isnull[i] && !att->attisdropped && att->attlen == -1)
+        {
+            if (VARATT_IS_EXTERNAL(DatumGetPointer(values[i])))
+            {
+                has_ext = true;
+                break; 
+            }
+        }
     }
-    return false;
+
+    if (unlikely(natts > MAX_STACK_ATTRS))
+    {
+       pfree(values);
+       pfree(isnull);
+    }
+
+    return has_ext;
 }
 
 /*
@@ -1332,7 +1332,7 @@ tde_tuple_has_external_slow(HeapTuple tup, TupleDesc tupdesc)
  *     infomask bit.  Normally reliable, but VACUUM FULL clears this bit on
  *     encrypted tuples to satisfy rewrite_heap_tuple's assertion
  *     (see pg_vault_tde_relation_copy_for_cluster).
- *  2. tde_tuple_has_external_slow() — per-attribute VARATT_IS_EXTERNAL scan
+ *  2. tde_tuple_has_external() — per-attribute VARATT_IS_EXTERNAL scan
  *     on the decrypted tuple.  Falls back to this when the bit is clear so
  *     TOAST chunks from VACUUM FULL-rewritten rows are never orphaned.
  *
@@ -1367,23 +1367,19 @@ pg_vault_tde_tuple_delete(Relation rel,
          * from encrypted tuples to satisfy rewrite_heap_tuple's assertion;
          * without the fallback those TOAST chunks would be orphaned.
          */
-        has_externals = tde_tuple_has_external_slow(plain, RelationGetDescr(rel));
+        has_externals = tde_tuple_has_external(plain, rel);
     }
 
     PG_TRY();
     {
         result = heapam_tuple_delete_cb(rel, tid, cid, snapshot, crosscheck, wait, tmfd, changingPart);
-        
-        if(result == TM_Ok && has_externals && plain != NULL) heap_toast_delete(rel, plain, false);
+
+        if(result == TM_Ok && has_externals) heap_toast_delete(rel, plain, false);
     }
     PG_CATCH();
     {
         if (shouldFree)
-        {
-            Size hdr = plain->t_data->t_hoff;
-            OPENSSL_cleanse((char *) plain->t_data + hdr, plain->t_len - hdr);
-            pfree(plain);
-        }
+            tde_release_plain(plain);
 
         if (slot != NULL)
             ExecDropSingleTupleTableSlot(slot);
@@ -1393,11 +1389,7 @@ pg_vault_tde_tuple_delete(Relation rel,
     PG_END_TRY();
 
     if (shouldFree)
-    {
-        Size hdr = plain->t_data->t_hoff;
-        OPENSSL_cleanse((char *) plain->t_data + hdr, plain->t_len - hdr);
-        pfree(plain);
-    }
+        tde_release_plain(plain);
     
     if (slot != NULL)
         ExecDropSingleTupleTableSlot(slot);
@@ -1437,7 +1429,7 @@ pg_vault_tde_tuple_delete(Relation rel,
  * rewrite_heap_tuple asserts !HeapTupleHasExternal(newTuple).  For re-toasted
  * tuples we clear HEAP_HASEXTERNAL from enc_new's t_infomask before the call.
  * TOAST chunk cleanup on later DELETE is still correct because
- * pg_vault_tde_tuple_delete uses tde_tuple_has_external_slow as a fallback
+ * pg_vault_tde_tuple_delete uses tde_tuple_has_external as a fallback
  * that does a per-attribute varlena tag scan instead of relying on the flag.
  */
 static void
@@ -1585,7 +1577,7 @@ pg_vault_tde_relation_copy_for_cluster(Relation OldTable,
                 /* Header bit is cleared on disk (see tde_encrypt_heap_tuple);
                  * scan the plaintext, else the re-TOAST migration below is
                  * skipped and the rewrite keeps OldTable's TOAST pointers. */
-                if (tde_tuple_has_external_slow(plain, tupdesc))
+                if (tde_tuple_has_external(plain, OldTable))
                 {
                     /*
                      * External TOAST pointers in the decrypted tuple reference
@@ -1634,7 +1626,7 @@ pg_vault_tde_relation_copy_for_cluster(Relation OldTable,
                  *
                  * Clear the flag so the assertion passes.
                  * pg_vault_tde_tuple_delete compensates via
-                 * tde_tuple_has_external_slow, which does a per-attribute
+                 * tde_tuple_has_external, which does a per-attribute
                  * VARATT_IS_EXTERNAL scan on the decrypted tuple regardless
                  * of this flag.
                  */
@@ -1645,7 +1637,7 @@ pg_vault_tde_relation_copy_for_cluster(Relation OldTable,
             }
             PG_CATCH(2);
             {
-                /* Cleanse any plaintext key material before re-throwing. */
+                /* Cleanse any plaintext key mterial before re-throwing. */
                 if (plain != NULL)
                 {
                     Size hdr = plain->t_data->t_hoff;
