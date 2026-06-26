@@ -6,16 +6,18 @@
  *
  * OVERVIEW:
  * ---------
- * This module manages the TdeRelDekCache shared-memory array and provides
- * the pg_vault_tde_kms_get_rel_dek() accessor used by all TAM encrypt/decrypt
- * paths in v1.5+.
+ * This module manages the TdeRelDekMap shared-memory hash table (an HTAB
+ * created with ShmemInitHash, keyed by relid) and provides the
+ * pg_vault_tde_kms_get_rel_dek() accessor used by all TAM encrypt/decrypt
+ * paths in v1.5+.  A single LWLock from the "TdeRelDekMap" named tranche
+ * guards the whole table.
  *
  * HOT PATH:
  * ---------
  * Every call to tde_encrypt_heap_tuple / tde_decrypt_heap_tuple goes through
  * pg_vault_tde_kms_get_rel_dek().  The fast path is:
- *   1. Acquire LW_SHARED on TdeRelDekCache.lock
- *   2. Linear-scan entries[] for relid match (< 1 µs for <= 1024 tables)
+ *   1. Acquire LW_SHARED on rel_dek_lock
+ *   2. hash_search(HASH_FIND) for the relid key (O(1) average)
  *   3. Copy DEK into caller's stack buffer
  *   4. Release LW_SHARED
  *
@@ -70,23 +72,24 @@
 /* -------------------------------------------------------------------------
  * Module-level shmem pointer
  * -------------------------------------------------------------------------*/
-static TdeRelDekCache *rel_dek_cache = NULL;
+static HTAB     *rel_dek_map    = NULL;
+static LWLock   *rel_dek_lock   = NULL;
 
 /* -------------------------------------------------------------------------
  * Shmem sizing helpers
  * -------------------------------------------------------------------------*/
 
 /*
- * tde_rel_dek_cache_size — size of the TdeRelDekCache shmem segment.
+ * tde_rel_dek_cache_size — size of the TdeRelDekMap HTAB shmem segment.
  *
- * Called from shmem_request_hook.  At that point the GUC has been read but
- * shmem allocation has not happened yet.
+ * Delegates to hash_estimate_size() for an HTAB of `capacity` TdeRelDekMap
+ * entries.  Called from shmem_request_hook.  At that point the GUC has been
+ * read but shmem allocation has not happened yet.
  */
 static Size
 tde_rel_dek_cache_size(int capacity)
 {
-    return offsetof(TdeRelDekCache, entries)
-           + (Size) capacity * sizeof(TdeRelDekEntry);
+    return hash_estimate_size(capacity, sizeof(TdeRelDekMap));
 }
 
 
@@ -96,39 +99,28 @@ tde_rel_dek_cache_size(int capacity)
 void
 pg_vault_tde_catalog_shmem_request(void)
 {
-    int capacity;
-
-    /*
-     * Read the GUC.  The GUC is registered before this hook fires, so
-     * pg_vault_tde_max_encrypted_relations is already populated.
-     */
-    capacity = pg_vault_tde_max_encrypted_relations;
+    int capacity = pg_vault_tde_max_encrypted_relations;
     if (capacity < 64)
         capacity = TDE_REL_DEK_CACHE_DEFAULT;
 
     RequestAddinShmemSpace(tde_rel_dek_cache_size(capacity));
-    RequestNamedLWLockTranche("TdeRelDekCache", 1);
+    RequestNamedLWLockTranche("TdeRelDekMap", 1);  /* Lock outside of the map */
 }
 
-TdeRelDekEntry* tde_catalog_cache_entry(Oid relid)
+bool tde_catalog_cache_entry(Oid relid, TdeRelDekMap* out_entry)
 {
-    int i; 
-    bool found = false;
+    TdeRelDekMap *e = NULL;
+    LWLockAcquire(rel_dek_lock, LW_SHARED);
 
-    TdeRelDekEntry *e = NULL;
-    LWLockAcquire(&rel_dek_cache->lock, LW_SHARED);
-    for (i = 0; i < rel_dek_cache->capacity; i++)
-    {
-        e = &rel_dek_cache->entries[i];
+    e = (TdeRelDekMap*) hash_search(rel_dek_map, &relid, HASH_FIND, NULL);
+    if(e && e->dek_valid)
+        memcpy(out_entry, e, sizeof(TdeRelDekMap));
+    else 
+        e = NULL;  
+         
+    LWLockRelease(rel_dek_lock);
 
-        if (e->relid == relid && e->dek_valid) {
-            found = true;
-            break;
-        }
-    }
-    LWLockRelease(&rel_dek_cache->lock);
-
-    return found ? e : NULL;
+    return e != NULL ? true : false;
 }
 
 /* -------------------------------------------------------------------------
@@ -137,42 +129,23 @@ TdeRelDekEntry* tde_catalog_cache_entry(Oid relid)
 void
 pg_vault_tde_catalog_shmem_init(void)
 {
-    int    capacity;
-    Size   seg_size;
-    bool   found;
+    HASHCTL info; 
+    int capacity = pg_vault_tde_max_encrypted_relations; 
 
-    capacity = pg_vault_tde_max_encrypted_relations;
-    if (capacity < 64)
+    if(capacity < 64)
         capacity = TDE_REL_DEK_CACHE_DEFAULT;
 
-    seg_size     = tde_rel_dek_cache_size(capacity);
-    rel_dek_cache = (TdeRelDekCache *)
-        ShmemInitStruct("TdeRelDekCache", seg_size, &found);
+    rel_dek_lock = &GetNamedLWLockTranche("TdeRelDekMap")[0].lock;
 
-    if (!found)
-    {
-        /*
-         * First postmaster backend to initialise this segment.
-         * Zero-fill (ShmemInitStruct guarantees this for new segments) and
-         * initialise the embedded LWLock.
-         *
-         * LWLockInitialize takes a pointer INTO the shmem segment — valid
-         * across all backends because it is a physical offset, not a
-         * virtual-address pointer.
-         */
-        MemSet(rel_dek_cache, 0, seg_size);
-        {
-            /*
-             * GetNamedLWLockTranche returns a LWLockPadded array; extract the
-             * tranche ID from the first slot to initialise our embedded lock.
-             */
-            LWLockPadded *named_locks = GetNamedLWLockTranche("TdeRelDekCache");
-            LWLockInitialize(&rel_dek_cache->lock,
-                             named_locks[0].lock.tranche);
-        }
-        rel_dek_cache->capacity = capacity;
-        rel_dek_cache->used     = 0;
-    }
+    MemSet(&info, 0, sizeof(info));
+    info.keysize = sizeof(Oid);
+    info.entrysize = sizeof(TdeRelDekMap);
+
+    rel_dek_map = ShmemInitHash("TdeRelDekMap",
+                                capacity, 
+                                capacity, 
+                                &info, 
+                                HASH_ELEM | HASH_BLOBS);
 }
 
 /* -------------------------------------------------------------------------
@@ -368,63 +341,53 @@ tde_catalog_read_row(Oid relid, TdeCatalogRow *out)
  * -------------------------------------------------------------------------*/
 static bool
 tde_rel_dek_cache_store(Oid relid,
-                        unsigned char *dek_temp,
-                        unsigned char *dek_out,
+                        unsigned char *dek,
                         uint64 generation)
 {
-    int             i;
-    TdeRelDekEntry *empty_slot = NULL;
+    TdeRelDekMap *stored_slot = NULL;
+    bool found;
 
-    if(!rel_dek_cache) 
-        ereport (ERROR, errmsg("pg_vault_tde: error: shmem cache is null, the extension must be loaded via shared_preload_libraries"));
+    if(!rel_dek_map) 
+        ereport(ERROR, errmsg("pg_vault_tde: error: shmem cache is null, the extension must be loaded via shared_preload_libraries"));
 
-    LWLockAcquire(&rel_dek_cache->lock, LW_EXCLUSIVE);
-    for (i = 0; i < rel_dek_cache->capacity; i++)
-    {
-        TdeRelDekEntry *e = &rel_dek_cache->entries[i];
+    LWLockAcquire(rel_dek_lock, LW_EXCLUSIVE);
+    stored_slot = (TdeRelDekMap*) hash_search(rel_dek_map, &relid, HASH_ENTER_NULL, &found);
 
-        if (e->relid == relid && e->dek_valid)
-        {
-            /* Another backend loaded the DEK while we were in catalog scan. */
-            memcpy(dek_out, e->dek, TDE_DEK_LEN);
-            OPENSSL_cleanse(dek_temp, TDE_DEK_LEN);
-            LWLockRelease(&rel_dek_cache->lock);
-            return true;
-        }
+    if(!stored_slot){
+        LWLockRelease(rel_dek_lock);
+        OPENSSL_cleanse(dek, TDE_DEK_LEN);
 
-        if (e->relid == relid && !e->dek_valid && e->prev_dek_valid)
-        {
-            /* Rotation window: re-arm the entry with the new DEK. */
-            memcpy(e->dek, dek_temp, TDE_DEK_LEN);
-            e->dek_valid = true;
-            OPENSSL_cleanse(dek_temp, TDE_DEK_LEN);
-            memcpy(dek_out, e->dek, TDE_DEK_LEN);
-            LWLockRelease(&rel_dek_cache->lock);
-            return true;
-        }
-
-        if (!empty_slot && e->relid == InvalidOid)
-            empty_slot = e;
-    }
-
-    if (!empty_slot)
-    {
-        OPENSSL_cleanse(dek_temp, TDE_DEK_LEN);
-        ereport(ERROR,
+        ereport(ERROR, 
                 errmsg("pg_vault_tde: DEK cache full (capacity=%d); "
-                       "Consider increasing pg_vault_tde.max_encrypted_relations.",
-                       rel_dek_cache->capacity));
+                         "consider increasing pg_vault_tde.max_encrypted_relations.",
+                         pg_vault_tde_max_encrypted_relations));
     }
 
-    memcpy(empty_slot->dek, dek_temp, TDE_DEK_LEN);
-    OPENSSL_cleanse(dek_temp, TDE_DEK_LEN);
-    memcpy(dek_out, empty_slot->dek, TDE_DEK_LEN);
-    empty_slot->relid      = relid;
-    empty_slot->dek_valid  = true;
-    empty_slot->generation = generation;
-    rel_dek_cache->used++;
+    if(found && stored_slot->dek_valid)
+    {
+        LWLockRelease(rel_dek_lock);
+        return false;
+    }
+    else if(found && !stored_slot->dek_valid && stored_slot->prev_dek_valid)
+    {
+        memcpy(stored_slot->dek, dek, TDE_DEK_LEN);
+        stored_slot->dek_valid = true; 
+        
+        LWLockRelease(rel_dek_lock);
+        return true;
+    }
 
-    LWLockRelease(&rel_dek_cache->lock);
+    if(!found)
+    {
+        stored_slot->prev_dek_valid = false;
+        MemSet(stored_slot->prev_dek, 0, TDE_DEK_LEN);
+    }
+
+    memcpy(stored_slot->dek, dek, TDE_DEK_LEN);
+    stored_slot->dek_valid = true; 
+    stored_slot->generation = generation;
+
+    LWLockRelease(rel_dek_lock);
     return true;
 }
 
@@ -438,9 +401,9 @@ bool
 pg_vault_tde_kms_get_rel_dek(Oid relid,
                                unsigned char *dek_out, int dek_len)
 {
-    int   i;
     bool  found = false;
     Oid   effective_relid;
+    TdeRelDekMap *e;
 
     Assert(dek_out != NULL);
     Assert(dek_len == TDE_DEK_LEN);
@@ -448,22 +411,19 @@ pg_vault_tde_kms_get_rel_dek(Oid relid,
     effective_relid = resolve_effective_relid(relid);
 
     /* ---- Fast path: LW_SHARED cache lookup ---- */
-    if(!rel_dek_cache) 
+    if(!rel_dek_map) 
         ereport (ERROR, errmsg("pg_vault_tde: error: shmem cache is null, the extension must be loaded via shared_preload_libraries"));
 
-    LWLockAcquire(&rel_dek_cache->lock, LW_SHARED);
-    for (i = 0; i < rel_dek_cache->capacity; i++)
-    {
-        TdeRelDekEntry *e = &rel_dek_cache->entries[i];
+    LWLockAcquire(rel_dek_lock, LW_SHARED);
+    e = (TdeRelDekMap*) hash_search(rel_dek_map, &effective_relid, HASH_FIND, NULL);
 
-        if (e->relid == effective_relid && e->dek_valid)
-        {
-            memcpy(dek_out, e->dek, TDE_DEK_LEN);
-            found = true;
-            break;
-        }
+    if (e && e->dek_valid)
+    {
+        memcpy(dek_out, e->dek, TDE_DEK_LEN);
+        found = true;
     }
-    LWLockRelease(&rel_dek_cache->lock);
+    
+    LWLockRelease(rel_dek_lock);
 
     if (found)
         return true;
@@ -531,9 +491,14 @@ pg_vault_tde_kms_get_rel_dek(Oid relid,
         }
 
         tde_audit(KMS_DEK_ACCESS, psprintf("%u", effective_relid), true);
-        /* Ownership of dek_temp transfers to tde_rel_dek_cache_store. */
-        return tde_rel_dek_cache_store(effective_relid, dek_temp, dek_out,
-                                       row.generation);
+
+        memcpy(dek_out, dek_temp, TDE_DEK_LEN);
+
+        /* Store the DEK for next calls */
+        tde_rel_dek_cache_store(effective_relid, dek_temp, row.generation);
+        
+        OPENSSL_cleanse(dek_temp, TDE_DEK_LEN);
+        return true;
     }
 }
 
@@ -544,33 +509,28 @@ bool
 pg_vault_tde_kms_get_rel_prev_dek(Oid relid,
                                    unsigned char *prev_dek_out, int dek_len)
 {
-    int  i;
     bool found = false;
     Oid effective_relid = resolve_effective_relid(relid);
+    TdeRelDekMap *e;
 
     Assert(prev_dek_out != NULL);
     Assert(dek_len == TDE_DEK_LEN);
 
-    if (!rel_dek_cache)
+    if (!rel_dek_map)
         return false;
 
-    LWLockAcquire(&rel_dek_cache->lock, LW_SHARED);
-    for (i = 0; i < rel_dek_cache->capacity; i++)
+    LWLockAcquire(rel_dek_lock, LW_SHARED);
+    e = (TdeRelDekMap*) hash_search(rel_dek_map, &effective_relid, HASH_FIND, NULL);
+
+    if (e && e->prev_dek_valid)
     {
-        TdeRelDekEntry *e = &rel_dek_cache->entries[i];
-        if (e->relid == effective_relid && e->prev_dek_valid)
-        {
-            memcpy(prev_dek_out, e->prev_dek, TDE_DEK_LEN);
-            found = true;
-            break;
-        }
+        memcpy(prev_dek_out, e->prev_dek, TDE_DEK_LEN);
+        found = true;
     }
-    LWLockRelease(&rel_dek_cache->lock);
+    
+    LWLockRelease(rel_dek_lock);
 
-    if (found)
-        return true;
-
-    return false;
+    return found; 
 }
 
 /*
@@ -875,27 +835,23 @@ pg_vault_tde_catalog_deregister_rel(Oid relid)
 void
 pg_vault_tde_catalog_evict_rel(Oid relid)
 {
-    int i;
+    bool found = false;
+    TdeRelDekMap *e;
 
-    if (!rel_dek_cache)
+    if (!rel_dek_map)
         return;
 
-    LWLockAcquire(&rel_dek_cache->lock, LW_EXCLUSIVE);
-    for (i = 0; i < rel_dek_cache->capacity; i++)
+    LWLockAcquire(rel_dek_lock, LW_EXCLUSIVE);
+
+    e = (TdeRelDekMap*) hash_search(rel_dek_map, &relid, HASH_FIND, &found);
+    if (found)
     {
-        TdeRelDekEntry *e = &rel_dek_cache->entries[i];
-        if (e->relid == relid)
-        {
-            OPENSSL_cleanse(e->dek, TDE_DEK_LEN);
-            OPENSSL_cleanse(e->prev_dek, TDE_DEK_LEN);
-            e->relid          = InvalidOid;
-            e->dek_valid      = false;
-            e->prev_dek_valid = false;
-            rel_dek_cache->used--;
-            break;
-        }
+        OPENSSL_cleanse(e->dek, TDE_DEK_LEN);
+        OPENSSL_cleanse(e->prev_dek, TDE_DEK_LEN);
+        hash_search(rel_dek_map, &relid, HASH_REMOVE, NULL);
     }
-    LWLockRelease(&rel_dek_cache->lock);
+
+    LWLockRelease(rel_dek_lock);
 }
 
 /* -------------------------------------------------------------------------
@@ -911,71 +867,46 @@ pg_vault_tde_catalog_evict_rel(Oid relid)
 void
 pg_vault_tde_catalog_evict_all(void)
 {
-    int i;
+    HASH_SEQ_STATUS seq;
+    TdeRelDekMap    *e; 
 
-    if (!rel_dek_cache)
+    if(!rel_dek_map)
         return;
 
-    LWLockAcquire(&rel_dek_cache->lock, LW_EXCLUSIVE);
-    for (i = 0; i < rel_dek_cache->capacity; i++)
+    LWLockAcquire(rel_dek_lock, LW_EXCLUSIVE);
+    
+    hash_seq_init(&seq, rel_dek_map);
+    while((e = (TdeRelDekMap*) hash_seq_search(&seq)) != NULL)
     {
-        TdeRelDekEntry *e = &rel_dek_cache->entries[i];
-        if (e->relid != InvalidOid)
-        {
-            OPENSSL_cleanse(e->dek, TDE_DEK_LEN);
-            OPENSSL_cleanse(e->prev_dek, TDE_DEK_LEN);
-            e->relid          = InvalidOid;
-            e->dek_valid      = false;
-            e->prev_dek_valid = false;
-        }
+        OPENSSL_cleanse(e->dek, TDE_DEK_LEN);
+        OPENSSL_cleanse(e->prev_dek, TDE_DEK_LEN);
+        hash_search(rel_dek_map, &e->relid, HASH_REMOVE, NULL);
     }
-    rel_dek_cache->used = 0;
-    LWLockRelease(&rel_dek_cache->lock);
+
+    LWLockRelease(rel_dek_lock);
 
     ereport(LOG, errmsg("pg_vault_tde: all DEKs evicted from shared memory cache"));
-}
-
-/* -------------------------------------------------------------------------
- * pg_vault_tde_catalog_get_dek_count — count live shmem DEK entries
- * -------------------------------------------------------------------------*/
-int
-pg_vault_tde_catalog_get_dek_count(void)
-{
-    int count;
-
-    if (!rel_dek_cache)
-        return 0;
-
-    LWLockAcquire(&rel_dek_cache->lock, LW_SHARED);
-    count = rel_dek_cache->used;
-    LWLockRelease(&rel_dek_cache->lock);
-
-    return count;
 }
 
 uint64
 pg_vault_tde_catalog_get_rel_generation(Oid relid)
 {
-    int    i;
     uint64 gen = 0;
     Oid    effective_relid;
+    TdeRelDekMap* e;
 
-    if (!OidIsValid(relid) || !rel_dek_cache)
+    if(!OidIsValid(relid) || !rel_dek_map)
         return 0;
 
     effective_relid = resolve_effective_relid(relid);
 
-    LWLockAcquire(&rel_dek_cache->lock, LW_SHARED);
-    for (i = 0; i < rel_dek_cache->capacity; i++)
-    {
-        TdeRelDekEntry *e = &rel_dek_cache->entries[i];
-        if (e->relid == effective_relid)
-        {
-            gen = e->generation;
-            break;
-        }
-    }
-    LWLockRelease(&rel_dek_cache->lock);
+    LWLockAcquire(rel_dek_lock, LW_SHARED);
+
+    e = (TdeRelDekMap*) hash_search(rel_dek_map, &effective_relid, HASH_FIND, NULL);
+    if(e) 
+        gen = e->generation;
+
+    LWLockRelease(rel_dek_lock);
 
     if (gen > 0)
         return gen;
@@ -994,27 +925,24 @@ pg_vault_tde_catalog_get_rel_generation(Oid relid)
 
 void pg_vault_tde_catalog_zero_rel_dek(Oid relid)
 {
-    int i;
     Oid effective_relid = resolve_effective_relid(relid);
+    TdeRelDekMap *e;
 
-    if (!rel_dek_cache)
+    if (!rel_dek_map)
         return;
 
-    LWLockAcquire(&rel_dek_cache->lock, LW_EXCLUSIVE);
-    for (i = 0; i < rel_dek_cache->capacity; i++)
+    LWLockAcquire(rel_dek_lock, LW_EXCLUSIVE);
+    
+    e = (TdeRelDekMap*) hash_search(rel_dek_map, &effective_relid, HASH_FIND, NULL);
+    if (e)
     {
-        TdeRelDekEntry *e = &rel_dek_cache->entries[i];
-        if (e->relid == effective_relid)
-        {
-            memcpy(e->prev_dek, e->dek, TDE_DEK_LEN);
-            OPENSSL_cleanse(e->dek, TDE_DEK_LEN);
-            e->dek_valid      = false;
-            e->prev_dek_valid = true;
-            e->generation++;
-            break;
-        }
+        memcpy(e->prev_dek, e->dek, TDE_DEK_LEN);
+        OPENSSL_cleanse(e->dek, TDE_DEK_LEN);
+        e->dek_valid      = false;
+        e->prev_dek_valid = true;
+        e->generation++;
     }
-    LWLockRelease(&rel_dek_cache->lock);
+    LWLockRelease(rel_dek_lock);
 
     ereport(LOG, errmsg("pg_vault_tde: Old dek saved and setted dek invalid"));
 }

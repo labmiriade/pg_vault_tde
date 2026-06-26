@@ -32,7 +32,6 @@
 #include "common/pg_prng.h"
 #include <openssl/evp.h>
 #include <openssl/rand.h>
-#include <openssl/crypto.h>
 
 #include "src/include/pg_vault_tde_kms.h"
 #include "src/include/pg_vault_tde_crypto.h"
@@ -40,22 +39,32 @@
 #include "src/include/pg_vault_tde_catalog.h" /* pg_vault_tde_kms_get_rel_dek (v1.5) */
 
 /* ============================================================
- * Per-backend reusable EVP contexts.
+ * Per-backend reusable EVP contexts, keyed by (relid, generation).
  *
- * Allocating EVP_CIPHER_CTX via EVP_CIPHER_CTX_new() invokes a heap malloc
- * (~20-30 ns) on every call.  On the multi_insert path this fires once per
- * tuple, adding 200-300 ms of pure allocation overhead for a 10M-row load.
+ * Allocating an EVP_CIPHER_CTX per call costs a heap malloc; installing the
+ * AES-256 key schedule (EVP_EncryptInit_ex2 with the DEK) costs more still.
+ * On bulk INSERT/scan both fire once per tuple.
  *
- * Instead we allocate once per backend on first use and reset the context
- * between calls via EVP_CIPHER_CTX_reset().  On any fatal error path we free
- * and NULL-out the pointer so the next call re-allocates cleanly.
+ * We allocate each context once per backend (first use) and cache the
+ * (relid, generation) it is keyed for.  As long as consecutive tuples share
+ * the same relation and generation we reuse the installed key schedule and
+ * only rearm the IV per call; the schedule is re-installed only when relid or
+ * generation changes.  On any fatal error path tde_crypto_ctx_cleanup() frees
+ * and NULL-outs both contexts so the next call re-allocates and re-keys.
  *
  * Thread safety: each PostgreSQL backend is single-threaded, so no locking
  * is required for these file-scope statics.
  * ============================================================ */
-static EVP_CIPHER_CTX *tde_gcm_enc_ctx = NULL;  /* encrypt context */
-static EVP_CIPHER_CTX *tde_gcm_dec_ctx = NULL;  /* decrypt context */
+/* One reusable EVP context per direction; re-keyed only when (relid, gen) changes. */
+typedef struct TdeCipherSlot
+{
+    EVP_CIPHER_CTX  *ctx;
+    Oid              relid;
+    uint64           generation;
+} TdeCipherSlot;
 
+static TdeCipherSlot tde_enc = { NULL, InvalidOid, 0 };
+static TdeCipherSlot tde_dec = { NULL, InvalidOid, 0 };
 /* ============================================================
  * Per-backend IV batch buffer.
  *
@@ -103,6 +112,18 @@ tde_next_iv(unsigned char *iv_out)
     iv_batch_pos++;
 }
 
+/* Allocate the two per-backend GCM contexts on first use. Idempotent. */
+static bool
+tde_crypto_ctx_init(void)
+{
+    if (tde_enc.ctx == NULL)
+        tde_enc.ctx = EVP_CIPHER_CTX_new();
+    if (tde_dec.ctx == NULL)
+        tde_dec.ctx = EVP_CIPHER_CTX_new();
+
+    return tde_enc.ctx != NULL && tde_dec.ctx != NULL;
+}
+
 /*
  * tde_crypto_ctx_cleanup -- free cached EVP contexts and wipe the IV batch.
  *
@@ -113,19 +134,21 @@ tde_next_iv(unsigned char *iv_out)
 void
 tde_crypto_ctx_cleanup(void)
 {
-    if (tde_gcm_enc_ctx != NULL)
+    if (tde_enc.ctx != NULL)
     {
-        EVP_CIPHER_CTX_free(tde_gcm_enc_ctx);
-        tde_gcm_enc_ctx = NULL;
+        EVP_CIPHER_CTX_free(tde_enc.ctx);
+        tde_enc.ctx = NULL;
     }
-    if (tde_gcm_dec_ctx != NULL)
+    if (tde_dec.ctx != NULL)
     {
-        EVP_CIPHER_CTX_free(tde_gcm_dec_ctx);
-        tde_gcm_dec_ctx = NULL;
+        EVP_CIPHER_CTX_free(tde_dec.ctx);
+        tde_dec.ctx = NULL;
     }
-    /* Wipe IV batch so key-adjacent entropy is not left in process memory */
+    tde_enc.relid = InvalidOid;
+    tde_dec.relid = InvalidOid;
+
     OPENSSL_cleanse(iv_batch, TDE_IV_BATCH_BYTES);
-    iv_batch_pos = TDE_IV_BATCH_SIZE; /* mark exhausted */
+    iv_batch_pos = TDE_IV_BATCH_SIZE;
 }
 
 /*
@@ -221,39 +244,23 @@ tde_gcm_encrypt_core(const unsigned char* dek, int dek_len, Oid relid,
      */
     tde_next_iv(iv_ptr);
 
-    /*
-     * Reuse the per-backend encrypt context; allocate on first use.
-     * EVP_CIPHER_CTX_reset() restores the context to its post-new() state
-     * without releasing the underlying memory allocation 
-     */
+    /* Re-key only when relid/gen changed; otherwise just rearm the IV. */
+    if (!tde_crypto_ctx_init())
+        goto gcm_error;
 
-    if(tde_gcm_enc_ctx == NULL)
+    if (tde_enc.relid != relid || tde_enc.generation != gen)
     {
-        tde_gcm_enc_ctx = EVP_CIPHER_CTX_new();
-        if(tde_gcm_enc_ctx == NULL)
-        {
-            OPENSSL_cleanse(out_buf, total);
-            pfree(out_buf);
-            ereport(ERROR, 
-                    errmsg("[CRYPTO] Failed to allocate GCM encrypt context"));
-        }
-    }
-    else
-    {
-        EVP_CIPHER_CTX_reset(tde_gcm_enc_ctx);
+        if (EVP_EncryptInit_ex2(tde_enc.ctx, tde_hw_accel_gcm_cipher(),
+                                dek, NULL, NULL) != 1)
+            goto gcm_error;
+
+        tde_enc.relid = relid;
+        tde_enc.generation = gen;
     }
 
-    ctx = tde_gcm_enc_ctx;
+    ctx = tde_enc.ctx;
 
-    /*
-     * EVP_EncryptInit_ex2: use the cipher from the hw_accel provider layer.
-     * This routes to QAT if loaded, or AES-NI via the default provider.
-     * 
-     * The NULL params argument means OpenSSL picks the algorithm-specific 
-     * defaults (96-bit IV for GCM, standard tag length).  
-     */
-    if(EVP_EncryptInit_ex2(ctx, tde_hw_accel_gcm_cipher(), 
-                           (unsigned char *) dek, iv_ptr, NULL) != 1)
+    if (EVP_EncryptInit_ex2(ctx, NULL, NULL, iv_ptr, NULL) != 1)
        goto gcm_error;
 
     /*
@@ -291,14 +298,7 @@ tde_gcm_encrypt_core(const unsigned char* dek, int dek_len, Oid relid,
     return out_buf;
     
 gcm_error:
-    /*
-     * Free and NULL-out the cached context so the next encrypt call gets a 
-     * fresh allocation. The context state is unknown after an OpenSSL error;
-     * Retaining it would risk using corrupted key-schedule material
-     */
-
-    EVP_CIPHER_CTX_free(tde_gcm_enc_ctx);
-    tde_gcm_enc_ctx = NULL;
+    tde_crypto_ctx_cleanup();
     ctx = NULL;
     OPENSSL_cleanse(out_buf, total);
     pfree(out_buf);
@@ -344,13 +344,15 @@ tde_gcm_encrypt(Oid relid, const char *plaintext, Size plaintext_len, Size *out_
  *
  * @param ciphertext      [IV|CT|TAG|VERSION|GEN] buffer
  * @param ciphertext_len  total buffer length
+ * @param out_plain       caller buffer; cap = ciphertext_len - TDE_V4_OVERHEAD
  * @param out_len         on return, plaintext length
- * @returns               palloc'd plaintext buffer; caller cleans up
+ * @returns               true on success; false if version byte is not v4
  */
-char *
-tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len, Size *out_len)
+bool
+tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len,
+                char *out_plain, Size *out_len)
 {
-    EVP_CIPHER_CTX     *ctx;
+    EVP_CIPHER_CTX      *ctx;
     char                dek[TDE_DEK_LEN];
 
     const unsigned char *iv_ptr;
@@ -359,12 +361,12 @@ tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len, Size *ou
     const unsigned char *version_ptr;
     const unsigned char *gen_ptr;
 
-    char               *out_buf;
     Size                pt_len;
     int                 olen = 0,
                         flen = 0;
     int                 auth_ok;
     uint64              stored_gen;
+    uint64              current_gen;
 
     Assert(ciphertext != NULL);
     Assert(out_len != NULL);
@@ -382,22 +384,20 @@ tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len, Size *ou
     gen_ptr = version_ptr + 1;
 
     if ((unsigned char) version_ptr[0] != TDE_V4_VERSION_BYTE)
-        return NULL;
+        return false;
 
     {
 
-        TdeRelDekEntry* cache_entry;
+        TdeRelDekMap cache_entry;
         Oid dek_relid = resolve_effective_relid(relid);
 
-        cache_entry = tde_catalog_cache_entry(dek_relid);
-
         memcpy(&stored_gen, gen_ptr, TDE_V4_GEN_LEN);
-    
-        if(cache_entry == NULL)
-        {
-            uint64  current_gen = pg_vault_tde_catalog_get_rel_generation(dek_relid);
-            bool    found = false;       
 
+        if(!tde_catalog_cache_entry(dek_relid, &cache_entry))
+        {
+            bool    found = false;   
+            current_gen = pg_vault_tde_catalog_get_rel_generation(dek_relid);
+                
             if(stored_gen == current_gen)
             {
                 found = pg_vault_tde_kms_get_rel_dek(dek_relid, (unsigned char *) dek, TDE_DEK_LEN);
@@ -408,49 +408,48 @@ tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len, Size *ou
             }
 
             if(!found)
-                return NULL;
+                return false;
         }
-        else 
+        else
         {
-            uint64 current_gen = cache_entry->generation;       
+            bool    found = false;
+            current_gen = cache_entry.generation;
 
-            if(stored_gen == current_gen)
+            if(stored_gen == current_gen && cache_entry.dek_valid)
             {
-                memcpy(dek, cache_entry->dek, TDE_DEK_LEN);
-            } 
-            else if(stored_gen == current_gen - 1)
-            {
-                memcpy(dek, cache_entry->prev_dek, TDE_DEK_LEN);
+                memcpy(dek, cache_entry.dek, TDE_DEK_LEN);
+                found = true;
             }
+            else if(stored_gen == current_gen - 1 && cache_entry.prev_dek_valid)
+            {
+                memcpy(dek, cache_entry.prev_dek, TDE_DEK_LEN);
+                found = true;
+            }
+
+            if(!found)
+                return false;
         }
-       
+
     }
 
-    out_buf = (char *) palloc0(pt_len + 1); /* +1: safe zero terminator */
-
-    /*
-     * Reuse the per-backend decrypt context; allocate on first use.
-     */
-    if (tde_gcm_dec_ctx == NULL)
-    {
-        tde_gcm_dec_ctx = EVP_CIPHER_CTX_new();
-        if (tde_gcm_dec_ctx == NULL)
-        {
-            OPENSSL_cleanse(dek, TDE_DEK_LEN);
-            pfree(out_buf);
-            ereport(ERROR,
-                    (errmsg("[CRYPTO] Failed to allocate GCM decrypt context")));
-        }
-    }
-    else
-        EVP_CIPHER_CTX_reset(tde_gcm_dec_ctx);
-    ctx = tde_gcm_dec_ctx;
-
-
-
-    if (EVP_DecryptInit_ex2(ctx, tde_hw_accel_gcm_cipher(),
-                            (unsigned char *) dek, iv_ptr, NULL) != 1)
+    /* Cache key is stored_gen: the generation of the DEK loaded above. */
+    if (!tde_crypto_ctx_init())
         goto gcm_dec_error;
+
+    if (tde_dec.relid != relid || tde_dec.generation != stored_gen)
+    {
+        if (EVP_DecryptInit_ex2(tde_dec.ctx, tde_hw_accel_gcm_cipher(),
+                                (unsigned char *) dek, NULL, NULL) != 1)
+            goto gcm_dec_error;
+
+        tde_dec.relid = relid;
+        tde_dec.generation = stored_gen;
+    }
+
+    ctx = tde_dec.ctx;
+
+    if(EVP_DecryptInit_ex2(ctx, NULL, NULL, iv_ptr, NULL) != 1)
+       goto gcm_dec_error;
 
     /* Set the expected tag BEFORE calling Final */
     if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG,
@@ -474,7 +473,7 @@ tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len, Size *ou
         OPENSSL_cleanse(aad, TDE_V4_AAD_LEN);
     }
 
-    if (EVP_DecryptUpdate(ctx, (unsigned char *) out_buf, &olen,
+    if (EVP_DecryptUpdate(ctx, (unsigned char *) out_plain, &olen,
                           ct_ptr, (int) pt_len) != 1)
         goto gcm_dec_error;
 
@@ -485,15 +484,15 @@ tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len, Size *ou
      * plaintext would be a critical security vulnerability.
      */
     auth_ok = EVP_DecryptFinal_ex(ctx,
-                                  (unsigned char *) out_buf + olen, &flen);
+                                  (unsigned char *) out_plain + olen, &flen);
 
-    /* ctx is kept alive in tde_gcm_dec_ctx for reuse — do NOT free here */
+    /* ctx is retained in tde_dec.ctx for reuse — do NOT free here */
     OPENSSL_cleanse(dek, TDE_DEK_LEN);
 
     if (auth_ok != 1)
     {
-        OPENSSL_cleanse(out_buf, pt_len + 1);
-        pfree(out_buf);
+        /* Wipe the caller buffer: never expose unauthenticated plaintext. */
+        OPENSSL_cleanse(out_plain, pt_len);
 
         ereport(ERROR,
                 (errmsg("[CRYPTO] AES-256-GCM authentication FAILED: "
@@ -501,19 +500,14 @@ tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len, Size *ou
     }
 
     *out_len = (Size)(olen + flen);
-    return out_buf;
+    return true;
 
 gcm_dec_error:
-    /*
-     * Free and NULL-out the cached context — unknown state after an error.
-     */
-    EVP_CIPHER_CTX_free(tde_gcm_dec_ctx);
-    tde_gcm_dec_ctx = NULL;
+    tde_crypto_ctx_cleanup();
     ctx = NULL;
     OPENSSL_cleanse(dek, TDE_DEK_LEN);
-    OPENSSL_cleanse(out_buf, pt_len + 1);
-    pfree(out_buf);
+    OPENSSL_cleanse(out_plain, pt_len);
     ereport(ERROR, (errmsg("[CRYPTO] AES-256-GCM decryption setup failed")));
-    return NULL; /* unreachable */
+    return false; /* unreachable */
 }
 

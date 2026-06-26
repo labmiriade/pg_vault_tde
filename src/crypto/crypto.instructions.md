@@ -51,17 +51,32 @@ Constants (defined ONLY in `pg_vault_tde_crypto.h`):
 
 ---
 
-## EVP Context Pool Pattern
+## EVP Context Pattern — keyed by (relid, generation)
+
+The GCM contexts are NOT reset per call. Each is cached together with the
+`(relid, generation)` it is keyed for, so the AES key schedule is reused across
+tuples of the same relation/generation:
 
 ```c
-static EVP_CIPHER_CTX *tde_gcm_enc_ctx = NULL;  /* lazily init'd */
-static EVP_CIPHER_CTX *tde_gcm_dec_ctx = NULL;
+typedef struct TdeCipherSlot {
+    EVP_CIPHER_CTX *ctx;
+    Oid             relid;
+    uint64          generation;
+} TdeCipherSlot;
+
+static TdeCipherSlot tde_enc = { NULL, InvalidOid, 0 };
+static TdeCipherSlot tde_dec = { NULL, InvalidOid, 0 };
 ```
 
-- **Create** on first use via `EVP_CIPHER_CTX_new()`
-- **Reset** between calls via `EVP_CIPHER_CTX_reset()` (reuses allocation)
-- **Free** in `on_proc_exit(tde_crypto_ctx_cleanup)` callback
-- **Never** free and reallocate per tuple — that costs 2 heap allocations
+- **Create** each `ctx` once via `EVP_CIPHER_CTX_new()` (first use, idempotent).
+- **Re-key** with `EVP_EncryptInit_ex2(ctx, cipher, dek, NULL, NULL)` ONLY when
+  the slot's cached `relid`/`generation` differs from the current op (expensive
+  key schedule). The decrypt slot keys on the *stored* generation from the wire
+  trailer so `prev_dek` rows during rotation get their own schedule.
+- **Per tuple** rearm only the IV: `EVP_EncryptInit_ex2(ctx, NULL, NULL, iv, NULL)`.
+- **Free** both in `on_proc_exit(tde_crypto_ctx_cleanup)`; the same function runs
+  on any fatal error path, NULL-ing the contexts so the next call re-allocates.
+- **Never** reset or free+reallocate per tuple — that throws away the key schedule.
 
 ---
 
@@ -153,7 +168,8 @@ Example:
 | `tde_gcm_decrypt` | 128 B | < 2 µs | (same) |
 | `tde_gcm_decrypt` | 1 KB | < 5 µs | (same) |
 | IV generation | 12 B | < 0.5 µs | `pg_strong_random` single call |
-| EVP context reset | — | < 0.1 µs | `EVP_CIPHER_CTX_reset` |
+| EVP IV rearm (same relid/gen) | — | < 0.1 µs | `EVP_EncryptInit_ex2(ctx,NULL,NULL,iv,NULL)` |
+| EVP re-key (relid/gen change) | — | ~1 µs | `EVP_EncryptInit_ex2` with DEK |
 
 If a change causes > 20% regression from these baselines, it requires
 @Coordinator approval and documentation in `doc/pg_vault_tde.md`.

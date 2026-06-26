@@ -7,7 +7,8 @@
  * WHY THIS EXISTS:
  * ----------------
  * Each encrypted_heap relation has its own DEK (v1.5+), fetched from the
- * active KMS provider and cached in a fixed-size shmem array (TdeRelDekCache).
+ * active KMS provider and cached in a shared-memory hash table (the
+ * TdeRelDekMap HTAB, keyed by relid).
  *
  * On-disk persistence: pg_vault_tde_catalog(relid, generation,
  * wrapped_dek, created_at).  The in-memory cache is authoritative at runtime;
@@ -40,45 +41,15 @@
 #define TDE_REL_DEK_CACHE_DEFAULT  1024
 #define TDE_WRAPPED_DEK_MAX_LEN    256
 
-
-/*
- * TdeRelDekEntry — one slot in the per-table DEK cache.
- *
- * Stored in the TdeRelDekCache shmem array.  relid == InvalidOid means the
- * slot is empty.
- *
- * KEY HYGIENE: dek[] and prev_dek[] MUST be OPENSSL_cleanse'd before the
- * entry is evicted or the slot is reused.
- */
-typedef struct TdeRelDekEntry
+typedef struct TdeRelDekMap
 {
-    Oid          relid;                 /* InvalidOid = empty slot */
+    Oid          relid;
     char         dek[TDE_DEK_LEN];     /* current AES-256 DEK, 32 bytes */
     char         prev_dek[TDE_DEK_LEN];/* previous DEK (valid during rotation) */
     uint64       generation;            /* rotation epoch for this relation */
     bool         dek_valid;             /* true iff dek[] holds a live key */
     bool         prev_dek_valid;        /* true iff prev_dek[] is populated */
-} TdeRelDekEntry;
-
-/*
- * TdeRelDekCache — the shmem structure holding all per-table DEK entries.
- *
- * Allocated once from shmem_startup_hook.  Protected by a single LWLock
- * embedded by value (never a pointer — would be a virtual address specific
- * to the initialising process, invalid in all other backends).
- *
- * For lookup, a linear scan is acceptable at <= 1024 tables (< 1 µs per
- * lookup for cache sizes the hardware typically prefetches).  A hash table
- * is a future optimisation for v1.6+ workloads with thousands of tables.
- */
-typedef struct TdeRelDekCache
-{
-    LWLock          lock;           /* embedded LWLock; acquired LW_SHARED for
-                                     * read, LW_EXCLUSIVE for insert/evict */
-    int             capacity;       /* total slots (from GUC at shmem_request) */
-    int             used;           /* live entries (relid != InvalidOid) */
-    TdeRelDekEntry  entries[FLEXIBLE_ARRAY_MEMBER];
-} TdeRelDekCache;
+} TdeRelDekMap;
 
 /*
  * Shared memory management (two-phase protocol):
@@ -87,7 +58,7 @@ typedef struct TdeRelDekCache
  */
 void pg_vault_tde_catalog_shmem_request(void);
 void pg_vault_tde_catalog_shmem_init(void);
-TdeRelDekEntry* tde_catalog_cache_entry(Oid relid);
+bool tde_catalog_cache_entry(Oid relid, TdeRelDekMap* out_entry);
 Oid resolve_effective_relid(Oid relid);
 
 /*
@@ -167,13 +138,6 @@ void pg_vault_tde_catalog_evict_rel(Oid relid);
  *   Acquires LW_EXCLUSIVE on the cache lock for the duration.
  */
 void pg_vault_tde_catalog_evict_all(void);
-
-/*
- * pg_vault_tde_catalog_get_dek_count:
- *   Return the number of live DEK entries currently held in the shmem cache.
- *   Acquires LW_SHARED; safe to call from any backend at any time.
- */
-int  pg_vault_tde_catalog_get_dek_count(void);
 
 void pg_vault_tde_catalog_zero_rel_dek(Oid relid);
 

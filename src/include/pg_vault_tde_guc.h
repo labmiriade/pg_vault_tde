@@ -138,7 +138,7 @@ extern bool        pg_vault_tde_wallet_auto_open;
 /*
  * Maximum number of independently-keyed encrypted_heap relations that may
  * be cached in shmem simultaneously (PGC_POSTMASTER, range 64–65536,
- * default 1024).  Determines the size of TdeRelDekCache at startup.
+ * default 1024).  Determines the size of the TdeRelDekMap HTAB at startup.
  */
 extern int         pg_vault_tde_max_encrypted_relations;
 

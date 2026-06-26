@@ -27,9 +27,11 @@
 void pg_vault_tde_kms_shmem_request(void);
 
 /*
- * Called from shmem_startup_hook chain — maps the DEK cache struct and
- * initialises the embedded LWLock (including LWLockNewTrancheId which
- * requires shared memory to be ready — safe here, not in _PG_init).
+ * Called from shmem_startup_hook chain — maps the Vault token cache struct
+ * (pg_vault_tde_kms_cache) and initialises its embedded LWLock (including
+ * LWLockNewTrancheId which requires shared memory to be ready — safe here,
+ * not in _PG_init).  The per-relation DEK cache is a separate HTAB owned
+ * by pg_vault_tde_catalog.c.
  */
 void pg_vault_tde_kms_shmem_init(void);
 

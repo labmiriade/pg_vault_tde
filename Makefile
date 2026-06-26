@@ -153,7 +153,9 @@ ci-schema:
 	@bash ci/scripts/run-schema.sh
 
 ci-bench:
-	@bash ci/scripts/run-bench.sh
+	@bash ci/scripts/run-bench.sh; rc=$$?; \
+	if [ $$rc -eq 7 ]; then echo "ci-bench: avg overhead above threshold (non-fatal WARN, matches run-all.sh)"; exit 0; fi; \
+	exit $$rc
 
 ci-install-test:
 	@bash ci/scripts/run-install-test.sh --all

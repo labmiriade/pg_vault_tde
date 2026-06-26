@@ -188,12 +188,13 @@ Index Access Method (IAM) — tde_btree                  src/iam/
    ▼
 Crypto Layer — AES-256-GCM (OpenSSL 3.x EVP)           src/crypto/
    │  [IV(12) | CIPHERTEXT | GCM-TAG(16) | VER(1) | GEN(8)] per tuple
-   │  Per-backend EVP_CIPHER_CTX pool (reset, not reallocate)
+   │  Per-backend EVP_CIPHER_CTX cached & keyed by (relid, generation):
+   │  AES key schedule reused across tuples, only the IV rearmed per call
    │  IV batch generation: 256 IVs per pg_strong_random() call
    │
    ▼
 KMS Layer — per-relation DEK cache                     src/kms/
-   │  ┌─ TdeRelDekCache (shmem, LWLock-protected, per-relation generation)
+   │  ┌─ TdeRelDekMap (shmem HTAB, one shared LWLock, per-relation generation)
    │  └─ pg_vault_tde_catalog (on-disk wrapped DEKs, one row per relation)
    │
    ▼
@@ -317,13 +318,14 @@ and timeout are all configurable via GUC parameters registered at startup
 
 ### DEK Cache (Shared Memory)
 
+Since v1.7 the cache is a shared-memory hash table (`HTAB`) keyed by `relid`,
+not a fixed array. A single `LWLock` from the `"TdeRelDekMap"` named tranche
+guards the whole table (no per-entry lock).
+
 ```
-TdeRelDekCache (shmem, capacity = pg_vault_tde.max_encrypted_relations, default 1024)
- ├─ lock           : LWLock (embedded by value)
- ├─ capacity       : int
- ├─ used           : int
- └─ entries[]      : TdeRelDekEntry per relation
-     ├─ relid          : Oid  (InvalidOid = empty slot)
+TdeRelDekMap (shmem HTAB, ShmemInitHash, capacity = pg_vault_tde.max_encrypted_relations, default 1024)
+ └─ TdeRelDekMap entry, keyed by relid:
+     ├─ relid          : Oid  (hash key)
      ├─ dek[32]        : AES-256 key bytes (OPENSSL_cleanse'd on rotation)
      ├─ prev_dek[32]   : previous DEK (rotation window fallback)
      ├─ generation     : uint64 per-relation counter
@@ -331,8 +333,8 @@ TdeRelDekCache (shmem, capacity = pg_vault_tde.max_encrypted_relations, default 
 ```
 
 DEK access via `pg_vault_tde_kms_get_rel_dek(relid)`:
-1. **Fast path**: linear scan under `LW_SHARED` — cache hit returns immediately.
-2. **Slow path** (cache miss): catalog read (`pg_vault_tde_catalog`) -> KMS unwrap -> insert under `LW_EXCLUSIVE`.
+1. **Fast path**: `hash_search(HASH_FIND)` under `LW_SHARED` — O(1) average; cache hit returns immediately.
+2. **Slow path** (cache miss): catalog read (`pg_vault_tde_catalog`) -> KMS unwrap -> `hash_search(HASH_ENTER)` under `LW_EXCLUSIVE`.
 
 ### Key Rotation
 

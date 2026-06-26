@@ -74,10 +74,11 @@ PostgreSQL Core
       ├── Crypto                       src/crypto/pg_vault_tde_crypto.c
       │    ├─ tde_gcm_encrypt()        AES-256-GCM via OpenSSL 3.x EVP
       │    └─ tde_gcm_decrypt()        Authenticated decryption
-      ├── KMS cache + provider vtable  src/kms/pg_vault_tde_kms.c
-      │    ├─ Per-relation DEK cache   TdeRelDekCache (shmem, LWLock per entry)
-      │    ├─ get DEK for a relation   pg_vault_tde_kms_get_rel_dek(relid)
-      │    └─ Vault provider (libcurl) vault_provider_{wrap,unwrap,rewrap}_dek()
+      ├── Per-relation DEK cache       src/kms/pg_vault_tde_catalog.c
+      │    ├─ DEK cache (shmem HTAB)    TdeRelDekMap (one shared LWLock)
+      │    └─ get DEK for a relation    pg_vault_tde_kms_get_rel_dek(relid)
+      ├── KMS provider vtable           src/kms/pg_vault_tde_kms.c
+      │    └─ Vault provider (libcurl)  vault_provider_{wrap,unwrap,rewrap}_dek()
       ├── Local wallet provider        src/kms/pg_vault_tde_kms_local.c (PKCS#12)
       ├── DEK catalog (on-disk)        src/kms/pg_vault_tde_catalog.c (wrapped_dek)
       ├── Rotation background worker   src/kms/pg_vault_tde_rotation_bgw.c
@@ -96,15 +97,15 @@ Vault / OpenBao (KEK owner)  ──or──  Local wallet (PKCS#12, KEK-on-disk)
         │  unwrap wrapped_dek via active provider vtable (synchronous;
         │  libcurl HTTP(S) for Vault, AES-256-WRAP for local)
         ▼
-pg_vault_tde_kms_get_rel_dek(relid)    [src/kms/pg_vault_tde_kms.c]
-        │   fast path: LW_SHARED scan of TdeRelDekCache (cache hit)
+pg_vault_tde_kms_get_rel_dek(relid)    [src/kms/pg_vault_tde_catalog.c]
+        │   fast path: LW_SHARED hash_search of TdeRelDekMap (cache hit)
         │   slow path: read pg_vault_tde_catalog.wrapped_dek → provider
-        │              unwrap → insert under LW_EXCLUSIVE
+        │              unwrap → hash_search(HASH_ENTER) under LW_EXCLUSIVE
         ▼
-TdeRelDekCache (shmem)                 [per-relation entry, embedded LWLock,
-        │                               generation + prev_dek rotation window]
-        │  DEK (32 bytes) copied to a per-backend buffer; backend compares its
-        │  cached generation with shmem and refreshes only on mismatch
+TdeRelDekMap (shmem HTAB)              [one entry per relid; single shared
+        │                               LWLock; generation + prev_dek window]
+        │  DEK (32 bytes) copied into a stack buffer on every call; the crypto
+        │  layer caches the AES key schedule keyed by (relid, generation)
         ▼
 tde_gcm_encrypt() / tde_gcm_decrypt()  [src/crypto/pg_vault_tde_crypto.c]
         │
@@ -114,32 +115,32 @@ Disk: [HeapTupleHeader | IV(12) | Ciphertext | GCM-TAG(16) | VER(1) | GEN(8)]
 
 ### Shared Memory Layout
 
-```c
-/* Per-relation DEK entry in shared memory (v1.5+) */
-typedef struct TdeRelDekEntry {
-    Oid     relid;                   /* InvalidOid = empty slot */
-    LWLock  lock;                    /* embedded by VALUE */
-    uint64  generation;
-    bool    dek_valid;
-    bool    prev_dek_valid;
-    char    dek[TDE_DEK_LEN];        /* current AES-256 DEK */
-    char    prev_dek[TDE_DEK_LEN];   /* rotation window fallback */
-} TdeRelDekEntry;
+Since v1.7 the cache is a shared-memory **hash table** (`HTAB`) keyed by
+`relid`, not a fixed array scanned linearly. Each entry is one `TdeRelDekMap`:
 
-typedef struct TdeRelDekCache {
-    int             capacity;        /* pg_vault_tde.max_encrypted_relations */
-    TdeRelDekEntry  entries[FLEXIBLE_ARRAY_MEMBER];
-} TdeRelDekCache;
+```c
+/* Per-relation DEK entry — value type of the TdeRelDekMap HTAB (v1.5+) */
+typedef struct TdeRelDekMap {
+    Oid     relid;                   /* hash key */
+    char    dek[TDE_DEK_LEN];        /* current AES-256 DEK, 32 bytes */
+    char    prev_dek[TDE_DEK_LEN];   /* previous DEK (valid during rotation) */
+    uint64  generation;              /* rotation epoch for this relation */
+    bool    dek_valid;               /* true iff dek[] holds a live key */
+    bool    prev_dek_valid;          /* true iff prev_dek[] is populated */
+} TdeRelDekMap;
 ```
 
 - `TDE_DEK_LEN` is defined **only** in `src/include/pg_vault_tde_kms.h`.
-- The LWLock is embedded by VALUE (not pointer) — safe across fork.
-- `TdeRelDekCache` lives in `src/kms/pg_vault_tde_catalog.c`. Its segment is
-  sized at `offsetof(TdeRelDekCache, entries) + capacity * sizeof(TdeRelDekEntry)`
-  where `capacity = pg_vault_tde.max_encrypted_relations`.
-- Its LWLock uses a **named** tranche: `RequestNamedLWLockTranche("TdeRelDekCache", 1)`
-  in the `shmem_request_hook`, then `GetNamedLWLockTranche()` + `LWLockInitialize()`
-  in the `shmem_startup_hook`.
+- The HTAB lives in `src/kms/pg_vault_tde_catalog.c`, created with
+  `ShmemInitHash("TdeRelDekMap", capacity, capacity, &info, HASH_ELEM | HASH_BLOBS)`
+  where `capacity = pg_vault_tde.max_encrypted_relations`. The segment is sized
+  with `hash_estimate_size(capacity, sizeof(TdeRelDekMap))`.
+- There is **no per-entry lock**. A single `LWLock` (file-scope `rel_dek_lock`)
+  from a **named** tranche guards the whole table:
+  `RequestNamedLWLockTranche("TdeRelDekMap", 1)` in the `shmem_request_hook`,
+  then `&GetNamedLWLockTranche("TdeRelDekMap")[0].lock` in the
+  `shmem_startup_hook`. The lock is taken `LW_SHARED` for lookups and
+  `LW_EXCLUSIVE` for insert/evict/rotate.
 - A second, fixed-size shmem struct (`pg_vault_tde_kms_cache`, in
   `pg_vault_tde_kms.c`) holds the shared Vault token. Its lock uses a **dynamic**
   tranche (`LWLockNewTrancheId()`), which is why that call lives in the
@@ -390,21 +391,43 @@ Test 16 covers this edge case.
 
 ## Performance
 
-### Per-Backend EVP Context Pool
+### Per-Backend EVP Contexts Keyed by (relid, generation)
 
-Creating and destroying an `EVP_CIPHER_CTX` on every tuple (as a naive
-implementation would do) costs 2 heap allocations per operation. Instead,
-pg_vault_tde maintains a **per-backend pool** of pre-allocated contexts:
+Two costs hide on the per-tuple crypto path: allocating an `EVP_CIPHER_CTX`
+(a heap malloc) and installing the AES-256 **key schedule**
+(`EVP_EncryptInit_ex2` with the DEK). A naive implementation pays both on every
+tuple. pg_vault_tde caches each context together with the key it is keyed for:
 
 ```c
-static EVP_CIPHER_CTX *tde_gcm_enc_ctx = NULL;  /* lazily initialised */
-static EVP_CIPHER_CTX *tde_gcm_dec_ctx = NULL;
+typedef struct TdeCipherSlot {
+    EVP_CIPHER_CTX *ctx;
+    Oid             relid;
+    uint64          generation;
+} TdeCipherSlot;
+
+static TdeCipherSlot tde_enc = { NULL, InvalidOid, 0 };  /* encrypt direction */
+static TdeCipherSlot tde_dec = { NULL, InvalidOid, 0 };  /* decrypt direction */
 ```
 
-On each encrypt/decrypt call, the context is **reset** with
-`EVP_CIPHER_CTX_reset()` (cheap — reuses the already-allocated struct)
-instead of free + alloc. Contexts are freed in the `on_proc_exit()` callback
-`tde_backend_cleanup()`. The same pattern is applied to the IAM SIV contexts
+Each context is allocated once per backend (`EVP_CIPHER_CTX_new()` on first
+use). The expensive key-schedule install runs **only when the slot's cached
+`(relid, generation)` differs** from the current operation — i.e. on the first
+tuple of a relation and again after a key rotation. For every other tuple the
+installed schedule is reused and only the per-tuple IV is rearmed with
+`EVP_EncryptInit_ex2(ctx, NULL, NULL, iv, NULL)`. Consecutive tuples of the same
+relation (the common bulk-INSERT / sequential-scan case) therefore skip the
+key schedule entirely.
+
+On decrypt the slot is keyed by the **stored** generation read from the wire
+trailer, so old-generation rows decrypted via `prev_dek` during the rotation
+window get their own cached schedule without thrashing the current-generation
+one.
+
+On any fatal OpenSSL error `tde_crypto_ctx_cleanup()` frees and NULL-outs both
+contexts (and resets their `relid` to `InvalidOid`) so the next call
+re-allocates and re-keys cleanly. Both contexts are freed in the
+`on_proc_exit()` callback `tde_crypto_ctx_cleanup()`, which also wipes the IV
+batch. The same allocate-once pattern is applied to the IAM SIV contexts
 (`tde_iam_siv_enc_ctx`, `tde_iam_siv_dec_ctx`).
 
 ### IV Batch Generation
@@ -451,13 +474,11 @@ overhead (no crypto) from actual encryption cost.
 
 ```
 ┌────────────────────────────────────────────────────┐
-│  Shared memory (TdeRelDekCache)                    │
+│  Shared memory                                     │
 │  ──────────────────────────────────────────────────│
 │  LWLock (embedded by value)                        │
-│  capacity: int  (pg_vault_tde.max_encrypted_rels)  │
-│  used: int                                         │
-│  entries[capacity]: TdeRelDekEntry                 │
-│    ├─ relid: Oid                                   │
+│  HTAB (TdeRelDekMap)                               │
+│    ├─ relid: Oid         (key)                     │
 │    ├─ dek[32]: char      (current DEK)             │
 │    ├─ prev_dek[32]: char (rotation window)         │
 │    ├─ generation: uint64                           │
@@ -474,18 +495,26 @@ overhead (no crypto) from actual encryption cost.
 └────────────────────────────────────────────────────┘
 ```
 
-1. On first encrypt/decrypt, backend copies DEK from shmem under `LW_SHARED`.
-2. On subsequent calls, backend compares `local_generation` with shmem
-   `generation`. If equal, uses local copy (no lock needed after first load).
-3. On mismatch, acquires `LW_SHARED`, refreshes local copy, updates
-   `local_generation`.
+1. Every encrypt/decrypt call fetches the DEK with
+   `pg_vault_tde_kms_get_rel_dek()`: `hash_search(HASH_FIND)` under `LW_SHARED`,
+   `memcpy` into a stack buffer, release. The buffer is `OPENSSL_cleanse`d after
+   use (caller responsibility).
+2. On a cache miss (first access after startup, or after the entry was evicted
+   by rotation), the slow path reads `pg_vault_tde_catalog.wrapped_dek`, unwraps
+   it via the active KMS provider, and inserts the entry under `LW_EXCLUSIVE`.
+3. Cross-call key-schedule reuse lives in the **crypto layer**, not here: the
+   `TdeCipherSlot` EVP contexts cache the installed AES schedule keyed by
+   `(relid, generation)` (see [Per-Backend EVP Contexts](#per-backend-evp-contexts-keyed-by-relid-generation)),
+   so re-fetching the DEK bytes per call is cheap and the expensive schedule
+   install is amortised.
 
 ### Generation-Epoch Rotation
 
 Key rotation is now **per-relation** via `pg_vault_tde_rotate_online(relname, batch_size)`.
-For each encrypted relation the operation:
-1. Acquires `LW_EXCLUSIVE` on the relation's `TdeRelDekEntry` lock.
-2. `OPENSSL_cleanse`s `dek[32]` (promotes current DEK to `prev_dek` for the rotation window).
+For each encrypted relation `pg_vault_tde_catalog_zero_rel_dek()`:
+1. Acquires `LW_EXCLUSIVE` on the single `rel_dek_lock` guarding the HTAB and
+   looks the entry up with `hash_search(HASH_FIND)`.
+2. Promotes the current DEK to `prev_dek` then `OPENSSL_cleanse`s `dek[32]` for the rotation window.
 3. Increments the per-relation `generation` counter.
 4. Sets `dek_valid = false` (triggers a catalog read + KMS unwrap on next access).
 5. Releases lock.
@@ -904,16 +933,15 @@ _PG_init()
   │       │       └── RequestAddinShmemSpace(sizeof(pg_vault_tde_kms_cache))
   │       └── pg_vault_tde_catalog_shmem_request()
   │               ├── RequestAddinShmemSpace(tde_rel_dek_cache_size(capacity))
-  │               └── RequestNamedLWLockTranche("TdeRelDekCache", 1)
+  │               └── RequestNamedLWLockTranche("TdeRelDekMap", 1)
   ├── install shmem_startup_hook  → pg_vault_tde_shmem_startup()
   │       ├── pg_vault_tde_kms_shmem_init()       (Vault-token cache)
   │       │       ├── ShmemInitStruct("pg_vault_tde_kms_cache", ..., &found)
   │       │       └── if !found: LWLockNewTrancheId() + LWLockInitialize()
   │       │                      ← dynamic tranche; requires shmem to be up!
   │       ├── pg_vault_tde_catalog_shmem_init()   (per-relation DEK cache)
-  │       │       ├── ShmemInitStruct("TdeRelDekCache", seg_size, &found)
-  │       │       └── if !found: GetNamedLWLockTranche("TdeRelDekCache")
-  │       │                      + LWLockInitialize() + set capacity/used
+  │       │       ├── ShmemInitHash("TdeRelDekMap", capacity, capacity, ...)
+  │       │       └── rel_dek_lock = &GetNamedLWLockTranche("TdeRelDekMap")[0].lock
   │       └── tde_shmem_started = true; tde_active_kms_provider->init()
   ├── pg_vault_tde_tam_init()
   │       └── memcpy(&tde_methods, GetHeapamTableAmRoutine(), sizeof(TableAmRoutine))
@@ -934,11 +962,12 @@ shmem structs use two different (both correct) tranche strategies:
 - **`pg_vault_tde_kms_cache`** (dynamic tranche): `RequestAddinShmemSpace()`
   in `shmem_request_hook`; `LWLockNewTrancheId()` + `LWLockInitialize()` in the
   `shmem_startup_hook` `!found` branch.
-- **`TdeRelDekCache`** (named tranche): `RequestAddinShmemSpace()` **and**
-  `RequestNamedLWLockTranche("TdeRelDekCache", 1)` in `shmem_request_hook`
+- **`TdeRelDekMap`** (named tranche): `RequestAddinShmemSpace()` **and**
+  `RequestNamedLWLockTranche("TdeRelDekMap", 1)` in `shmem_request_hook`
   (named-tranche *requests* are allowed there — only `LWLockNewTrancheId()` is
-  not), then `GetNamedLWLockTranche()` + `LWLockInitialize()` in
-  `shmem_startup_hook`.
+  not), then `GetNamedLWLockTranche("TdeRelDekMap")` in `shmem_startup_hook`
+  (the HTAB and its lock are created by `ShmemInitHash` / picked up from the
+  tranche; no `LWLockInitialize()` needed for a named-tranche lock).
 
 This is the correct pattern for all PG17+ / PG18 extensions that need a
 dynamic LWLock tranche.

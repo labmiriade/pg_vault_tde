@@ -21,21 +21,14 @@
 #define TDE_V4_OVERHEAD      (1 + TDE_V4_GEN_LEN + TDE_GCM_IV_LEN + TDE_GCM_TAG_LEN)
 
 
-typedef struct EncryptCtx
-{
-    EVP_CIPHER_CTX  *tde_gcm_ctx;
-    Oid             relid; 
-    uint64          generation;
-
-} EncryptCtx;
-
 /* Encrypt plaintext using the DEK for relid. Returns palloc'd buffer. */
 char *tde_gcm_encrypt(Oid relid, const char *plaintext, Size plaintext_len,
                       Size *out_len);
 
-/* Decrypt a buffer produced by tde_gcm_encrypt. Verifies GCM tag. */
-char *tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len,
-                      Size *out_len);
+/* Decrypt into caller's out_plain (cap = ciphertext_len - TDE_V4_OVERHEAD). */
+/* Verifies GCM tag: ERROR on tamper, false on non-v4 version byte. */
+bool tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len,
+                     char *out_plain, Size *out_len);
 
 /* Free per-backend EVP contexts and wipe the IV batch buffer. */
 void tde_crypto_ctx_cleanup(void);

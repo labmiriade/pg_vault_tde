@@ -97,10 +97,19 @@ tde_toast_encrypt_chunk(Oid parent_relid, const char *chunk_data, Size chunk_len
 char *
 tde_toast_decrypt_chunk(Oid parent_relid, const char *enc_data, Size enc_len, Size *out_len)
 {
+    char *out;
+
     Assert(enc_data != NULL);
     Assert(enc_len > TDE_V4_OVERHEAD);
 
-    return tde_gcm_decrypt(parent_relid, enc_data, enc_len, out_len);
+    /* Chunk path (not the hot seq-scan): palloc the plaintext destination. */
+    out = (char *) palloc(enc_len - TDE_V4_OVERHEAD);
+    if (!tde_gcm_decrypt(parent_relid, enc_data, enc_len, out, out_len))
+    {
+        pfree(out);
+        return NULL;
+    }
+    return out;
 }
 
 /*

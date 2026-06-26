@@ -249,43 +249,31 @@ tde_decrypt_heap_tuple(HeapTuple enc, Oid relid)
     Size        hdr_len   = enc->t_data->t_hoff;
     char       *enc_data  = (char *) enc->t_data + hdr_len;
     Size        enc_len   = enc->t_len - hdr_len;
-    Size        pt_len    = 0;
-    char       *pt_buf;
+    Size        pt_len    = enc_len - TDE_V4_OVERHEAD;
     HeapTuple   plain;
-    /*
-     * Pass-through mode: when encryption is disabled the stored tuple is
-     * already plaintext — return a copy unchanged.
-     */
+    /* Pass-through mode: stored tuple is plaintext — return a copy. */
     if (!pg_vault_tde_enabled)
-    {
-        HeapTuple copy = heap_copytuple(enc);
-        return copy;
-    }
-    /*
-     * Minimum size check: every v4 tuple carries TDE_V4_OVERHEAD (37) bytes
-     * (IV + GCM tag + version + generation), so anything shorter is corrupt.
-     * tde_gcm_decrypt rejects any buffer whose trailer version byte is not 0x04.
-     */
+        return heap_copytuple(enc);
+    /* Every v4 tuple carries TDE_V4_OVERHEAD bytes; shorter means corrupt. */
     if (hdr_len > enc->t_len || enc_len < (Size) TDE_V4_OVERHEAD)
         ereport(ERROR,
                 (errcode(ERRCODE_DATA_CORRUPTED),
                  errmsg("pg_vault_tde: encrypted tuple too short (%zu bytes)",
                         enc_len)));
-    pt_buf = tde_gcm_decrypt(relid, enc_data, enc_len, &pt_len);
-    /*
-     * tde_gcm_decrypt validates the v4 wire format and verifies the GCM tag;
-     * a non-NULL result means the plaintext length is correct.
-     */
-    Assert(pt_buf != NULL);
+    /* Allocate once, copy header, then decrypt straight into user-data. */
     plain = (HeapTuple) palloc0(HEAPTUPLESIZE + hdr_len + pt_len);
+    plain->t_data = (HeapTupleHeader) ((char *) plain + HEAPTUPLESIZE);
+    memcpy(plain->t_data, enc->t_data, hdr_len);
+    /* GCM verified inside; ERROR on tamper, false on non-v4 version byte. */
+    if (!tde_gcm_decrypt(relid, enc_data, enc_len,
+                         (char *) plain->t_data + hdr_len, &pt_len))
+    {
+        pfree(plain);
+        return NULL;
+    }
     plain->t_len      = (uint32) (hdr_len + pt_len);
     plain->t_self     = enc->t_self;
     plain->t_tableOid = enc->t_tableOid;
-    plain->t_data     = (HeapTupleHeader) ((char *) plain + HEAPTUPLESIZE);
-    memcpy(plain->t_data, enc->t_data, hdr_len);
-    memcpy((char *) plain->t_data + hdr_len, pt_buf, pt_len);
-    OPENSSL_cleanse(pt_buf, pt_len);
-    pfree(pt_buf);
     return plain;
 }
 /*
@@ -314,7 +302,6 @@ static void
 pg_vault_tde_decode_slot(TupleTableSlot *slot)
 {
     BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) slot;
-    HeapTuple   enc_copy;
     HeapTuple   plain;
     ItemPointerData saved_tid;
     Oid         saved_tableoid;
@@ -350,7 +337,6 @@ pg_vault_tde_decode_slot(TupleTableSlot *slot)
      * part of its internal ExecClearTuple.  Releasing early causes O(rows)
      * buffer hits during sequential scans (see function header comment).
      */
-    enc_copy = heap_copytuple(bslot->base.tuple);
     /* Decrypt (verifies GCM tag; ereport(ERROR) on tamper) */
     /*
      * Extract the relation OID from the encrypted tuple copy.
@@ -359,8 +345,9 @@ pg_vault_tde_decode_slot(TupleTableSlot *slot)
      * when heap_copytuple runs above).
      * For tuples from index scans, t_tableOid is also set by heap_hot_search_buffer.
      */
-    plain = tde_decrypt_heap_tuple(enc_copy, enc_copy->t_tableOid);
-    pfree(enc_copy);
+    plain = tde_decrypt_heap_tuple(bslot->base.tuple, saved_tableoid);
+
+
     /* Stamp physical address onto decrypted tuple */
     ItemPointerCopy(&saved_tid, &plain->t_self);
     plain->t_tableOid = saved_tableoid;

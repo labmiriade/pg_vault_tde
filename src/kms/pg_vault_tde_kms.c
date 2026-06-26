@@ -90,9 +90,10 @@ pg_vault_tde_kms_shmem_request(void)
  * pg_vault_tde_kms_shmem_init
  *
  * Called from the shmem_startup_hook chain after shared memory has been
- * allocated.  Maps the DEK cache struct and wires up the embedded LWLock.
- * Also allocates the per-backend local DEK cache in TopMemoryContext
- * (which survives across transactions within the same backend).
+ * allocated.  Maps the Vault token cache struct (pg_vault_tde_kms_cache) and
+ * wires up its embedded LWLock via the dynamic-tranche pattern.
+ * (The per-relation DEK cache is a separate HTAB owned by
+ * pg_vault_tde_catalog.c — see pg_vault_tde_catalog_shmem_init.)
  */
 void
 pg_vault_tde_kms_shmem_init(void)
