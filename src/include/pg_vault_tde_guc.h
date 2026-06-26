@@ -150,6 +150,15 @@ extern int         pg_vault_tde_max_encrypted_relations;
  */
 extern bool        pg_vault_tde_toast_encryption;
 
+/*
+ * Custom WAL resource manager for TOAST chunks (PGC_POSTMASTER, default: false).
+ * When true, encrypted TOAST chunks are WAL-logged under TDE_RMGR_ID so the
+ * logical decoder routes them away from the reorder buffer's toast_hash (see
+ * src/logical/pg_vault_tde_rmgr.c).  Requires the rmgr to be registered at
+ * preload time, hence PGC_POSTMASTER.
+ */
+extern bool        pg_vault_tde_toast_custom_rmgr;
+
 /* -----------------------------------------------------------------------
  * v1.6 GUCs — Flexible wallet passphrase ingestion
  * -----------------------------------------------------------------------*/

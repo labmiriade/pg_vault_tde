@@ -51,6 +51,8 @@
 #include "src/include/pg_vault_tde_crypto.h"
 #include "src/include/pg_vault_tde_tam.h"
 #include "src/include/pg_vault_tde_toast.h"
+#include "src/include/pg_vault_tde_guc.h"      /* pg_vault_tde_toast_custom_rmgr */
+#include "src/include/pg_vault_tde_rmgr.h"     /* tde_toast_wal_insert */
 /*
  * tde_toast_encrypt_chunk
  *
@@ -312,7 +314,17 @@ Datum pg_vault_tde_toast_save_datum(Relation rel, Datum value,
             {
                 chunk_enc = tde_encrypt_heap_tuple(toast_tup, toast_tup->t_tableOid);
 
-                heap_insert(toast_rel, chunk_enc, mycid, options, NULL);
+                /*
+                 * Normally heap_insert (logs under RM_HEAP_ID).  With the
+                 * custom-rmgr GUC on, log the chunk under TDE_RMGR_ID instead
+                 * so the logical decoder routes it away from the reorder
+                 * buffer's toast_hash.  Both emit a byte-identical WAL record
+                 * except for the resource manager id.
+                 */
+                if (pg_vault_tde_toast_custom_rmgr)
+                    tde_toast_wal_insert(toast_rel, chunk_enc, mycid, options, NULL);
+                else
+                    heap_insert(toast_rel, chunk_enc, mycid, options, NULL);
 
                 /*
                 * heap_insert writes the physical TID into toast_enc->t_self.

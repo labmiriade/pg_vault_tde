@@ -207,6 +207,21 @@ tde_encrypt_heap_tuple(HeapTuple plain, Oid relid)
     memcpy(enc->t_data, plain->t_data, hdr_len);                 /* header verbatim */
     memcpy((char *) enc->t_data + hdr_len, enc_buf, enc_len);    /* encrypted payload */
     pfree(enc_buf);  /* ciphertext - no need to cleanse */
+
+    /*
+     * Clear HEAP_HASEXTERNAL on the encrypted tuple.  From the core's point of
+     * view the encrypted tuple is an opaque blob with no external columns — the
+     * TOAST pointer lives INSIDE the ciphertext, invisible to heap_deform.
+     * Leaving the bit set makes core touch the ciphertext as if it had external
+     * data; in particular ExtractReplicaIdentity() (heap_delete/heap_update) runs
+     * toast_flatten_tuple()/heap_deform_tuple() on the ciphertext and logs a
+     * garbage replica identity, breaking logical UPDATE/DELETE.  TOAST lifecycle
+     * is driven by the TAM itself (per-attribute VARATT scan on the decrypted
+     * tuple, tde_tuple_has_external_slow), not this bit — and VACUUM FULL already
+     * writes encrypted tuples with this bit cleared, so the codebase copes.
+     */
+    enc->t_data->t_infomask &= ~HEAP_HASEXTERNAL;
+
     return enc;
 }
 /*
@@ -1192,7 +1207,15 @@ pg_vault_tde_tuple_update(Relation rel, ItemPointer otid,
     {
         /* Read old tuple metadata from slot storage (no materialized copy). */
         old_tuple = ExecFetchSlotHeapTuple(slot_old, false, NULL);
-        old_has_external = HeapTupleHasExternal(old_tuple);
+        /*
+         * Detect old-tuple TOAST via the per-attribute VARATT scan in addition
+         * to the HEAP_HASEXTERNAL bit: encrypted tuples carry the bit cleared
+         * (see tde_encrypt_heap_tuple), so the fast check alone would miss the
+         * old TOAST and orphan its chunks on a large→small UPDATE.  Same
+         * two-level detection that pg_vault_tde_tuple_delete uses.
+         */
+        old_has_external = HeapTupleHasExternal(old_tuple) ||
+                           tde_tuple_has_external_slow(old_tuple, RelationGetDescr(rel));
     }
 
     /*
@@ -1565,7 +1588,17 @@ pg_vault_tde_relation_copy_for_cluster(Relation OldTable,
                 plain = tde_decrypt_heap_tuple(enc_copy, RelationGetRelid(OldTable));
                 plain_for_write = plain;
 
-                if (HeapTupleHasExternal(plain))
+                /*
+                 * Two-level external detection: encrypted tuples carry
+                 * HEAP_HASEXTERNAL cleared (see tde_encrypt_heap_tuple), so the
+                 * decrypted tuple's header bit is clear even when it holds
+                 * external TOAST pointers.  Fall back to the per-attribute scan
+                 * so VACUUM FULL re-TOASTs the old chunks into NewTable instead
+                 * of leaving the rewritten tuple pointing at the dropped old
+                 * TOAST relation ("missing chunk number 0").
+                 */
+                if (HeapTupleHasExternal(plain) ||
+                    tde_tuple_has_external_slow(plain, tupdesc))
                 {
                     /*
                      * External TOAST pointers in the decrypted tuple reference
