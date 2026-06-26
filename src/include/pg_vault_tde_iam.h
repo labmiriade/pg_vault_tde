@@ -16,9 +16,9 @@
  * AES-256-SIV key encryption/decryption for B-Tree index entries.
  * Callers MUST OPENSSL_cleanse + pfree the returned buffers after use.
  */
-char *tde_iam_encrypt_key(const char* dek, int dek_len, 
+char *tde_iam_encrypt_key(Oid idx_oid, const char* dek, int dek_len,
                           const char *plaintext, Size plaintext_len, Size *out_len);
-char *tde_iam_decrypt_key(const char* dek, int dek_len, 
+char *tde_iam_decrypt_key(Oid idx_oid, const char* dek, int dek_len,
                           const char *ciphertext, Size ciphertext_len, Size *out_len);
 
 /*
@@ -100,6 +100,6 @@ void tde_iam_init(void);
  * Free per-backend AES-SIV EVP contexts.
  * Called from tde_backend_cleanup() which is registered via on_proc_exit().
  */
-void tde_iam_siv_ctx_cleanup(void);
+void tde_iam_ctx_cleanup(void);
 
 #endif /* PG_VAULT_TDE_IAM_H */

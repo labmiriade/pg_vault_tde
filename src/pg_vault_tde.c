@@ -126,7 +126,7 @@ tde_backend_cleanup(int code, Datum arg)
 {
     tde_audit(AUDIT_LOG_STOP, NULL, true);
     tde_crypto_ctx_cleanup();
-    tde_iam_siv_ctx_cleanup();
+    tde_iam_ctx_cleanup();
     tde_hw_accel_cleanup();
 }
 
