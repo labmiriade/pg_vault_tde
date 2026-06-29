@@ -4,6 +4,7 @@ use warnings;
 use Test::More tests => 17;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
+END { system('/bin/sh', '-c', 'rm -rf /var/lib/pg_vault_tde/*') }
 
 # Offset constants matching tde_backup_header C struct layout (little-endian host)
 # magic(10) | pad(2) | format_version(4) | wrapped_dek_len(2) | wrapped_dek(512) | tail_pad(2) = 532
@@ -44,6 +45,7 @@ $node->append_conf('postgresql.conf',
 $node->start;
 
 $node->safe_psql('postgres', 'CREATE EXTENSION pg_vault_tde;');
+system('/bin/sh', '-c', 'rm -rf /var/lib/pg_vault_tde/*');
 $node->safe_psql('postgres', "SELECT pg_vault_tde_wallet_init('test-password')");
 $node->safe_psql('postgres', q{
     CREATE TABLE secret (id serial, val text) USING encrypted_heap;

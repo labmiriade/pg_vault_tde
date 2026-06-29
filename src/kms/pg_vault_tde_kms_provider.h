@@ -77,18 +77,6 @@ typedef struct TdeKmsProvider
     bool (*init)(void);
 
     /*
-     * generate_dek — produce a fresh 32-byte AES-256 DEK.
-     *
-     * The provider generates entropy and fills dek_out[dek_len].
-     * For the Vault provider, `pg_strong_random` is the entropy source
-     * (server-side generation; Vault Transit is only used for wrapping).
-     * For the local wallet, same: `pg_strong_random`.
-     *
-     * Returns true on success.
-     */
-    bool (*generate_dek)(unsigned char *dek_out, int dek_len);
-
-    /*
      * wrap_dek — encrypt (wrap) a plaintext DEK using the KMS KEK.
      *
      * Input  : dek[dek_len]           — plaintext DEK (NEVER stored to disk)
@@ -108,14 +96,16 @@ typedef struct TdeKmsProvider
      * unwrap_dek — decrypt a wrapped DEK back to plaintext.
      *
      * Input  : wrapped[wrapped_len]   — opaque ciphertext from wrap_dek
-     * Output : dek_out[dek_len]       — plaintext DEK; caller MUST
+     *          *dek_len               — capacity of dek_out (must be >= TDE_DEK_LEN)
+     * Output : dek_out[*dek_len]      — plaintext DEK; caller MUST
      *                                   OPENSSL_cleanse after use
+     *          *dek_len               — actual bytes written (always TDE_DEK_LEN on success)
      *
-     * Returns true on success, false if the KEK is unavailable or the
-     * wrapped ciphertext is corrupt.
+     * Returns true on success, false if the buffer is too small, the KEK is
+     * unavailable, or the wrapped ciphertext is corrupt.
      */
     bool (*unwrap_dek)(const unsigned char *wrapped, int wrapped_len,
-                       unsigned char *dek_out, int dek_len);
+                       unsigned char *dek_out, int *dek_len);
 
     /*
      * rewrap_dek — re-wrap an existing DEK under a new KEK version.
@@ -131,6 +121,10 @@ typedef struct TdeKmsProvider
      */
     bool (*rewrap_dek)(const unsigned char *old_wrapped, int old_len,
                        unsigned char *new_wrapped, int *new_len);
+
+    /* Arms the provider for a rewrap cycle; must be called before pg_vault_tde_catalog_rewrap_all(). */
+    bool (*prepare_kek_rotation)(void);
+    void (*commit_kek_rotation)(void);
 
     /*
      * health_check — probe provider availability.

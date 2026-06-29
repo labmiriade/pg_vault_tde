@@ -1,4 +1,7 @@
 CLAUDE.md
-.env
+REFACTOR.md
+*.env*
 .vscode/
 .github/
+.claude/
+AGENTS.md

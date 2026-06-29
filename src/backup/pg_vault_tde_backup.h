@@ -17,11 +17,11 @@
  */
 #define TDE_GCM_IV_LEN   12
 #define TDE_GCM_TAG_LEN  16
-#define TDE_V2_GEN_LEN    8
-#define TDE_V2_OVERHEAD  (1 + TDE_V2_GEN_LEN + TDE_GCM_IV_LEN + TDE_GCM_TAG_LEN)
+#define TDE_V4_GEN_LEN    8
+#define TDE_V4_OVERHEAD  (1 + TDE_V4_GEN_LEN + TDE_GCM_IV_LEN + TDE_GCM_TAG_LEN)
 #else
 #include "pg_vault_tde_kms.h"     /* TDE_DEK_LEN */
-#include "pg_vault_tde_crypto.h"  /* TDE_GCM_IV_LEN, TDE_GCM_TAG_LEN, TDE_V2_OVERHEAD */
+#include "pg_vault_tde_crypto.h"  /* TDE_GCM_IV_LEN, TDE_GCM_TAG_LEN, TDE_V4_OVERHEAD */
 #endif
 
 #define TDE_BACKUP_MAGIC_LEN     10  /* strlen("PGVAULTTDE") */
@@ -95,6 +95,18 @@ char *tde_backup_decrypt_block(const TdeBackupContext* ctx,
                                 const char* block_data, Size block_len,
                                 uint64 block_seq, Size* out_len);
     
+
+/*
+ * Minimal connection parameters; mirrors fe_utils/connect_utils.h ConnParams
+ * without requiring libpgfeutils (not shipped by all distro packages).
+ */
+typedef struct ConnParams
+{
+    const char *dbname;
+    const char *pghost;
+    const char *pgport;
+    const char *pguser;
+} ConnParams;
 
 bool tde_backup_init(ConnParams* params);
 

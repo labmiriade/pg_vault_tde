@@ -36,11 +36,11 @@ typedef struct PdeKmsProvider {
 
     /*
      * unwrap_dek — recover the plaintext DEK from the wrapped blob read out of
-     * tde_backup_header.  @dek_len is input-only capacity; unwrapped output is
-     * always exactly TDE_DEK_LEN bytes.
+     * tde_backup_header.  *dek_len is in: capacity (>= TDE_DEK_LEN),
+     * out: actual bytes written (always TDE_DEK_LEN on success).
      */
     bool (*unwrap_dek)(const unsigned char* wrapped_dek, int wrapped_len,
-                        unsigned char* dek_out, int dek_len);
+                        unsigned char* dek_out, int *dek_len);
 
     void (*shutdown)(void);
 } PdeKmsProvider;

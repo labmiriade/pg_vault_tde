@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# ci/scripts/run-regress.sh — Run the 24-test pg_regress suite
+# ci/scripts/run-regress.sh — Run the full pg_vault_tde regression suite
 #
-# Starts a standalone pg-test container, copies regression_test.sql,
-# executes it, and reports pass/fail.
+# Starts a standalone pg-test container configured with kms_provider=local,
+# initialises the local wallet, and runs all four regression SQL files.
+
 #
 # Exit code: 0 on success, 2 on test failure.
 #
@@ -17,21 +18,56 @@ CONTAINER="pg-tde-regress-$$"
 cleanup() { stop_container "$CONTAINER"; }
 trap cleanup EXIT
 
-log_stage "REGRESSION TESTS (52 v1.4 + 20 v1.5 + 37 v1.6 = 109 total)"
+log_stage "REGRESSION TESTS (52 v1.4 + 20 v1.5 + 37 v1.6 + 18 v1.7  = 127 total)"
 
 build_pg_test_image
 
-start_pg_container "$CONTAINER" "${PG_TEST_PORT:-15432}"
+# ── Start container with kms_provider=local configured ───────────────────
+#
+# We inline the container start instead of using start_pg_container() because
+# we need to add extra postgres -c flags AFTER the image name (postgres args),
+# whereas start_pg_container extra_args are passed as container runtime args
+# (before the image name).
+#
+log_info "Starting pg-tde-regress container with kms_provider=local ..."
+$RT rm -f "$CONTAINER" 2>/dev/null || true
+$RT run --rm -d \
+    --name "$CONTAINER" \
+    -e POSTGRES_PASSWORD=postgres \
+    -p "${PG_TEST_PORT:-15432}:5432" \
+    "${PG_TEST_IMAGE:-pg-tde-test}:latest" \
+    postgres \
+        -c "shared_preload_libraries=pg_vault_tde" \
+        -c "pg_vault_tde.dev_mode=on" \
+        -c "pg_vault_tde.kms_provider=local" \
+        -c "pg_vault_tde.wallet_auto_open=off" \
+        -c "pg_vault_tde.wallet_dev_mode_passphrase=tde_regression_pass_2026" \
+        -c "log_min_messages=warning"
+
+wait_pg_ready "$CONTAINER"
 
 # Verify extension is loaded
 log_info "Verifying pg_vault_tde extension ..."
 container_psql "$CONTAINER" -c \
-    "SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_vault_tde';" 
+    "SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_vault_tde';"
+
+# Initialise wallet so wallet_init() sets the global shmem DEK.
+# The passphrase matches wallet_dev_mode_passphrase so subsequent
+# wrap/unwrap operations in the tests work without interactive unlock.
+log_info "Initialising local wallet ..."
+if ! container_psql "$CONTAINER" -v ON_ERROR_STOP=1 -c \
+        "SELECT pg_vault_tde_wallet_init('tde_regression_pass_2026');"; then
+    log_error "REGRESSION: wallet_init failed"
+    $RT logs "$CONTAINER" --tail 30 2>/dev/null || true
+    exit 2
+fi
+log_ok "Local wallet initialised"
 
 # Copy fresh regression SQL (in case image is cached with old version)
 $RT cp "$REPO_ROOT/sql/regression_test.sql"    "$CONTAINER:/tmp/regression_test.sql"
 $RT cp "$REPO_ROOT/sql/regression_test_v15.sql" "$CONTAINER:/tmp/regression_test_v15.sql"
 $RT cp "$REPO_ROOT/sql/regression_test_v16.sql" "$CONTAINER:/tmp/regression_test_v16.sql"
+$RT cp "$REPO_ROOT/sql/regression_test_v17.sql" "$CONTAINER:/tmp/regression_test_v17.sql"
 
 # ── Phase 1: v1.4 baseline (52 tests) ────────────────────────────────────
 log_info "Running v1.4 regression_test.sql (52 tests) ..."
@@ -113,13 +149,6 @@ case "$LIVE_VERSION" in
 esac
 
 # ── Phase 5: v1.6 wallet tests (tests 73-109) ────────────────────────────
-#
-# In this container kms_provider defaults to 'vault', so tests 74-80
-# (which require kms_provider='local') emit SKIP notices and exit cleanly.
-# Only test 73 (structural function-registration check) runs unconditionally.
-#
-# To run all wallet tests unconditionally use:  make ci-wallet
-#
 log_info "Running v1.6 wallet regression_test_v16.sql (tests 73-109) ..."
 START=$(timer_start)
 if container_psql "$CONTAINER" -f /tmp/regression_test_v16.sql; then
@@ -132,5 +161,18 @@ else
     exit 2
 fi
 
-log_ok "REGRESSION COMPLETE: ALL 109 TESTS PASSED (v1.4 × 52 + v1.5 × 20 + v1.6 × 37)"
+# ── Phase 6: v1.7 wallet tests (tests 111-128) ────────────────────────────
+log_info "Running v1.7 wallet regression_test_v17.sql (tests 111-128) ..."
+START=$(timer_start)
+if container_psql "$CONTAINER" -f /tmp/regression_test_v17.sql; then
+    ELAPSED=$(timer_elapsed "$START")
+    log_ok "REGRESSION v1.7 wallet: tests 111-128 OK ($(timer_fmt "$ELAPSED"))"
+else
+    ELAPSED=$(timer_elapsed "$START")
+    log_error "REGRESSION v1.7 wallet: FAILED after $(timer_fmt "$ELAPSED")"
+    $RT logs "$CONTAINER" --tail 80 2>/dev/null || true
+    exit 2
+fi
+
+log_ok "REGRESSION COMPLETE: ALL 127 TESTS PASSED (v1.4 × 52 + v1.5 × 20 + v1.6 × 37 + v1.7 × 18)"
 exit 0

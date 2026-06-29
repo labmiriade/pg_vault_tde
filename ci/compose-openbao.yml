@@ -1,147 +1,187 @@
 # ci/compose-openbao.yml — OpenBao multi-node integration test environment
 #
-# Provides a realistic KMS environment with 3-node OpenBao Raft HA cluster
-# and a pg_vault_tde PostgreSQL instance that authenticates via AppRole.
+# Provides a realistic KMS environment with a 3-node OpenBao Raft HA cluster
+# (Integrated Storage) and a pg_vault_tde PostgreSQL instance that
+# authenticates via AppRole.
 #
 # Services:
-#   bao-1        — OpenBao primary (Raft leader)
-#   bao-2        — OpenBao secondary (Raft follower)
-#   bao-3        — OpenBao secondary (Raft follower)
-#   bao-init     — One-shot init container: bootstraps transit, AppRole
+#   bao-1        — OpenBao Raft node (first to be initialised → leader)
+#   bao-2        — OpenBao Raft node (auto-joins via retry_join)
+#   bao-3        — OpenBao Raft node (auto-joins via retry_join)
+#   bao-init     — One-shot init container: operator init + unseal all nodes,
+#                  then bootstraps transit + AppRole
 #   pg-bao       — PostgreSQL + pg_vault_tde, auth_method=approle
 #
 # Usage:
 #   podman-compose -f ci/compose-openbao.yml up -d
 #   podman-compose -f ci/compose-openbao.yml down -v
 #
-# Note: bao-init waits until bao-1 is healthy (raft leader elected), then:
-#   1. Enables the transit secrets engine
-#   2. Creates the TDE encryption key
-#   3. Enables AppRole auth
-#   4. Creates a TDE policy + AppRole role
-#   5. Writes role_id and secret_id to /tmp/approle.env for pg-bao to consume
+# Design notes:
+#   * Nodes run real production mode (`bao server -config=...`) with a Raft
+#     storage stanza — NOT dev mode (dev mode is in-memory single-node and
+#     cannot form a Raft cluster). The HCL configs live in ci/openbao/.
+#   * The command is `bao server ...` (not `server ...`) on purpose: the image
+#     entrypoint special-cases a bare `server` arg by injecting dev-only flags
+#     (-dev-root-token-id / -dev-listen-address), which crash a production node.
+#     Leading `bao` bypasses that injection while keeping the chown/drop-root.
+#   * bao-init breaks the chicken-and-egg (nodes are sealed until init unseals
+#     them) by depending on `service_started`, not `service_healthy`.
 #
 # Copyright (c) 2026 Miriade S.r.l. — PostgreSQL License (BSD)
 
 services:
 
-  # ── OpenBao node 1 (Raft leader) ───────────────────────────────────────
+  # ── OpenBao node 1 ─────────────────────────────────────────────────────
   bao-1:
     image: ${OPENBAO_IMAGE:-docker.io/openbao/openbao:2}
     container_name: bao-1
     hostname: bao-1
-    cap_add:
-      - IPC_LOCK
-    command: server
-    environment:
-      BAO_DEV_ROOT_TOKEN_ID: ${BAO_ROOT_TOKEN:-bao-root-token}
-      BAO_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    command: ["bao", "server", "-config=/openbao/config/main.hcl"]
     ports:
       - "${BAO_PORT_1:-18200}:8200"
     volumes:
-      - bao-1-data:/bao/data
+      - ./openbao/bao-1.hcl:/openbao/config/main.hcl:ro
+      - bao-1-file:/openbao/file
     healthcheck:
       test:
         - "CMD-SHELL"
-        - |
-          wget -q --spider http://localhost:8200/v1/sys/health \
-            && wget -qO- http://localhost:8200/v1/sys/health \
-               | grep -q '"sealed":false'
+        - wget -qO- 'http://localhost:8200/v1/sys/health?standbyok=true' | grep -q '"sealed":false'
       interval: 3s
       timeout: 5s
-      retries: 20
+      retries: 30
       start_period: 5s
     networks:
       - tde-bao
 
-  # ── OpenBao node 2 (Raft follower) ─────────────────────────────────────
+  # ── OpenBao node 2 ─────────────────────────────────────────────────────
   bao-2:
     image: ${OPENBAO_IMAGE:-docker.io/openbao/openbao:2}
     container_name: bao-2
     hostname: bao-2
-    cap_add:
-      - IPC_LOCK
-    command: server
-    environment:
-      BAO_DEV_ROOT_TOKEN_ID: ${BAO_ROOT_TOKEN:-bao-root-token}
-      BAO_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
-      # Join bao-1 as the Raft leader
-      BAO_DEV_JOIN_RAFT: http://bao-1:8200
+    command: ["bao", "server", "-config=/openbao/config/main.hcl"]
     ports:
       - "${BAO_PORT_2:-18201}:8200"
     volumes:
-      - bao-2-data:/bao/data
+      - ./openbao/bao-2.hcl:/openbao/config/main.hcl:ro
+      - bao-2-file:/openbao/file
     depends_on:
       bao-1:
-        condition: service_healthy
+        condition: service_started
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - wget -qO- 'http://localhost:8200/v1/sys/health?standbyok=true' | grep -q '"sealed":false'
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
     networks:
       - tde-bao
 
-  # ── OpenBao node 3 (Raft follower) ─────────────────────────────────────
+  # ── OpenBao node 3 ─────────────────────────────────────────────────────
   bao-3:
     image: ${OPENBAO_IMAGE:-docker.io/openbao/openbao:2}
     container_name: bao-3
     hostname: bao-3
-    cap_add:
-      - IPC_LOCK
-    command: server
-    environment:
-      BAO_DEV_ROOT_TOKEN_ID: ${BAO_ROOT_TOKEN:-bao-root-token}
-      BAO_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
-      BAO_DEV_JOIN_RAFT: http://bao-1:8200
+    command: ["bao", "server", "-config=/openbao/config/main.hcl"]
     ports:
       - "${BAO_PORT_3:-18202}:8200"
     volumes:
-      - bao-3-data:/bao/data
+      - ./openbao/bao-3.hcl:/openbao/config/main.hcl:ro
+      - bao-3-file:/openbao/file
     depends_on:
       bao-1:
-        condition: service_healthy
+        condition: service_started
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - wget -qO- 'http://localhost:8200/v1/sys/health?standbyok=true' | grep -q '"sealed":false'
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
     networks:
       - tde-bao
 
   # ── Bootstrap container ─────────────────────────────────────────────────
-  # Enables the transit secrets engine, creates the TDE key, configures
-  # AppRole auth, and writes credentials to a shared volume.
-  # Exits 0 when complete — compose will mark it as exited (not unhealthy).
+  # operator init bao-1, unseal every node (followers auto-join via retry_join),
+  # then enable transit + AppRole and publish AppRole creds to a shared volume.
+  # Exits 0 when complete.
   bao-init:
     image: ${OPENBAO_IMAGE:-docker.io/openbao/openbao:2}
     container_name: bao-init
     environment:
       BAO_ADDR: http://bao-1:8200
-      BAO_TOKEN: ${BAO_ROOT_TOKEN:-bao-root-token}
       TDE_MOUNT: ${BAO_MOUNT:-transit}
       TDE_KEY: ${BAO_KEY_NAME:-pg-tde-dek}
       TDE_ROLE: tde-role
       TDE_POLICY: tde-policy
     volumes:
-      - bao-init-data:/tmp/bao-init
+      - bao-init-data:/openbao/init
     depends_on:
       bao-1:
-        condition: service_healthy
+        condition: service_started
+      bao-2:
+        condition: service_started
+      bao-3:
+        condition: service_started
+    entrypoint: ["/bin/sh", "-c"]
     command:
-      - sh
-      - -c
       - |
         set -e
-        echo "[bao-init] Waiting for OpenBao to be ready ..."
-        for i in $(seq 1 30); do
-          if bao status -address=$$BAO_ADDR 2>/dev/null | grep -q "Initialized.*true"; then
+        SHARED=/openbao/init
+        mkdir -p $$SHARED
+
+        echo "[bao-init] Waiting for bao-1 API ..."
+        for i in $$(seq 1 60); do
+          if wget -qO- "$$BAO_ADDR/v1/sys/health?uninitcode=200&sealedcode=200&standbyok=true" >/dev/null 2>&1; then
             break
           fi
-          echo "[bao-init] Attempt $$i/30 ..."
+          echo "[bao-init] waiting for bao-1 ($$i/60) ..."
           sleep 2
         done
+
+        STATUS=$$(bao status -address=$$BAO_ADDR 2>/dev/null || true)
+        if echo "$$STATUS" | grep -q 'Initialized.*true'; then
+          echo "[bao-init] Cluster already initialised, reusing saved keys ..."
+          UNSEAL_KEY=$$(cat $$SHARED/unseal_key)
+          ROOT_TOKEN=$$(cat $$SHARED/root_token)
+        else
+          echo "[bao-init] Initialising bao-1 (1 key share) ..."
+          INIT=$$(bao operator init -address=$$BAO_ADDR -key-shares=1 -key-threshold=1)
+          UNSEAL_KEY=$$(echo "$$INIT" | grep 'Unseal Key 1:'      | awk '{print $$NF}')
+          ROOT_TOKEN=$$(echo "$$INIT" | grep 'Initial Root Token:' | awk '{print $$NF}')
+          printf '%s\n' "$$UNSEAL_KEY" > $$SHARED/unseal_key
+          printf '%s\n' "$$ROOT_TOKEN" > $$SHARED/root_token
+        fi
+
+        echo "[bao-init] Unsealing bao-1 (leader) ..."
+        bao operator unseal -address=http://bao-1:8200 "$$UNSEAL_KEY" >/dev/null
+
+        for node in bao-2 bao-3; do
+          echo "[bao-init] Unsealing $$node (auto-joins via retry_join) ..."
+          for i in $$(seq 1 30); do
+            if bao operator unseal -address=http://$$node:8200 "$$UNSEAL_KEY" >/dev/null 2>&1; then
+              echo "[bao-init] $$node unsealed."
+              break
+            fi
+            echo "[bao-init] $$node not ready to unseal ($$i/30) ..."
+            sleep 2
+          done
+        done
+
+        export BAO_ADDR=http://bao-1:8200
+        export BAO_TOKEN=$$ROOT_TOKEN
 
         echo "[bao-init] Enabling transit secrets engine at $$TDE_MOUNT ..."
         bao secrets enable -address=$$BAO_ADDR -path=$$TDE_MOUNT transit || true
 
         echo "[bao-init] Creating TDE encryption key ..."
-        bao write -address=$$BAO_ADDR $$TDE_MOUNT/keys/$$TDE_KEY \
-          type=aes256-gcm96 || true
+        bao write -address=$$BAO_ADDR $$TDE_MOUNT/keys/$$TDE_KEY type=aes256-gcm96 || true
 
         echo "[bao-init] Writing TDE policy ..."
         bao policy write -address=$$BAO_ADDR $$TDE_POLICY - <<'POLICY'
-        path "transit/datakey/plaintext/pg-tde-dek" {
+        path "transit/encrypt/pg-tde-dek" {
           capabilities = ["create", "update"]
         }
         path "transit/decrypt/pg-tde-dek" {
@@ -149,6 +189,9 @@ services:
         }
         path "transit/rewrap/pg-tde-dek" {
           capabilities = ["create", "update"]
+        }
+        path "transit/keys/pg-tde-dek/rotate" {
+          capabilities = ["create", "update"] 
         }
         path "sys/health" {
           capabilities = ["read"]
@@ -175,14 +218,13 @@ services:
         SECRET_ID=$$(bao write -address=$$BAO_ADDR -field=secret_id -f auth/approle/role/$$TDE_ROLE/secret-id)
 
         echo "[bao-init] Writing credentials to shared volume ..."
-        printf 'BAO_ROLE_ID=%s\nBAO_SECRET_ID=%s\n' "$$ROLE_ID" "$$SECRET_ID" \
-          > /tmp/bao-init/approle.env
-        echo "$$ROLE_ID" > /tmp/bao-init/role_id
-        echo "$$SECRET_ID" > /tmp/bao-init/secret_id
+        printf 'BAO_ROLE_ID=%s\nBAO_SECRET_ID=%s\n' "$$ROLE_ID" "$$SECRET_ID" > $$SHARED/approle.env
+        printf '%s\n' "$$ROLE_ID"   > $$SHARED/role_id
+        printf '%s\n' "$$SECRET_ID" > $$SHARED/secret_id
 
         echo "[bao-init] Bootstrap complete."
         echo "  role_id:   $$ROLE_ID"
-        echo "  secret_id: (written to /tmp/bao-init/secret_id)"
+        echo "  secret_id: (written to $$SHARED/secret_id)"
     networks:
       - tde-bao
 
@@ -197,36 +239,33 @@ services:
       POSTGRES_PASSWORD: postgres
       BAO_ADDR: http://bao-1:8200
     volumes:
-      - bao-init-data:/tmp/bao-init:ro
-    # pg-bao starts after bao-init exits (code 0 = bootstrap done).
-    # We use a wrapper that sources the AppRole credentials written by bao-init
-    # and starts postgres with the correct GUCs.
-    command:
+      - bao-init-data:/openbao/init:ro
+    command: 
       - bash
       - -c
       - |
         set -e
         echo "[pg-bao] Waiting for AppRole credentials from bao-init ..."
         for i in $(seq 1 60); do
-          if [ -f /tmp/bao-init/role_id ] && [ -f /tmp/bao-init/secret_id ]; then
+          if [ -f /openbao/init/role_id ] && [ -f /openbao/init/secret_id ]; then
             break
           fi
           echo "[pg-bao] Attempt $$i/60 ..."
           sleep 2
         done
 
-        ROLE_ID=$$(cat /tmp/bao-init/role_id)
-        SECRET_ID=$$(cat /tmp/bao-init/secret_id)
+        ROLE_ID=$$(cat /openbao/init/role_id)
+        SECRET_ID=$$(cat /openbao/init/secret_id)
         echo "[pg-bao] Credentials loaded. Starting PostgreSQL ..."
 
         exec docker-entrypoint.sh postgres \
           -c shared_preload_libraries=pg_vault_tde \
-          -c pg_vault_tde.dev_mode=on \
+          -c pg_vault_tde.kms_provider=vault \
           -c pg_vault_tde.vault_url=http://bao-1:8200 \
-          -c pg_vault_tde.auth_method=approle \
-          -c "pg_vault_tde.approle_role_id=$$ROLE_ID" \
-          -c "pg_vault_tde.approle_secret_id=$$SECRET_ID" \
-          -c pg_vault_tde.vault_mount=${BAO_MOUNT:-transit} \
+          -c pg_vault_tde.vault_auth_method=approle \
+          -c pg_vault_tde.vault_role_id=$$ROLE_ID \
+          -c pg_vault_tde.vault_secret_id=$$SECRET_ID \
+          -c pg_vault_tde.vault_transit_mount=${BAO_MOUNT:-transit} \
           -c pg_vault_tde.vault_key_name=${BAO_KEY_NAME:-pg-tde-dek} \
           -c pg_vault_tde.bgw_enabled=on \
           -c pg_vault_tde.token_renewal_interval=120 \
@@ -236,8 +275,6 @@ services:
     depends_on:
       bao-1:
         condition: service_healthy
-      bao-init:
-        condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 3s
@@ -248,9 +285,9 @@ services:
       - tde-bao
 
 volumes:
-  bao-1-data:
-  bao-2-data:
-  bao-3-data:
+  bao-1-file:
+  bao-2-file:
+  bao-3-file:
   bao-init-data:
 
 networks:

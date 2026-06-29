@@ -1,6 +1,5 @@
 #include "postgres_fe.h"
 #include "libpq-fe.h"
-#include "fe_utils/connect_utils.h"
 #include "common/fe_memutils.h"
 #include "common/logging.h"
 #include "getopt_long.h"

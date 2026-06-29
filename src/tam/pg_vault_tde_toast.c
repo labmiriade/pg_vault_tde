@@ -78,7 +78,7 @@ tde_toast_encrypt_chunk(Oid parent_relid, const char *chunk_data, Size chunk_len
 
     /*
      * Delegate to the shared AES-256-GCM primitive with the parent
-     * relation's DEK.  The [VERSION|GEN|IV|CT|TAG] wire format is
+     * relation's DEK.  The [IV|CT|TAG|VERSION|GEN] wire format is
      * self-contained: each chunk carries its own IV.
      */
     return tde_gcm_encrypt(parent_relid, chunk_data, chunk_len, out_len);
@@ -91,7 +91,7 @@ tde_toast_encrypt_chunk(Oid parent_relid, const char *chunk_data, Size chunk_len
  * Verifies the GCM authentication tag before returning plaintext; any
  * tampering aborts via ereport(ERROR).
  *
- * @param enc_data     [VERSION|GEN|IV|CT|TAG] encrypted chunk
+ * @param enc_data     [IV|CT|TAG|VERSION|GEN] encrypted chunk
  * @param enc_len      total encrypted length
  * @param out_len      set to decrypted chunk length
  * @returns            palloc'd plaintext chunk; caller cleans up
@@ -99,10 +99,19 @@ tde_toast_encrypt_chunk(Oid parent_relid, const char *chunk_data, Size chunk_len
 char *
 tde_toast_decrypt_chunk(Oid parent_relid, const char *enc_data, Size enc_len, Size *out_len)
 {
-    Assert(enc_data != NULL);
-    Assert(enc_len > TDE_GCM_OVERHEAD);
+    char *out;
 
-    return tde_gcm_decrypt(parent_relid, enc_data, enc_len, out_len);
+    Assert(enc_data != NULL);
+    Assert(enc_len > TDE_V4_OVERHEAD);
+
+    /* Chunk path (not the hot seq-scan): palloc the plaintext destination. */
+    out = (char *) palloc(enc_len - TDE_V4_OVERHEAD);
+    if (!tde_gcm_decrypt(parent_relid, enc_data, enc_len, out, out_len))
+    {
+        pfree(out);
+        return NULL;
+    }
+    return out;
 }
 
 /*

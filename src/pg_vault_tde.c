@@ -37,6 +37,7 @@
 #include "src/include/pg_vault_tde_hw_accel.h"
 #include "src/include/pg_vault_tde_guc.h"
 #include "src/include/pg_vault_tde_catalog.h"
+#include "src/include/pg_vault_tde_audit.h"
 #include "src/include/pg_vault_tde_rmgr.h"
 #include "src/kms/pg_vault_tde_kms_provider.h"
 
@@ -94,11 +95,27 @@ bool  pg_vault_tde_dev_mode                  = false;/* enables dev conveniences
  */
 const TdeKmsProvider *tde_active_kms_provider = NULL;
 
+/*
+ * tde_shmem_started — true after pg_vault_tde_shmem_startup() completes.
+ *
+ * Used by the kms_provider GUC assign hook to decide whether it is safe to
+ * call provider->init() immediately (shmem is ready) or defer until the
+ * shmem_startup_hook runs (postmaster pre-shmem phase).
+ *
+ * This is a plain static (process-local); each backend inherits the true value
+ * from the postmaster after it has been forked post-startup.
+ */
+static bool tde_shmem_started = false;
+
 /* Hook chain pointers — we save the previous hook so we compose correctly. */
 static shmem_request_hook_type    prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type    prev_shmem_startup_hook = NULL;
 static ProcessUtility_hook_type   prev_process_utility_hook = NULL;
 static object_access_hook_type    prev_object_access_hook = NULL;
+
+/* Audit hook — NULL unless an external audit module installs one. */
+tde_audit_hook audit_hook_ptr = NULL;
+
 /*
  * tde_backend_cleanup -- on_proc_exit callback.
  *
@@ -109,8 +126,9 @@ static object_access_hook_type    prev_object_access_hook = NULL;
 static void
 tde_backend_cleanup(int code, Datum arg)
 {
+    tde_audit(AUDIT_LOG_STOP, NULL, true);
     tde_crypto_ctx_cleanup();
-    tde_iam_siv_ctx_cleanup();
+    tde_iam_ctx_cleanup();
     tde_hw_accel_cleanup();
 }
 
@@ -130,6 +148,59 @@ pg_vault_tde_iam_handler(PG_FUNCTION_ARGS)
 }
 
 void _PG_init(void);
+
+/*
+ * tde_kms_provider_assign — GUC assign hook for pg_vault_tde.kms_provider.
+ *
+ * Fires whenever the GUC changes value: during postgresql.conf processing at
+ * postmaster startup, when per-database settings from ALTER DATABASE SET are
+ * applied at backend connect time (inside InitPostgres), and on SET inside a
+ * session.
+ *
+ * The hook updates tde_active_kms_provider to the new provider vtable.  If
+ * shmem is already ready (tde_shmem_started == true) it also calls init() so
+ * the provider can open its wallet / restore its DEK.  In the postmaster
+ * pre-shmem phase tde_shmem_started is false, so init() is deferred until
+ * pg_vault_tde_shmem_startup().
+ *
+ * This is the ONLY place that sets tde_active_kms_provider; the previous
+ * assignment block in pg_vault_tde_shmem_startup() has been removed.
+ */
+static void
+tde_kms_provider_assign(const char *newval, void *extra)
+{
+    const TdeKmsProvider *new_provider = NULL;
+
+    if (newval == NULL || newval[0] == '\0')
+    {
+        /* Empty/unset: clear the pointer, leave init for later */
+        tde_active_kms_provider = NULL;
+        return;
+    }
+
+    if (strcmp(newval, "local") == 0)
+        new_provider = pg_vault_tde_kms_local_provider();
+    else if (strcmp(newval, "vault") == 0)
+        new_provider = pg_vault_tde_kms_vault_provider();
+    else
+    {
+        /* Unknown value — check_hook should have rejected it; be defensive */
+        tde_active_kms_provider = NULL;
+        return;
+    }
+
+    tde_active_kms_provider = new_provider;
+
+    /*
+     * Call init() only once shmem is available.  In the postmaster config-load
+     * phase tde_shmem_started is still false; init() will be called from
+     * pg_vault_tde_shmem_startup() instead.  In a backend (after fork) shmem
+     * is already attached, so we can initialise immediately — this is the path
+     * that makes ALTER DATABASE SET pg_vault_tde.kms_provider work.
+     */
+    if (tde_shmem_started && new_provider->init)
+        (void) new_provider->init();
+}
 
 /*
  * tde_get_tableam_name_for_rel
@@ -225,12 +296,15 @@ tde_object_access_hook(ObjectAccessType access, Oid classId, Oid objectId,
 
     table_close(rel, NoLock);
 
-    /* Only handle plain heap tables; skip TOAST, indexes, sequences, etc. */
-    if (relkind != RELKIND_RELATION || !OidIsValid(relam))
+    /* Only handle plain heap and index tables; skip TOAST, sequences, etc. */
+    if ((relkind != RELKIND_RELATION && relkind != RELKIND_INDEX))
+        return;
+
+    if(!OidIsValid(relam))
         return;
 
     amname = get_am_name(relam);
-    if (amname == NULL || strcmp(amname, "encrypted_heap") != 0)
+    if (amname == NULL || (strcmp(amname, "encrypted_heap") != 0 && strcmp(amname, "tde_btree") != 0))
         return;
 
     /*
@@ -239,7 +313,7 @@ tde_object_access_hook(ObjectAccessType access, Oid classId, Oid objectId,
      * is idempotent: if the entry already exists it returns immediately
      * without overwriting the existing DEK.
      */
-    pg_vault_tde_catalog_register_rel(objectId, pg_vault_tde_vault_key_name);
+    pg_vault_tde_catalog_register_rel(objectId);
 
     ereport(DEBUG1,
             errmsg("pg_vault_tde: [object_access] registered DEK for new "
@@ -403,7 +477,8 @@ tde_process_utility_hook(PlannedStmt *pstmt,
             return;
         }
 
-        pg_vault_tde_catalog_register_rel(relid, pg_vault_tde_vault_key_name);
+        pg_vault_tde_catalog_register_rel(relid);
+        tde_audit(RELATION_ENCRYPT, psprintf("%u", relid), true);
 
         ereport(DEBUG1,
                 (errmsg("pg_vault_tde: registered relid=%u in DEK catalog",
@@ -423,9 +498,8 @@ tde_process_utility_hook(PlannedStmt *pstmt,
      * After the table is committed we can look it up by name and register
      * it in the catalog.
      *
-     * We use SPI to INSERT into pg_vault_tde_catalog.  The vault_key_name
-     * defaults to pg_vault_tde.vault_key_name GUC (or "local" for wallet
-     * provider).  The wrapped_dek column is populated lazily on first access
+     * We use SPI to INSERT into pg_vault_tde_catalog. 
+     * The wrapped_dek column is populated lazily on first access
      * by the catalog hot-path.
      */
     if (is_create_encrypted)
@@ -445,10 +519,8 @@ tde_process_utility_hook(PlannedStmt *pstmt,
             return;
         }
         /*
-         * Guard: pg_vault_tde_catalog is created by the v1.5 upgrade script
-         * (pg_vault_tde--1.4--1.5.sql).  On a v1.0 deployment that has not
-         * yet been upgraded, the table does not exist and we skip the INSERT
-         * gracefully.  Encrypted tables still work using the global DEK.
+         * Guard: pg_vault_tde_catalog is created by the v1.5 upgrade script.
+         * On a pre-v1.5 deployment skip the INSERT gracefully.
          */
         ext_ns = get_extension_schema(get_extension_oid(pg_vault_tde_extension_name, true));
         if (!OidIsValid(ext_ns) ||
@@ -468,7 +540,8 @@ tde_process_utility_hook(PlannedStmt *pstmt,
          * pg_vault_tde_catalog_register_rel() manages its own SPI connection
          * and calls OPENSSL_cleanse() on the plaintext DEK after wrapping.
          */
-        pg_vault_tde_catalog_register_rel(relid, pg_vault_tde_vault_key_name);
+        pg_vault_tde_catalog_register_rel(relid);
+        tde_audit(RELATION_ENCRYPT, psprintf("%u", relid), true);
 
         ereport(DEBUG1,
                 (errmsg("pg_vault_tde: registered relid=%u in DEK catalog",
@@ -573,6 +646,7 @@ tde_process_utility_hook(PlannedStmt *pstmt,
         }
 
         pg_vault_tde_catalog_deregister_rel(relid);
+        tde_audit(RELATION_DECRYPT, psprintf("%u", relid), true);
 
         ereport(DEBUG1,
                 (errmsg("pg_vault_tde: deregistered relid=%u in DEK catalog",
@@ -580,6 +654,48 @@ tde_process_utility_hook(PlannedStmt *pstmt,
     }
 }
 
+static const char *
+tde_event_string(TdeAuditEvent event)
+{
+    switch (event)
+    {
+        case KMS_DEK_ACCESS:        return "DEK_ACCESS";
+        case KMS_DEK_CREATE:        return "DEK_CREATE";
+        case KMS_DEK_UPDATE:        return "DEK_UPDATE";
+        case KMS_DEK_ROTATE:        return "DEK_ROTATE";
+        case KMS_DEK_DELETE:        return "DEK_DELETE";
+        case KMS_KEK_ROTATE:        return "KEK_ROTATE";
+        case KMS_AUTH_SUCCESS:      return "KMS_AUTH_SUCCESS";
+        case KMS_AUTH_FAILURE:      return "KMS_AUTH_FAILURE";
+        case WALLET_OPEN:           return "WALLET_OPEN";
+        case WALLET_CLOSE:          return "WALLET_CLOSE";
+        case RELATION_ENCRYPT:      return "RELATION_ENCRYPT";
+        case RELATION_DECRYPT:      return "RELATION_DECRYPT";
+        case ACCESS_DENIED:         return "ACCESS_DENIED";
+        case AUDIT_LOG_START:       return "AUDIT_LOG_START";
+        case AUDIT_LOG_STOP:        return "AUDIT_LOG_STOP";
+        case INTEGRITY_VIOLATION:   return "INTEGRITY_VIOLATION";
+        default:                    return "UNKNOWN";
+    }
+}
+
+static void tde_audit_handler(TdeAuditEvent event, const char* reloid, bool success)
+{
+    const char *rolname = OidIsValid(GetUserId())
+                          ? GetUserNameFromId(GetUserId(), true)
+                          : "(system)";
+    ereport(LOG,
+        (errmsg("AUDIT: event=%s, oid=%s, user=%s, success=%s, pid=%d",
+                tde_event_string(event),
+                reloid != NULL ? reloid : "-",
+                rolname != NULL ? rolname : "(unknown)",
+                success ? "t" : "f",
+                MyProcPid),
+            errhidestmt(true),
+            errhidecontext(true)
+        )
+    );
+}
 /*
  * pg_vault_tde_shmem_request
  *
@@ -617,33 +733,36 @@ pg_vault_tde_shmem_startup(void)
     pg_vault_tde_kms_shmem_init();
 
     /*
-     * v1.5: initialise the per-table DEK shmem cache.  Must run after
-     * the global KMS shmem (pg_vault_tde_kms_shmem_init) since the catalog
-     * cache may call the global DEK path as a fallback for v1.4 tables.
+     * v1.5+: initialise the per-table DEK shmem cache.  Must run after
+     * pg_vault_tde_kms_shmem_init (KMS shmem must exist first).
      */
     pg_vault_tde_catalog_shmem_init();
 
     /*
-     * v1.5: activate the KMS provider selected by pg_vault_tde.kms_provider.
-     * Providers call their init() function here so they can access shmem.
+     * Mark shmem as available.  The kms_provider assign hook checks this flag
+     * before calling provider->init(); from this point on any GUC change (e.g.
+     * ALTER DATABASE SET applied at backend connect) will trigger init()
+     * directly in the assign hook rather than requiring a second startup path.
      */
-    if (pg_vault_tde_kms_provider &&
-        strcmp(pg_vault_tde_kms_provider, "local") == 0)
-    {
-        tde_active_kms_provider = pg_vault_tde_kms_local_provider();
-    }
-    else
-    {
-        /*
-         * Default: vault provider.  The vault provider's init() sets up the
-         * curl handle and attempts the configured auth method.
-         */
-        tde_active_kms_provider = pg_vault_tde_kms_vault_provider();
-    }
+    tde_shmem_started = true;
 
+    /*
+     * tde_active_kms_provider was already set by the GUC assign hook when
+     * postgresql.conf was processed during startup.  Call init() now that
+     * shmem is available.  If no provider was configured at the cluster level
+     * (per-database-only setup) tde_active_kms_provider is NULL here and
+     * each backend will activate its provider via the assign hook.
+     */
     if (tde_active_kms_provider && tde_active_kms_provider->init)
         (void) tde_active_kms_provider->init();
+    else if (!tde_active_kms_provider)
+        ereport(LOG,
+                errmsg("pg_vault_tde: no cluster-level KMS provider configured; "
+                       "per-database provider (ALTER DATABASE SET "
+                       "pg_vault_tde.kms_provider) will be activated on first "
+                       "connection"));
 }
+
 
 /*
  * _PG_init
@@ -674,11 +793,6 @@ _PG_init(void)
      * and each new connection picks up the effective value for its database.
      * This is the primary mechanism for multi-tenant key isolation within a
      * single PostgreSQL cluster.
-     *
-     * The only parameters that remain PGC_POSTMASTER are those that affect
-     * shared-memory sizing at startup (max_encrypted_relations) or that
-     * require a deterministic provider selection before shmem is mapped
-     * (crypto_provider).
      */
 
     /*
@@ -846,19 +960,19 @@ _PG_init(void)
      * The provider is re-evaluated per connection from the effective GUC value.
      */
     DefineCustomStringVariable("pg_vault_tde.kms_provider",
-        "KMS provider backend: vault (default) or local (PKCS#12 wallet)",
+        "KMS provider backend: vault or local (PKCS#12 wallet)",
         "Selects which Key Management Service backend is active.  "
-        "'vault' (default): uses HashiCorp Vault / OpenBao Transit API.  "
+        "'vault': uses HashiCorp Vault / OpenBao Transit API.  "
         "'local': uses a PKCS#12 wallet at pg_vault_tde.wallet_path.  "
         "Settable per-database via ALTER DATABASE SET.",
         &pg_vault_tde_kms_provider, "", PGC_SUSET,
-        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+        GUC_SUPERUSER_ONLY, NULL, tde_kms_provider_assign, NULL);
 
     /* Local wallet path (v1.5) — default resolved at runtime from $PGDATA */
     DefineCustomStringVariable("pg_vault_tde.wallet_path",
         "Absolute path to the PKCS#12 local wallet file",
         "Used only when pg_vault_tde.kms_provider = 'local'.  "
-        "Default: $PGDATA/base/<DB_OID>/pg_vault_tde/wallet.p12",
+        "Default: /var/lib/pg_vault_tde/<DB_OID>/wallet.p12",
         &pg_vault_tde_wallet_path, "", PGC_SUSET,
         GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
@@ -991,6 +1105,9 @@ _PG_init(void)
      */
     prev_object_access_hook = object_access_hook;
     object_access_hook = tde_object_access_hook;
+
+    audit_hook_ptr = tde_audit_handler;
+    tde_audit(AUDIT_LOG_START, NULL, true);
 
     /*
      * Wire the mutable tde_methods copy: copy heapam's TableAmRoutine and

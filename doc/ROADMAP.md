@@ -1,6 +1,6 @@
 # pg_vault_tde Roadmap
 
-> Last updated: 2026-06-23 — **v1.7 current**. 109 regression tests (52 v1.4 + 20 v1.5 + 37 v1.6) carried forward, plus the `tap/12_logical_repl_toast.t` end-to-end logical replication test. Key v1.7 changes: all KMS GUCs promoted to PGC_SUSET (per-database KMS via `ALTER DATABASE SET`); `pg_restore_tde` decrypt-and-pipe loop completed; logical replication of `encrypted_heap` TOAST columns via a custom WAL resource manager (`pg_vault_tde.toast_custom_rmgr`); documentation updated throughout.
+> Last updated: 2026-06-29 — **v1.7 current**. 109 regression tests (52 v1.4 + 20 v1.5 + 37 v1.6) carried forward, plus the `tap/12_logical_repl_toast.t` end-to-end logical replication test. Key v1.7 changes: all KMS GUCs promoted to PGC_SUSET (per-database KMS via `ALTER DATABASE SET`); `pg_restore_tde` decrypt-and-pipe loop completed; logical replication of `encrypted_heap` TOAST columns via a custom WAL resource manager (`pg_vault_tde.toast_custom_rmgr`); documentation updated throughout.
 
 ---
 
@@ -87,7 +87,7 @@ AppRole response-wrapping. Wallet SQL stubs registered (not functional). Tests 5
 | Feature | Status |
 |---------|--------|
 | `pg_vault_tde_wallet_change_passphrase(old, new)` — re-wraps all DEKs atomically via SPI | ✅ Done |
-| `pg_vault_tde_wallet_rotate_kek()` — new random KEK, re-wrap all DEKs, atomic wallet file write | ✅ Done |
+| `pg_vault_tde_rotate_kek()` — new random KEK, re-wrap all DEKs, atomic wallet file write | ✅ Done |
 
 #### 5. Wallet Export/Import Ceremony
 
@@ -247,10 +247,10 @@ Covered by tests 81, 84, and 85.
   `SPI_tuptable`, invalidating the next iteration and crashing the backend
   on the second tuple (segfault, signal 11).  Solved by snapshotting the
   read set into caller-owned arrays before issuing any UPDATE.
-  Same dual fix applied to `pg_vault_tde_wallet_rotate_kek()`.
+  Same dual fix applied to `pg_vault_tde_rotate_kek()`.
   Tests 78–79 now PASS under `make ci-wallet`.
 
-- `pg_vault_tde_wallet_rotate_kek()` — extended with a dual-source KEK
+- `pg_vault_tde_wallet_kek()` — extended with a dual-source KEK
   policy: prefers the in-memory cached KEK from `wallet_unlock` when
   available (so tests don't need GUC config), falls back to the GUC
   passphrase source otherwise.
@@ -311,10 +311,11 @@ Provider-agnostic `pg_vault_tde_kms_wrap_dek()`/`unwrap_dek()` API. Vault Transi
 as key protector (not key store) — raw DEK never sent to Vault, only wrapped ciphertext.
 `pg_vault_tde_catalog.wrapped_dek` authoritative for all providers.
 
-### 3. tde_btree Fixed-Size Type Encryption (Medium)
+### 3. tde_btree Fixed-Size Type Encryption — ✅ Completed in v1.7
 
 Custom btree key serialisation layer for `int4`/`int8`/`uuid`/`date`/`timestamptz`.
-New `tde_*_enc_ops` operator classes; deprecation path from v1.5 plaintext ops.
+All operator classes now store encrypted index keys. Index-only scans are disabled
+by design to prevent returning raw AES-256-SIV ciphertext to clients.
 
 ### 4. Logical Replication of TOAST Columns (Medium) — COMPLETED ✅
 
@@ -429,7 +430,7 @@ These gaps **cannot be closed without modifying PostgreSQL core**.
 | **v1.3** | Vault KEK + multi_insert + BGW | ✅ 2026 | 48 | Transit KEK wrapping, batch COPY, token renewal BGW, health_check |
 | **v1.4** | CI/CD + tde_btree + Wire Format v2 | ✅ 2026-07-05 | 52 | OpenBao 3-node Raft, ambuild/aminsert/amrescan, generation tag |
 | **v1.5** | Per-Table DEK + Online Rotation + AAD | ✅ 2026 | 72 | Per-table catalog, native type ops, wire format v3, rotate_online BGW |
-| **v1.6** | Local Wallet KMS (production-ready) + write-path / catalog bugfix patch | ✅ 2026-06-03 | 109 | Wallet unlock/lock, passphrase flexibility, KEK rotation, export/import, Vault→wallet migration; PG_TRY widening; TOAST relid auto-registration; STORAGE EXTERNAL TAM read bypass; all-read-paths TOAST coverage; forensic helpers; tests 73–109 |
-| **v1.7** | Per-database KMS + pg_restore_tde + PGC_SUSET + logical replication of TOAST | 🔄 Current (2026-06-23) | 109 + E2E TAP | All KMS GUCs PGC_SUSET → per-database KMS via `ALTER DATABASE SET`; `pg_restore_tde` full decrypt-and-pipe restore loop; logical replication of `encrypted_heap` TOAST columns via custom WAL rmgr (`toast_custom_rmgr`); documentation overhaul |
+| **v1.6** | Local Wallet KMS (production-ready) + write-path / catalog bugfix patch | ✅ 2026-07-20 (patched 2026-05-08) | 109 | Wallet unlock/lock, passphrase flexibility, KEK rotation, export/import, Vault→wallet migration; PG_TRY widening; TOAST relid auto-registration; STORAGE EXTERNAL TAM read bypass; all-read-paths TOAST coverage; forensic helpers; tests 73–109 |
+| **v1.7** | Per-database KMS + pg_restore_tde + PGC_SUSET + v1.4 removal | 🔄 Current (2026-06-08) | 109 | All KMS GUCs PGC_SUSET → per-database KMS via `ALTER DATABASE SET`; `pg_restore_tde` full decrypt-and-pipe restore loop; removed v1.4 global-DEK backward compat (`TdeShmemData`, `rotate_key`, `key_generation`, `clear_prev_dek`, `encrypt_test`, `decrypt_test`); documentation overhaul |
 | **v1.8** | TOAST Chunks + HSM + Audit | Q4 2027 | ~100 | TOAST chunk AES-GCM, PKCS#11/HSM, audit trail, KEK/DEK hierarchy |
 | **v1.9** | KMIP + Column-Level + HA | Q2 2028 | ~130 | KMIP 1.2, column-level encryption, GIN/Hash AMs, streaming replication HA |

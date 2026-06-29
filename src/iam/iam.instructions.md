@@ -66,25 +66,36 @@ Same pool pattern as the GCM layer:
 
 ---
 
-## Implementation Status (v1.0)
+## Implementation Status (v1.7)
 
 | Hook | Status | Notes |
 |------|--------|-------|
-| `ambuild` | ✅ Wired | Full index build with encryption |
-| `aminsert` | ✅ Wired | Per-key encryption on INSERT |
-| `amgettuple` | Delegates to btree | Decryption needed for query results |
-| `amrescan` | Delegates to btree | Standard btree behavior |
+| `ambuild` | ✅ Wired | Full index build with encryption; all types (varlena + fixed-size) |
+| `aminsert` | ✅ Wired | Per-key encryption on INSERT; all types encrypted |
+| `amgettuple` | Delegates to btree | Returns encrypted key; heap fetch required for plaintext |
+| `amrescan` | ✅ Wired | Encrypts equality scan keys; range keys pass through (empty results) |
 | `amendscan` | Delegates to btree | Standard btree behavior |
 | `ambulkdelete` | Delegates to btree | Standard btree behavior |
 | `amvacuumcleanup` | Delegates to btree | Standard btree behavior |
+| Index-only scan | ❌ Not supported | By design: would expose raw AES-SIV ciphertext without decryption |
 
 ---
 
-## Known Limitation: Range Scans
+## Known Limitations
+
+### Range Scans (by design, permanent)
 
 `WHERE col > 'x'` on a `tde_btree`-indexed column returns empty results.
 AES-SIV does not preserve ordering. This is documented in README.md and
 `doc/pg_vault_tde.md`. Users must use sequential scans for range predicates.
+
+### Index-Only Scans (not supported, by design)
+
+PostgreSQL index-only scans return column values directly from the index without
+fetching the heap tuple. Since `tde_btree` index pages store AES-256-SIV ciphertexts,
+an index-only scan would return raw ciphertext to the client — bypassing the TAM
+`decode_slot` decryption path entirely. The `tde_btree` handler prevents the planner
+from selecting this path.
 
 ---
 

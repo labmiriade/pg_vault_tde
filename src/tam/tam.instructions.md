@@ -241,7 +241,7 @@ to its expected error conditions and the correct `ereport` level:
 | Callback | Failure Mode | ereport Level | Error Message |
 |----------|-------------|---------------|---------------|
 | `scan_getnextslot` | GCM tag mismatch | ERROR | "GCM authentication failed: tuple at (%u,%u) may be tampered or encrypted with a different DEK" |
-| `scan_getnextslot` | DEK not set | ERROR | "pg_vault_tde: no DEK available — call pg_vault_tde_set_test_dek() or configure Vault" |
+| `scan_getnextslot` | DEK not set | ERROR | "pg_vault_tde: no DEK available |
 | `tuple_insert` | encrypt returns NULL | ERROR | "pg_vault_tde: encryption failed for tuple" |
 | `tuple_update` | old tuple GCM mismatch | ERROR | "GCM authentication failed on UPDATE source tuple" |
 | `index_fetch_tuple` | rd_tableam restore failed | PANIC | "pg_vault_tde: failed to restore rd_tableam — relation cache corrupted" |

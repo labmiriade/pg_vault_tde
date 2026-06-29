@@ -15,24 +15,23 @@
  * We do NOT hardcode an ENGINE; the default provider handles this, meaning
  * the code benefits from AES-NI on modern x86/ARM without any extra work.
  *
- * Ciphertext wire format:
- *   [  IV  (12 bytes) ][ CIPHERTEXT (plaintext_len bytes) ][ GCM TAG (16 bytes) ]
+ * Ciphertext wire format (v4 IV-first trailer):
+ *   [ IV(12) ][ CIPHERTEXT(plaintext_len) ][ GCM TAG(16) ][ VERSION(1) ][ GEN(8) ]
  *
  * A 12-byte (96-bit) IV is the NIST-recommended size for GCM.
  * We generate it via PostgreSQL's pg_strong_random() which is /dev/urandom
  * backed on Linux \u2014 we do NOT use OpenSSL's RAND_bytes to stay within the
  * PostgreSQL memory/resource model.
  *
- * The GCM tag (16 bytes) is appended last, matching the common TLS layout
- * and simplifying audits against known implementations.
+ * IV-first so the blob differs from byte 0 every time: heap_update never sees
+ * a constant prefix, so HOT is never wrongly chosen and tde_btree stays coherent.
  */
 #include "postgres.h"
-#include "miscadmin.h"          /* MyDatabaseId — needed for v3 AAD binding */
+#include "miscadmin.h"          /* MyDatabaseId — needed for AAD binding */
 #include "utils/memutils.h"
 #include "common/pg_prng.h"
 #include <openssl/evp.h>
 #include <openssl/rand.h>
-#include <openssl/crypto.h>
 
 #include "src/include/pg_vault_tde_kms.h"
 #include "src/include/pg_vault_tde_crypto.h"
@@ -40,22 +39,32 @@
 #include "src/include/pg_vault_tde_catalog.h" /* pg_vault_tde_kms_get_rel_dek (v1.5) */
 
 /* ============================================================
- * Per-backend reusable EVP contexts.
+ * Per-backend reusable EVP contexts, keyed by (relid, generation).
  *
- * Allocating EVP_CIPHER_CTX via EVP_CIPHER_CTX_new() invokes a heap malloc
- * (~20-30 ns) on every call.  On the multi_insert path this fires once per
- * tuple, adding 200-300 ms of pure allocation overhead for a 10M-row load.
+ * Allocating an EVP_CIPHER_CTX per call costs a heap malloc; installing the
+ * AES-256 key schedule (EVP_EncryptInit_ex2 with the DEK) costs more still.
+ * On bulk INSERT/scan both fire once per tuple.
  *
- * Instead we allocate once per backend on first use and reset the context
- * between calls via EVP_CIPHER_CTX_reset().  On any fatal error path we free
- * and NULL-out the pointer so the next call re-allocates cleanly.
+ * We allocate each context once per backend (first use) and cache the
+ * (relid, generation) it is keyed for.  As long as consecutive tuples share
+ * the same relation and generation we reuse the installed key schedule and
+ * only rearm the IV per call; the schedule is re-installed only when relid or
+ * generation changes.  On any fatal error path tde_crypto_ctx_cleanup() frees
+ * and NULL-outs both contexts so the next call re-allocates and re-keys.
  *
  * Thread safety: each PostgreSQL backend is single-threaded, so no locking
  * is required for these file-scope statics.
  * ============================================================ */
-static EVP_CIPHER_CTX *tde_gcm_enc_ctx = NULL;  /* encrypt context */
-static EVP_CIPHER_CTX *tde_gcm_dec_ctx = NULL;  /* decrypt context */
+/* One reusable EVP context per direction; re-keyed only when (relid, gen) changes. */
+typedef struct TdeCipherSlot
+{
+    EVP_CIPHER_CTX  *ctx;
+    Oid              relid;
+    uint64           generation;
+} TdeCipherSlot;
 
+static TdeCipherSlot tde_enc = { NULL, InvalidOid, 0 };
+static TdeCipherSlot tde_dec = { NULL, InvalidOid, 0 };
 /* ============================================================
  * Per-backend IV batch buffer.
  *
@@ -103,6 +112,18 @@ tde_next_iv(unsigned char *iv_out)
     iv_batch_pos++;
 }
 
+/* Allocate the two per-backend GCM contexts on first use. Idempotent. */
+static bool
+tde_crypto_ctx_init(void)
+{
+    if (tde_enc.ctx == NULL)
+        tde_enc.ctx = EVP_CIPHER_CTX_new();
+    if (tde_dec.ctx == NULL)
+        tde_dec.ctx = EVP_CIPHER_CTX_new();
+
+    return tde_enc.ctx != NULL && tde_dec.ctx != NULL;
+}
+
 /*
  * tde_crypto_ctx_cleanup -- free cached EVP contexts and wipe the IV batch.
  *
@@ -113,24 +134,25 @@ tde_next_iv(unsigned char *iv_out)
 void
 tde_crypto_ctx_cleanup(void)
 {
-    if (tde_gcm_enc_ctx != NULL)
+    if (tde_enc.ctx != NULL)
     {
-        EVP_CIPHER_CTX_free(tde_gcm_enc_ctx);
-        tde_gcm_enc_ctx = NULL;
+        EVP_CIPHER_CTX_free(tde_enc.ctx);
+        tde_enc.ctx = NULL;
     }
-    if (tde_gcm_dec_ctx != NULL)
+    if (tde_dec.ctx != NULL)
     {
-        EVP_CIPHER_CTX_free(tde_gcm_dec_ctx);
-        tde_gcm_dec_ctx = NULL;
+        EVP_CIPHER_CTX_free(tde_dec.ctx);
+        tde_dec.ctx = NULL;
     }
-    /* Wipe IV batch so key-adjacent entropy is not left in process memory */
+    tde_enc.relid = InvalidOid;
+    tde_dec.relid = InvalidOid;
+
     OPENSSL_cleanse(iv_batch, TDE_IV_BATCH_BYTES);
-    iv_batch_pos = TDE_IV_BATCH_SIZE; /* mark exhausted */
+    iv_batch_pos = TDE_IV_BATCH_SIZE;
 }
 
 /*
- * tde_compute_aad -- build the 16-byte AEAD Additional Authenticated Data
- *                    for the v3 wire format.
+ * tde_compute_aad -- build the 16-byte AEAD Additional Authenticated Data.
  *
  * AAD layout (all fields little-endian):
  *   [MyDatabaseId(4) | relid(4) | generation(8)]
@@ -147,7 +169,7 @@ tde_crypto_ctx_cleanup(void)
  * tag check after rotation (belt-and-suspenders on top of the prev_dek path).
  */
 static void
-tde_compute_aad(Oid relid, uint64 generation, unsigned char aad[TDE_V3_AAD_LEN])
+tde_compute_aad(Oid relid, uint64 generation, unsigned char aad[TDE_V4_AAD_LEN])
 {
     uint32 dboid = (uint32) MyDatabaseId;
     uint32 rel   = (uint32) relid;
@@ -161,27 +183,20 @@ tde_compute_aad(Oid relid, uint64 generation, unsigned char aad[TDE_V3_AAD_LEN])
  * tde_gcm_encrypt_core
  *
  * Encrypts @plaintext_len bytes at @plaintext using AES-256-GCM.
- * 
- * When relid is valid table OID, produces a v3 wire format: 
- *   [VERSION(1:0x03) | GENERATION(8) | IV(12) | CT(N) | TAG(16)]
- * 
- * where TAG is GCM tag that covers a 16-byte AAD (Additional Authenticated Data)
- * computed from (MyDatabaseId, relid, generation)
- * 
- * Where relid == InvalidOid (backup-path), falls back to the v2 wire 
- * format without AAD.
- * 
- * Returns a palloc'd buffer. The caller MUST class OPENSSL_cleanse + pfree
- * on the returned buffer when done.
+ *
+ * Produces the v4 wire format [IV(12) | CT(N) | TAG(16) | VERSION(1) | GEN(8)];
+ * the tag covers a 16-byte AAD from (MyDatabaseId, relid, generation).
+ *
+ * Returns a palloc'd buffer. The caller MUST OPENSSL_cleanse + pfree it.
  * 
  * @param dek           Data Encryption Key used for encryption
  * @param dek_len       Data Encryption Key length
- * @param relid         relation OID for AAD (InvalidOid = no AAD -> v2)
+ * @param relid         relation OID for AAD
  * @param plaintext     pointer to plaintext data
  * @param plaintext_len number of byte to be encrypted
  * @param out_len       on return, total buffer length
- * 
- * @returns             palloc'd [VERSION|GEN|IV|CT|TAG] buffer or die
+ *
+ * @returns             palloc'd [IV|CT|TAG|VERSION|GEN] buffer or die
  *  
  */
 
@@ -194,6 +209,8 @@ tde_gcm_encrypt_core(const unsigned char* dek, int dek_len, Oid relid,
     unsigned char*  iv_ptr;
     unsigned char*  ct_ptr;
     unsigned char*  tag_ptr;
+    unsigned char*  version_ptr; 
+    unsigned char*  gen_ptr;
     int             olen = 0;
     int             flen = 0;
     Size            total;
@@ -201,33 +218,25 @@ tde_gcm_encrypt_core(const unsigned char* dek, int dek_len, Oid relid,
 
     Assert(plaintext != NULL);
     Assert(out_len != NULL);
+    Assert(OidIsValid(relid));
 
-    /*
-     * Wire format selection:
-     *   v3 (0x03) when relid is a valid table OID - includes GCM AAD binding.
-     *   v2 (0x02) when relid == InvalidOid (backup blocks)
-     * 
-     * The layout for bot is [VERSION(1)|GEN(8)|IV(12)|CT(N)|TAG(16)]
-     * 
-     * The AAD is fed to GCM but is NOT stored in the wire buffer
-     */
-    {
-        /*OVERHEAD is the same for both v2 and v3 format*/
-        total = plaintext_len + TDE_V2_OVERHEAD; 
-        out_buf = (char*) palloc0(total);
+    /* Wire format: [IV(12) | CT(N) | TAG(16) | VERSION(1) | GEN(8) |] */
+    total = plaintext_len + TDE_V4_OVERHEAD;
 
-        /*Write versione byte*/
-        ((unsigned char *) out_buf)[0] = OidIsValid(relid) ? TDE_V3_VERSION_BYTE : TDE_V2_VERSION_BYTE;
-        
-        /*Write generation*/
-        gen = pg_vault_tde_kms_get_generation();
-        memcpy(out_buf + 1, &gen, TDE_V2_GEN_LEN);
-    }
-
+    out_buf = (char*) palloc0(total);
+   
     /*Calculate ptr position for every component of the layout*/
-    iv_ptr = (unsigned char *) out_buf + 1 + TDE_V2_GEN_LEN;
+    iv_ptr = (unsigned char *) out_buf;
     ct_ptr = iv_ptr + TDE_GCM_IV_LEN;
     tag_ptr = ct_ptr + plaintext_len;
+    version_ptr = tag_ptr + TDE_GCM_TAG_LEN;
+    gen_ptr = version_ptr + 1;
+
+    version_ptr[0] = TDE_V4_VERSION_BYTE;
+
+    gen = pg_vault_tde_catalog_get_rel_generation(relid);
+    memcpy(gen_ptr, &gen, TDE_V4_GEN_LEN);
+
 
     /*
      * Fetch the next IV from per-backend batch (256 IVs per pg_strong_random call)
@@ -235,63 +244,41 @@ tde_gcm_encrypt_core(const unsigned char* dek, int dek_len, Oid relid,
      */
     tde_next_iv(iv_ptr);
 
-    /*
-     * Reuse the per-backend encrypt context; allocate on first use.
-     * EVP_CIPHER_CTX_reset() restores the context to its post-new() state
-     * without releasing the underlying memory allocation 
-     */
+    /* Re-key only when relid/gen changed; otherwise just rearm the IV. */
+    if (!tde_crypto_ctx_init())
+        goto gcm_error;
 
-    if(tde_gcm_enc_ctx == NULL)
+    if (tde_enc.relid != relid || tde_enc.generation != gen)
     {
-        tde_gcm_enc_ctx = EVP_CIPHER_CTX_new();
-        if(tde_gcm_enc_ctx == NULL)
-        {
-            OPENSSL_cleanse(out_buf, total);
-            pfree(out_buf);
-            ereport(ERROR, 
-                    errmsg("[CRYPTO] Failed to allocate GCM encrypt context"));
-        }
-    }
-    else
-    {
-        EVP_CIPHER_CTX_reset(tde_gcm_enc_ctx);
+        if (EVP_EncryptInit_ex2(tde_enc.ctx, tde_hw_accel_gcm_cipher(),
+                                dek, NULL, NULL) != 1)
+            goto gcm_error;
+
+        tde_enc.relid = relid;
+        tde_enc.generation = gen;
     }
 
-    ctx = tde_gcm_enc_ctx;
+    ctx = tde_enc.ctx;
 
-    /*
-     * EVP_EncryptInit_ex2: use the cipher from the hw_accel provider layer.
-     * This routes to QAT if loaded, or AES-NI via the default provider.
-     * 
-     * The NULL params argument means OpenSSL picks the algorithm-specific 
-     * defaults (96-bit IV for GCM, standard tag length).  
-     */
-    if(EVP_EncryptInit_ex2(ctx, tde_hw_accel_gcm_cipher(), 
-                           (unsigned char *) dek, iv_ptr, NULL) != 1)
+    if (EVP_EncryptInit_ex2(ctx, NULL, NULL, iv_ptr, NULL) != 1)
        goto gcm_error;
 
     /*
-     * v3 wire format: feed AAD. 
-     * 
-     * Passing NULL as the output pointer is the EVP GCM convention for 
-     * "authenticate only, do not encrypt". The AAD is bound into the 
-     * GCM tag so decryption will fail if the tuple is replayed into a 
-     * different table or database. The 16-byte AAD itself is not stored 
-     * on disk.
+     * Feed AAD: NULL output pointer signals GCM "authenticate only, do not
+     * encrypt". Binds dboid+relid+generation into the tag so a ciphertext
+     * cannot be replayed into a different table or database.
      */
-
-    if(OidIsValid(relid))
     {
-        unsigned char aad[TDE_V3_AAD_LEN];
-        int            aad_len = 0;
+        unsigned char aad[TDE_V4_AAD_LEN];
+        int           aad_len = 0;
 
         tde_compute_aad(relid, gen, aad);
-        if(EVP_EncryptUpdate(ctx, NULL, &aad_len, aad, TDE_V3_AAD_LEN) != 1)
+        if(EVP_EncryptUpdate(ctx, NULL, &aad_len, aad, TDE_V4_AAD_LEN) != 1)
         {
-            OPENSSL_cleanse(aad, TDE_V3_AAD_LEN);
+            OPENSSL_cleanse(aad, TDE_V4_AAD_LEN);
             goto gcm_error;
         }
-        OPENSSL_cleanse(aad, TDE_V3_AAD_LEN);
+        OPENSSL_cleanse(aad, TDE_V4_AAD_LEN);
     }
 
     if(EVP_EncryptUpdate(ctx, ct_ptr, &olen,
@@ -311,18 +298,10 @@ tde_gcm_encrypt_core(const unsigned char* dek, int dek_len, Oid relid,
     return out_buf;
     
 gcm_error:
-    /*
-     * Free and NULL-out the cached context so the next encrypt call gets a 
-     * fresh allocation. The context state is unknown after an OpenSSL error;
-     * Retaining it would risk using corrupted key-schedule material
-     */
-
-    EVP_CIPHER_CTX_free(tde_gcm_enc_ctx);
-    tde_gcm_enc_ctx = NULL;
+    tde_crypto_ctx_cleanup();
     ctx = NULL;
     OPENSSL_cleanse(out_buf, total);
     pfree(out_buf);
-    ereport(ERROR, errmsg("[CRYPTO] AES-256-GCM encryption failed"));
     return NULL;
 }
 
@@ -345,8 +324,6 @@ tde_gcm_encrypt(Oid relid, const char *plaintext, Size plaintext_len, Size *out_
                             plaintext, plaintext_len, &enc_len)))
     {
         OPENSSL_cleanse(dek, TDE_DEK_LEN);
-        OPENSSL_cleanse(encrypted, sizeof(encrypted));
-        pfree(encrypted);
         ereport(ERROR, 
                 errmsg("[CRYPTO] AES-256-GCM encryption failed"));
     }
@@ -357,18 +334,6 @@ tde_gcm_encrypt(Oid relid, const char *plaintext, Size plaintext_len, Size *out_
     return encrypted;
 }
 
-char * 
-tde_gcm_encrypt_with_dek(const unsigned char* dek, int dek_len, 
-                         const char* plaintext, Size plaintext_size, Size* out_len)
-{
-    char* out_buf;
-
-    out_buf = tde_gcm_encrypt_core(dek, TDE_DEK_LEN, InvalidOid, 
-                                   plaintext, plaintext_size, out_len);
-
-    return out_buf;
-}
-
 /*
  * tde_gcm_decrypt
  *
@@ -377,118 +342,112 @@ tde_gcm_encrypt_with_dek(const unsigned char* dek, int dek_len,
  * causes an ereport(ERROR) (not a WARNING) \u2014 we must never return
  * unauthenticated plaintext to the query executor.
  *
- * @param ciphertext      [IV|CIPHERTEXT|TAG] buffer
+ * @param ciphertext      [IV|CT|TAG|VERSION|GEN] buffer
  * @param ciphertext_len  total buffer length
+ * @param out_plain       caller buffer; cap = ciphertext_len - TDE_V4_OVERHEAD
  * @param out_len         on return, plaintext length
- * @returns               palloc'd plaintext buffer; caller cleans up
+ * @returns               true on success; false if version byte is not v4
  */
-char *
-tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len, Size *out_len)
+bool
+tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len,
+                char *out_plain, Size *out_len)
 {
-    EVP_CIPHER_CTX     *ctx;
+    EVP_CIPHER_CTX      *ctx;
     char                dek[TDE_DEK_LEN];
+
     const unsigned char *iv_ptr;
     const unsigned char *ct_ptr;
     const unsigned char *tag_ptr;
-    char               *out_buf;
+    const unsigned char *version_ptr;
+    const unsigned char *gen_ptr;
+
     Size                pt_len;
     int                 olen = 0,
                         flen = 0;
     int                 auth_ok;
-    bool                is_v2 = false; /* tracks which parse path was used */
-    bool                is_v3 = false; /* v3 = v2 layout + AAD tag binding */
+    uint64              stored_gen;
+    uint64              current_gen;
 
     Assert(ciphertext != NULL);
     Assert(out_len != NULL);
 
-    if (ciphertext_len <= (Size)(TDE_GCM_IV_LEN + TDE_GCM_TAG_LEN))
+    if (ciphertext_len <= (Size) TDE_V4_OVERHEAD)
         ereport(ERROR,
                 (errmsg("[CRYPTO] Ciphertext too short for AES-256-GCM")));
 
-    /*
-     * Wire format auto-detection.
-     *
-     * v3 format: first byte == TDE_V3_VERSION_BYTE (0x03).
-     *   [VERSION(1) | GENERATION(8) | IV(12) | CT(N) | TAG(16)]
-     *   GCM tag covers 16-byte AAD = [dboid(4) | relid(4) | gen(8)].
-     *   Minimum length = TDE_V2_OVERHEAD (37) bytes.
-     *
-     * v2 format: first byte == TDE_V2_VERSION_BYTE (0x02).
-     *   Same on-disk layout as v3; no AAD in the GCM tag.
-     *   Minimum length = TDE_V2_OVERHEAD (37) bytes.
-     *
-     * v1 format: anything else — starts directly with the IV.
-     *   [IV(12) | CT(N) | TAG(16)]
-     *   Minimum length = TDE_GCM_OVERHEAD (28) bytes.
-     *
-     * False-positive risk for v2/v3 detection (first byte of a v1 IV is 0x02
-     * or 0x03): probability 2/256 (~0.8%).  When that happens GCM tag
-     * authentication fails on the v2/v3 try and we fall back to the v1 path.
-     */
-    if ((unsigned char) ciphertext[0] == TDE_V3_VERSION_BYTE &&
-        ciphertext_len > (Size) TDE_V2_OVERHEAD)
-    {
-        /*
-         * v3 path: same layout as v2; AAD will be fed to GCM below.
-         * Generation is read from the wire header for AAD recomputation.
-         */
-        is_v3   = true;
-        is_v2   = true; /* v3 is a superset of v2 layout */
-        pt_len  = ciphertext_len - TDE_V2_OVERHEAD;
-        iv_ptr  = (const unsigned char *) ciphertext + 1 + TDE_V2_GEN_LEN;
-        ct_ptr  = iv_ptr + TDE_GCM_IV_LEN;
-        tag_ptr = ct_ptr + pt_len;
-    }
-    else if ((unsigned char) ciphertext[0] == TDE_V2_VERSION_BYTE &&
-             ciphertext_len > (Size) TDE_V2_OVERHEAD)
-    {
-        /*
-         * v2 path: skip version byte + generation prefix, then parse
-         * the standard GCM layout.  Generation is currently read but not
-         * used for DEK selection (reserved for v1.5 smart-selection).
-         */
-        is_v2   = true;
-        pt_len  = ciphertext_len - TDE_V2_OVERHEAD;
-        iv_ptr  = (const unsigned char *) ciphertext + 1 + TDE_V2_GEN_LEN;
-        ct_ptr  = iv_ptr + TDE_GCM_IV_LEN;
-        tag_ptr = ct_ptr + pt_len;
-    }
-    else
-    {
-        /* v1 path: no prefix, IV starts at byte 0 */
-        pt_len  = ciphertext_len - TDE_GCM_IV_LEN - TDE_GCM_TAG_LEN;
-        iv_ptr  = (const unsigned char *) ciphertext;
-        ct_ptr  = iv_ptr + TDE_GCM_IV_LEN;
-        tag_ptr = ct_ptr + pt_len;
-    }
+    /* Wire format: [IV(12) | CT(N) | TAG(16) | VERSION(1) | GEN(8)] */
+    pt_len  = ciphertext_len - TDE_V4_OVERHEAD;
+    iv_ptr  = (const unsigned char *) ciphertext;
+    ct_ptr  = iv_ptr + TDE_GCM_IV_LEN;
+    tag_ptr = ct_ptr + pt_len;
+    version_ptr = tag_ptr + TDE_GCM_TAG_LEN;
+    gen_ptr = version_ptr + 1;
 
-    if (!pg_vault_tde_kms_get_rel_dek(relid, (unsigned char *) dek, TDE_DEK_LEN))
-        ereport(ERROR,
-                (errmsg("[CRYPTO] DEK unavailable for relid=%u; cannot decrypt data", relid)));
+    if ((unsigned char) version_ptr[0] != TDE_V4_VERSION_BYTE)
+        return false;
 
-    out_buf = (char *) palloc0(pt_len + 1); /* +1: safe zero terminator */
-
-    /*
-     * Reuse the per-backend decrypt context; allocate on first use.
-     */
-    if (tde_gcm_dec_ctx == NULL)
     {
-        tde_gcm_dec_ctx = EVP_CIPHER_CTX_new();
-        if (tde_gcm_dec_ctx == NULL)
-        {
-            OPENSSL_cleanse(dek, TDE_DEK_LEN);
-            pfree(out_buf);
-            ereport(ERROR,
-                    (errmsg("[CRYPTO] Failed to allocate GCM decrypt context")));
+
+        TdeRelDekMap cache_entry;
+        Oid dek_relid = resolve_effective_relid(relid);
+        bool    found = false;
+
+        memcpy(&stored_gen, gen_ptr, TDE_V4_GEN_LEN);
+
+        if(!tde_catalog_cache_entry(dek_relid, &cache_entry))
+        {   
+            current_gen = pg_vault_tde_catalog_get_rel_generation(dek_relid);
+                
+            if(stored_gen == current_gen)
+            {
+                found = pg_vault_tde_kms_get_rel_dek(dek_relid, (unsigned char *) dek, TDE_DEK_LEN);
+            } 
+            else if(stored_gen == current_gen - 1)
+            {
+                found = pg_vault_tde_kms_get_rel_prev_dek(dek_relid, (unsigned char *) dek, TDE_DEK_LEN);
+            }
         }
-    }
-    else
-        EVP_CIPHER_CTX_reset(tde_gcm_dec_ctx);
-    ctx = tde_gcm_dec_ctx;
+        else
+        {
+            current_gen = cache_entry.generation;
 
-    if (EVP_DecryptInit_ex2(ctx, tde_hw_accel_gcm_cipher(),
-                            (unsigned char *) dek, iv_ptr, NULL) != 1)
+            if(stored_gen == current_gen && cache_entry.dek_valid)
+            {
+                memcpy(dek, cache_entry.dek, TDE_DEK_LEN);
+                found = true;
+            }
+            else if(stored_gen == current_gen - 1 && cache_entry.prev_dek_valid)
+            {
+                memcpy(dek, cache_entry.prev_dek, TDE_DEK_LEN);
+                found = true;
+            }
+        }
+
+        OPENSSL_cleanse(&cache_entry, sizeof(TdeRelDekMap));
+
+        if(!found)
+            return false;
+
+    }
+
+    /* Cache key is stored_gen: the generation of the DEK loaded above. */
+    if (!tde_crypto_ctx_init())
         goto gcm_dec_error;
+
+    if (tde_dec.relid != relid || tde_dec.generation != stored_gen)
+    {
+        if (EVP_DecryptInit_ex2(tde_dec.ctx, tde_hw_accel_gcm_cipher(),
+                                (unsigned char *) dek, NULL, NULL) != 1)
+            goto gcm_dec_error;
+
+        tde_dec.relid = relid;
+        tde_dec.generation = stored_gen;
+    }
+
+    ctx = tde_dec.ctx;
+
+    if(EVP_DecryptInit_ex2(ctx, NULL, NULL, iv_ptr, NULL) != 1)
+       goto gcm_dec_error;
 
     /* Set the expected tag BEFORE calling Final */
     if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG,
@@ -496,29 +455,23 @@ tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len, Size *ou
         goto gcm_dec_error;
 
     /*
-     * v3 wire format: feed AEAD AAD before decrypting ciphertext.
-     *
-     * The generation used for AAD recomputation MUST come from the wire
-     * header (the generation stored at encrypt time), NOT from the current
+     * Feed AAD using the generation from the wire header, NOT the current
      * live generation — they may differ after a key rotation.
      */
-    if (is_v3 && OidIsValid(relid))
     {
-        uint64        stored_gen;
-        unsigned char aad[TDE_V3_AAD_LEN];
+        unsigned char aad[TDE_V4_AAD_LEN];
         int           aad_len = 0;
 
-        memcpy(&stored_gen, ciphertext + 1, TDE_V2_GEN_LEN);
         tde_compute_aad(relid, stored_gen, aad);
-        if (EVP_DecryptUpdate(ctx, NULL, &aad_len, aad, TDE_V3_AAD_LEN) != 1)
+        if (EVP_DecryptUpdate(ctx, NULL, &aad_len, aad, TDE_V4_AAD_LEN) != 1)
         {
-            OPENSSL_cleanse(aad, TDE_V3_AAD_LEN);
+            OPENSSL_cleanse(aad, TDE_V4_AAD_LEN);
             goto gcm_dec_error;
         }
-        OPENSSL_cleanse(aad, TDE_V3_AAD_LEN);
+        OPENSSL_cleanse(aad, TDE_V4_AAD_LEN);
     }
 
-    if (EVP_DecryptUpdate(ctx, (unsigned char *) out_buf, &olen,
+    if (EVP_DecryptUpdate(ctx, (unsigned char *) out_plain, &olen,
                           ct_ptr, (int) pt_len) != 1)
         goto gcm_dec_error;
 
@@ -529,224 +482,30 @@ tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len, Size *ou
      * plaintext would be a critical security vulnerability.
      */
     auth_ok = EVP_DecryptFinal_ex(ctx,
-                                  (unsigned char *) out_buf + olen, &flen);
+                                  (unsigned char *) out_plain + olen, &flen);
 
-    /* ctx is kept alive in tde_gcm_dec_ctx for reuse — do NOT free here */
+    /* ctx is retained in tde_dec.ctx for reuse — do NOT free here */
     OPENSSL_cleanse(dek, TDE_DEK_LEN);
 
     if (auth_ok != 1)
     {
-        /*
-         * GCM authentication failed with the current DEK.  This may indicate
-         * data corruption, tampering, or a key rotation: the tuple might have
-         * been encrypted with the previous DEK.  Try the prev_dek if available.
-         *
-         * This fallback is the key mechanism that enables graceful key rotation:
-         * after rotate_key() + set_test_dek()/vault_fetch_dek(), rows encrypted
-         * with the old key remain readable during the re-encryption window.
-         */
-        char prev_dek[TDE_DEK_LEN];
+        /* Wipe the caller buffer: never expose unauthenticated plaintext. */
+        OPENSSL_cleanse(out_plain, pt_len);
 
-        if (pg_vault_tde_kms_get_rel_prev_dek(relid, (unsigned char *) prev_dek, TDE_DEK_LEN))
-        {
-            int  prev_olen = 0, prev_flen = 0;
-            bool prev_ok   = true;
-
-            /* Reset the context for a fresh decrypt attempt */
-            EVP_CIPHER_CTX_reset(ctx);
-
-            /* Wipe the output buffer from the failed attempt */
-            OPENSSL_cleanse(out_buf, pt_len + 1);
-
-            if (EVP_DecryptInit_ex2(ctx, tde_hw_accel_gcm_cipher(),
-                                    (unsigned char *) prev_dek, iv_ptr, NULL) != 1)
-                prev_ok = false;
-
-            if (prev_ok &&
-                EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG,
-                                    TDE_GCM_TAG_LEN, (void *) tag_ptr) != 1)
-                prev_ok = false;
-
-            /*
-             * For v3 tuples, the AAD must be fed before data, even during
-             * the prev_dek retry — the stored generation and table OID have
-             * not changed; only the DEK differs.
-             */
-            if (prev_ok && is_v3 && OidIsValid(relid))
-            {
-                uint64        stored_gen;
-                unsigned char aad[TDE_V3_AAD_LEN];
-                int           aad_len = 0;
-
-                memcpy(&stored_gen, ciphertext + 1, TDE_V2_GEN_LEN);
-                tde_compute_aad(relid, stored_gen, aad);
-                if (EVP_DecryptUpdate(ctx, NULL, &aad_len,
-                                      aad, TDE_V3_AAD_LEN) != 1)
-                    prev_ok = false;
-                OPENSSL_cleanse(aad, TDE_V3_AAD_LEN);
-            }
-
-            if (prev_ok &&
-                EVP_DecryptUpdate(ctx, (unsigned char *) out_buf, &prev_olen,
-                                  ct_ptr, (int) pt_len) != 1)
-                prev_ok = false;
-
-            if (prev_ok)
-            {
-                auth_ok = EVP_DecryptFinal_ex(ctx,
-                                              (unsigned char *) out_buf + prev_olen,
-                                              &prev_flen);
-            }
-
-            OPENSSL_cleanse(prev_dek, TDE_DEK_LEN);
-
-            if (auth_ok == 1)
-            {
-                /* Success with prev_dek — tuple encrypted with old key */
-                ereport(DEBUG1,
-                        (errmsg("[CRYPTO] Decrypted with previous DEK (rotation fallback)")));
-                *out_len = (Size)(prev_olen + prev_flen);
-                return out_buf;
-            }
-        }
-
-        /* Both current and prev DEK failed.
-         *
-         * If we took the v2 parse path due to a false-positive (first byte
-         * of a v1 IV happened to be 0x02, probability ~1/256), retry with
-         * the v1 parse layout.  This handles backward-compatibility for
-         * existing v1 tables being read by a v1.4+ server.
-         */
-        if (is_v2 && ciphertext_len > (Size) TDE_GCM_OVERHEAD)
-        {
-            Size                 v1_pt_len = ciphertext_len - TDE_GCM_IV_LEN - TDE_GCM_TAG_LEN;
-            const unsigned char *v1_iv     = (const unsigned char *) ciphertext;
-            const unsigned char *v1_ct     = v1_iv + TDE_GCM_IV_LEN;
-            const unsigned char *v1_tag    = v1_ct + v1_pt_len;
-            char                 v1_dek[TDE_DEK_LEN];
-            char                *v1_buf    = (char *) palloc0(v1_pt_len + 1);
-            int                  v1_olen = 0, v1_flen = 0, v1_ok = 0;
-
-            if (pg_vault_tde_kms_get_rel_dek(relid, (unsigned char *) v1_dek, TDE_DEK_LEN))
-            {
-                EVP_CIPHER_CTX_reset(ctx);
-                if (EVP_DecryptInit_ex2(ctx, tde_hw_accel_gcm_cipher(),
-                                        (unsigned char *) v1_dek, v1_iv, NULL) == 1 &&
-                    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG,
-                                        TDE_GCM_TAG_LEN, (void *) v1_tag) == 1 &&
-                    EVP_DecryptUpdate(ctx, (unsigned char *) v1_buf, &v1_olen,
-                                      v1_ct, (int) v1_pt_len) == 1)
-                {
-                    v1_ok = EVP_DecryptFinal_ex(ctx,
-                                                (unsigned char *) v1_buf + v1_olen,
-                                                &v1_flen);
-                }
-                OPENSSL_cleanse(v1_dek, TDE_DEK_LEN);
-
-                if (v1_ok == 1)
-                {
-                    /* Success: this was a v1 tuple with a 0x02 IV prefix */
-                    OPENSSL_cleanse(out_buf, pt_len + 1);
-                    pfree(out_buf);
-                    ereport(DEBUG1,
-                            (errmsg("[CRYPTO] v2 false-positive resolved via v1 fallback")));
-                    *out_len = (Size)(v1_olen + v1_flen);
-                    return v1_buf;
-                }
-            }
-
-            OPENSSL_cleanse(v1_buf, v1_pt_len + 1);
-            pfree(v1_buf);
-        }
-
-        /* All parse paths failed — genuine integrity violation */
-        OPENSSL_cleanse(out_buf, pt_len + 1);
-        pfree(out_buf);
         ereport(ERROR,
                 (errmsg("[CRYPTO] AES-256-GCM authentication FAILED: "
                         "data integrity violation or wrong DEK")));
     }
 
     *out_len = (Size)(olen + flen);
-    return out_buf;
+    return true;
 
 gcm_dec_error:
-    /*
-     * Free and NULL-out the cached context — unknown state after an error.
-     */
-    EVP_CIPHER_CTX_free(tde_gcm_dec_ctx);
-    tde_gcm_dec_ctx = NULL;
+    tde_crypto_ctx_cleanup();
     ctx = NULL;
     OPENSSL_cleanse(dek, TDE_DEK_LEN);
-    OPENSSL_cleanse(out_buf, pt_len + 1);
-    pfree(out_buf);
+    OPENSSL_cleanse(out_plain, pt_len);
     ereport(ERROR, (errmsg("[CRYPTO] AES-256-GCM decryption setup failed")));
-    return NULL; /* unreachable */
+    return false; /* unreachable */
 }
 
-/* ----------------------------------------------------------------
- * SQL-callable test wrappers for integration testing.
- * These expose the raw crypto primitives so we can verify that
- * AES-256-GCM encrypt → decrypt round-trips correctly, and that
- * ciphertext does NOT contain plaintext.
- * ----------------------------------------------------------------
- */
-#include "fmgr.h"
-#include "utils/builtins.h"
-#include "varatt.h"
-
-/*
- * pg_vault_tde_encrypt_test(text) → bytea
- *
- * Encrypts the input text and returns the ciphertext as bytea.
- * Requires a DEK to be set (via pg_vault_tde_set_test_dek first).
- */
-PG_FUNCTION_INFO_V1(pg_vault_tde_encrypt_test);
-PGDLLEXPORT Datum
-pg_vault_tde_encrypt_test(PG_FUNCTION_ARGS)
-{
-    text   *input   = PG_GETARG_TEXT_PP(0);
-    char   *plain   = VARDATA_ANY(input);
-    Size    plen    = VARSIZE_ANY_EXHDR(input);
-    Size    enc_len = 0;
-    char   *encrypted;
-    bytea  *result;
-
-    encrypted = tde_gcm_encrypt(InvalidOid, plain, plen, &enc_len);
-
-    result = (bytea *) palloc(VARHDRSZ + enc_len);
-    SET_VARSIZE(result, VARHDRSZ + enc_len);
-    memcpy(VARDATA(result), encrypted, enc_len);
-
-    OPENSSL_cleanse(encrypted, enc_len);
-    pfree(encrypted);
-
-    PG_RETURN_BYTEA_P(result);
-}
-
-/*
- * pg_vault_tde_decrypt_test(bytea) → text
- *
- * Decrypts a ciphertext produced by pg_vault_tde_encrypt_test.
- * Verifies GCM authentication tag — fails if tampered.
- */
-PG_FUNCTION_INFO_V1(pg_vault_tde_decrypt_test);
-PGDLLEXPORT Datum
-pg_vault_tde_decrypt_test(PG_FUNCTION_ARGS)
-{
-    bytea  *input   = PG_GETARG_BYTEA_PP(0);
-    char   *ct      = VARDATA_ANY(input);
-    Size    ct_len  = VARSIZE_ANY_EXHDR(input);
-    Size    pt_len  = 0;
-    char   *decrypted;
-    text   *result;
-
-    decrypted = tde_gcm_decrypt(InvalidOid, ct, ct_len, &pt_len);
-
-    result = cstring_to_text_with_len(decrypted, pt_len);
-
-    OPENSSL_cleanse(decrypted, pt_len);
-    pfree(decrypted);
-
-    PG_RETURN_TEXT_P(result);
-}

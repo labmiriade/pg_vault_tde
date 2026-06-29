@@ -4,6 +4,7 @@ use warnings;
 use Test::More tests => 16;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
+END { system('/bin/sh', '-c', 'rm -rf /var/lib/pg_vault_tde/*') }
 
 my $node = PostgreSQL::Test::Cluster->new('cli_test_node');
 $node->init;
@@ -13,6 +14,7 @@ $node->append_conf('postgresql.conf',
     "pg_vault_tde.wallet_passphrase_command = 'echo test-password'\n");
 $node->start;
 $node->safe_psql('postgres', 'CREATE EXTENSION pg_vault_tde;');
+system('/bin/sh', '-c', 'rm -rf /var/lib/pg_vault_tde/*');
 $node->safe_psql('postgres', "SELECT pg_vault_tde_wallet_init('test-password')");
 
 my $dummy_out  = $node->data_dir . '/cli_dummy.dump';

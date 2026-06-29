@@ -7,6 +7,7 @@ use Test::More tests => 9;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use IPC::Run qw(run);
+END { system('/bin/sh', '-c', 'rm -rf /var/lib/pg_vault_tde/*') }
 
 my $vault_addr = $ENV{VAULT_ADDR}
     or plan skip_all => 'VAULT_ADDR not set — skipping Vault integration test';
@@ -26,12 +27,16 @@ $node->safe_psql('local_kms', q{
     ALTER DATABASE local_kms SET pg_vault_tde.wallet_passphrase_command = 'echo test-password';
 });
 
+$node->restart;
+
+system('/bin/sh', '-c', 'rm -rf /var/lib/pg_vault_tde/*');
 $node->safe_psql('local_kms', "SELECT pg_vault_tde_wallet_init('test-password');");
 
 my $local_oid = $node->safe_psql('postgres',
     "SELECT oid FROM pg_database WHERE datname = 'local_kms';"
 );
-my $local_wallet = $node->data_dir . "/base/$local_oid/pg_vault_tde/wallet.p12";
+$local_oid =~ s/^\s+|\s+$//g;
+my $local_wallet = "/var/lib/pg_vault_tde/$local_oid/wallet.p12";
 
 ok(-e $local_wallet, "wallet for local KMS database exists");
 

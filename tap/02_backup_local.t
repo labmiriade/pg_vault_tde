@@ -6,6 +6,7 @@ use warnings;
 use Test::More tests => 7;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
+END { system('/bin/sh', '-c', 'rm -rf /var/lib/pg_vault_tde/*') }
 
 # --- PostgreSQL node ---
 my $node = PostgreSQL::Test::Cluster->new('backup_test_node');
@@ -19,6 +20,7 @@ $node->start;
 ok($node->psql('postgres', 'CREATE EXTENSION pg_vault_tde;') == 0,
    'CREATE EXTENSION succeeds');
 
+system('/bin/sh', '-c', 'rm -rf /var/lib/pg_vault_tde/*');
 $node->safe_psql('postgres',
     "SELECT pg_vault_tde_wallet_init('test-password')");
 

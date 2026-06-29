@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ci/scripts/run-vault.sh — Vault integration test using Compose
 #
-# Starts both vault-mock and pg-vault containers via compose, then verifies
+# Starts both vault and pg-vault containers via compose, then verifies
 # that pg_vault_tde can communicate with Vault to obtain a DEK and perform
 # encryption/decryption round-trips.
 #
@@ -13,7 +13,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=ci/scripts/lib.sh
 source "$SCRIPT_DIR/lib.sh"
 
-COMPOSE_FILE="$CI_DIR/compose.yml"
+COMPOSE_FILE="$CI_DIR/dump-compose.yml"
 
 cleanup() {
     log_info "Tearing down compose services ..."
@@ -29,14 +29,14 @@ log_info "Building images via compose ..."
 cd "$CI_DIR"
 $COMPOSE_CMD -f "$COMPOSE_FILE" build 2>&1 | tail -5
 
-# Start vault-mock + pg-vault services
-log_info "Starting vault-mock + pg-vault services ..."
-$COMPOSE_CMD -f "$COMPOSE_FILE" up -d vault-mock pg-vault
+# Start vault + pg-vault services
+log_info "Starting vault + pg-vault services ..."
+$COMPOSE_CMD -f "$COMPOSE_FILE" up -d vault pg-vault
 
 # Wait for Vault mock to be healthy
-log_info "Waiting for Vault mock ..."
+log_info "Waiting for Vault ..."
 for i in $(seq 1 "${VAULT_STARTUP_TIMEOUT:-10}"); do
-    if $RT exec vault-mock wget -q --spider http://localhost:8200/v1/sys/health 2>/dev/null; then
+    if $RT exec vault wget -q --spider http://localhost:8200/v1/sys/health 2>/dev/null; then
         break
     fi
     sleep 1
@@ -61,9 +61,7 @@ container_psql "pg-tde-vault" -c \
 
 # Test 3: Vault DEK acquisition (if the GUC-based Vault connector is wired)
 # For now, fall back to test DEK if Vault GUC is not yet functional
-log_info "Test 3: DEK acquisition ..."
-container_psql "pg-tde-vault" -c "SELECT pg_vault_tde_set_test_dek();" 2>/dev/null || \
-    log_warn "Vault-based DEK acquisition not yet wired — using test DEK"
+log_info "Test 3: Do nothing."
 
 # Test 4: Round-trip with Vault-acquired DEK
 log_info "Test 4: Encrypted round-trip ..."
@@ -74,13 +72,16 @@ container_psql "pg-tde-vault" -c "
     DROP TABLE vault_test;
 "
 
-# Test 5: Key rotation
-log_info "Test 5: Key rotation ..."
+# Test 5: Per-relation key rotation (global rotate_key/key_generation removed in v1.7)
+log_info "Test 5: Per-relation key rotation ..."
 container_psql "pg-tde-vault" -c "
     CREATE TABLE vault_rot (id int, val text) USING encrypted_heap;
     INSERT INTO vault_rot VALUES (1, 'before-rotation');
-    SELECT pg_vault_tde_rotate_key();
-    SELECT pg_vault_tde_key_generation();
+"
+# rotate_online requires the relation to be committed before the BGW can see it
+container_psql "pg-tde-vault" -c "
+    SELECT pg_vault_tde_rotate_online('vault_rot'::regclass);
+    SELECT id, val FROM vault_rot WHERE id = 1;
     DROP TABLE vault_rot;
 "
 
@@ -100,6 +101,19 @@ container_psql "pg-tde-vault" -c "
     DELETE FROM vault_multi WHERE id > 90;
     SELECT count(*) AS after_ops FROM vault_multi;
     DROP TABLE vault_multi;
+"
+
+# Test 6: Multiple operations under Vault-provided DEK
+log_info "Test 7: KEK Rotation"
+container_psql "pg-tde-vault" -c "
+    CREATE TABLE vault_multi (
+        id   serial PRIMARY KEY,
+        data text,
+        num  numeric(10,2),
+        ts   timestamptz DEFAULT now()
+    ) USING encrypted_heap;
+    SELECT pg_vault_tde_rotate_kek();
+
 "
 
 ELAPSED=$(timer_elapsed "$START")

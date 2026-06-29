@@ -45,24 +45,6 @@ CREATE OPERATOR CLASS tde_bytea_ops DEFAULT FOR TYPE bytea USING tde_btree AS
     OPERATOR 5 >  (bytea, bytea),
     FUNCTION 1 byteacmp(bytea, bytea);
 
--- Expose DEK rotation trigger (called by DBA or automation)
-CREATE FUNCTION pg_vault_tde_rotate_key()
-    RETURNS void
-    LANGUAGE C STRICT
-    AS 'MODULE_PATHNAME', 'pg_vault_tde_rotate_key';
-
--- Expose current key generation for monitoring
-CREATE FUNCTION pg_vault_tde_key_generation()
-    RETURNS bigint
-    LANGUAGE C STRICT
-    AS 'MODULE_PATHNAME', 'pg_vault_tde_key_generation';
-
--- KMS diagnostic status (v1.1): returns a text summary of DEK cache state
-CREATE FUNCTION pg_vault_tde_kms_status()
-    RETURNS text
-    LANGUAGE C STRICT
-    AS 'MODULE_PATHNAME', 'pg_vault_tde_kms_status';
-
 -- Token refresh (v1.1): manually renew the current Vault token lease
 CREATE FUNCTION pg_vault_tde_refresh_token()
     RETURNS boolean
@@ -77,13 +59,6 @@ COMMENT ON ACCESS METHOD tde_btree IS
 -- ================================================================
 -- Test / diagnostic functions (safe for development and CI use)
 -- ================================================================
-
--- Inject a random test DEK into shared memory (NO Vault needed)
-CREATE FUNCTION pg_vault_tde_set_test_dek()
-    RETURNS void
-    LANGUAGE C STRICT
-    AS 'MODULE_PATHNAME', 'pg_vault_tde_set_test_dek';
-
 -- Encrypt text → bytea via AES-256-GCM (requires DEK set)
 CREATE FUNCTION pg_vault_tde_encrypt_test(text)
     RETURNS bytea
@@ -99,12 +74,6 @@ CREATE FUNCTION pg_vault_tde_decrypt_test(bytea)
 -- ================================================================
 -- v1.1: Vault DEK fetch, key rotation utilities, integrity checks
 -- ================================================================
-
--- Fetch DEK from Vault Transit API (returns true on success)
-CREATE FUNCTION pg_vault_tde_vault_fetch_dek()
-    RETURNS boolean
-    LANGUAGE C STRICT
-    AS 'MODULE_PATHNAME', 'pg_vault_tde_vault_fetch_dek_sql';
 
 -- Re-encrypt all rows in an encrypted_heap table with the current DEK.
 -- After key rotation, uses prev_dek fallback to read old-DEK rows.
@@ -138,13 +107,6 @@ CREATE FUNCTION pg_vault_tde_encrypted_size(
     RETURNS record
     LANGUAGE C STRICT
     AS 'MODULE_PATHNAME', 'pg_vault_tde_encrypted_size';
-
--- Clear the previous DEK from shared memory (call after re-encryption).
--- Removes the rotation fallback — old-DEK rows become permanently unreadable.
-CREATE FUNCTION pg_vault_tde_clear_prev_dek()
-    RETURNS void
-    LANGUAGE C STRICT
-    AS 'MODULE_PATHNAME', 'pg_vault_tde_clear_prev_dek';
 
 -- Hardware acceleration diagnostics: OpenSSL provider, cipher info, AES-NI.
 CREATE FUNCTION pg_vault_tde_hw_accel_info(
@@ -185,11 +147,3 @@ CREATE FUNCTION pg_vault_tde_health_check(
     RETURNS record
     LANGUAGE C STRICT
     AS 'MODULE_PATHNAME', 'pg_vault_tde_health_check';
-
--- Re-wrap the persisted wrapped DEK with the latest Vault Transit KEK version.
--- Call after rotating the KEK in Vault (vault write -f transit/keys/<key>/rotate).
--- The plaintext DEK does not change — only the wrapping key version.
-CREATE FUNCTION pg_vault_tde_vault_rewrap_dek()
-    RETURNS boolean
-    LANGUAGE C STRICT
-    AS 'MODULE_PATHNAME', 'pg_vault_tde_vault_rewrap_dek';

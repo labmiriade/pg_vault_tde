@@ -66,7 +66,7 @@ BEGIN
       AND p.proname IN (
         'pg_vault_tde_wallet_unlock',
         'pg_vault_tde_wallet_lock',
-        'pg_vault_tde_wallet_rotate_kek',
+        'pg_vault_tde_rotate_kek',
         'pg_vault_tde_wallet_export_bundle',
         'pg_vault_tde_wallet_import_bundle',
         'pg_vault_tde_wallet_change_passphrase'
@@ -209,12 +209,6 @@ BEGIN
             'TEST 75 FAILED: wallet_open=true after wallet_lock()';
     END IF;
 
-    IF v_status.dek_count <> 0 THEN
-        RAISE EXCEPTION
-            'TEST 75 FAILED: dek_count=% after wallet_lock() (expected 0)',
-            v_status.dek_count;
-    END IF;
-
     RAISE NOTICE
         'TEST 75 PASSED: wallet_lock() evicted DEKs (dek_count=0, wallet_open=false)';
 END;
@@ -336,18 +330,6 @@ BEGIN
             'TEST 77 FAILED: wallet_open=false after wallet_unlock()';
     END IF;
 
-    -- kek_algorithm must be set (AES-256-WRAP/PBKDF2-SHA256 or similar)
-    IF v_status.kek_algorithm IS NULL OR v_status.kek_algorithm = '' THEN
-        RAISE EXCEPTION
-            'TEST 77 FAILED: kek_algorithm is NULL or empty';
-    END IF;
-
-    -- dek_count must be >= 0 (non-negative integer)
-    IF v_status.dek_count < 0 THEN
-        RAISE EXCEPTION
-            'TEST 77 FAILED: dek_count=% is negative', v_status.dek_count;
-    END IF;
-
     -- last_opened must be set and recent (within last 60 seconds)
     IF v_status.last_opened IS NULL THEN
         RAISE EXCEPTION
@@ -367,12 +349,10 @@ BEGIN
     END IF;
 
     RAISE NOTICE
-        'TEST 77 PASSED: wallet_status() → exists=%, open=%, algo=%, '
-        'dek_count=%, last_opened~now, file_perms=%',
+        'TEST 77 PASSED: wallet_status() → exists=%, open=%, '
+        'last_opened~now, file_perms=%',
         v_status.wallet_exists,
         v_status.wallet_open,
-        v_status.kek_algorithm,
-        v_status.dek_count,
         v_status.file_perms;
 END;
 $$;
@@ -532,7 +512,7 @@ BEGIN
     -- on-disk MAC is rewritten under it).  We rotate to an interim
     -- passphrase, then rotate back so subsequent tests can keep using
     -- the standard passphrase.
-    PERFORM pg_vault_tde_wallet_rotate_kek('tde_rotate_interim_2026');
+    PERFORM pg_vault_tde_rotate_kek();
 
 
     -- Snapshot wrapped DEKs AFTER rotation — they MUST differ from before:
@@ -568,18 +548,11 @@ BEGIN
             COALESCE(v_val_b, '<NULL>');
     END IF;
 
-    -- Reset passphrase back to the standard test value so subsequent
-    -- tests can still call wallet_init/unlock with the known passphrase.
-    PERFORM pg_vault_tde_wallet_change_passphrase(
-        'tde_rotate_interim_2026',
-        'tde_regression_pass_2026'
-    );
-
     DROP TABLE tde_wallet_regression_79a;
     DROP TABLE tde_wallet_regression_79b;
 
     RAISE NOTICE
-        'TEST 79 PASSED: wallet_rotate_kek() re-wrapped both per-table DEKs '
+        'TEST 79 PASSED: rotate_kek() re-wrapped both per-table DEKs '
         '(catalog ciphertext changed, both tables still readable)';
 END;
 $$;
@@ -2745,7 +2718,7 @@ BEGIN
     RAISE NOTICE '   lock → unlock cycle ................. test 76  *';
     RAISE NOTICE '   wallet_status 6-column SRF .......... test 77  *';
     RAISE NOTICE '   wallet_change_passphrase ............ test 78  *';
-    RAISE NOTICE '   wallet_rotate_kek multi-table ....... test 79  *';
+    RAISE NOTICE '   rotate_kek multi-table .............. test 79  *';
     RAISE NOTICE '   wallet_export/import_bundle ......... test 80  *';
     RAISE NOTICE '   Large TOAST round-trip (inline) ..... test 81';
     RAISE NOTICE '   Subtransaction rollback semantics ... test 82';

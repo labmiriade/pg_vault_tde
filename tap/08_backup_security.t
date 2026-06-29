@@ -4,6 +4,7 @@ use warnings;
 use Test::More tests => 8;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
+END { system('/bin/sh', '-c', 'rm -rf /var/lib/pg_vault_tde/*') }
 
 # Offset of first ciphertext byte (header=532 + block_len=4 + version=1 + IV=12)
 use constant OFF_CIPHERTEXT => 549;
@@ -17,6 +18,7 @@ $node->append_conf('postgresql.conf',
 $node->start;
 
 $node->safe_psql('postgres', 'CREATE EXTENSION pg_vault_tde;');
+system('/bin/sh', '-c', 'rm -rf /var/lib/pg_vault_tde/*');
 $node->safe_psql('postgres', "SELECT pg_vault_tde_wallet_init('test-password')");
 
 $node->safe_psql('postgres', q{

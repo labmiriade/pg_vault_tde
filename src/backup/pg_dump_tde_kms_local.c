@@ -47,11 +47,11 @@ static PdeLocalConfig* config = NULL;
 
 
 static bool     local_init(PGconn* conn);
-static bool     local_generate_dek(unsigned char* out, int len);
+static bool     pg_vault_tde_catalog_generate_dek(unsigned char* out, int len);
 static bool     local_wrap_dek(const unsigned char* dek, int dek_len,
                                 unsigned char* out, int* out_len);
-static bool     local_unwrap_dek(const unsigned char* wrapped_dek, int wrapped_len, 
-                                 unsigned char* dek_out, int dek_len);
+static bool     local_unwrap_dek(const unsigned char* wrapped_dek, int wrapped_len,
+                                 unsigned char* dek_out, int *dek_len);
 static bool     local_config_load(PGconn* conn, PdeLocalConfig* config);
 static bool     local_get_passphrase(char *pass_out, Size pass_max);
 static bool     local_passphrase_from_command(char *pass_out, Size pass_max);
@@ -62,8 +62,8 @@ static bool     local_open_wallet(const char* path, const char* passphrase,
 static bool     local_wrap_dek_with_pass(const unsigned char *dek, int dek_len,
                          unsigned char *wrapped_out, int *out_len,
                          const char *passphrase, const char *wallet_path);
-static bool     local_unwrap_dek_with_pass(const unsigned char* wrapped_dek, int wrapped_len, 
-                                            unsigned char* dek_out, int dek_len, 
+static bool     local_unwrap_dek_with_pass(const unsigned char* wrapped_dek, int wrapped_len,
+                                            unsigned char* dek_out, int *dek_len,
                                             const char* passphrase, const char* wallet_path);
 static void     local_shutdown(void);
 
@@ -80,7 +80,7 @@ static void     local_shutdown(void);
  * @param wallet_path   path to the .p12 wallet file
  */
 static bool local_unwrap_dek_with_pass(const unsigned char* wrapped_dek, int wrapped_len,
-                                        unsigned char* dek_out, int dek_len,
+                                        unsigned char* dek_out, int *dek_len,
                                         const char* passphrase, const char* wallet_path)
 {
     unsigned char kek[KEK_LEN];
@@ -88,9 +88,9 @@ static bool local_unwrap_dek_with_pass(const unsigned char* wrapped_dek, int wra
     int update_len = 0;
     int final_len = 0;
     bool ok = false;
-    int max_out;
 
     Assert(wrapped_dek != NULL);
+    Assert(dek_out != NULL && dek_len != NULL);
     Assert(passphrase != NULL);
     Assert(wallet_path != NULL);
 
@@ -109,25 +109,17 @@ static bool local_unwrap_dek_with_pass(const unsigned char* wrapped_dek, int wra
         return false;
     }
 
-    /* AES-256-WRAP adds 8 bytes of overhead; plaintext is always wrapped_len - 8. */
-    max_out = wrapped_len - 8;
-    if(max_out < 0 || max_out > dek_len) 
-    {
-        OPENSSL_cleanse(kek, KEK_LEN);
-        pg_log_error("pg_dump_tde: DEK buffer too small");
-        return false;
-    }
-
     if(EVP_DecryptInit_ex2(evp_ctx, EVP_aes_256_wrap(), kek, NULL, NULL) == 1 &&
        EVP_DecryptUpdate(evp_ctx, dek_out, &update_len, wrapped_dek, wrapped_len) == 1 &&
        EVP_DecryptFinal_ex(evp_ctx, dek_out + update_len, &final_len) == 1)
     {
+        *dek_len = update_len + final_len;
         ok = true;
     }
     else
     {
-        pg_log_error("pg_dump_tde: AES-256-UNWRAP failed (wrong passpharase) "
-                     "or corrupt wrapped DEK: %s", 
+        pg_log_error("pg_dump_tde: AES-256-UNWRAP failed (wrong passphrase "
+                     "or corrupt wrapped DEK): %s",
                      ERR_reason_error_string(ERR_get_error()));
     }
 
@@ -141,15 +133,14 @@ static bool local_unwrap_dek_with_pass(const unsigned char* wrapped_dek, int wra
  * Reads passphrase via local_get_passphrase() (env/command/file priority order).
  */
 static bool local_unwrap_dek(const unsigned char* wrapped_dek, int wrapped_len,
-                             unsigned char* dek_out, int dek_len)
+                             unsigned char* dek_out, int *dek_len)
 {
     const char* path;
     char pass[1024];
     bool ok;
 
     Assert(wrapped_dek != NULL);
-    Assert(dek_out != NULL);
-    Assert(dek_len == TDE_DEK_LEN);
+    Assert(dek_out != NULL && dek_len != NULL);
 
     if(!local_get_passphrase(pass, sizeof(pass)))
     {
@@ -510,7 +501,7 @@ static bool local_config_load(PGconn* conn, PdeLocalConfig* config)
 
 /** PdeKmsProvider.generate_dek — fill @out with @len random bytes via pg_strong_random(). */
 static bool
-local_generate_dek(unsigned char *out, int len)
+pg_vault_tde_catalog_generate_dek(unsigned char *out, int len)
 {
     Assert(out != NULL);
     Assert(len == TDE_DEK_LEN);
@@ -576,7 +567,7 @@ static bool local_init(PGconn *conn)
 static const PdeKmsProvider local_provider_impl = {
     .name           = "local",
     .init           = local_init, 
-    .generate_dek   = local_generate_dek, 
+    .generate_dek   = pg_vault_tde_catalog_generate_dek, 
     .wrap_dek       = local_wrap_dek, 
     .unwrap_dek     = local_unwrap_dek,
     .shutdown       = local_shutdown, 

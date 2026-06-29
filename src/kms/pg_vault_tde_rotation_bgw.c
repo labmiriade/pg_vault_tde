@@ -365,31 +365,38 @@ pg_vault_tde_rotation_bgw_main(Datum main_arg)
                             "pg_vault_tde_rotate_online()",
                             args.relid)));
 
-        /*
-         * Zero the current DEK in the catalog.
-         *
-         * For CI pipelines that use wallet_auto_open=off without an env var,
-         * set pg_vault_tde.wallet_dev_mode_passphrase in postgresql.conf (or
-         * as a -c flag at postgres startup) and enable dev_mode=on.  The
-         * GUC value is inherited by all backends and BGWs from the postmaster.
-         */
-        pg_vault_tde_catalog_zero_rel_dek(args.relid);
+        if (get_rel_relkind(args.relid) == RELKIND_INDEX)
+        {
+            Oid             tde_btree_amoid = get_index_am_oid("tde_btree", true);
+            ReindexParams   reindex_params  = {0};
 
-        /*Generate new dek for already registered rel*/
-        pg_vault_tde_catalog_update_rel_dek(args.relid, pg_vault_tde_vault_key_name);
+            /* Only tde_btree indexes have a DEK entry — validate before touching shmem. */
+            if (!OidIsValid(tde_btree_amoid) ||
+                get_rel_relam(args.relid) != tde_btree_amoid)
+                ereport(ERROR,
+                        (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                         errmsg("pg_vault_tde_rotate_online: index %u is not a "
+                                "tde_btree index — only tde_btree indexes "
+                                "have DEK entries", args.relid)));
 
-        /*
-         * Make the new catalog row visible to the current command.
-         * CatalogTupleUpdate inside register_rel calls GetCurrentCommandId(true)
-         * which marks the CID as used but does NOT advance it.  Without this
-         * explicit increment, the snapshot taken by kms_get_rel_dek's slow path
-         * still sees the OLD catalog row (cmax == curcid) and returns the old
-         * DEK — meaning reencrypt_table re-encrypts every tuple with the same
-         * key, making rotation a silent no-op on heap data.
-         */
-        CommandCounterIncrement();
+            pg_vault_tde_catalog_zero_rel_dek(args.relid);
+            pg_vault_tde_catalog_update_rel_dek(args.relid);
+            CommandCounterIncrement();
 
-        tuples_done = pg_vault_tde_reencrypt_table(args.relid);
+            reindex_index(NULL, args.relid, false,
+                          get_rel_persistence(args.relid), &reindex_params);
+            tuples_done = tuples_total;
+        }
+        else
+        {
+            pg_vault_tde_catalog_zero_rel_dek(args.relid);
+            pg_vault_tde_catalog_update_rel_dek(args.relid);
+            /* CommandCounterIncrement makes the new catalog row visible to kms_get_rel_dek's
+             * slow path — without it, reencrypt_table re-encrypts with the old DEK. */
+            CommandCounterIncrement();
+
+            tuples_done = pg_vault_tde_reencrypt_table(args.relid);
+        }
 
         PopActiveSnapshot();
         CommitTransactionCommand();
