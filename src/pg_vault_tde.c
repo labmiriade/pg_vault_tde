@@ -38,6 +38,7 @@
 #include "src/include/pg_vault_tde_guc.h"
 #include "src/include/pg_vault_tde_catalog.h"
 #include "src/include/pg_vault_tde_audit.h"
+#include "src/include/pg_vault_tde_rmgr.h"
 #include "src/kms/pg_vault_tde_kms_provider.h"
 
 #ifdef PG_MODULE_MAGIC
@@ -77,6 +78,7 @@ char *pg_vault_tde_wallet_passphrase_env  = NULL; /* env var NAME */
 bool  pg_vault_tde_wallet_auto_open       = true;
 int   pg_vault_tde_max_encrypted_relations = 1024;
 bool  pg_vault_tde_toast_encryption       = true;
+bool  pg_vault_tde_toast_custom_rmgr      = false;  /* gated off by default */
 
 /* -----------------------------------------------------------------------
  * v1.6 GUC definitions — flexible passphrase ingestion
@@ -1010,6 +1012,18 @@ _PG_init(void)
         &pg_vault_tde_toast_encryption, true, PGC_SUSET,
         0, NULL, NULL, NULL);
 
+    /* Custom WAL resource manager for TOAST chunks (logical replication) */
+    DefineCustomBoolVariable("pg_vault_tde.toast_custom_rmgr",
+        "WAL-log encrypted TOAST chunks under the custom pg_vault_tde rmgr",
+        "When true, encrypted TOAST chunks are written via the custom WAL "
+        "resource manager (TDE_RMGR_ID) so the logical decoder routes them "
+        "away from the reorder buffer's toast_hash, enabling logical "
+        "replication of encrypted_heap tables with TOASTed columns.  Requires "
+        "the rmgr to be registered at preload time, hence PGC_POSTMASTER.  "
+        "Default off.",
+        &pg_vault_tde_toast_custom_rmgr, false, PGC_POSTMASTER,
+        0, NULL, NULL, NULL);
+
     /* ----------------------------------------------------------------
      * v1.6 GUC registrations — flexible wallet passphrase ingestion
      * ---------------------------------------------------------------- */
@@ -1102,6 +1116,15 @@ _PG_init(void)
      * initialised before any actual crypto is attempted.
      */
     pg_vault_tde_tam_init();
+
+    /*
+     * Register the custom WAL resource manager for encrypted TOAST chunks.
+     * RegisterCustomRmgr() must run during shared_preload_libraries loading,
+     * which is guaranteed here (_PG_init bails out early otherwise).  The rmgr
+     * is always registered; the GUC pg_vault_tde.toast_custom_rmgr only gates
+     * whether the write path actually uses it.
+     */
+    tde_rmgr_register();
 
     /*
      * Wire the mutable tde_btree_methods copy: copy btree's IndexAmRoutine

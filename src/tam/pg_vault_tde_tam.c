@@ -227,6 +227,21 @@ tde_encrypt_heap_tuple(HeapTuple plain, Oid relid)
     memcpy(enc->t_data, plain->t_data, hdr_len);                 /* header verbatim */
     memcpy((char *) enc->t_data + hdr_len, enc_buf, enc_len);    /* encrypted payload */
     pfree(enc_buf);  /* ciphertext - no need to cleanse */
+
+    /*
+     * Clear HEAP_HASEXTERNAL on the encrypted tuple.  From the core's point of
+     * view the encrypted tuple is an opaque blob with no external columns — the
+     * TOAST pointer lives INSIDE the ciphertext, invisible to heap_deform.
+     * Leaving the bit set makes core touch the ciphertext as if it had external
+     * data; in particular ExtractReplicaIdentity() (heap_delete/heap_update) runs
+     * toast_flatten_tuple()/heap_deform_tuple() on the ciphertext and logs a
+     * garbage replica identity, breaking logical UPDATE/DELETE.  TOAST lifecycle
+     * is driven by the TAM itself (per-attribute VARATT scan on the decrypted
+     * tuple, tde_tuple_has_external_slow), not this bit — and VACUUM FULL already
+     * writes encrypted tuples with this bit cleared, so the codebase copes.
+     */
+    enc->t_data->t_infomask &= ~HEAP_HASEXTERNAL;
+
     return enc;
 }
 /*

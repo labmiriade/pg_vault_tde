@@ -69,7 +69,8 @@ OBJS = \
 	src/tam/pg_vault_tde_tam.o \
 	src/tam/pg_vault_tde_toast.o \
 	src/iam/pg_vault_tde_iam.o \
-	src/logical/pg_vault_tde_pgoutput.o
+	src/logical/pg_vault_tde_pgoutput.o \
+	src/logical/pg_vault_tde_rmgr.o
 
 # SQL scripts installed as part of the extension.
 DATA = sql/pg_vault_tde--1.7.sql 

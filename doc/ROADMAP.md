@@ -1,6 +1,6 @@
 # pg_vault_tde Roadmap
 
-> Last updated: 2026-06-11 — **v1.7 current**. 109 regression tests (52 v1.4 + 20 v1.5 + 37 v1.6) carried forward. Key v1.7 changes: all KMS GUCs promoted to PGC_SUSET (per-database KMS via `ALTER DATABASE SET`); `pg_restore_tde` decrypt-and-pipe loop completed; v1.4 global-DEK API removed (`rotate_key`, `key_generation`, `clear_prev_dek`, `encrypt_test`, `decrypt_test`, `TdeShmemData`); documentation updated throughout.
+> Last updated: 2026-06-29 — **v1.7 current**. 109 regression tests (52 v1.4 + 20 v1.5 + 37 v1.6) carried forward, plus the `tap/12_logical_repl_toast.t` end-to-end logical replication test. Key v1.7 changes: all KMS GUCs promoted to PGC_SUSET (per-database KMS via `ALTER DATABASE SET`); `pg_restore_tde` decrypt-and-pipe loop completed; logical replication of `encrypted_heap` TOAST columns via a custom WAL resource manager (`pg_vault_tde.toast_custom_rmgr`); documentation updated throughout.
 
 ---
 
@@ -50,7 +50,7 @@ AppRole response-wrapping. Wallet SQL stubs registered (not functional). Tests 5
 
 ## v1.6 — Local Wallet KMS — Production-Ready Offline Encryption — COMPLETED ✅
 
-> Completed: 2026-07-20 — patched 2026-06-03 — **109 regression tests** (52 v1.4 + 20 v1.5 + 37 v1.6: 8 wallet + 29 TOAST/per-table DEK isolation/storage-path coverage + forensic helpers; test 110 deferred as permanent limit) — PG 17 + PG 18, zero compiler warnings.
+> Completed: 2026-06-03 — **109 regression tests** (52 v1.4 + 20 v1.5 + 37 v1.6: 8 wallet + 29 TOAST/per-table DEK isolation/storage-path coverage + forensic helpers; test 110 deferred as permanent limit) — PG 17 + PG 18, zero compiler warnings.
 >
 > **Theme**: The Local Wallet KMS provider becomes a first-class, fully flexible offline
 > encryption backend — an equal to the Vault connector.
@@ -227,7 +227,7 @@ Covered by tests 81, 84, and 85.
 - Test 107 — Tuple readable after `pg_vault_tde_rotation_online()` completes.
 - Test 108 — `CREATE TABLE AS` with `encrypted_heap`.
 - Test 109 — VACUUM FULL on table with STORAGE EXTERNAL columns.
-- Test 110 — WITH HOLD cursor: no plaintext spill to disk (`pgsql_tmp` files contain only ciphertext).
+- Test 110 — WITH HOLD cursor plaintext spill: **deferred as a permanent limitation** — the executor's tuplestore bypasses the TAM write path, so `pg_vault_tde` cannot intercept the spill; the test is commented out in `regression_test_v16.sql`.
 
 #### CI script idempotency
 
@@ -299,11 +299,11 @@ Test 85 covers this end-to-end with `STORAGE EXTERNAL` + an incompressible
 **Theme**: Close the TOAST data-leak gap, formalize the KEK/DEK wrap hierarchy across
 all providers, add PKCS#11/HSM support, audit trail for compliance (PCI-DSS, HIPAA).
 
-### 1. TOAST Chunk-Level Storage Encryption (DONE in v1.6)
+### 1. TOAST Chunk-Level Storage Encryption (foundation — shipped in v1.6)
 
-Per-chunk AES-256-GCM at `pg_toast_NNNNN` storage layer using parent relation DEK.
-`pg_vault_tde_detoast_datum()` wrapper decrypts chunks before reassembly. Raw TOAST
-pages no longer contain plaintext.
+Per-chunk AES-256-GCM at the `pg_toast_NNNNN` storage layer using the parent
+relation DEK (delivered in v1.6; listed here as the foundation the v1.7 logical
+replication work in §4 builds on). Raw TOAST pages no longer contain plaintext.
 
 ### 2. Proper KEK/DEK Wrapping Hierarchy (Critical)
 
@@ -317,10 +317,17 @@ Custom btree key serialisation layer for `int4`/`int8`/`uuid`/`date`/`timestampt
 All operator classes now store encrypted index keys. Index-only scans are disabled
 by design to prevent returning raw AES-256-SIV ciphertext to clients.
 
-### 4. Logical Replication TOAST Decrypt (Medium)
+### 4. Logical Replication of TOAST Columns (Medium) — COMPLETED ✅
 
-Decrypt TOAST chunks in `change_cb` before `ReorderBufferToastReplace()`.
-Depends on §1 (`pg_vault_tde_detoast_datum()`).
+Custom WAL resource manager (`pg_vault_tde.toast_custom_rmgr`, PGC_POSTMASTER,
+default off): `tde_toast_wal_insert()` logs encrypted TOAST chunks under
+`TDE_RMGR_ID` so the logical decoder routes them away from the reorder buffer's
+`toast_hash`; `rm_decode` captures them per transaction and `tde_toast_stitch()`
+reconstructs the plaintext value into the decrypted main tuple before `pgoutput`
+serializes it. UPDATE/DELETE require `REPLICA IDENTITY FULL` + a primary key
+(`DEFAULT` / PK-less unsupported — the replica identity would be read from
+ciphertext). Covered end-to-end by `tap/12_logical_repl_toast.t`.
+See doc/pg_vault_tde.md → "Logical Decoding and Replication".
 
 ### 5. PKCS#11 / HSM Integration (Critical)
 

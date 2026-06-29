@@ -1368,36 +1368,79 @@ END;
 $$;
 
 -- ================================================================
--- TEST 48: Logical decoding output plugin registration (v1.2)
+-- TEST 48: Logical decoding emits DECRYPTED data for encrypted_heap (v1.2)
 --
--- Verifies that _PG_output_plugin_init is discoverable by creating
--- a logical replication slot using our plugin.  Does not test actual
--- replication (which requires a subscriber) but validates that the
--- plugin loads and initializes without error.
+-- Creates a logical slot with our output plugin, INSERTs known values
+-- into an encrypted_heap table, decodes the slot via
+-- pg_logical_slot_get_binary_changes(), and asserts the DECRYPTED values
+-- appear in the decoded output (not ciphertext / wire-format garbage).
+--
+--   RED  (stub plugin):    no output produced  -> assertion fails.
+--   GREEN (wrapper plugin): pgoutput serializes the decrypted tuple
+--                           -> the values appear in the decoded stream.
+--
+-- Skips gracefully when wal_level <> logical (e.g. some CI runs).
 -- ================================================================
-DO $$
-DECLARE
-    v_slot text := 'tde_test_slot';
-BEGIN
-    -- Create a logical replication slot using our plugin
-    -- This calls _PG_output_plugin_init internally
-    BEGIN
-        PERFORM pg_create_logical_replication_slot(v_slot, 'pg_vault_tde');
-        RAISE NOTICE 'TEST 48 PASSED: logical decoding plugin loads OK';
 
-        -- Clean up the slot
-        PERFORM pg_drop_replication_slot(v_slot);
-    EXCEPTION WHEN others THEN
-        -- If wal_level != logical, the slot creation fails with a clear error
-        -- This is acceptable in CI where wal_level may be 'replica'
-        IF SQLERRM LIKE '%wal_level%' OR SQLERRM LIKE '%logical%' THEN
-            RAISE NOTICE 'TEST 48 SKIPPED: wal_level is not logical (expected in some CI)';
-        ELSE
-            RAISE EXCEPTION 'TEST 48 FAILED: %', SQLERRM;
-        END IF;
-    END;
+-- Idempotent pre-cleanup (in case a previous failed run left objects behind)
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'tde_s48') THEN
+        PERFORM pg_drop_replication_slot('tde_s48');
+    END IF;
 END;
 $$;
+DROP PUBLICATION IF EXISTS tde_lr_pub;
+DROP TABLE IF EXISTS tde_lr_demo;
+
+SELECT pg_vault_tde_set_test_dek();
+CREATE TABLE tde_lr_demo (id int PRIMARY KEY, val int) USING encrypted_heap;
+CREATE PUBLICATION tde_lr_pub FOR TABLE tde_lr_demo;
+
+-- Create the slot (skip-guard for non-logical wal_level).
+DO $$
+BEGIN
+    PERFORM pg_create_logical_replication_slot('tde_s48', 'pg_vault_tde');
+EXCEPTION WHEN others THEN
+    IF SQLERRM LIKE '%wal_level%' OR SQLERRM LIKE '%logical%' THEN
+        RAISE NOTICE 'TEST 48 SKIPPED: wal_level is not logical (expected in some CI)';
+    ELSE
+        RAISE EXCEPTION 'TEST 48 FAILED (slot create): %', SQLERRM;
+    END IF;
+END;
+$$;
+
+-- Stream NEW changes (captured by the slot created above).
+INSERT INTO tde_lr_demo VALUES (4, 400), (5, 500);
+
+-- Decode the slot and assert the DECRYPTED values are present.
+DO $$
+DECLARE
+    decoded text;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'tde_s48') THEN
+        RAISE NOTICE 'TEST 48 SKIPPED: slot absent (wal_level not logical)';
+        RETURN;
+    END IF;
+
+    SELECT string_agg(encode(data, 'escape'), '') INTO decoded
+    FROM pg_logical_slot_get_binary_changes('tde_s48', NULL, NULL,
+             'proto_version', '4', 'publication_names', 'tde_lr_pub');
+
+    IF decoded LIKE '%400%' AND decoded LIKE '%500%' THEN
+        RAISE NOTICE 'TEST 48 PASSED: logical decoding emitted decrypted values';
+    ELSE
+        RAISE EXCEPTION 'TEST 48 FAILED: decrypted values 400/500 not found in decoded output (got: %)',
+            left(coalesce(decoded, '<empty>'), 200);
+    END IF;
+
+    PERFORM pg_drop_replication_slot('tde_s48');
+END;
+$$;
+
+-- Cleanup
+DROP PUBLICATION IF EXISTS tde_lr_pub;
+DROP TABLE IF EXISTS tde_lr_demo;
 
 
 -- ================================================================

@@ -14,15 +14,16 @@
 3. [Crypto Layer](#crypto-layer)
 4. [KMS and Key Caching](#kms-and-key-caching)
 5. [Index Access Method (IAM)](#index-access-method)
-6. [Known Limitations](#known-limitations)
-7. [Security Considerations](#security-considerations)
-8. [Wire Format Reference](#wire-format-reference)
-9. [SQL API Reference](#sql-api-reference)
-10. [Extension Initialization](#extension-initialization)
-11. [Testing Strategy](#testing-strategy)
-12. [Packaging](#packaging)
-13. [Roadmap](#roadmap)
-14. [Contributing](#contributing)
+6. [Logical Decoding and Replication](#logical-decoding-and-replication)
+7. [Known Limitations](#known-limitations)
+8. [Security Considerations](#security-considerations)
+9. [Wire Format Reference](#wire-format-reference)
+10. [SQL API Reference](#sql-api-reference)
+11. [Extension Initialization](#extension-initialization)
+12. [Testing Strategy](#testing-strategy)
+13. [Packaging](#packaging)
+14. [Roadmap](#roadmap)
+15. [Contributing](#contributing)
 
 ---
 
@@ -673,6 +674,94 @@ SELECT * FROM employees WHERE id > 1;            -- seq scan, not index scan
 
 ---
 
+## Logical Decoding and Replication
+
+`pg_vault_tde` ships a logical decoding output plugin (`pg_vault_tde_pgoutput`)
+so that `encrypted_heap` tables can be published to logical replication
+subscribers **in plaintext**, even though their on-disk tuples — and their WAL —
+are ciphertext.
+
+### Why a plugin is needed
+
+The TAM decrypt-on-read callbacks run in the query executor, not in the WAL
+sender. A logical decoder reads raw WAL records whose tuple bodies are
+ciphertext, so without intervention a subscriber receives encrypted garbage.
+
+### Non-TOAST tables — pgoutput wrapper
+
+`_PG_output_plugin_init` loads the built-in `pgoutput` via
+`load_external_function()`, lets it populate every callback, then overrides the
+change callbacks with thin wrappers that decrypt the tuple **in place** (via
+`tde_decrypt_heap_tuple`) before delegating back to `pgoutput` for the actual
+serialization. Because the emitted wire format is exactly the `pgoutput`
+protocol, this works with `pg_recvlogical` and with a native `CREATE
+SUBSCRIPTION` pointed at a slot created with this plugin. (Same wrapping
+technique as Citus's CDC decoder.)
+
+### TOAST columns — custom WAL resource manager
+
+Externally-TOASTed columns need more than in-place decryption: the core reorder
+buffer reassembles a TOAST value by `heap_deform_tuple()`-ing the chunks and the
+main tuple **before any output-plugin callback runs**, and on an encrypted tuple
+that crashes (`got sequence entry … for toast chunk`). There is no extension
+hook earlier than that point.
+
+The lever that does exist is a **custom WAL resource manager**, gated by the GUC
+`pg_vault_tde.toast_custom_rmgr` (PGC_POSTMASTER, default **off**; requires
+`pg_vault_tde` in `shared_preload_libraries`). When enabled:
+
+1. **Write path** — `tde_toast_wal_insert()` (a faithful clone of `heap_insert`)
+   logs encrypted TOAST chunks under `TDE_RMGR_ID` instead of `RM_HEAP_ID`. The
+   WAL record is byte-identical to heap's except for the resource manager id, so
+   crash recovery is unaffected (`rm_redo` delegates to `heap_redo`).
+2. **Decode** — routing the chunks to our `rm_decode` keeps them out of the
+   reorder buffer's `toast_hash`, so the core never deforms the still-encrypted
+   main tuple. `rm_decode` captures the raw encrypted chunks per transaction
+   (no catalog access during decode).
+3. **Stitch** — `tde_toast_stitch()`, called from the plugin's change callback
+   after the main tuple has been decrypted, decrypts the captured chunks,
+   reconstructs the plaintext value, and rewrites the external on-disk TOAST
+   pointers into in-memory indirect pointers — a faithful analogue of core's
+   `ReorderBufferToastReplace()`. `pgoutput` then serializes the full plaintext.
+
+### Requirements and supported operations
+
+| Operation | Requirement |
+|-----------|-------------|
+| INSERT (inline, TOAST, bursts) | `toast_custom_rmgr = on` for TOAST columns |
+| Initial table sync (COPY) | works via the TAM read path (decrypt-on-read) |
+| UPDATE / DELETE | **`REPLICA IDENTITY FULL` + a primary key** |
+
+`REPLICA IDENTITY FULL` is mandatory for UPDATE/DELETE: with `DEFAULT` the core
+derives the replica identity by reading the **encrypted** old tuple as if it
+were the key, producing a constant garbage key — the subscriber then silently
+targets the wrong row. Tables without a primary key are likewise unsupported for
+UPDATE/DELETE (no key to match on). These are documented limitations, not bugs:
+they follow from the tuple being an opaque ciphertext blob to the core.
+
+### Structural limitations
+
+- **`heap_insert` clone maintenance** — `tde_toast_wal_insert()` mirrors
+  `heap_insert()` and must be re-synced on each major PostgreSQL release; it is
+  version-audited against the upstream function (see the comment in
+  `src/logical/pg_vault_tde_rmgr.c`).
+- **Reorder-buffer coupling** — the stitch path mirrors internal contracts of
+  `ReorderBufferToastReplace` (buffer copy-back, memory context) that are not a
+  stable public API.
+- **Aborted-transaction capture** — a TOAST-writing transaction that reaches a
+  full snapshot and then aborts *without being streamed* leaves its captured
+  chunks in memory until the decoding process exits (there is no output-plugin
+  hook for non-streamed aborts; it is a slow, per-abort leak, not per-row).
+- **Resource manager id** — the experimental id `RM_EXPERIMENTAL_ID` (128) is
+  used for now; a stable custom rmid will be reserved and registered on the
+  PostgreSQL community wiki before GA.
+
+This ciphertext-as-opaque-blob conflict — every place the core reads a single
+column (e.g. replica identity) sees ciphertext — is the motivation for the
+column-level encryption alternative on the v1.8 roadmap.
+
+---
+
 ## Known Limitations
 
 ### Current Limitations (v1.7 — Current Release)
@@ -681,7 +770,7 @@ SELECT * FROM employees WHERE id > 1;            -- seq scan, not index scan
 |---|-----------|-------------|
 | 1 | **TOAST chunk-level storage encryption** — ✅ **Resolved in v1.6**: large values round-trip fully encrypted via `pg_vault_tde_toast_am` returning `encrypted_heap` AM. Disable with `pg_vault_tde.toast_encryption = off` for legacy behaviour. | v1.6 ✅ |
 | 2 | **tde_btree fixed-size types plaintext index keys** — ✅ **Resolved in v1.7**: `int4`, `int8`, `uuid`, `date`, `timestamptz` btree index keys are now encrypted with AES-256-SIV, matching varlena type behaviour. | v1.7 ✅ |
-| 3 | **Logical replication TOAST gap** — tables with externally-TOAST'd columns not supported for logical decoding | v1.7 |
+| 3 | **Logical replication of TOAST columns** — ✅ **Resolved in v1.7** via the custom WAL resource manager (enable `pg_vault_tde.toast_custom_rmgr`). UPDATE/DELETE require `REPLICA IDENTITY FULL` + a primary key; `REPLICA IDENTITY DEFAULT` and PK-less tables remain unsupported. See [Logical Decoding and Replication](#logical-decoding-and-replication). | v1.7 ✅ |
 | 4 | **WAL unencrypted** — requires `XLogInsert()` hook unavailable in extension API | Permanently deferred |
 | 5 | **All-or-nothing table encryption** — no per-column granularity | v1.8 |
 | 6 | **Range scans on tde_btree** — `WHERE col > x` returns empty (AES-SIV not order-preserving) | By design, permanent |
@@ -742,11 +831,12 @@ and skips the HOT path. The constant `[VERSION | GENERATION]` bytes were moved t
    workloads by roughly the single-insert overhead multiplied by batch size.
    Batch-encrypted `heap_multi_insert` is targeted for v1.1.
 
-5. **Logical replication** (ticket #5)  
-   A `pgoutput`-compatible decoding plugin that decrypts tuples before
-   publishing to subscribers is required for logical replication
-   compatibility. The WAL sender runs in a separate code path from the
-   query executor.
+5. **Logical replication** (ticket #5) — ✅ **Resolved** (non-TOAST in v1.2,
+   TOAST columns in v1.7)  
+   The `pg_vault_tde_pgoutput` plugin decrypts tuples before publishing to
+   subscribers; the custom WAL resource manager
+   (`pg_vault_tde.toast_custom_rmgr`) extends this to externally-TOASTed
+   columns. See [Logical Decoding and Replication](#logical-decoding-and-replication).
 
 6. **IAM range scans** (ticket #6)  
    `WHERE col > 'x'` on a column with a `tde_btree` index always returns

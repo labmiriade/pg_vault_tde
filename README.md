@@ -559,7 +559,7 @@ CREATE INDEX ON secrets USING tde_btree (id);
 | Page checksums | ✅ Full | Checksums over encrypted content (complementary to GCM) |
 | Logical replication (non-TOAST) | ✅ Full (v1.2) | `pg_vault_tde_pgoutput` plugin decrypts tuples before streaming |
 | TOAST (large values > ≈2 kB) | ✅ Full | Heap-level round-trips functional; per-chunk storage encryption |
-| Logical replication (TOAST columns) | 🔜 v1.7 | TOAST decrypt in `change_cb` before `ReorderBufferToastReplace()` |
+| Logical replication (TOAST columns) | ✅ Full (v1.7) | Custom WAL rmgr (`toast_custom_rmgr`) routes encrypted chunks past the reorder buffer; stitched in `change_cb`. UPDATE/DELETE need `REPLICA IDENTITY FULL` + PK |
 | Range scans on TDE indexes | ⚠️ By design | `tde_btree`/`tde_gin`/`tde_hash` use AES-SIV — equality only; ranges return empty |
 | Column-level encryption | 🔜 v1.8 | Per-column `ENABLE COLUMN ENCRYPTION` DDL |
 
@@ -891,18 +891,26 @@ See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
    AES-256-SIV (equality-preserving, NOT order-preserving). `WHERE col > 'x'` on a
    `tde_btree` index returns empty results. Use sequential scans for range predicates.
 
-3. **Logical replication TOAST gap** (→ v1.7): Tables with externally-TOASTed columns
-   are not supported for logical decoding.
+3. **Logical replication of TOAST columns** (✅ resolved in v1.7): Enable
+   `pg_vault_tde.toast_custom_rmgr` (PGC_POSTMASTER, default off) to publish
+   externally-TOASTed columns to subscribers. UPDATE/DELETE require
+   `REPLICA IDENTITY FULL` **and** a primary key; `REPLICA IDENTITY DEFAULT` and
+   PK-less tables remain unsupported (the replica identity would be read from
+   ciphertext). See doc/pg_vault_tde.md → "Logical Decoding and Replication".
 
 4. **All-or-nothing table encryption** (→ v1.8): All columns in an `encrypted_heap`
    table are encrypted. Per-column `ENABLE COLUMN ENCRYPTION` DDL is planned for v1.8.
 
-5. **`WITH HOLD` cursor temporary file is unencrypted** (→ v1.7): When a `CURSOR WITH HOLD`
+5. **WAL unencrypted** (permanently deferred): Full WAL encryption requires a hook in
+   `XLogInsert()` / `XLogWrite()` — not achievable as a PostgreSQL extension.
+
+6. **`WITH HOLD` cursor temporary file is unencrypted** (permanently deferred): When a `CURSOR WITH HOLD`
    spills its result set to a temporary file on disk (e.g. when `work_mem` is exhausted),
    the file is written in **plaintext**. PostgreSQL writes the materialized tuples directly
    through the executor's tuplestore layer, bypassing the TAM write path, so
    `pg_vault_tde` has no opportunity to encrypt the data before it reaches disk.
-   **Mitigation until v1.7:** set `work_mem` large enough to keep cursor data in memory,
+
+   **Mitigation:** set `work_mem` large enough to keep cursor data in memory,
    or avoid `WITH HOLD` cursors on encrypted tables in memory-constrained environments.
 
 6. **HOT updates are disabled by design** (so that updating an indexed column always
