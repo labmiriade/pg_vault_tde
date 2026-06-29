@@ -16,6 +16,7 @@ teardown
 }
 
 session "setupper"
+setup { SET client_min_messages = error; }
 
 step "su_setup"
 {
@@ -29,15 +30,18 @@ step "su_setup"
 }
 
 session "reader"
+setup { SET client_min_messages = error; }
 step "rx_begin"  { BEGIN ISOLATION LEVEL REPEATABLE READ; }
 step "rx_read1"  { SELECT data FROM tde_iso_test WHERE id = 1; }
 step "rx_read2"  { SELECT id FROM tde_iso_test WHERE data = 'Isolation_test'; }
 step "rx_commit" { COMMIT; }
 
 session "rotator"
+setup { SET client_min_messages = error; }
 step "rot_rotate" { SELECT pg_vault_tde_rotate_online('tde_iso_test'); }
 
 session "writer"
+setup { SET client_min_messages = error; }
 
 step "wx_begin"  { BEGIN; --Read committed}
 step "wx_write"  { INSERT INTO tde_iso_test (data) VALUES ('Isolation_test'); }
@@ -46,6 +50,7 @@ step "wx_commit" { COMMIT; }
 step "wx_abort"  { ROLLBACK; }
 
 session "vacuumer"
+setup { SET client_min_messages = error; }
 step "vacuum"    { VACUUM tde_iso_test; }
 
 permutation "su_setup" "rx_begin" "rx_read1" "rot_rotate" "wx_begin" "wx_write" "wx_commit" "rx_read2" "rx_commit"

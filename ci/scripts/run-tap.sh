@@ -90,6 +90,7 @@ if $RT exec -u postgres "$CONTAINER" bash -c '
     exit 0
 else
     ELAPSED=$(timer_elapsed "$START")
+    $RT cp "$CONTAINER":/test/log "$REPO_ROOT"/test/tap
     log_error "TAP: FAILED after $(timer_fmt "$ELAPSED")"
     exit 3
 fi

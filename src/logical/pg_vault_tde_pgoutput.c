@@ -106,14 +106,14 @@ static void tde_output_stream_abort_cb(LogicalDecodingContext *ctx,
  * relation:
  *   - full tuples (INSERT/UPDATE newtuple, or the old tuple under
  *     REPLICA IDENTITY FULL): the user-data region IS our wire format
- *     [VER(1)|GEN(8)|IV(12)|CT|TAG(16)], >= TDE_V2_OVERHEAD bytes.
+ *     [IV(12)|CT|TAG(16)|VER(1)|GEN(8)], >= TDE_V4_OVERHEAD bytes.
  *   - the REPLICA IDENTITY DEFAULT old tuple: only the key column(s), e.g. a
  *     4-byte int4 key.  This is NOT in our wire format; blindly decrypting it
  *     errors ("encrypted tuple too short") or reads out of bounds.
  *
  * We only decrypt tuples that are plausibly in our format: at least
- * TDE_V2_OVERHEAD bytes of user data AND a recognized version byte (0x02/0x03).
- * Anything else is passed through untouched.
+ * TDE_V4_OVERHEAD bytes of user data AND the v4 version byte (0x04) in the
+ * trailer.  Anything else is passed through untouched.
  */
 static bool
 tde_tuple_looks_encrypted(HeapTuple tup)
@@ -130,11 +130,12 @@ tde_tuple_looks_encrypted(HeapTuple tup)
         return false;
 
     data_len = tup->t_len - hdr_len;
-    if (data_len < (Size) TDE_V2_OVERHEAD)
-        return false;           /* too short to be a v2/v3 encrypted region */
+    if (data_len < (Size) TDE_V4_OVERHEAD)
+        return false;           /* too short to be a v4 encrypted region */
 
-    ver = *((unsigned char *) tup->t_data + hdr_len);
-    return (ver == TDE_V2_VERSION_BYTE || ver == TDE_V3_VERSION_BYTE);
+    /* v4 is IV-first: version byte lives in the trailer [.. | TAG | VERSION(1) | GEN(8)] */
+    ver = *((unsigned char *) tup->t_data + tup->t_len - (TDE_V4_GEN_LEN + 1));
+    return (ver == TDE_V4_VERSION_BYTE);
 }
 
 /*

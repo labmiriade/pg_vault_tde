@@ -1,7 +1,7 @@
 Parsed test spec with 5 sessions
 
 starting permutation: su_setup rx_begin rx_read1 rot_rotate wx_begin wx_write wx_commit rx_read2 rx_commit
-step su_setup:
+step su_setup: 
     CREATE TABLE tde_iso_test (
         id serial PRIMARY KEY,
         data text
@@ -12,7 +12,7 @@ step su_setup:
 
 step rx_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
 step rx_read1: SELECT data FROM tde_iso_test WHERE id = 1;
-data
+data           
 ---------------
 initial_value_1
 (1 row)
@@ -20,7 +20,7 @@ initial_value_1
 step rot_rotate: SELECT pg_vault_tde_rotate_online('tde_iso_test');
 pg_vault_tde_rotate_online
 --------------------------
-
+                          
 (1 row)
 
 step wx_begin: BEGIN; --Read committed
@@ -34,7 +34,7 @@ id
 step rx_commit: COMMIT;
 
 starting permutation: su_setup wx_begin wx_write rot_rotate wx_commit rx_read2
-step su_setup:
+step su_setup: 
     CREATE TABLE tde_iso_test (
         id serial PRIMARY KEY,
         data text
@@ -48,7 +48,7 @@ step wx_write: INSERT INTO tde_iso_test (data) VALUES ('Isolation_test');
 step rot_rotate: SELECT pg_vault_tde_rotate_online('tde_iso_test');
 pg_vault_tde_rotate_online
 --------------------------
-
+                          
 (1 row)
 
 step wx_commit: COMMIT;
@@ -60,7 +60,7 @@ step rx_read2: SELECT id FROM tde_iso_test WHERE data = 'Isolation_test';
 
 
 starting permutation: su_setup wx_begin wx_write rot_rotate rx_begin rx_read2 wx_commit rx_read2 rx_commit
-step su_setup:
+step su_setup: 
     CREATE TABLE tde_iso_test (
         id serial PRIMARY KEY,
         data text
@@ -74,7 +74,7 @@ step wx_write: INSERT INTO tde_iso_test (data) VALUES ('Isolation_test');
 step rot_rotate: SELECT pg_vault_tde_rotate_online('tde_iso_test');
 pg_vault_tde_rotate_online
 --------------------------
-
+                          
 (1 row)
 
 step rx_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
@@ -92,7 +92,7 @@ id
 step rx_commit: COMMIT;
 
 starting permutation: su_setup wx_begin wx_update rot_rotate wx_abort
-step su_setup:
+step su_setup: 
     CREATE TABLE tde_iso_test (
         id serial PRIMARY KEY,
         data text
@@ -106,13 +106,13 @@ step wx_update: UPDATE tde_iso_test SET data = 'Updated' WHERE id = 50;
 step rot_rotate: SELECT pg_vault_tde_rotate_online('tde_iso_test');
 pg_vault_tde_rotate_online
 --------------------------
-
+                          
 (1 row)
 
 step wx_abort: ROLLBACK;
 
 starting permutation: su_setup vacuum rot_rotate
-step su_setup:
+step su_setup: 
     CREATE TABLE tde_iso_test (
         id serial PRIMARY KEY,
         data text
@@ -125,12 +125,12 @@ step vacuum: VACUUM tde_iso_test;
 step rot_rotate: SELECT pg_vault_tde_rotate_online('tde_iso_test');
 pg_vault_tde_rotate_online
 --------------------------
-
+                          
 (1 row)
 
 
 starting permutation: su_setup rot_rotate vacuum
-step su_setup:
+step su_setup: 
     CREATE TABLE tde_iso_test (
         id serial PRIMARY KEY,
         data text
@@ -142,7 +142,7 @@ step su_setup:
 step rot_rotate: SELECT pg_vault_tde_rotate_online('tde_iso_test');
 pg_vault_tde_rotate_online
 --------------------------
-
+                          
 (1 row)
 
 step vacuum: VACUUM tde_iso_test;

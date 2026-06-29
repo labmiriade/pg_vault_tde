@@ -42,9 +42,13 @@ $pub->append_conf('postgresql.conf', <<'CONF');
 shared_preload_libraries = 'pg_vault_tde'
 pg_vault_tde.dev_mode = on
 pg_vault_tde.toast_custom_rmgr = on
+pg_vault_tde.kms_provider = 'local'
+pg_vault_tde.wallet_passphrase_command = 'echo test-password'
 CONF
 $pub->start;
 $pub->safe_psql('postgres', 'CREATE EXTENSION pg_vault_tde;');
+system('/bin/sh', '-c', 'rm -rf /var/lib/pg_vault_tde/*');
+$pub->safe_psql('postgres', "SELECT pg_vault_tde_wallet_init('test-password');");
 
 # ── Subscriber: vanilla PostgreSQL (plain heap, no extension) ───────────────
 my $sub = PostgreSQL::Test::Cluster->new('subscriber');

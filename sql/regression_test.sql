@@ -1393,7 +1393,6 @@ $$;
 DROP PUBLICATION IF EXISTS tde_lr_pub;
 DROP TABLE IF EXISTS tde_lr_demo;
 
-SELECT pg_vault_tde_set_test_dek();
 CREATE TABLE tde_lr_demo (id int PRIMARY KEY, val int) USING encrypted_heap;
 CREATE PUBLICATION tde_lr_pub FOR TABLE tde_lr_demo;
 
