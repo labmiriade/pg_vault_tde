@@ -1,4 +1,4 @@
--- regression_test_v17.sql — TDE tests 111-119 for pg_vault_tde v1.7
+-- regression_test_v17.sql — TDE tests 111-131 for pg_vault_tde v1.7
 --
 -- These tests cover the tde_*_enc_ops operator classes introduced in v1.7,
 -- which encrypt fixed-size B-Tree index keys (int4, int8, uuid, date,
@@ -906,12 +906,219 @@ $$;
 
 
 -- ================================================================
+-- FOREIGN KEYS (tests 129-131)
+--
+-- Regression for the RI_FKey_check SIGSEGV on encrypted_heap: an encrypted
+-- child's new row is validated via tuple_satisfies_snapshot on a decrypted
+-- slot (pin released), which the pg_vault_tde override re-pins from t_self.
+-- Tests 129/131 hit that path; all three assert FK integrity per AM mix.
+-- ================================================================
+
+-- ================================================================
+-- TEST 129: FK encrypted parent + encrypted child (crash regression).
+-- Full lifecycle: valid INSERT round-trips, orphan INSERT / bad UPDATE /
+-- DELETE of a referenced parent all rejected.
+-- ================================================================
+DO $$
+DECLARE
+    v_read text;
+    ok     boolean;
+BEGIN
+    DROP TABLE IF EXISTS tde_fk_child_129;
+    DROP TABLE IF EXISTS tde_fk_parent_129;
+
+    CREATE TABLE tde_fk_parent_129 (
+        id    int PRIMARY KEY,
+        label text
+    ) USING encrypted_heap;
+    CREATE TABLE tde_fk_child_129 (
+        id        int PRIMARY KEY,
+        parent_id int REFERENCES tde_fk_parent_129 (id),
+        note      text
+    ) USING encrypted_heap;
+
+    INSERT INTO tde_fk_parent_129 VALUES (1, 'parent_one'), (2, 'parent_two');
+
+    -- Valid FK insert: must NOT crash and must decrypt on readback.
+    INSERT INTO tde_fk_child_129 VALUES (10, 1, 'child_of_one');
+    SELECT note INTO v_read FROM tde_fk_child_129 WHERE id = 10;
+    IF v_read IS DISTINCT FROM 'child_of_one' THEN
+        RAISE EXCEPTION 'TEST 129 FAILED: valid FK child round-trip mismatch (got %)',
+            COALESCE(v_read, '<NULL>');
+    END IF;
+
+    -- INSERT referencing a non-existent parent key must be rejected.
+    ok := false;
+    BEGIN
+        INSERT INTO tde_fk_child_129 VALUES (11, 999, 'orphan');
+    EXCEPTION WHEN foreign_key_violation THEN ok := true;
+    END;
+    IF NOT ok THEN
+        RAISE EXCEPTION 'TEST 129 FAILED: orphan INSERT was not rejected by the FK';
+    END IF;
+
+    -- UPDATE the child FK to a non-existent parent must be rejected.
+    ok := false;
+    BEGIN
+        UPDATE tde_fk_child_129 SET parent_id = 888 WHERE id = 10;
+    EXCEPTION WHEN foreign_key_violation THEN ok := true;
+    END;
+    IF NOT ok THEN
+        RAISE EXCEPTION 'TEST 129 FAILED: UPDATE to a non-existent parent was not rejected';
+    END IF;
+
+    -- DELETE of a referenced parent row must be rejected.
+    ok := false;
+    BEGIN
+        DELETE FROM tde_fk_parent_129 WHERE id = 1;
+    EXCEPTION WHEN foreign_key_violation THEN ok := true;
+    END;
+    IF NOT ok THEN
+        RAISE EXCEPTION 'TEST 129 FAILED: DELETE of a referenced parent was not rejected';
+    END IF;
+
+    -- Deleting an unreferenced parent is allowed.
+    DELETE FROM tde_fk_parent_129 WHERE id = 2;
+
+    DROP TABLE tde_fk_child_129;
+    DROP TABLE tde_fk_parent_129;
+    RAISE NOTICE
+        'TEST 129 PASSED: FK lifecycle on encrypted parent + encrypted child (no decode_slot crash)';
+END;
+$$;
+
+-- ================================================================
+-- TEST 130: FK encrypted parent + PLAIN child — integrity preserved.
+-- A plain child does not weaken the FK to an encrypted parent: orphan
+-- INSERT and DELETE of a referenced parent are both rejected. Only the
+-- child's confidentiality is forgone (plaintext on disk), not the FK.
+-- ================================================================
+DO $$
+DECLARE
+    v_read text;
+    ok     boolean;
+BEGIN
+    DROP TABLE IF EXISTS tde_fk_child_130;
+    DROP TABLE IF EXISTS tde_fk_parent_130;
+
+    CREATE TABLE tde_fk_parent_130 (
+        id    int PRIMARY KEY,
+        label text
+    ) USING encrypted_heap;
+    CREATE TABLE tde_fk_child_130 (
+        id        int PRIMARY KEY,
+        parent_id int REFERENCES tde_fk_parent_130 (id),
+        note      text
+    ) USING heap;            -- plain child
+
+    INSERT INTO tde_fk_parent_130 VALUES (1, 'enc_parent_one'), (2, 'enc_parent_two');
+
+    -- Valid FK insert into the plain child: parent must be found despite encryption.
+    INSERT INTO tde_fk_child_130 VALUES (10, 1, 'plain_child_of_one');
+    SELECT note INTO v_read FROM tde_fk_child_130 WHERE id = 10;
+    IF v_read IS DISTINCT FROM 'plain_child_of_one' THEN
+        RAISE EXCEPTION 'TEST 130 FAILED: plain child round-trip mismatch (got %)',
+            COALESCE(v_read, '<NULL>');
+    END IF;
+
+    -- Orphan INSERT must still be rejected (integrity not lost).
+    ok := false;
+    BEGIN
+        INSERT INTO tde_fk_child_130 VALUES (11, 999, 'orphan');
+    EXCEPTION WHEN foreign_key_violation THEN ok := true;
+    END;
+    IF NOT ok THEN
+        RAISE EXCEPTION 'TEST 130 FAILED: orphan INSERT into plain child was not rejected '
+                        '(referential integrity to the encrypted parent was lost)';
+    END IF;
+
+    -- DELETE of the referenced encrypted parent must be blocked by the plain child.
+    ok := false;
+    BEGIN
+        DELETE FROM tde_fk_parent_130 WHERE id = 1;
+    EXCEPTION WHEN foreign_key_violation THEN ok := true;
+    END;
+    IF NOT ok THEN
+        RAISE EXCEPTION 'TEST 130 FAILED: DELETE of the referenced encrypted parent was not blocked';
+    END IF;
+
+    DROP TABLE tde_fk_child_130;
+    DROP TABLE tde_fk_parent_130;
+    RAISE NOTICE
+        'TEST 130 PASSED: encrypted parent + plain child — referential integrity fully enforced '
+        '(only child confidentiality is forgone, not the FK guarantee)';
+END;
+$$;
+
+-- ================================================================
+-- TEST 131: FK PLAIN parent + encrypted child (crash regression).
+-- Same decoded-slot path as 129, but the referenced parent is plain heap.
+-- Full lifecycle: valid INSERT round-trips, orphan INSERT and DELETE of a
+-- referenced parent rejected.
+-- ================================================================
+DO $$
+DECLARE
+    v_read text;
+    ok     boolean;
+BEGIN
+    DROP TABLE IF EXISTS tde_fk_child_131;
+    DROP TABLE IF EXISTS tde_fk_parent_131;
+
+    CREATE TABLE tde_fk_parent_131 (
+        id    int PRIMARY KEY,
+        label text
+    ) USING heap;            -- plain parent
+    CREATE TABLE tde_fk_child_131 (
+        id        int PRIMARY KEY,
+        parent_id int REFERENCES tde_fk_parent_131 (id),
+        note      text
+    ) USING encrypted_heap;
+
+    INSERT INTO tde_fk_parent_131 VALUES (1, 'plain_parent_one'), (2, 'plain_parent_two');
+
+    -- Valid FK insert into the encrypted child: must NOT crash and must decrypt.
+    INSERT INTO tde_fk_child_131 VALUES (10, 1, 'enc_child_of_one');
+    SELECT note INTO v_read FROM tde_fk_child_131 WHERE id = 10;
+    IF v_read IS DISTINCT FROM 'enc_child_of_one' THEN
+        RAISE EXCEPTION 'TEST 131 FAILED: encrypted child round-trip mismatch (got %)',
+            COALESCE(v_read, '<NULL>');
+    END IF;
+
+    -- Orphan INSERT must be rejected.
+    ok := false;
+    BEGIN
+        INSERT INTO tde_fk_child_131 VALUES (11, 999, 'orphan');
+    EXCEPTION WHEN foreign_key_violation THEN ok := true;
+    END;
+    IF NOT ok THEN
+        RAISE EXCEPTION 'TEST 131 FAILED: orphan INSERT into encrypted child was not rejected';
+    END IF;
+
+    -- DELETE of the referenced plain parent must be blocked by the encrypted child.
+    ok := false;
+    BEGIN
+        DELETE FROM tde_fk_parent_131 WHERE id = 1;
+    EXCEPTION WHEN foreign_key_violation THEN ok := true;
+    END;
+    IF NOT ok THEN
+        RAISE EXCEPTION 'TEST 131 FAILED: DELETE of the referenced plain parent was not blocked';
+    END IF;
+
+    DROP TABLE tde_fk_child_131;
+    DROP TABLE tde_fk_parent_131;
+    RAISE NOTICE
+        'TEST 131 PASSED: FK lifecycle on plain parent + encrypted child (no decode_slot crash)';
+END;
+$$;
+
+
+-- ================================================================
 -- PHASE SUMMARY
 -- ================================================================
 DO $$
 BEGIN
     RAISE NOTICE '============================================================';
-    RAISE NOTICE 'v1.7 Tests 111-128 — COMPLETE';
+    RAISE NOTICE 'v1.7 Tests 111-131 — COMPLETE';
     RAISE NOTICE '   tde_int4_enc_ops + disk forensic check . test 111';
     RAISE NOTICE '   tde_int8_enc_ops equality lookup ........ test 112';
     RAISE NOTICE '   tde_uuid_enc_ops equality lookup ........ test 113';
@@ -930,6 +1137,9 @@ BEGIN
     RAISE NOTICE '   DETACH keeps leaf readable .............. test 126';
     RAISE NOTICE '   MIXED tree limitation (doc) ............. test 127';
     RAISE NOTICE '   HOT disabled on encrypted_heap (IV-first) .. test 128';
+    RAISE NOTICE '   FK encrypted parent + encrypted child ... test 129';
+    RAISE NOTICE '   FK encrypted parent + plain child ....... test 130';
+    RAISE NOTICE '   FK plain parent + encrypted child ....... test 131';
     RAISE NOTICE '============================================================';
 END;
 $$;

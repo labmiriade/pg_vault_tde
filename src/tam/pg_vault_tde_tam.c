@@ -116,6 +116,9 @@ static TM_Result  (*heapam_tuple_lock_cb)(Relation, ItemPointer, Snapshot,
                                            TupleTableSlot *, CommandId,
                                            LockTupleMode, LockWaitPolicy,
                                            uint8, TM_FailureData *);
+static bool       (*heapam_tuple_satisfies_snapshot_cb)(Relation,
+                                                         TupleTableSlot *,
+                                                         Snapshot);
 /* save original heapam delete callback */
 static TM_Result (*heapam_tuple_delete_cb)(Relation rel,
                                            ItemPointer tid,
@@ -887,6 +890,47 @@ pg_vault_tde_tuple_lock(Relation relation, ItemPointer tid,
     if (result == TM_Ok && !TupIsNull(slot))
         pg_vault_tde_decode_slot(slot);  /* automatic TOAST routing */
     return result;
+}
+
+/*
+ * pg_vault_tde_tuple_satisfies_snapshot
+ *
+ * Visibility recheck used by RI foreign-key triggers via
+ * table_tuple_satisfies_snapshot (RI_FKey_check, ri_triggers.c).  heapam's
+ * version takes the slot's pinned buffer content lock and runs
+ * HeapTupleSatisfiesVisibility on the on-buffer tuple — it asserts the slot
+ * still holds a valid buffer pin.
+ *
+ * Our read paths decrypt into a palloc'd HeapTuple and release the pin
+ * (decode_slot leaves bslot->buffer == InvalidBuffer), so delegating would
+ * call LockBuffer(InvalidBuffer) → GetBufferDescriptor(-1) → SIGSEGV.
+ *
+ * The MVCC header is plaintext and copied verbatim into the decrypted tuple,
+ * so visibility only needs the page the tuple lives on (for hint bits).
+ * Re-pin it from the tuple's physical TID, lock shared, run the standard check.
+ */
+static bool
+pg_vault_tde_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
+                                       Snapshot snapshot)
+{
+    BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) slot;
+    Buffer  buffer;
+    bool    res;
+
+    Assert(TTS_IS_BUFFERTUPLE(slot));
+
+    /* Still buffer-backed (non-decrypted slot): heapam handles it directly. */
+    if (bslot->buffer != InvalidBuffer)
+        return heapam_tuple_satisfies_snapshot_cb(rel, slot, snapshot);
+
+    /* Decrypted slot: re-pin the page the tuple lives on for the check. */
+    buffer = ReadBuffer(rel,
+                        ItemPointerGetBlockNumber(&bslot->base.tuple->t_self));
+    LockBuffer(buffer, BUFFER_LOCK_SHARE);
+    res = HeapTupleSatisfiesVisibility(bslot->base.tuple, snapshot, buffer);
+    LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+    ReleaseBuffer(buffer);
+    return res;
 }
 
 /*
@@ -1763,6 +1807,7 @@ pg_vault_tde_tam_init(void)
     heapam_scan_sample_next_tuple_cb        = heapam->scan_sample_next_tuple;
     heapam_tuple_fetch_row_version_cb       = heapam->tuple_fetch_row_version;
     heapam_tuple_lock_cb                    = heapam->tuple_lock;
+    heapam_tuple_satisfies_snapshot_cb      = heapam->tuple_satisfies_snapshot;
     heapam_tuple_delete_cb                  = heapam->tuple_delete;
     /* --- Install encrypt/decrypt wrappers --- */
     /* Slot type: always buffer-backed (needed for decode_slot cast) */
@@ -1781,6 +1826,8 @@ pg_vault_tde_tam_init(void)
     tde_methods.scan_sample_next_tuple      = pg_vault_tde_scan_sample_next_tuple;
     tde_methods.tuple_fetch_row_version     = pg_vault_tde_tuple_fetch_row_version;
     tde_methods.tuple_lock                  = pg_vault_tde_tuple_lock;
+    /* Visibility recheck (RI FK triggers): tolerate decrypted, unpinned slots */
+    tde_methods.tuple_satisfies_snapshot    = pg_vault_tde_tuple_satisfies_snapshot;
     /* Index build: bypass rd_tableam identity check inside heap_getnext */
     tde_methods.index_build_range_scan      = pg_vault_tde_index_build_range_scan;
     tde_methods.relation_copy_for_cluster   = pg_vault_tde_relation_copy_for_cluster;

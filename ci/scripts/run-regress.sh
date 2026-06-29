@@ -161,12 +161,12 @@ else
     exit 2
 fi
 
-# ── Phase 6: v1.7 wallet tests (tests 111-128) ────────────────────────────
-log_info "Running v1.7 wallet regression_test_v17.sql (tests 111-128) ..."
+# ── Phase 6: v1.7 wallet tests (tests 111-131) ────────────────────────────
+log_info "Running v1.7 wallet regression_test_v17.sql (tests 111-131) ..."
 START=$(timer_start)
 if container_psql "$CONTAINER" -f /tmp/regression_test_v17.sql; then
     ELAPSED=$(timer_elapsed "$START")
-    log_ok "REGRESSION v1.7 wallet: tests 111-128 OK ($(timer_fmt "$ELAPSED"))"
+    log_ok "REGRESSION v1.7 wallet: tests 111-131 OK ($(timer_fmt "$ELAPSED"))"
 else
     ELAPSED=$(timer_elapsed "$START")
     log_error "REGRESSION v1.7 wallet: FAILED after $(timer_fmt "$ELAPSED")"
@@ -174,5 +174,5 @@ else
     exit 2
 fi
 
-log_ok "REGRESSION COMPLETE: ALL 127 TESTS PASSED (v1.4 × 52 + v1.5 × 20 + v1.6 × 37 + v1.7 × 18)"
+log_ok "REGRESSION COMPLETE: ALL 130 TESTS PASSED (v1.4 × 52 + v1.5 × 20 + v1.6 × 37 + v1.7 × 21)"
 exit 0
