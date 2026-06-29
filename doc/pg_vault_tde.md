@@ -210,47 +210,55 @@ This function is the core of the read path. It:
 
 1. Casts the slot to `BufferHeapTupleTableSlot` (known buffer-backed after heapam)
 2. **Guards against double-decode**: checks `bslot->buffer == InvalidBuffer`
-3. Saves `bslot->base.tuple->t_self` (physical TID from buffer page header)
-4. Calls `heap_copytuple(bslot->base.tuple)` while buffer pin is held
-5. Calls `ExecClearTuple(slot)` to release the buffer pin
-6. Calls `tde_decrypt_heap_tuple(enc_copy)` (verifies GCM tag via OpenSSL)
-7. Stamps `plain->t_self = saved_tid`, `plain->t_tableOid = saved_tableoid`
-8. Calls `ExecForceStoreHeapTuple(plain, slot, true)`
-9. **Manually sets `slot->tts_tid = saved_tid`** — `ExecForceStoreHeapTuple`
-   does NOT restore `tts_tid` for virtual/minimal slots; it must be set explicitly
+3. Saves `bslot->base.tuple->t_self` (physical TID) and `t_tableOid` (relation OID) from the buffer page
+4. Calls `tde_decrypt_heap_tuple(bslot->base.tuple, saved_tableoid)` — decrypts the
+   buffer-backed tuple directly (verifies GCM tag via OpenSSL). **No `heap_copytuple`
+   and no explicit `ExecClearTuple`**: the buffer pin must stay held until the
+   force-store below. Releasing it early forces O(rows) buffer re-pins during a
+   sequential scan instead of O(pages) (see performance note in the function header).
+5. Stamps `plain->t_self = saved_tid`, `plain->t_tableOid = saved_tableoid`
+6. Calls `ExecForceStoreHeapTuple(plain, slot, true)` — this performs the single
+   internal `ExecClearTuple` that releases the buffer pin (the only release point)
+7. **Manually sets `slot->tts_tid = saved_tid`** — `ExecForceStoreHeapTuple`
+   does NOT restore `tts_tid` for buffer slots; it must be set explicitly
 
 ```c
 static void pg_vault_tde_decode_slot(TupleTableSlot *slot)
 {
     BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) slot;
+    HeapTuple   plain;
+    ItemPointerData saved_tid;
+    Oid         saved_tableoid;
 
     /*
      * Guard against double-decode: after ExecForceStoreHeapTuple the buffer
      * is released (buffer == InvalidBuffer) but base.tuple is still set.
      * Re-entering here would try to decrypt already-plain data.
      */
-    if (bslot->buffer == InvalidBuffer) return;
+    if (bslot->buffer == InvalidBuffer)
+        return;
 
     /*
-     * Read TID from the buffer-backed pointer directly, NOT from
+     * Read TID + relation OID from the buffer-backed pointer directly, NOT from
      * ExecFetchSlotHeapTuple(slot, false, ...) which returns the tupdata
      * workspace with an uninitialized t_self.
      */
-    ItemPointerData saved_tid;
     ItemPointerCopy(&bslot->base.tuple->t_self, &saved_tid);
+    saved_tableoid = bslot->base.tuple->t_tableOid;
 
-    /* Copy encrypted data while the buffer pin is still held. */
-    HeapTuple enc_copy = heap_copytuple(bslot->base.tuple);
-    ExecClearTuple(slot);   /* releases buffer pin */
+    /*
+     * Decrypt the buffer-backed tuple in place (verifies GCM tag; ereport(ERROR)
+     * on tamper).  Do NOT call heap_copytuple/ExecClearTuple first: the pin must
+     * stay held until ExecForceStoreHeapTuple, which releases it exactly once per
+     * tuple.  Releasing early causes O(rows) buffer hits on sequential scans.
+     */
+    plain = tde_decrypt_heap_tuple(bslot->base.tuple, saved_tableoid);
 
-    HeapTuple plain = tde_decrypt_heap_tuple(enc_copy);
-    pfree(enc_copy);
+    ItemPointerCopy(&saved_tid, &plain->t_self);
+    plain->t_tableOid = saved_tableoid;
 
-    plain->t_self    = saved_tid;
-    plain->t_tableOid = slot->tts_tableOid;
-
-    ExecForceStoreHeapTuple(plain, slot, true);
-    slot->tts_tid = saved_tid;  /* ExecForceStoreHeapTuple does not set this */
+    ExecForceStoreHeapTuple(plain, slot, true);   /* internal ExecClearTuple releases pin */
+    ItemPointerCopy(&saved_tid, &slot->tts_tid);  /* ExecForceStoreHeapTuple does not set this */
 }
 ```
 
@@ -383,7 +391,7 @@ Test 16 covers this edge case.
 - DEK copies in per-backend memory are `OPENSSL_cleanse`d before `pfree`.
 - Plaintext `HeapTuple` intermediates are `OPENSSL_cleanse`d after encryption.
 - Per-backend EVP contexts are freed via `on_proc_exit()` callbacks
-  (`tde_iam_siv_ctx_cleanup` for AES-SIV; analogous cleanup for GCM contexts).
+  (`tde_iam_ctx_cleanup` for AES-SIV; analogous cleanup for GCM contexts).
 - Shared-memory DEK is `OPENSSL_cleanse`d during rotation before the new key
   is written.
 
@@ -427,8 +435,9 @@ On any fatal OpenSSL error `tde_crypto_ctx_cleanup()` frees and NULL-outs both
 contexts (and resets their `relid` to `InvalidOid`) so the next call
 re-allocates and re-keys cleanly. Both contexts are freed in the
 `on_proc_exit()` callback `tde_crypto_ctx_cleanup()`, which also wipes the IV
-batch. The same allocate-once pattern is applied to the IAM SIV contexts
-(`tde_iam_siv_enc_ctx`, `tde_iam_siv_dec_ctx`).
+batch. The same allocate-once pattern is applied to the IAM: a single per-backend
+AES-256-SIV context, re-keyed only when the `(idx_oid, generation)` pair changes
+(`tde_iam_ctx_prepare`), freed by `tde_iam_ctx_cleanup()`.
 
 ### IV Batch Generation
 
@@ -808,7 +817,7 @@ access control but do not replace it.
 │  ... tuples grow downward from end of page ...                     │
 │                                                                    │
 │  ┌─────────────────────────────┬─────────────────────────────────┐ │
-│  │  HeapTupleHeaderData        ││IV(12)│CT│TAG(16)│VER(1)│GEN(8)|| │
+│  │  HeapTupleHeaderData        │IV(12)│CT│TAG(16)│VER(1)│GEN(8)│ │
 │  │  (t_hoff bytes, PLAINTEXT)  │                                 │ │
 │  └─────────────────────────────┴─────────────────────────────────┘ │
 └────────────────────────────────────────────────────────────────────┘
@@ -885,10 +894,10 @@ value; no shared state is changed.
 
 | Parameter | Type | Default | Context | Description |
 |---|---|---|---|---|
-| `kms_provider` | string | `vault` | suset | Active KMS backend: `vault`, `local` (v1.6). Settable per-database. |
+| `kms_provider` | string | `''` (unset — must be configured) | suset | Active KMS backend: `vault`, `local` (v1.6). Settable per-database. |
 | `vault_url` | string | `''` | suset | Vault / OpenBao base URL |
 | `vault_namespace` | string | `''` | suset | Vault namespace (enterprise; empty for community) |
-| `vault_auth_method` | string | `token` | suset | Vault auth method: `token`, `approle`, or `kubernetes` — hidden from `pg_settings` |
+| `vault_auth_method` | string | `token` | suset | Vault auth method: `token`, `approle`, or `kubernetes` |
 | `vault_token` | string | `''` | suset | Auth token — hidden from `pg_settings` (`GUC_NOT_IN_SAMPLE`) |
 | `vault_role_id` | string | `''` | suset | AppRole role_id UUID — hidden from `pg_settings` |
 | `vault_secret_id` | string | `''` | suset | AppRole secret_id — hidden from `pg_settings` |
@@ -948,7 +957,7 @@ _PG_init()
   │           + install 4 write + 7 read + 1 TOAST AM wrappers
   └── register on_proc_exit(tde_backend_cleanup)
           ├── tde_crypto_ctx_cleanup()   ← EVP_CIPHER_CTX_free + OPENSSL_cleanse iv_batch
-          └── tde_iam_siv_ctx_cleanup()  ← EVP_CIPHER_CTX_free SIV enc/dec pool
+          └── tde_iam_ctx_cleanup()      ← EVP_CIPHER_CTX_free SIV enc/dec context
 ```
 
 #### Critical: Why LWLockNewTrancheId cannot be called from _PG_init

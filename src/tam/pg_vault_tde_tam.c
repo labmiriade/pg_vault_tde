@@ -264,12 +264,13 @@ tde_decrypt_heap_tuple(HeapTuple enc, Oid relid)
     plain = (HeapTuple) palloc0(HEAPTUPLESIZE + hdr_len + pt_len);
     plain->t_data = (HeapTupleHeader) ((char *) plain + HEAPTUPLESIZE);
     memcpy(plain->t_data, enc->t_data, hdr_len);
-    /* GCM verified inside; ERROR on tamper, false on non-v4 version byte. */
+    /* GCM auth failure ereports inside; returns false only on non-v4 version byte. */
     if (!tde_gcm_decrypt(relid, enc_data, enc_len,
                          (char *) plain->t_data + hdr_len, &pt_len))
     {
         pfree(plain);
-        return NULL;
+        ereport(ERROR,
+                    (errmsg("pg_vault_tde: decryption failed")));
     }
     plain->t_len      = (uint32) (hdr_len + pt_len);
     plain->t_self     = enc->t_self;
@@ -294,7 +295,7 @@ tde_decrypt_heap_tuple(HeapTuple enc, Oid relid)
  *
  * Instead we let ExecForceStoreHeapTuple() release the pin internally
  * (it calls ExecClearTuple as its first step).  The pin stays held during
- * heap_copytuple → decrypt → pfree, and is released only once per tuple
+ * the in-place decrypt, and is released only once per tuple
  * by the force-store call — preserving the natural page-at-a-time access
  * pattern of heapam.
  */
@@ -328,9 +329,9 @@ pg_vault_tde_decode_slot(TupleTableSlot *slot)
     ItemPointerCopy(&bslot->base.tuple->t_self, &saved_tid);
     saved_tableoid = bslot->base.tuple->t_tableOid;
     /*
-     * Palloc a copy of the encrypted tuple while the buffer pin is still
-     * held by the slot.  This is just a memcpy — cheap compared to a page
-     * re-fetch if the pin were released prematurely.
+     * Decrypt the buffer-backed tuple directly while the slot still holds the
+     * pin.  tde_decrypt_heap_tuple pallocs the plaintext copy; the encrypted
+     * source is read straight from the shared buffer.
      *
      * NOTE: Do NOT call ExecClearTuple() here.  The buffer pin must stay
      * held until ExecForceStoreHeapTuple() below, which releases it as
@@ -356,8 +357,8 @@ pg_vault_tde_decode_slot(TupleTableSlot *slot)
      *
      * ExecForceStoreHeapTuple calls ExecClearTuple internally as its first
      * step, which releases the buffer pin.  This is the ONLY place the pin
-     * is released — exactly once per tuple, and only after we have already
-     * copied the ciphertext out via heap_copytuple above.
+     * is released — exactly once per tuple, and only after the plaintext copy
+     * has already been produced by tde_decrypt_heap_tuple above.
      *
      * IMPORTANT: ExecForceStoreHeapTuple into a BufferHeapTupleTableSlot
      * does NOT set slot->tts_tid (it calls ExecClearTuple then copies the
@@ -1269,7 +1270,7 @@ tde_tuple_has_external(HeapTuple tup, Relation rel)
         return false;
     
     tupdesc = RelationGetDescr(rel);
-    natts = Min(tupdesc->natts, HeapTupleHeaderGetNatts(tup->t_data));
+    natts = tupdesc->natts;
 
     if (unlikely(natts > MAX_STACK_ATTRS))
     {

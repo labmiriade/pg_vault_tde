@@ -9,7 +9,7 @@ decrypted after it leaves. Encryption keys are managed by **HashiCorp Vault** /
 **OpenBao** or a **local PKCS#12 wallet** and cached in shared memory with
 automatic rotation.
 
-**Current release: v1.7** — 118 regression tests (52 v1.4 + 20 v1.5 + 37 v1.6), zero compiler warnings on PG 17 + PG 18.
+**Current release: v1.7** — 109 regression tests (52 v1.4 + 20 v1.5 + 37 v1.6), zero compiler warnings on PG 17 + PG 18.
 
 ### PostgreSQL Version Compatibility
 
@@ -218,7 +218,7 @@ v4 overhead: **37 bytes per tuple** (12-byte IV + 16-byte GCM authentication tag
 The IV-first layout keeps the version/generation bytes at the **end** so the blob has no
 byte-stable prefix — this is what structurally disables HOT updates (see
 [Limitations](#limitations-v17)).
-v4 also passes `[database_oid(4) | relfilenode(4) | generation(8)]` as AEAD Additional
+v4 also passes `[database_oid(4) | relid(4) | generation(8)]` as AEAD Additional
 Authenticated Data (AAD) — zero wire overhead; prevents cross-table ciphertext smuggling.
 
 ---
@@ -286,7 +286,7 @@ pg_vault_tde.wallet_auto_open      = on
 -- First-time wallet setup (\set reads the shell var without exposing it in logs):
 \set PASSPHRASE `echo $TDE_WALLET_PASSPHRASE`
 SELECT pg_vault_tde_wallet_init(:'PASSPHRASE');
--- Check status (6-column SRF):
+-- Check status (5-column SRF):
 SELECT * FROM pg_vault_tde_wallet_status();
 -- Interactive unlock (without PG restart):
 SELECT pg_vault_tde_wallet_unlock('my_passphrase');
@@ -421,7 +421,6 @@ All parameters are `suset` — settable per-database with `ALTER DATABASE SET`.
 | `vault_key_name` | string | `pg-tde-dek` | suset | Transit key name for DEK wrapping. Override per-database to isolate tenant keys. |
 | `vault_ca_cert` | string | `''` | suset | Path to CA bundle for Vault TLS verification |
 | `vault_timeout_ms` | integer | `5000` | suset | Vault HTTP timeout in ms (0 = no timeout) |
-| `vault_response_wrapping` | boolean | `off` | suset | Use Vault response-wrapping for AppRole secret_id (v1.5) |
 
 ### Background Worker
 
@@ -435,8 +434,6 @@ All parameters are `suset` — settable per-database with `ALTER DATABASE SET`.
 | Parameter | Type | Default | Context | Description |
 |---|---|---|---|---|
 | `enabled` | boolean | `on` | suset | Master switch — set `off` to measure TAM overhead without crypto. Settable per-database. |
-| `dump_plaintext_warning` | boolean | `on` | sighup | Emit WARNING when `pg_dump`/`COPY TO` reads from an encrypted table (v1.7) |
-| `encrypt_statistics` | boolean | `off` | sighup | Encrypt `pg_statistic` MCVs/histograms for encrypted columns (v1.8) |
 
 ---
 
@@ -461,16 +458,17 @@ AUDIT: event=<name>, oid=<relation_oid_or_dash>, user=<role_name>, success=<t|f>
 
 ### Logged events
 
-| Event | Trigger | PCI DSS ref |
+The `event=` field carries the value below (note the DEK/KEK events drop the `KMS_` prefix in the log line):
+
+| `event=` value | Trigger | PCI DSS ref |
 |---|---|---|
 | `AUDIT_LOG_START` | Audit subsystem initialised at server start | 10.2.1.6 |
 | `AUDIT_LOG_STOP` | Audit subsystem shut down | 10.2.1.6 |
-| `KMS_DEK_ACCESS` | DEK read from shared-memory cache or KMS | — |
-| `KMS_DEK_CREATE` | New per-relation DEK generated | — |
-| `KMS_DEK_UPDATE` | DEK metadata updated in catalog | — |
-| `KMS_DEK_ROTATE` | Per-relation DEK rotated (`pg_vault_tde_rotate_online`) | 10.2.1.7 |
-| `KMS_DEK_DELETE` | DEK revoked / removed from catalog (`DROP TABLE`) | 10.2.1.7 |
-| `KMS_KEK_ROTATE` | KEK rotated (`pg_vault_tde_rotate_kek`) | 10.2.1.7 |
+| `DEK_ACCESS` | DEK read from shared-memory cache or KMS | — |
+| `DEK_CREATE` | New per-relation DEK generated | — |
+| `DEK_ROTATE` | Per-relation DEK rotated (`pg_vault_tde_rotate_online`) | 10.2.1.7 |
+| `DEK_DELETE` | DEK revoked / removed from catalog (`DROP TABLE`) | 10.2.1.7 |
+| `KEK_ROTATE` | KEK rotated (`pg_vault_tde_rotate_kek`) | 10.2.1.7 |
 | `KMS_AUTH_SUCCESS` | KMS / Vault authentication succeeded | 10.2.1.5 |
 | `KMS_AUTH_FAILURE` | KMS / Vault authentication failed | 10.2.1.5 |
 | `WALLET_OPEN` | Local wallet opened (`pg_vault_tde_wallet_unlock`) | — |
@@ -478,7 +476,9 @@ AUDIT: event=<name>, oid=<relation_oid_or_dash>, user=<role_name>, success=<t|f>
 | `RELATION_ENCRYPT` | Relation converted to `encrypted_heap` | 10.2.1.7 |
 | `RELATION_DECRYPT` | `encrypted_heap` converted back to plain heap | 10.2.1.7 |
 | `ACCESS_DENIED` | Decryption failed — wrong key or missing permission | 10.2.1.4 |
-| `INTEGRITY_VIOLATION` | GCM authentication tag or page checksum failure | — |
+
+`DEK_UPDATE` and `INTEGRITY_VIOLATION` are defined in the audit enum but not yet
+emitted by any code path (reserved for a future release).
 
 ### Routing audit logs
 
@@ -502,14 +502,14 @@ log stream without any extension-level configuration.
 
 | Function | Returns | Description |
 |---|---|---|
-| `pg_vault_tde_health_check()` | composite | KMS, DEK, crypto, and wallet status (15 columns) |
+| `pg_vault_tde_health_check()` | composite | Status (5 columns: version, enabled, kms_provider, enc_ops_available, checked_at) |
 | `pg_vault_tde_verify_integrity(regclass)` | void | GCM tag audit scan of all tuples |
 | `pg_vault_tde_reencrypt_table(regclass, int)` | bigint | Batch re-encrypt with current DEK (locks table) |
 | `pg_vault_tde_rotate_online(regclass, int)` | void | BGW-based online rotation, no exclusive lock **(v1.5)** |
 | `pg_vault_tde_rotation_status(regclass)` | composite | Online rotation progress **(v1.5)** |
 | `pg_vault_tde_wallet_init(text)` | void | Create local wallet and generate KEK **(v1.5)** |
 | `pg_vault_tde_wallet_change_passphrase(text, text)` | void | Re-protect wallet with new passphrase and automatically rotate the KEK (`local` provider only); no separate `rotate_kek()` needed **(v1.6)** |
-| `pg_vault_tde_wallet_status()` | composite | Wallet existence, open state, algorithm, DEK count, last opened, file perms (6 cols) **(v1.6)** |
+| `pg_vault_tde_wallet_status()` | composite | Wallet existence, open state, algorithm, last opened, file perms (5 cols) **(v1.6)** |
 | `pg_vault_tde_wallet_unlock(text)` | void | Interactive wallet unlock without PG restart **(v1.6)** |
 | `pg_vault_tde_wallet_lock()` | void | Evict all DEKs from shmem, mark wallet closed **(v1.6)** |
 | `pg_vault_tde_rotate_kek()` | void | Rotate the KEK and re-wrap all per-table DEKs under a new key; works for both `local` and `vault` providers; no tuple data re-encrypted **(v1.7)** |
@@ -613,7 +613,7 @@ Test coverage (109 tests = 52 v1.4 + 20 v1.5 + 37 v1.6):
 - Tests 65-67: tde_btree native type operator classes (text, int4, uuid) **(v1.5)**
 - Tests 68-69: Wire format v3 AEAD AAD — cross-table paste attack rejected **(v1.5)**
 - Tests 70-72: Online key rotation BGW — concurrent SELECTs, progress tracking, BGW completion **(v1.5)**
-- Tests 73-77: Wallet provider — init/unlock/lock, `wallet_status()` 6-col schema (`wallet_exists`, `wallet_open`, `kek_algorithm`, `dek_count`, `last_opened`, `file_perms`), DEK round-trip with wallet KEK **(v1.6)**
+- Tests 73-77: Wallet provider — init/unlock/lock, `wallet_status()` 5-col schema (`wallet_exists`, `wallet_open`, `kek_algorithm`, `last_opened`, `file_perms`), DEK round-trip with wallet KEK **(v1.6)**
 - Tests 78-79: Wallet `change_passphrase` re-wraps under new KEK; `rotate_kek` re-wraps all per-table DEKs (catalog ciphertext changes; both tables remain readable) **(v1.6 patch)**
 - Test 80: Wallet `export_bundle`/`import_bundle` round-trip — SKIPS gracefully if `pg_vault_tde.wallet_passphrase_env` source is not configured (export needs the passphrase string to derive the bundle HMAC key) **(v1.6)**
 - Test 81: DDL hook registers BOTH parent and `reltoastrelid` in `pg_vault_tde_catalog`; DROP deregisters both **(v1.6)**
@@ -902,7 +902,6 @@ See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
    the file is written in **plaintext**. PostgreSQL writes the materialized tuples directly
    through the executor's tuplestore layer, bypassing the TAM write path, so
    `pg_vault_tde` has no opportunity to encrypt the data before it reaches disk.
-
    **Mitigation until v1.7:** set `work_mem` large enough to keep cursor data in memory,
    or avoid `WITH HOLD` cursors on encrypted tables in memory-constrained environments.
 
@@ -910,7 +909,6 @@ See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
    maintains the index): On an `encrypted_heap` table `heap_update` never chooses a HOT
    (heap-only) update — every UPDATE writes new index entries, keeping `tde_btree` indexes
    coherent without a `REINDEX`.
-
    **How:** `heap_update` decides whether an update is HOT by comparing the indexed columns
    byte-for-byte between the old and new tuple. Both tuples are encrypted, and the v4 wire
    format is **IV-first**: it begins with the random GCM IV, which changes on every

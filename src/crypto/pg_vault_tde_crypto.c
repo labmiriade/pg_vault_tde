@@ -390,12 +390,12 @@ tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len,
 
         TdeRelDekMap cache_entry;
         Oid dek_relid = resolve_effective_relid(relid);
+        bool    found = false;
 
         memcpy(&stored_gen, gen_ptr, TDE_V4_GEN_LEN);
 
         if(!tde_catalog_cache_entry(dek_relid, &cache_entry))
-        {
-            bool    found = false;   
+        {   
             current_gen = pg_vault_tde_catalog_get_rel_generation(dek_relid);
                 
             if(stored_gen == current_gen)
@@ -406,13 +406,9 @@ tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len,
             {
                 found = pg_vault_tde_kms_get_rel_prev_dek(dek_relid, (unsigned char *) dek, TDE_DEK_LEN);
             }
-
-            if(!found)
-                return false;
         }
         else
         {
-            bool    found = false;
             current_gen = cache_entry.generation;
 
             if(stored_gen == current_gen && cache_entry.dek_valid)
@@ -425,10 +421,12 @@ tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len,
                 memcpy(dek, cache_entry.prev_dek, TDE_DEK_LEN);
                 found = true;
             }
-
-            if(!found)
-                return false;
         }
+
+        OPENSSL_cleanse(&cache_entry, sizeof(TdeRelDekMap));
+
+        if(!found)
+            return false;
 
     }
 
