@@ -2452,16 +2452,23 @@ pg_vault_tde_migrate_vault_to_wallet_sql(PG_FUNCTION_ARGS)
 
         MemoryContextReset(tuple_ctx);
 
-        PG_TRY();
         {
-            heap_deform_tuple(old_tuple, tup_desc, values, is_null);
+            volatile bool skip = false;
 
-            if (is_null[3])
+            PG_TRY();
             {
-                continue;
-            }
+                heap_deform_tuple(old_tuple, tup_desc, values, is_null);
 
-            wdek_bytea = DatumGetByteaPP(values[Anum_pg_vault_tde_wrapped_dek-1]);
+                if (is_null[Anum_pg_vault_tde_wrapped_dek - 1])
+                {
+                    ereport(WARNING,
+                            errmsg("pg_vault_tde: catalog entry with null DEK, skipping"));
+                    skip = true;
+                }
+
+                if (!skip)
+                {
+                wdek_bytea = DatumGetByteaPP(values[Anum_pg_vault_tde_wrapped_dek-1]);
             vault_wlen = (int) VARSIZE_ANY_EXHDR(wdek_bytea);
 
             old_ctx = MemoryContextSwitchTo(tuple_ctx);
@@ -2509,25 +2516,30 @@ pg_vault_tde_migrate_vault_to_wallet_sql(PG_FUNCTION_ARGS)
 
             new_tuple = heap_modify_tuple(old_tuple, tup_desc, values, is_null, replaces);
 
-            CatalogTupleUpdateWithInfo(catalog_rel, &(old_tuple->t_self), new_tuple, indstate);
+                CatalogTupleUpdateWithInfo(catalog_rel, &(old_tuple->t_self), new_tuple, indstate);
 
-            MemoryContextSwitchTo(old_ctx);
+                MemoryContextSwitchTo(old_ctx);
 
-            migrated++;
-        }
-        PG_CATCH();
-        {
-            OPENSSL_cleanse(plain_dek, TDE_DEK_LEN);
-            OPENSSL_cleanse(new_wrapped, sizeof(new_wrapped));
-            OPENSSL_cleanse(new_pass, strlen(new_pass));
-            OPENSSL_cleanse(new_kek, TDE_DEK_LEN);
-            pfree(new_pass);
-            systable_endscan(scan);
-            CatalogCloseIndexes(indstate);
-            table_close(catalog_rel, ShareRowExclusiveLock);
-            PG_RE_THROW();
-        }
-        PG_END_TRY();
+                migrated++;
+                } /* end if (!skip) */
+            }
+            PG_CATCH();
+            {
+                OPENSSL_cleanse(plain_dek, TDE_DEK_LEN);
+                OPENSSL_cleanse(new_wrapped, sizeof(new_wrapped));
+                OPENSSL_cleanse(new_pass, strlen(new_pass));
+                OPENSSL_cleanse(new_kek, TDE_DEK_LEN);
+                pfree(new_pass);
+                systable_endscan(scan);
+                CatalogCloseIndexes(indstate);
+                table_close(catalog_rel, ShareRowExclusiveLock);
+                PG_RE_THROW();
+            }
+            PG_END_TRY();
+
+            if (skip)
+                continue;
+        } /* end scoping block */
     }
 
     MemoryContextDelete(tuple_ctx);
