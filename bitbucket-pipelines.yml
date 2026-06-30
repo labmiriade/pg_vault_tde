@@ -75,239 +75,240 @@ definitions:
     - pg_isready -p $PGPORT -t 30
 
 pipelines:
-  default:
-    # ══════════════════════════════════════════════════════════════════════
-    # PostgreSQL 17
-    # ══════════════════════════════════════════════════════════════════════
-    - step:
-        name: Build (PG 17)
-        caches: [apt-pgdg]
-        script:
-          - export PG_MAJOR=17
-          - *install-pg17
-          - make PG_CONFIG=$(which pg_config) 2>&1 | tee /tmp/build.log
-          - |
-            if grep -qE ': warning:' /tmp/build.log; then
-              echo "FATAL: Compilation produced warnings — zero-warning policy violated"
-              grep ': warning:' /tmp/build.log
-              exit 1
-            fi
-          - make install PG_CONFIG=$(which pg_config)
+  branches:
+    feature/pipeline-ci:
+      # ══════════════════════════════════════════════════════════════════════
+      # PostgreSQL 17
+      # ══════════════════════════════════════════════════════════════════════
+      - step:
+          name: Build (PG 17)
+          caches: [apt-pgdg]
+          script:
+            - export PG_MAJOR=17
+            - *install-pg17
+            - make PG_CONFIG=$(which pg_config) 2>&1 | tee /tmp/build.log
+            - |
+              if grep -qE ': warning:' /tmp/build.log; then
+                echo "FATAL: Compilation produced warnings — zero-warning policy violated"
+                grep ': warning:' /tmp/build.log
+                exit 1
+              fi
+            - make install PG_CONFIG=$(which pg_config)
 
-    - step:
-        name: Regression Tests (PG 17)
-        caches: [apt-pgdg]
-        script:
-          - export PG_MAJOR=17
-          - *install-pg17
-          - make PG_CONFIG=$(which pg_config)
-          - make install PG_CONFIG=$(which pg_config)
-          - *init-cluster
-          - createdb -p $PGPORT regression_tde
-          - make installcheck
-              PGPORT=$PGPORT
-              PGDATABASE=regression_tde
-              PG_CONFIG=$(which pg_config)
-              REGRESS_OPTS="--dbname=regression_tde --port=$PGPORT"
-        after-script:
-          - cat "$PGDATA/logfile" 2>/dev/null || true
-          - pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true
+      - step:
+          name: Regression Tests (PG 17)
+          caches: [apt-pgdg]
+          script:
+            - export PG_MAJOR=17
+            - *install-pg17
+            - make PG_CONFIG=$(which pg_config)
+            - make install PG_CONFIG=$(which pg_config)
+            - *init-cluster
+            - createdb -p $PGPORT regression_tde
+            - make installcheck
+                PGPORT=$PGPORT
+                PGDATABASE=regression_tde
+                PG_CONFIG=$(which pg_config)
+                REGRESS_OPTS="--dbname=regression_tde --port=$PGPORT"
+          after-script:
+            - cat "$PGDATA/logfile" 2>/dev/null || true
+            - pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true
 
-    - step:
-        name: TAP Tests (PG 17)
-        caches: [apt-pgdg]
-        script:
-          - export PG_MAJOR=17
-          - *install-pg17
-          - apt-get install -y --no-install-recommends
-              perl cpanminus libipc-run-perl
-              libhttp-daemon-perl libhttp-message-perl
-          - make PG_CONFIG=$(which pg_config)
-          - make install PG_CONFIG=$(which pg_config)
-          - prove -v tap/*.t
-        after-script:
-          - cat /tmp/tde_test_data/logfile 2>/dev/null || true
+      - step:
+          name: TAP Tests (PG 17)
+          caches: [apt-pgdg]
+          script:
+            - export PG_MAJOR=17
+            - *install-pg17
+            - apt-get install -y --no-install-recommends
+                perl cpanminus libipc-run-perl
+                libhttp-daemon-perl libhttp-message-perl
+            - make PG_CONFIG=$(which pg_config)
+            - make install PG_CONFIG=$(which pg_config)
+            - prove -v tap/*.t
+          after-script:
+            - cat /tmp/tde_test_data/logfile 2>/dev/null || true
 
-    - step:
-        name: Isolation Tests (PG 17)
-        caches: [apt-pgdg]
-        script:
-          - export PG_MAJOR=17
-          - *install-pg17
-          - make PG_CONFIG=$(which pg_config)
-          - make install PG_CONFIG=$(which pg_config)
-          - export PGPORT=15433
-          - export PGDATA=/tmp/tde_isolation_data
-          - pg_ctlcluster $PG_MAJOR main stop 2>/dev/null || true
-          - su - postgres -c "initdb -D $PGDATA --no-locale -E UTF8" || initdb -D "$PGDATA" --no-locale -E UTF8
-          - |
-            cat >> "$PGDATA/postgresql.conf" <<EOF
-            shared_preload_libraries = 'pg_vault_tde'
-            port = $PGPORT
-            max_prepared_transactions = 10
-            log_min_messages = warning
-            EOF
-          - pg_ctl -D "$PGDATA" -l "$PGDATA/logfile" start
-          - pg_isready -p $PGPORT -t 30
-          - createdb -p $PGPORT isolation_tde
-          - make installcheck-isolation
-              PGPORT=$PGPORT
-              PG_CONFIG=$(which pg_config)
-              ISOLATION_OPTS="--dbname=isolation_tde --port=$PGPORT"
-        after-script:
-          - cat "$PGDATA/logfile" 2>/dev/null || true
-          - pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true
+      - step:
+          name: Isolation Tests (PG 17)
+          caches: [apt-pgdg]
+          script:
+            - export PG_MAJOR=17
+            - *install-pg17
+            - make PG_CONFIG=$(which pg_config)
+            - make install PG_CONFIG=$(which pg_config)
+            - export PGPORT=15433
+            - export PGDATA=/tmp/tde_isolation_data
+            - pg_ctlcluster $PG_MAJOR main stop 2>/dev/null || true
+            - su - postgres -c "initdb -D $PGDATA --no-locale -E UTF8" || initdb -D "$PGDATA" --no-locale -E UTF8
+            - |
+              cat >> "$PGDATA/postgresql.conf" <<EOF
+              shared_preload_libraries = 'pg_vault_tde'
+              port = $PGPORT
+              max_prepared_transactions = 10
+              log_min_messages = warning
+              EOF
+            - pg_ctl -D "$PGDATA" -l "$PGDATA/logfile" start
+            - pg_isready -p $PGPORT -t 30
+            - createdb -p $PGPORT isolation_tde
+            - make installcheck-isolation
+                PGPORT=$PGPORT
+                PG_CONFIG=$(which pg_config)
+                ISOLATION_OPTS="--dbname=isolation_tde --port=$PGPORT"
+          after-script:
+            - cat "$PGDATA/logfile" 2>/dev/null || true
+            - pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true
 
-    - step:
-        name: Memory Safety (PG 17)
-        caches: [apt-pgdg]
-        script:
-          - export PG_MAJOR=17
-          - *install-pg17
-          - apt-get install -y --no-install-recommends valgrind
-          - export PGPORT=15434
-          - export PGDATA=/tmp/tde_memcheck_data
-          - make clean
-          - make PG_CONFIG=$(which pg_config)
-              CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g -O1"
-              SHLIB_LINK="-lasan"
-          - make install PG_CONFIG=$(which pg_config)
-          - pg_ctlcluster $PG_MAJOR main stop 2>/dev/null || true
-          - su - postgres -c "initdb -D $PGDATA --no-locale -E UTF8" || initdb -D "$PGDATA" --no-locale -E UTF8
-          - |
-            cat >> "$PGDATA/postgresql.conf" <<EOF
-            shared_preload_libraries = 'pg_vault_tde'
-            port = $PGPORT
-            log_min_messages = warning
-            EOF
-          - pg_ctl -D "$PGDATA" -l "$PGDATA/logfile" start
-          - pg_isready -p $PGPORT -t 30
-          - createdb -p $PGPORT memcheck_tde
-          - >
-            ASAN_OPTIONS="detect_leaks=1:abort_on_error=1"
-            make installcheck
-              PGPORT=$PGPORT
-              PGDATABASE=memcheck_tde
-              PG_CONFIG=$(which pg_config)
-              REGRESS_OPTS="--dbname=memcheck_tde --port=$PGPORT"
-        after-script:
-          - cat "$PGDATA/logfile" 2>/dev/null || true
-          - pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true
+      - step:
+          name: Memory Safety (PG 17)
+          caches: [apt-pgdg]
+          script:
+            - export PG_MAJOR=17
+            - *install-pg17
+            - apt-get install -y --no-install-recommends valgrind
+            - export PGPORT=15434
+            - export PGDATA=/tmp/tde_memcheck_data
+            - make clean
+            - make PG_CONFIG=$(which pg_config)
+                CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g -O1"
+                SHLIB_LINK="-lasan"
+            - make install PG_CONFIG=$(which pg_config)
+            - pg_ctlcluster $PG_MAJOR main stop 2>/dev/null || true
+            - su - postgres -c "initdb -D $PGDATA --no-locale -E UTF8" || initdb -D "$PGDATA" --no-locale -E UTF8
+            - |
+              cat >> "$PGDATA/postgresql.conf" <<EOF
+              shared_preload_libraries = 'pg_vault_tde'
+              port = $PGPORT
+              log_min_messages = warning
+              EOF
+            - pg_ctl -D "$PGDATA" -l "$PGDATA/logfile" start
+            - pg_isready -p $PGPORT -t 30
+            - createdb -p $PGPORT memcheck_tde
+            - >
+              ASAN_OPTIONS="detect_leaks=1:abort_on_error=1"
+              make installcheck
+                PGPORT=$PGPORT
+                PGDATABASE=memcheck_tde
+                PG_CONFIG=$(which pg_config)
+                REGRESS_OPTS="--dbname=memcheck_tde --port=$PGPORT"
+          after-script:
+            - cat "$PGDATA/logfile" 2>/dev/null || true
+            - pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true
 
-    # ══════════════════════════════════════════════════════════════════════
-    # PostgreSQL 18
-    # ══════════════════════════════════════════════════════════════════════
-    - step:
-        name: Build (PG 18)
-        caches: [apt-pgdg]
-        script:
-          - export PG_MAJOR=18
-          - *install-pg18
-          - make PG_CONFIG=$(which pg_config) 2>&1 | tee /tmp/build.log
-          - |
-            if grep -qE ': warning:' /tmp/build.log; then
-              echo "FATAL: Compilation produced warnings — zero-warning policy violated"
-              grep ': warning:' /tmp/build.log
-              exit 1
-            fi
-          - make install PG_CONFIG=$(which pg_config)
+      # ══════════════════════════════════════════════════════════════════════
+      # PostgreSQL 18
+      # ══════════════════════════════════════════════════════════════════════
+      - step:
+          name: Build (PG 18)
+          caches: [apt-pgdg]
+          script:
+            - export PG_MAJOR=18
+            - *install-pg18
+            - make PG_CONFIG=$(which pg_config) 2>&1 | tee /tmp/build.log
+            - |
+              if grep -qE ': warning:' /tmp/build.log; then
+                echo "FATAL: Compilation produced warnings — zero-warning policy violated"
+                grep ': warning:' /tmp/build.log
+                exit 1
+              fi
+            - make install PG_CONFIG=$(which pg_config)
 
-    - step:
-        name: Regression Tests (PG 18)
-        caches: [apt-pgdg]
-        script:
-          - export PG_MAJOR=18
-          - *install-pg18
-          - make PG_CONFIG=$(which pg_config)
-          - make install PG_CONFIG=$(which pg_config)
-          - *init-cluster
-          - createdb -p $PGPORT regression_tde
-          - make installcheck
-              PGPORT=$PGPORT
-              PGDATABASE=regression_tde
-              PG_CONFIG=$(which pg_config)
-              REGRESS_OPTS="--dbname=regression_tde --port=$PGPORT"
-        after-script:
-          - cat "$PGDATA/logfile" 2>/dev/null || true
-          - pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true
+      - step:
+          name: Regression Tests (PG 18)
+          caches: [apt-pgdg]
+          script:
+            - export PG_MAJOR=18
+            - *install-pg18
+            - make PG_CONFIG=$(which pg_config)
+            - make install PG_CONFIG=$(which pg_config)
+            - *init-cluster
+            - createdb -p $PGPORT regression_tde
+            - make installcheck
+                PGPORT=$PGPORT
+                PGDATABASE=regression_tde
+                PG_CONFIG=$(which pg_config)
+                REGRESS_OPTS="--dbname=regression_tde --port=$PGPORT"
+          after-script:
+            - cat "$PGDATA/logfile" 2>/dev/null || true
+            - pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true
 
-    - step:
-        name: TAP Tests (PG 18)
-        caches: [apt-pgdg]
-        script:
-          - export PG_MAJOR=18
-          - *install-pg18
-          - apt-get install -y --no-install-recommends
-              perl cpanminus libipc-run-perl
-              libhttp-daemon-perl libhttp-message-perl
-          - make PG_CONFIG=$(which pg_config)
-          - make install PG_CONFIG=$(which pg_config)
-          - prove -v tap/*.t
-        after-script:
-          - cat /tmp/tde_test_data/logfile 2>/dev/null || true
+      - step:
+          name: TAP Tests (PG 18)
+          caches: [apt-pgdg]
+          script:
+            - export PG_MAJOR=18
+            - *install-pg18
+            - apt-get install -y --no-install-recommends
+                perl cpanminus libipc-run-perl
+                libhttp-daemon-perl libhttp-message-perl
+            - make PG_CONFIG=$(which pg_config)
+            - make install PG_CONFIG=$(which pg_config)
+            - prove -v tap/*.t
+          after-script:
+            - cat /tmp/tde_test_data/logfile 2>/dev/null || true
 
-    - step:
-        name: Isolation Tests (PG 18)
-        caches: [apt-pgdg]
-        script:
-          - export PG_MAJOR=18
-          - *install-pg18
-          - make PG_CONFIG=$(which pg_config)
-          - make install PG_CONFIG=$(which pg_config)
-          - export PGPORT=15433
-          - export PGDATA=/tmp/tde_isolation_data
-          - pg_ctlcluster $PG_MAJOR main stop 2>/dev/null || true
-          - su - postgres -c "initdb -D $PGDATA --no-locale -E UTF8" || initdb -D "$PGDATA" --no-locale -E UTF8
-          - |
-            cat >> "$PGDATA/postgresql.conf" <<EOF
-            shared_preload_libraries = 'pg_vault_tde'
-            port = $PGPORT
-            max_prepared_transactions = 10
-            log_min_messages = warning
-            EOF
-          - pg_ctl -D "$PGDATA" -l "$PGDATA/logfile" start
-          - pg_isready -p $PGPORT -t 30
-          - createdb -p $PGPORT isolation_tde
-          - make installcheck-isolation
-              PGPORT=$PGPORT
-              PG_CONFIG=$(which pg_config)
-              ISOLATION_OPTS="--dbname=isolation_tde --port=$PGPORT"
-        after-script:
-          - cat "$PGDATA/logfile" 2>/dev/null || true
-          - pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true
+      - step:
+          name: Isolation Tests (PG 18)
+          caches: [apt-pgdg]
+          script:
+            - export PG_MAJOR=18
+            - *install-pg18
+            - make PG_CONFIG=$(which pg_config)
+            - make install PG_CONFIG=$(which pg_config)
+            - export PGPORT=15433
+            - export PGDATA=/tmp/tde_isolation_data
+            - pg_ctlcluster $PG_MAJOR main stop 2>/dev/null || true
+            - su - postgres -c "initdb -D $PGDATA --no-locale -E UTF8" || initdb -D "$PGDATA" --no-locale -E UTF8
+            - |
+              cat >> "$PGDATA/postgresql.conf" <<EOF
+              shared_preload_libraries = 'pg_vault_tde'
+              port = $PGPORT
+              max_prepared_transactions = 10
+              log_min_messages = warning
+              EOF
+            - pg_ctl -D "$PGDATA" -l "$PGDATA/logfile" start
+            - pg_isready -p $PGPORT -t 30
+            - createdb -p $PGPORT isolation_tde
+            - make installcheck-isolation
+                PGPORT=$PGPORT
+                PG_CONFIG=$(which pg_config)
+                ISOLATION_OPTS="--dbname=isolation_tde --port=$PGPORT"
+          after-script:
+            - cat "$PGDATA/logfile" 2>/dev/null || true
+            - pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true
 
-    - step:
-        name: Memory Safety (PG 18)
-        caches: [apt-pgdg]
-        script:
-          - export PG_MAJOR=18
-          - *install-pg18
-          - apt-get install -y --no-install-recommends valgrind
-          - export PGPORT=15434
-          - export PGDATA=/tmp/tde_memcheck_data
-          - make clean
-          - make PG_CONFIG=$(which pg_config)
-              CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g -O1"
-              SHLIB_LINK="-lasan"
-          - make install PG_CONFIG=$(which pg_config)
-          - pg_ctlcluster $PG_MAJOR main stop 2>/dev/null || true
-          - su - postgres -c "initdb -D $PGDATA --no-locale -E UTF8" || initdb -D "$PGDATA" --no-locale -E UTF8
-          - |
-            cat >> "$PGDATA/postgresql.conf" <<EOF
-            shared_preload_libraries = 'pg_vault_tde'
-            port = $PGPORT
-            log_min_messages = warning
-            EOF
-          - pg_ctl -D "$PGDATA" -l "$PGDATA/logfile" start
-          - pg_isready -p $PGPORT -t 30
-          - createdb -p $PGPORT memcheck_tde
-          - >
-            ASAN_OPTIONS="detect_leaks=1:abort_on_error=1"
-            make installcheck
-              PGPORT=$PGPORT
-              PGDATABASE=memcheck_tde
-              PG_CONFIG=$(which pg_config)
-              REGRESS_OPTS="--dbname=memcheck_tde --port=$PGPORT"
-        after-script:
-          - cat "$PGDATA/logfile" 2>/dev/null || true
-          - pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true
+      - step:
+          name: Memory Safety (PG 18)
+          caches: [apt-pgdg]
+          script:
+            - export PG_MAJOR=18
+            - *install-pg18
+            - apt-get install -y --no-install-recommends valgrind
+            - export PGPORT=15434
+            - export PGDATA=/tmp/tde_memcheck_data
+            - make clean
+            - make PG_CONFIG=$(which pg_config)
+                CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g -O1"
+                SHLIB_LINK="-lasan"
+            - make install PG_CONFIG=$(which pg_config)
+            - pg_ctlcluster $PG_MAJOR main stop 2>/dev/null || true
+            - su - postgres -c "initdb -D $PGDATA --no-locale -E UTF8" || initdb -D "$PGDATA" --no-locale -E UTF8
+            - |
+              cat >> "$PGDATA/postgresql.conf" <<EOF
+              shared_preload_libraries = 'pg_vault_tde'
+              port = $PGPORT
+              log_min_messages = warning
+              EOF
+            - pg_ctl -D "$PGDATA" -l "$PGDATA/logfile" start
+            - pg_isready -p $PGPORT -t 30
+            - createdb -p $PGPORT memcheck_tde
+            - >
+              ASAN_OPTIONS="detect_leaks=1:abort_on_error=1"
+              make installcheck
+                PGPORT=$PGPORT
+                PGDATABASE=memcheck_tde
+                PG_CONFIG=$(which pg_config)
+                REGRESS_OPTS="--dbname=memcheck_tde --port=$PGPORT"
+          after-script:
+            - cat "$PGDATA/logfile" 2>/dev/null || true
+            - pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true
