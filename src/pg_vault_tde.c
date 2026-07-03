@@ -13,6 +13,7 @@
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h" /* object_access_hook, OAT_POST_CREATE */
 #include "catalog/pg_class.h"     /* RelationRelationId, Form_pg_class, ClassOidIndexId */
+#include "catalog/pg_inherits.h"  /* find_all_inheritors */
 #include "utils/fmgroids.h"     /* F_OIDEQ */
 #include "utils/snapmgr.h"      /* SnapshotSelf */
 #include "commands/defrem.h"
@@ -493,10 +494,28 @@ tde_process_utility_hook(PlannedStmt *pstmt,
                 Relation rel = try_relation_open(rid, NoLock);
                 if (rel != NULL)
                 {
-                    if (OidIsValid(rel->rd_rel->relam) &&
-                        strcmp(get_am_name(rel->rd_rel->relam),
-                                "encrypted_heap") == 0)
+                    bool guard = false;
+                    List *inheritors_oids = find_all_inheritors(rid, NoLock, NULL);
+                        
+                    foreach_oid(irid, inheritors_oids)
                     {
+                        Relation irel = try_relation_open(irid, NoLock);
+                        if (irel != NULL)
+                        {
+                            if (OidIsValid(irel->rd_rel->relam) &&
+                                strcmp(get_am_name(irel->rd_rel->relam), "encrypted_heap") == 0)
+                            {
+                                guard = true;
+                                relation_close(irel, NoLock);
+                                break;
+                            }
+                            relation_close(irel, NoLock);
+                        }
+                    }
+                    
+
+                    if (guard)
+                    {   
                         if (!tde_is_safe_index_am(stmt->accessMethod))
                             ereport(ERROR,
                                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
