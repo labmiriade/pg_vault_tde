@@ -219,6 +219,37 @@ tde_get_tableam_name_for_create(CreateStmt *create_stmt)
     return NULL;
 }
 
+
+/*
+ * tde_safe_index_ams / tde_is_safe_index_am
+ *
+ * Whitelist of index access methods considered safe on encrypted_heap
+ * tables (i.e. access methods that guarantee the indexed value is stored
+ * encrypted on disk). We deliberately use a whitelist rather than a
+ * blacklist of "unsafe" AMs: an unknown/future access method (from core
+ * PostgreSQL or another extension) must be rejected by default, not
+ * silently allowed because we forgot to blacklist it. Extend this array
+ * when the extension gains additional encrypting index AMs (e.g. a
+ * future tde_gin).
+ */
+
+static const char *tde_safe_index_ams[] = {
+    "tde_btree", 
+    NULL
+};
+
+static bool 
+tde_is_safe_index_am(const char *am_name)
+{
+    int i;
+    for(i = 0; tde_safe_index_ams[i] != NULL; i++)
+    {
+        if(strcmp(tde_safe_index_ams[i], am_name) == 0)
+            return true;
+    }
+    return false;
+}
+
 /*
  * tde_object_access_hook — register per-table DEK immediately on table creation.
  *
@@ -438,6 +469,49 @@ tde_process_utility_hook(PlannedStmt *pstmt,
                     }     
                 }
             }
+        }
+    }
+
+    else if (IsA(parsetree, IndexStmt))
+    {
+        IndexStmt *stmt = (IndexStmt *) parsetree;
+
+        /* 
+         * For CREATE INDEX (non-constraint), reject any index access method
+         * other than the ones in our whitelist when the target table uses
+         * encrypted_heap — otherwise the indexed column's plaintext value
+         * would be stored unencrypted in the index.
+         */
+
+        if (!stmt->isconstraint)
+        {
+
+            Oid rid = RangeVarGetRelid(stmt->relation, NoLock, true /* missing_ok */);
+
+            if (OidIsValid(rid))
+            {
+                Relation rel = try_relation_open(rid, NoLock);
+                if (rel != NULL)
+                {
+                    if (OidIsValid(rel->rd_rel->relam) &&
+                        strcmp(get_am_name(rel->rd_rel->relam),
+                                "encrypted_heap") == 0)
+                    {
+                        if (!tde_is_safe_index_am(stmt->accessMethod))
+                            ereport(ERROR,
+                                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                errmsg("pg_vault_tde: index access method \"%s\" is not supported "
+                                        "on encrypted_heap table \"%s\"",
+                                        stmt->accessMethod, stmt->relation->relname),
+                                errhint("Use \"CREATE INDEX ... USING tde_btree\" with an "
+                                        "encrypted operator class (e.g. tde_text_ops, "
+                                        "tde_int4_enc_ops) instead.")));
+
+                    }
+                    relation_close(rel, NoLock);
+                }
+            }
+            
         }
     }
 
