@@ -508,6 +508,91 @@ tde_process_utility_hook(PlannedStmt *pstmt,
         Oid         relid;
         Oid         ext_ns;
 
+
+                ListCell *lc;
+        List *offending_cols = NIL;
+
+
+        foreach(lc, stmt->tableElts)
+        {
+            Node *elt = (Node*) lfirst(lc);
+            if (IsA(elt, ColumnDef))
+            {
+                ColumnDef *coldef = (ColumnDef*) elt;
+                ListCell* lc2;
+
+                foreach(lc2, coldef->constraints)
+                {
+                    Constraint* con = (Constraint*) lfirst(lc2);
+                    
+                    if (con->contype == CONSTR_PRIMARY || con->contype == CONSTR_UNIQUE)
+                    {
+                        String *colnode = makeString(coldef->colname);
+
+                        if(!list_member(offending_cols, colnode))
+                            offending_cols = lappend(offending_cols, colnode);
+                    }
+                        
+                }
+
+            }
+            else if (IsA(elt, Constraint))
+            {
+                Constraint *con = (Constraint*) elt;
+                if (con->contype == CONSTR_PRIMARY || con->contype == CONSTR_UNIQUE)
+                {
+                    ListCell *lc3;
+                    foreach(lc3, con->keys)
+                    {
+                        String *colnode = lfirst_node(String, lc3);
+
+                        if(!list_member(offending_cols, colnode))
+                            offending_cols = lappend(offending_cols, colnode);
+                    }
+                }
+            }
+
+            
+        }
+        
+        if(offending_cols != NIL)
+        {
+            StringInfoData buf;
+            ListCell *lc1;
+            bool first = true;
+
+            initStringInfo(&buf);
+
+            foreach(lc1, offending_cols)
+            {
+                char* colname = strVal(lfirst_node(String, lc1));
+                if(!first)
+                    appendStringInfoString(&buf, _(", "));
+                first = false;
+                appendStringInfo(&buf, _("\"%s\""), colname);
+            }
+        
+            
+            ereport(WARNING, 
+                    (errmsg_plural("pg_vault_tde: the constraints on column %s "
+                            "of encrypted_heap table \"%s\" will be backed " 
+                            "by a standard (unencrypted) btree index",
+                            "pg_vault_tde: the constraints on columns %s "
+                            "of encrypted_heap table \"%s\" will be backed " 
+                            "by a standard (unencrypted) btree index",
+                            list_length(offending_cols),
+                            buf.data, stmt->relation->relname),
+                    errdetail("PostgreSQL requires PRIMARY KEY/UNIQUE constraints "
+                              "to use the native btree access methods; the indexed "
+                              "column's plaintext value will be stored on disk in the index."),
+                    errhint("Consider a surrogate non-sensitive key, or enforce " 
+                            "uniqueness separately with "
+                            "\"CREATE UNIQUE INDEX ... USING tde_btree\".")
+                    )
+            );
+            pfree(buf.data);
+        }
+
         relid = RangeVarGetRelid(stmt->relation, NoLock, true /* missing_ok */);
         if (!OidIsValid(relid))
         {
@@ -546,6 +631,8 @@ tde_process_utility_hook(PlannedStmt *pstmt,
         ereport(DEBUG1,
                 (errmsg("pg_vault_tde: registered relid=%u in DEK catalog",
                         relid)));
+
+
     }
 
     /*
