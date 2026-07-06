@@ -231,8 +231,8 @@ run_profile() {
     if [[ "$SKIP_PASSTHROUGH" != "1" ]]; then
         log_info "  Pass-through baseline (enabled=off) ..."
         run_sql -c "ALTER SYSTEM SET pg_vault_tde.enabled = off;" > /dev/null
-        run_sql -c "SELECT pg_reload_conf();" > /dev/null
-        sleep 0.5
+        $RT restart "$CONTAINER" > /dev/null 
+        wait_pg_ready "$CONTAINER"
 
         ins_pt=$(avg_insert_ms bench_enc "$ROWS" "$payload")
         run_sql -c "
@@ -244,8 +244,8 @@ run_profile() {
         upd_pt=$(avg_ms "" "UPDATE bench_enc SET data = md5(data) WHERE id % 10 = 0")
 
         run_sql -c "ALTER SYSTEM SET pg_vault_tde.enabled = on;" > /dev/null
-        run_sql -c "SELECT pg_reload_conf();" > /dev/null
-        sleep 0.5
+        $RT restart "$CONTAINER" > /dev/null
+        wait_pg_ready "$CONTAINER"
     fi
 }
 

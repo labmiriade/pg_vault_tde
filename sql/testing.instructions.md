@@ -223,7 +223,8 @@ Arguments: `bash bench_tde.sh <row_count>`
 
 Workloads compared: INSERT, SELECT, UPDATE, index scan, TABLESAMPLE.
 Both `plain_heap` and `encrypted_heap` are tested. Use
-`pg_vault_tde.enabled = off` to isolate TAM overhead from crypto cost.
+`pg_vault_tde.enabled = off` (requires a server restart) to isolate TAM
+overhead from crypto cost.
 
 ---
 
