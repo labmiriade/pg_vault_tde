@@ -1753,7 +1753,7 @@ BEGIN
         payload text
     ) USING encrypted_heap;
 
-    CREATE INDEX tde_cluster_61_idx ON tde_cluster_61 (id);
+    CREATE INDEX tde_cluster_61_idx ON tde_cluster_61 USING tde_btree (id);
 
     large_val := repeat('CLUSTER_DATA_', 900);  -- ~11 KB
 
@@ -1849,7 +1849,7 @@ BEGIN
         payload text
     ) USING encrypted_heap;
 
-    CREATE INDEX tde_toast_bitmap_63_idx ON tde_toast_bitmap_63 (id);
+    CREATE INDEX tde_toast_bitmap_63_idx ON tde_toast_bitmap_63 USING tde_btree (id);
 
     large_val := repeat('TOAST_BITMAP_', 900);  -- ~11 KB
 
