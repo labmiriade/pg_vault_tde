@@ -1343,6 +1343,7 @@ vault_resp_init(vault_response_buf *buf)
     buf->len    = 0;
     buf->data   = palloc(buf->alloc);
     buf->data[0] = '\0';
+    buf->overflow = false;
     return true;
 }
 
