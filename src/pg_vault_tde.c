@@ -857,13 +857,16 @@ _PG_init(void)
         NULL, &pg_vault_tde_vault_timeout_ms, 5000, 0, 300000,
         PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
-    /*
-     * enabled — PGC_SUSET so a superuser can toggle crypto off per-session
-     * (e.g. for benchmarking overhead) or per-database without a restart.
+    /* 
+     * enabled — PGC_POSTMASTER: fissato all'avvio del server, non modificabile
+     * a runtime. Il valore è codificato per-tupla su disco (header vs wire v4
+     * cifrato): se il GUC fosse togglabile a runtime, righe scritte con
+     * enabled=on e lette con enabled=off restituirebbero ciphertext grezzo
+     * come plaintext — perdita di integrità silenziosa.
      */
     DefineCustomBoolVariable("pg_vault_tde.enabled",
         "Enable AES-256-GCM encryption for encrypted_heap tables",
-        NULL, &pg_vault_tde_enabled, true, PGC_SUSET,
+        NULL, &pg_vault_tde_enabled, true, PGC_POSTMASTER,
         0, NULL, NULL, NULL);
 
     /* DEK cache TTL in seconds (v1.1) — 0 disables time-based expiry */

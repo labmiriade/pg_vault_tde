@@ -479,8 +479,10 @@ bash bench_tde.sh 100000
 
 The script runs INSERT, SELECT, UPDATE, index scan, and TABLESAMPLE workloads
 on `plain_heap` vs `encrypted_heap`, and prints a comparison table with
-overhead percentages. Use `pg_vault_tde.enabled = off` to isolate pure TAM
-overhead (no crypto) from actual encryption cost.
+overhead percentages. Use `pg_vault_tde.enabled = off` (requires a server
+restart — the GUC is `PGC_POSTMASTER`) to isolate pure TAM overhead (no
+crypto) from actual encryption cost. See the warning in README.md before
+toggling this on any database with existing `encrypted_heap` data.
 
 ```
 ┌────────────────────────────────────────────────────┐
