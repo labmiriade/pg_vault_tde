@@ -129,8 +129,10 @@ wait_pg_ready() {
 # ---------------------------------------------------------------------------
 build_pg_test_image() {
     local image="${PG_TEST_IMAGE:-pg-tde-test}"
-    log_info "Building $image image ..."
+    local pg_major="${PG_VERSION:-${PG_MAJOR:-18}}"
+    log_info "Building $image image (PostgreSQL ${pg_major}) ..."
     $RT build \
+        --build-arg PG_MAJOR="$pg_major" \
         -f "$CI_DIR/containers/pg-test.Containerfile" \
         -t "$image:latest" \
         "$REPO_ROOT" 2>&1 | tail -5

@@ -59,7 +59,8 @@ START=$(timer_start)
 # After a successful first run (no expected file), copy actual → expected so
 # subsequent runs act as regression guards.
 if $RT exec -u postgres "$CONTAINER" bash -c '
-    export PATH="/usr/lib/postgresql/18/bin:/usr/lib/postgresql/18/lib/pgxs/src/test/isolation:$PATH"
+    PGV=$(pg_config --version | awk "{print \$2}" | cut -d. -f1)
+    export PATH="/usr/lib/postgresql/${PGV}/lib/pgxs/src/test/isolation:$PATH"
     export PGDATA="/var/lib/postgresql/data"
     OUTDIR=$(mktemp -d /tmp/isolation_out.XXXXXX)
     ALL_PASS=true

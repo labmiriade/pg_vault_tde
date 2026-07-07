@@ -78,10 +78,11 @@ log_info "Running TAP tests with prove ..."
 START=$(timer_start)
 
 if $RT exec -u postgres "$CONTAINER" bash -c '
-    export PATH="/usr/lib/postgresql/18/bin:$PATH"
+    PGV=$(pg_config --version | awk "{print \$2}" | cut -d. -f1)
+    export PATH="/usr/lib/postgresql/${PGV}/bin:$PATH"
     export PGDATA="/var/lib/postgresql/data"
-    export PERL5LIB="/usr/lib/postgresql/18/lib/pgxs/src/test/perl${PERL5LIB:+:$PERL5LIB}"
-    export PG_REGRESS="/usr/lib/postgresql/18/lib/pgxs/src/test/regress/pg_regress"
+    export PERL5LIB="/usr/lib/postgresql/${PGV}/lib/pgxs/src/test/perl${PERL5LIB:+:$PERL5LIB}"
+    export PG_REGRESS="/usr/lib/postgresql/${PGV}/lib/pgxs/src/test/regress/pg_regress"
     cd /test
     prove -v --failures tap/*.t 
 '; then
