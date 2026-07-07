@@ -1531,22 +1531,17 @@ pg_vault_tde_relation_copy_for_cluster(Relation OldTable,
     PG_TRY();
     {
         /*
-         * Use heap_beginscan directly (not table_beginscan) to bypass our
-         * TAM override.  This gives us:
-         *   - raw ciphertext tuples pointing into pinned buffer pages
-         *   - hscan->rs_cbuf valid for HeapTupleSatisfiesVacuum
-         *
-         * PG18 introduced a mandatory async read stream in heapgettup.
+         * PG17 introduced a mandatory async read stream in heapgettup.
          * heap_fetch_next_buffer asserts scan->rs_read_stream != NULL, and
          * the stream is created in heap_beginscan only when SO_TYPE_SEQSCAN
          * is present.  Without it, every heapgettup call crashes (Assert in
-         * cassert builds, NULL-deref segfault in release builds).
+         * cassert builds, NULL-deref segfault in release builds).  This is
+         * unconditional because it already applies on PG17, the minimum
+         * supported version.
          */
         hscan = (HeapScanDesc) heap_beginscan(OldTable, SnapshotAny, 0, NULL,
                                               NULL,
-#if PG_VERSION_NUM >= 180000
                                               SO_TYPE_SEQSCAN |
-#endif
                                               SO_ALLOW_STRAT | SO_ALLOW_SYNC);
 
         while ((enc_raw = heap_getnext((TableScanDesc) hscan,
