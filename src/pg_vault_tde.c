@@ -29,6 +29,13 @@
 #include "utils/builtins.h"
 #include "access/table.h"
 #include "commands/extension.h"
+#if PG_VERSION_NUM < 180000
+#include "executor/executor.h"   /* ExecutorStart_hook, standard_ExecutorStart */
+#include "nodes/plannodes.h"     /* ModifyTable, arbiterIndexes */
+#include "access/genam.h"        /* index_open, index_close */
+#include "catalog/pg_am_d.h"     /* BTREE_AM_OID */
+#include "parser/parsetree.h"    /* rt_fetch */
+#endif
 
 #include "src/include/pg_vault_tde_kms.h"
 #include "src/include/pg_vault_tde_tam.h"
@@ -112,6 +119,9 @@ static shmem_request_hook_type    prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type    prev_shmem_startup_hook = NULL;
 static ProcessUtility_hook_type   prev_process_utility_hook = NULL;
 static object_access_hook_type    prev_object_access_hook = NULL;
+#if PG_VERSION_NUM < 180000
+static ExecutorStart_hook_type    prev_executor_start_hook = NULL;
+#endif
 
 /* Audit hook — NULL unless an external audit module installs one. */
 tde_audit_hook audit_hook_ptr = NULL;
@@ -334,6 +344,170 @@ tde_object_access_hook(ObjectAccessType access, Oid classId, Oid objectId,
  * ACCESS METHOD from using encrypted_heap — those paths also trigger TAM
  * callbacks and the catalog is updated lazily on first DEK access.
  */
+#if PG_VERSION_NUM < 180000
+/*
+ * tde_executor_start_hook
+ *
+ * PG17's BuildSpeculativeIndexInfo() (catalog/index.c) hard-asserts
+ * index->rd_rel->relam == BTREE_AM_OID before building unique-check info
+ * for an ON CONFLICT arbiter index — a safety gate PG18 later removed by
+ * generalising the function to any AM (via IndexAmTranslateCompareType).
+ * tde_btree registers its own AM oid, so on PG17 every
+ * INSERT ... ON CONFLICT against a tde_btree unique index fails with
+ * "unexpected non-btree speculative unique index".
+ *
+ * BuildSpeculativeIndexInfo() is NOT called during ExecutorStart: it runs
+ * lazily inside ExecInsert() (nodeModifyTable.c), on the FIRST row of the
+ * query, via ExecOpenIndices(resultRelInfo, speculative) where speculative
+ * is simply (onConflictAction != ONCONFLICT_NONE) — not limited to the
+ * planner-inferred arbiterIndexes, and not limited to ExecutorStart's
+ * window.  ExecOpenIndices calls BuildSpeculativeIndexInfo() for *every*
+ * unique index on the target relation(s) (ii_Unique), so "ON CONFLICT DO
+ * NOTHING" with no explicit conflict target (arbiterIndexes == NIL) still
+ * hits every unique index, and the check fires sometime during
+ * ExecutorRun, not ExecutorStart.
+ *
+ * We therefore impersonate BTREE_AM_OID on every unique tde_btree index of
+ * every result relation starting here, but defer the restore to a
+ * MemoryContextCallback tied to the query's own EState (es_query_cxt),
+ * which is guaranteed to fire once when that context is deleted at
+ * ExecutorEnd (success) or transaction abort (error) — covering the whole
+ * ExecutorRun window during which ExecOpenIndices/BuildSpeculativeIndexInfo
+ * actually executes.  This mirrors the per-backend RelationData swap
+ * pattern already used for rd_tableam in
+ * pg_vault_tde_relation_copy_for_cluster (tam.c), just scoped to a whole
+ * query instead of a single call.  The fields BuildSpeculativeIndexInfo
+ * fills in (ii_UniqueOps/Strats) are derived from rd_opfamily, not from
+ * relam, so the swap has no effect on their correctness — it exists
+ * purely to pass the version-specific gate.  rd_indam (the actual AM
+ * dispatch table used for aminsert) is cached at relcache-build time and
+ * is untouched by this relam poke, so real inserts still route through
+ * our AES-256-SIV tde_btree wrappers, not real btree.
+ */
+typedef struct TdeSpeculativeSwapCtx
+{
+    List   *swapped;    /* open Relation* (AccessShareLock) to restore/close */
+    Oid     real_amoid;   /* tde_btree's real AM oid to restore relam to */
+} TdeSpeculativeSwapCtx;
+
+static void
+tde_restore_speculative_relam(void *arg)
+{
+    TdeSpeculativeSwapCtx *ctx = (TdeSpeculativeSwapCtx *) arg;
+    ListCell *lc;
+
+    foreach(lc, ctx->swapped)
+    {
+        Relation idxrel = (Relation) lfirst(lc);
+
+        idxrel->rd_rel->relam = ctx->real_amoid;
+        index_close(idxrel, AccessShareLock);
+    }
+}
+
+static void
+tde_executor_start_hook(QueryDesc *queryDesc, int eflags)
+{
+    List       * volatile swapped = NIL; /* open Relation* whose relam we swapped */
+    ModifyTable *mt = NULL;
+    volatile Oid tde_btree_amoid = InvalidOid;
+
+    if (queryDesc->plannedstmt->planTree != NULL &&
+        IsA(queryDesc->plannedstmt->planTree, ModifyTable))
+        mt = (ModifyTable *) queryDesc->plannedstmt->planTree;
+
+    if (mt != NULL &&
+        mt->operation == CMD_INSERT &&
+        mt->onConflictAction != ONCONFLICT_NONE)
+    {
+        ListCell *lc_rel;
+
+        tde_btree_amoid = get_index_am_oid("tde_btree", true);
+
+        if (OidIsValid(tde_btree_amoid))
+        {
+            foreach(lc_rel, mt->resultRelations)
+            {
+                Index            rti = lfirst_int(lc_rel);
+                RangeTblEntry   *rte = rt_fetch(rti, queryDesc->plannedstmt->rtable);
+                Relation         heapRel;
+                List            *idxoids;
+                ListCell        *lc_idx;
+
+                heapRel = table_open(rte->relid, AccessShareLock);
+                idxoids = RelationGetIndexList(heapRel);
+
+                foreach(lc_idx, idxoids)
+                {
+                    Oid         idxoid = lfirst_oid(lc_idx);
+                    Relation    idxrel = index_open(idxoid, AccessShareLock);
+
+                    if (idxrel->rd_index->indisunique &&
+                        idxrel->rd_rel->relam == tde_btree_amoid)
+                    {
+                        idxrel->rd_rel->relam = BTREE_AM_OID;
+                        swapped = lappend(swapped, idxrel);
+                    }
+                    else
+                        index_close(idxrel, AccessShareLock);
+                }
+
+                list_free(idxoids);
+                table_close(heapRel, AccessShareLock);
+            }
+        }
+    }
+
+    PG_TRY();
+    {
+        if (prev_executor_start_hook)
+            prev_executor_start_hook(queryDesc, eflags);
+        else
+            standard_ExecutorStart(queryDesc, eflags);
+    }
+    PG_CATCH();
+    {
+        /*
+         * ExecutorStart itself failed before the query ever got an EState
+         * we could hang a deferred callback off of — restore immediately.
+         */
+        ListCell *lc;
+
+        foreach(lc, swapped)
+        {
+            Relation idxrel = (Relation) lfirst(lc);
+
+            idxrel->rd_rel->relam = tde_btree_amoid;
+            index_close(idxrel, AccessShareLock);
+        }
+        list_free(swapped);
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+
+    if (swapped != NIL)
+    {
+        MemoryContext           oldcxt;
+        TdeSpeculativeSwapCtx  *ctx;
+        MemoryContextCallback  *cb;
+
+        oldcxt = MemoryContextSwitchTo(queryDesc->estate->es_query_cxt);
+
+        ctx = palloc(sizeof(TdeSpeculativeSwapCtx));
+        ctx->swapped = list_copy(swapped);
+        ctx->real_amoid = tde_btree_amoid;
+
+        cb = palloc(sizeof(MemoryContextCallback));
+        cb->func = tde_restore_speculative_relam;
+        cb->arg = ctx;
+        MemoryContextRegisterResetCallback(queryDesc->estate->es_query_cxt, cb);
+
+        MemoryContextSwitchTo(oldcxt);
+        list_free(swapped);
+    }
+}
+#endif                          /* PG_VERSION_NUM < 180000 */
+
 static void
 tde_process_utility_hook(PlannedStmt *pstmt,
                          const char *queryString,
@@ -1100,6 +1274,17 @@ _PG_init(void)
      */
     prev_process_utility_hook = ProcessUtility_hook;
     ProcessUtility_hook = tde_process_utility_hook;
+
+#if PG_VERSION_NUM < 180000
+    /*
+     * Executor start hook: temporarily impersonate BTREE_AM_OID on
+     * ON CONFLICT arbiter indexes backed by tde_btree, working around a
+     * PG17-only core safety check removed in PG18 — see
+     * tde_executor_start_hook for the full explanation.
+     */
+    prev_executor_start_hook = ExecutorStart_hook;
+    ExecutorStart_hook = tde_executor_start_hook;
+#endif
 
     /*
      * Object access hook: register the DEK for newly created encrypted_heap
