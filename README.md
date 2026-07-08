@@ -250,11 +250,8 @@ pg_vault_tde.kms_provider = 'vault'   # HashiCorp Vault / OpenBao (default)
 
 ### Per-Database KMS Configuration
 
-Because all `pg_vault_tde` GUC parameters are declared `PGC_SUSET`, a superuser
-can assign **different KMS settings to individual databases** in the same cluster
-without restarting PostgreSQL.  Each connection picks up the effective GUC value
-for its own database, so `postgres` can use a central Vault instance while
-`tenant_a` uses a dedicated transit key and `tenant_b` uses a local wallet:
+Because all `pg_vault_tde` KMS-provider GUC parameters are declared `PGC_SUSET` (the master `enabled` switch and a couple of shared-memory-sizing parameters are `PGC_POSTMASTER` and cannot be scoped per database — see [doc/pg_vault_tde.md](doc/pg_vault_tde.md#guc-parameters)), a superuser can assign **different KMS settings to individual databases** in the same cluster without restarting PostgreSQL.
+Each connection picks up the effective GUC value for its own database, so `postgres` can use a central Vault instance while `tenant_a` uses a dedicated transit key and `tenant_b` uses a local wallet:
 
 ```sql
 -- cluster-level default (postgresql.conf / ALTER SYSTEM)
