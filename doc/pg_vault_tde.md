@@ -191,7 +191,8 @@ buffer-backed `HeapTuple` MUST call `pg_vault_tde_decode_slot()`.
 
 | Callback | Scan Type | Status |
 |---|---|---|
-| `scan_getnextslot` | SeqScan, TidRangeScan | ✅ Override |
+| `scan_getnextslot` | SeqScan | ✅ Override |
+| `scan_getnextslot_tidrange` | TidRangeScan | ✅ Override |
 | `index_fetch_tuple` | Index Scan, Index Only Scan | ✅ Override |
 | `scan_bitmap_next_tuple` | BitmapHeapScan | ✅ Override |
 | `scan_analyze_next_tuple` | ANALYZE | ✅ Override |
