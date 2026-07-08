@@ -2468,59 +2468,59 @@ pg_vault_tde_migrate_vault_to_wallet_sql(PG_FUNCTION_ARGS)
 
                 if (!skip)
                 {
-                wdek_bytea = DatumGetByteaPP(values[Anum_pg_vault_tde_wrapped_dek-1]);
-            vault_wlen = (int) VARSIZE_ANY_EXHDR(wdek_bytea);
+                    wdek_bytea = DatumGetByteaPP(values[Anum_pg_vault_tde_wrapped_dek-1]);
+                    vault_wlen = (int) VARSIZE_ANY_EXHDR(wdek_bytea);
 
-            old_ctx = MemoryContextSwitchTo(tuple_ctx);
+                    old_ctx = MemoryContextSwitchTo(tuple_ctx);
 
-            /*
-             * Unwrap using the active (Vault) provider.  The scan filter on
-             * kms_provider = 'vault' guarantees we only land here for vault rows.
-             */
-            if (!tde_active_kms_provider)
-                ereport(ERROR,
-                        errmsg("pg_vault_tde: migrate_vault_to_wallet: no active KMS provider"));
-            {
-                int plain_dek_len = TDE_DEK_LEN;
-                if (!tde_active_kms_provider->unwrap_dek(
-                        (unsigned char *) VARDATA_ANY(wdek_bytea), vault_wlen,
-                        plain_dek, &plain_dek_len))
-                    ereport(ERROR,
-                            errmsg("pg_vault_tde: migrate_vault_to_wallet: vault unwrap "
-                                   "failed for relid %u", DatumGetObjectId(values[Anum_pg_vault_tde_relid-1])));
-            }
+                    /*
+                    * Unwrap using the active (Vault) provider.  The scan filter on
+                    * kms_provider = 'vault' guarantees we only land here for vault rows.
+                    */
+                    if (!tde_active_kms_provider)
+                        ereport(ERROR,
+                                errmsg("pg_vault_tde: migrate_vault_to_wallet: no active KMS provider"));
+                    {
+                        int plain_dek_len = TDE_DEK_LEN;
+                        if (!tde_active_kms_provider->unwrap_dek(
+                                (unsigned char *) VARDATA_ANY(wdek_bytea), vault_wlen,
+                                plain_dek, &plain_dek_len))
+                            ereport(ERROR,
+                                    errmsg("pg_vault_tde: migrate_vault_to_wallet: vault unwrap "
+                                        "failed for relid %u", DatumGetObjectId(values[Anum_pg_vault_tde_relid-1])));
+                    }
 
-            if (!local_wrap_dek_with_kek(plain_dek, TDE_DEK_LEN,
-                                         new_wrapped, &new_len,
-                                         new_kek))
-            {
-                ereport(ERROR,
-                        errmsg("pg_vault_tde: migrate_vault_to_wallet: local wrap "
-                               "failed for relid %u", DatumGetObjectId(values[Anum_pg_vault_tde_relid-1])));
-            }
-            OPENSSL_cleanse(plain_dek, TDE_DEK_LEN);
+                    if (!local_wrap_dek_with_kek(plain_dek, TDE_DEK_LEN,
+                                                new_wrapped, &new_len,
+                                                new_kek))
+                    {
+                        ereport(ERROR,
+                                errmsg("pg_vault_tde: migrate_vault_to_wallet: local wrap "
+                                    "failed for relid %u", DatumGetObjectId(values[Anum_pg_vault_tde_relid-1])));
+                    }
+                    OPENSSL_cleanse(plain_dek, TDE_DEK_LEN);
 
-            /* Build bytea for the new wrapped DEK */
-            new_wdek_b = (bytea *) palloc(VARHDRSZ + new_len);
-            SET_VARSIZE(new_wdek_b, VARHDRSZ + new_len);
-            memcpy(VARDATA(new_wdek_b), new_wrapped, new_len);
-            OPENSSL_cleanse(new_wrapped, sizeof(new_wrapped));
+                    /* Build bytea for the new wrapped DEK */
+                    new_wdek_b = (bytea *) palloc(VARHDRSZ + new_len);
+                    SET_VARSIZE(new_wdek_b, VARHDRSZ + new_len);
+                    memcpy(VARDATA(new_wdek_b), new_wrapped, new_len);
+                    OPENSSL_cleanse(new_wrapped, sizeof(new_wrapped));
 
-            memset(replaces, 0, sizeof(replaces));
-            replaces[Anum_pg_vault_tde_wrapped_dek-1] = true;                         /* wrapped_dek */
-            values[Anum_pg_vault_tde_wrapped_dek-1] = PointerGetDatum(new_wdek_b);
-            is_null[Anum_pg_vault_tde_wrapped_dek-1] = false;
-            replaces[Anum_pg_vault_tde_kms_provider-1] = true;                         /* kms_provider */
-            values[Anum_pg_vault_tde_kms_provider-1] = CStringGetTextDatum("local");
-            is_null[Anum_pg_vault_tde_kms_provider-1] = false;
+                    memset(replaces, 0, sizeof(replaces));
+                    replaces[Anum_pg_vault_tde_wrapped_dek-1] = true;                         /* wrapped_dek */
+                    values[Anum_pg_vault_tde_wrapped_dek-1] = PointerGetDatum(new_wdek_b);
+                    is_null[Anum_pg_vault_tde_wrapped_dek-1] = false;
+                    replaces[Anum_pg_vault_tde_kms_provider-1] = true;                         /* kms_provider */
+                    values[Anum_pg_vault_tde_kms_provider-1] = CStringGetTextDatum("local");
+                    is_null[Anum_pg_vault_tde_kms_provider-1] = false;
 
-            new_tuple = heap_modify_tuple(old_tuple, tup_desc, values, is_null, replaces);
+                    new_tuple = heap_modify_tuple(old_tuple, tup_desc, values, is_null, replaces);
 
-                CatalogTupleUpdateWithInfo(catalog_rel, &(old_tuple->t_self), new_tuple, indstate);
+                        CatalogTupleUpdateWithInfo(catalog_rel, &(old_tuple->t_self), new_tuple, indstate);
 
-                MemoryContextSwitchTo(old_ctx);
+                        MemoryContextSwitchTo(old_ctx);
 
-                migrated++;
+                        migrated++;
                 } /* end if (!skip) */
             }
             PG_CATCH();
