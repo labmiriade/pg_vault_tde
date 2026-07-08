@@ -71,14 +71,14 @@ static TableAmRoutine tde_methods;
  * Saved original heapam callbacks (non-NULL after tam_init).
  *
  * We intercept ALL read paths that deliver a HeapTuple into a slot:
- *  - scan_getnextslot      : sequential scan
- *  - scan_getnextslot      : Tid range scan
- *  - index_fetch_tuple     : index scan (CRITICAL — was missing)
- *  - scan_bitmap_next_tuple: bitmap heap scan (BitmapHeapScan nodes)
- *  - scan_analyze_next_tuple: ANALYZE statistics collection
- *  - scan_sample_next_tuple: TABLESAMPLE clauses
- *  - tuple_fetch_row_version: direct TID fetch (TidScan, lock recheck)
- *  - tuple_lock            : SELECT FOR UPDATE / FOR SHARE
+ *  - scan_getnextslot              : sequential scan
+ *  - scan_getnextslot_tidrange     : Tid range scan
+ *  - index_fetch_tuple             : index scan (CRITICAL — was missing)
+ *  - scan_bitmap_next_tuple        : bitmap heap scan (BitmapHeapScan nodes)
+ *  - scan_analyze_next_tuple       : ANALYZE statistics collection
+ *  - scan_sample_next_tuple        : TABLESAMPLE clauses
+ *  - tuple_fetch_row_version       : direct TID fetch (TidScan, lock recheck)
+ *  - tuple_lock                    : SELECT FOR UPDATE / FOR SHARE
  *
  * Write paths call heap_insert / heap_update / heap_multi_insert directly.
  */
