@@ -1111,6 +1111,56 @@ BEGIN
 END;
 $$;
 
+-- ================================================================
+-- TEST 134: TidRangeScan — exercises scan_getnextslot_tidrange path
+--           (PSQLE-109)
+--
+-- scan_getnextslot_tidrange is a SEPARATE TableAmRoutine callback from
+-- scan_getnextslot: overriding scan_getnextslot alone does NOT cover
+-- queries planned as "Tid Range Scan" (physical ctid range predicates,
+-- available since PG14). Without the dedicated wrapper, this scan
+-- returns raw ciphertext to the executor instead of plaintext.
+--
+-- We disable seqscan/indexscan/bitmapscan so the only remaining scan
+-- method for a ctid range predicate is Tid Range Scan (enable_tidscan
+-- stays on, the default), then verify the decrypted output.
+-- ================================================================
+DO $$
+  DECLARE
+      cnt int;
+      v   text;
+  BEGIN
+      CREATE TABLE tde_tidrange_134 (id int, secret text) USING encrypted_heap;
+      INSERT INTO tde_tidrange_134
+          SELECT g, 'PLAINTEXT_SECRET_' || g FROM generate_series(1, 200) g;
+      
+      SET enable_seqscan = off;
+      SET enable_indexscan = off;
+      SET enable_bitmapscan = off;
+      
+      SELECT count(*) INTO cnt
+        FROM tde_tidrange_134 WHERE ctid BETWEEN '(0,0)' AND '(9999,0)';
+      IF cnt <> 200 THEN
+          RAISE EXCEPTION 'TEST 134a FAILED: expected 200 rows, got %', cnt;
+      END IF;
+      
+      SELECT secret INTO v FROM tde_tidrange_134
+       WHERE ctid BETWEEN '(0,0)' AND '(9999,0)' AND id = 100;
+      IF v IS DISTINCT FROM 'PLAINTEXT_SECRET_100' THEN
+          RAISE EXCEPTION
+              'TEST 134b FAILED: expected plaintext "PLAINTEXT_SECRET_100", got "%" '
+              '(ciphertext leak via Tid Range Scan)', v;
+      END IF;
+      
+      RESET enable_seqscan;
+      RESET enable_indexscan;
+      RESET enable_bitmapscan;
+      DROP TABLE tde_tidrange_134;
+      RAISE NOTICE
+          'TEST 134 PASSED: Tid Range Scan decrypts correctly (scan_getnextslot_tidrange path)';
+  END;
+  $$;
+
 
 -- ================================================================
 -- PHASE SUMMARY
@@ -1119,27 +1169,28 @@ DO $$
 BEGIN
     RAISE NOTICE '============================================================';
     RAISE NOTICE 'v1.7 Tests 111-131 — COMPLETE';
-    RAISE NOTICE '   tde_int4_enc_ops + disk forensic check . test 111';
-    RAISE NOTICE '   tde_int8_enc_ops equality lookup ........ test 112';
-    RAISE NOTICE '   tde_uuid_enc_ops equality lookup ........ test 113';
-    RAISE NOTICE '   tde_date_enc_ops equality lookup ........ test 114';
-    RAISE NOTICE '   tde_timestamptz_enc_ops equality lookup . test 115';
-    RAISE NOTICE '   DEK rotation → stale index → REINDEX .... test 116';
-    RAISE NOTICE '   multi-column enc_ops + text + int8 mix .. test 117';
-    RAISE NOTICE '   CREATE INDEX on pre-populated table ..... test 118';
-    RAISE NOTICE '   ON CONFLICT DO NOTHING + enc_ops unique . test 119';
-    RAISE NOTICE '   partition routing + round-trip .......... test 120';
-    RAISE NOTICE '   per-leaf DEK isolation .................. test 121';
-    RAISE NOTICE '   AM inheritance (PARTITION OF) ........... test 122';
-    RAISE NOTICE '   encrypted leaf on-disk forensic ......... test 123';
-    RAISE NOTICE '   cross-partition row movement ............ test 124';
-    RAISE NOTICE '   ATTACH pre-existing encrypted table ..... test 125';
-    RAISE NOTICE '   DETACH keeps leaf readable .............. test 126';
-    RAISE NOTICE '   MIXED tree limitation (doc) ............. test 127';
+    RAISE NOTICE '   tde_int4_enc_ops + disk forensic check ..... test 111';
+    RAISE NOTICE '   tde_int8_enc_ops equality lookup ........... test 112';
+    RAISE NOTICE '   tde_uuid_enc_ops equality lookup ........... test 113';
+    RAISE NOTICE '   tde_date_enc_ops equality lookup ........... test 114';
+    RAISE NOTICE '   tde_timestamptz_enc_ops equality lookup .... test 115';
+    RAISE NOTICE '   DEK rotation → stale index → REINDEX ....... test 116';
+    RAISE NOTICE '   multi-column enc_ops + text + int8 mix ..... test 117';
+    RAISE NOTICE '   CREATE INDEX on pre-populated table ........ test 118';
+    RAISE NOTICE '   ON CONFLICT DO NOTHING + enc_ops unique .... test 119';
+    RAISE NOTICE '   partition routing + round-trip ............. test 120';
+    RAISE NOTICE '   per-leaf DEK isolation ..................... test 121';
+    RAISE NOTICE '   AM inheritance (PARTITION OF) .............. test 122';
+    RAISE NOTICE '   encrypted leaf on-disk forensic ............ test 123';
+    RAISE NOTICE '   cross-partition row movement ............... test 124';
+    RAISE NOTICE '   ATTACH pre-existing encrypted table ........ test 125';
+    RAISE NOTICE '   DETACH keeps leaf readable ................. test 126';
+    RAISE NOTICE '   MIXED tree limitation (doc) ................ test 127';
     RAISE NOTICE '   HOT disabled on encrypted_heap (IV-first) .. test 128';
-    RAISE NOTICE '   FK encrypted parent + encrypted child ... test 129';
-    RAISE NOTICE '   FK encrypted parent + plain child ....... test 130';
-    RAISE NOTICE '   FK plain parent + encrypted child ....... test 131';
+    RAISE NOTICE '   FK encrypted parent + encrypted child ...... test 129';
+    RAISE NOTICE '   FK encrypted parent + plain child .......... test 130';
+    RAISE NOTICE '   FK plain parent + encrypted child .......... test 131';
+    RAISE NOTICE '   scan_getnextslot_tidrange .................. test 134';
     RAISE NOTICE '============================================================';
 END;
 $$;
