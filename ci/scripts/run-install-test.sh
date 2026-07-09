@@ -53,7 +53,7 @@ if [[ "$RUN_ALL" -eq 1 ]]; then
     PG_VERSIONS=(17 18)
     FORMATS=(deb rpm)
 fi
-[[ ${#PG_VERSIONS[@]} -eq 0 ]] && PG_VERSIONS=(18)
+[[ ${#PG_VERSIONS[@]} -eq 0 ]] && PG_VERSIONS=("${PG_VERSION:-18}")
 [[ ${#FORMATS[@]} -eq 0 ]]    && FORMATS=(deb)
 
 # ---------------------------------------------------------------------------
