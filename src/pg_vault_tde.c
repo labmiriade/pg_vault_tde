@@ -13,6 +13,7 @@
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h" /* object_access_hook, OAT_POST_CREATE */
 #include "catalog/pg_class.h"     /* RelationRelationId, Form_pg_class, ClassOidIndexId */
+#include "catalog/pg_inherits.h"  /* find_all_inheritors */
 #include "utils/fmgroids.h"     /* F_OIDEQ */
 #include "utils/snapmgr.h"      /* SnapshotSelf */
 #include "commands/defrem.h"
@@ -217,6 +218,37 @@ tde_get_tableam_name_for_create(CreateStmt *create_stmt)
     if (create_stmt->accessMethod != NULL)
         return create_stmt->accessMethod;
     return NULL;
+}
+
+
+/*
+ * tde_safe_index_ams / tde_is_safe_index_am
+ *
+ * Whitelist of index access methods considered safe on encrypted_heap
+ * tables (i.e. access methods that guarantee the indexed value is stored
+ * encrypted on disk). We deliberately use a whitelist rather than a
+ * blacklist of "unsafe" AMs: an unknown/future access method (from core
+ * PostgreSQL or another extension) must be rejected by default, not
+ * silently allowed because we forgot to blacklist it. Extend this array
+ * when the extension gains additional encrypting index AMs (e.g. a
+ * future tde_gin).
+ */
+
+static const char *tde_safe_index_ams[] = {
+    "tde_btree", 
+    NULL
+};
+
+static bool 
+tde_is_safe_index_am(const char *am_name)
+{
+    int i;
+    for(i = 0; tde_safe_index_ams[i] != NULL; i++)
+    {
+        if(strcmp(tde_safe_index_ams[i], am_name) == 0)
+            return true;
+    }
+    return false;
 }
 
 /*
@@ -441,6 +473,67 @@ tde_process_utility_hook(PlannedStmt *pstmt,
         }
     }
 
+    else if (IsA(parsetree, IndexStmt))
+    {
+        IndexStmt *stmt = (IndexStmt *) parsetree;
+
+        /* 
+         * For CREATE INDEX (non-constraint), reject any index access method
+         * other than the ones in our whitelist when the target table uses
+         * encrypted_heap — otherwise the indexed column's plaintext value
+         * would be stored unencrypted in the index.
+         */
+
+        if (!stmt->isconstraint)
+        {
+
+            Oid rid = RangeVarGetRelid(stmt->relation, NoLock, true /* missing_ok */);
+
+            if (OidIsValid(rid))
+            {
+                Relation rel = try_relation_open(rid, NoLock);
+                if (rel != NULL)
+                {
+                    bool guard = false;
+                    List *inheritors_oids = find_all_inheritors(rid, NoLock, NULL);
+                        
+                    foreach_oid(irid, inheritors_oids)
+                    {
+                        Relation irel = try_relation_open(irid, NoLock);
+                        if (irel != NULL)
+                        {
+                            if (OidIsValid(irel->rd_rel->relam) &&
+                                strcmp(get_am_name(irel->rd_rel->relam), "encrypted_heap") == 0)
+                            {
+                                guard = true;
+                                relation_close(irel, NoLock);
+                                break;
+                            }
+                            relation_close(irel, NoLock);
+                        }
+                    }
+                    
+
+                    if (guard)
+                    {   
+                        if (!tde_is_safe_index_am(stmt->accessMethod))
+                            ereport(ERROR,
+                                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                errmsg("pg_vault_tde: index access method \"%s\" is not supported "
+                                        "on encrypted_heap table \"%s\"",
+                                        stmt->accessMethod, stmt->relation->relname),
+                                errhint("Use \"CREATE INDEX ... USING tde_btree\" with an "
+                                        "encrypted operator class (e.g. tde_text_ops, "
+                                        "tde_int4_enc_ops) instead.")));
+
+                    }
+                    relation_close(rel, NoLock);
+                }
+            }
+            
+        }
+    }
+
 
     /*
      * We register the tuple table BEFORE utility_hook execution
@@ -508,6 +601,91 @@ tde_process_utility_hook(PlannedStmt *pstmt,
         Oid         relid;
         Oid         ext_ns;
 
+
+                ListCell *lc;
+        List *offending_cols = NIL;
+
+
+        foreach(lc, stmt->tableElts)
+        {
+            Node *elt = (Node*) lfirst(lc);
+            if (IsA(elt, ColumnDef))
+            {
+                ColumnDef *coldef = (ColumnDef*) elt;
+                ListCell* lc2;
+
+                foreach(lc2, coldef->constraints)
+                {
+                    Constraint* con = (Constraint*) lfirst(lc2);
+                    
+                    if (con->contype == CONSTR_PRIMARY || con->contype == CONSTR_UNIQUE)
+                    {
+                        String *colnode = makeString(coldef->colname);
+
+                        if(!list_member(offending_cols, colnode))
+                            offending_cols = lappend(offending_cols, colnode);
+                    }
+                        
+                }
+
+            }
+            else if (IsA(elt, Constraint))
+            {
+                Constraint *con = (Constraint*) elt;
+                if (con->contype == CONSTR_PRIMARY || con->contype == CONSTR_UNIQUE)
+                {
+                    ListCell *lc3;
+                    foreach(lc3, con->keys)
+                    {
+                        String *colnode = lfirst_node(String, lc3);
+
+                        if(!list_member(offending_cols, colnode))
+                            offending_cols = lappend(offending_cols, colnode);
+                    }
+                }
+            }
+
+            
+        }
+        
+        if(offending_cols != NIL)
+        {
+            StringInfoData buf;
+            ListCell *lc1;
+            bool first = true;
+
+            initStringInfo(&buf);
+
+            foreach(lc1, offending_cols)
+            {
+                char* colname = strVal(lfirst_node(String, lc1));
+                if(!first)
+                    appendStringInfoString(&buf, _(", "));
+                first = false;
+                appendStringInfo(&buf, _("\"%s\""), colname);
+            }
+        
+            
+            ereport(WARNING, 
+                    (errmsg_plural("pg_vault_tde: the constraints on column %s "
+                            "of encrypted_heap table \"%s\" will be backed " 
+                            "by a standard (unencrypted) btree index",
+                            "pg_vault_tde: the constraints on columns %s "
+                            "of encrypted_heap table \"%s\" will be backed " 
+                            "by a standard (unencrypted) btree index",
+                            list_length(offending_cols),
+                            buf.data, stmt->relation->relname),
+                    errdetail("PostgreSQL requires PRIMARY KEY/UNIQUE constraints "
+                              "to use the native btree access methods; the indexed "
+                              "column's plaintext value will be stored on disk in the index."),
+                    errhint("Consider a surrogate non-sensitive key, or enforce " 
+                            "uniqueness separately with "
+                            "\"CREATE UNIQUE INDEX ... USING tde_btree\".")
+                    )
+            );
+            pfree(buf.data);
+        }
+
         relid = RangeVarGetRelid(stmt->relation, NoLock, true /* missing_ok */);
         if (!OidIsValid(relid))
         {
@@ -546,6 +724,8 @@ tde_process_utility_hook(PlannedStmt *pstmt,
         ereport(DEBUG1,
                 (errmsg("pg_vault_tde: registered relid=%u in DEK catalog",
                         relid)));
+
+
     }
 
     /*
