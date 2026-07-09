@@ -1,4 +1,4 @@
--- regression_test_v17.sql — TDE tests 111-131 for pg_vault_tde v1.7
+-- regression_test_v17.sql — TDE tests 111-133 for pg_vault_tde v1.7
 --
 -- These tests cover the tde_*_enc_ops operator classes introduced in v1.7,
 -- which encrypt fixed-size B-Tree index keys (int4, int8, uuid, date,
@@ -14,7 +14,7 @@
 --   psql -f sql/pg_vault_tde--1.4--1.5.sql
 --   psql -f sql/pg_vault_tde--1.5--1.6.sql
 --   psql -f sql/pg_vault_tde--1.6--1.7.sql
---   psql -f sql/regression_test_v17.sql     (v1.7 tests 111-119)
+--   psql -f sql/regression_test_v17.sql     (v1.7 tests 111-133)
 --
 -- Exit-on-error: any failed assertion aborts the script.
 \set ON_ERROR_STOP on
@@ -1111,6 +1111,94 @@ BEGIN
 END;
 $$;
 
+
+-- ================================================================
+-- DDL GUARD (tests 132-133)
+--
+-- CREATE INDEX ... USING <AM> on an encrypted_heap table is rejected
+-- unless <AM> is a whitelisted encrypting index AM (tde_btree). Test
+-- 132 covers a plain table; test 133 covers a partitioned table where
+-- only a leaf, not the queried parent, is encrypted_heap.
+-- ================================================================
+
+-- ================================================================
+-- TEST 132: CREATE INDEX with an unsafe access method on encrypted_heap 
+-- is rejected
+--
+-- Verifies that pg_vault_tde_process_utility_hook blocks CREATE INDEX
+-- ... USING <non-whitelisted AM> on an encrypted_heap table, raising
+-- ERRCODE_FEATURE_NOT_SUPPORTED.
+-- ================================================================
+DO $$
+DECLARE 
+    ok boolean;
+BEGIN
+    DROP TABLE IF EXISTS tde_ddl_guard_132;
+
+    CREATE TABLE tde_ddl_guard_132(
+        id int,
+        label text
+    ) USING encrypted_heap;
+
+    ok := false;
+    BEGIN
+        CREATE INDEX ON tde_ddl_guard_132 USING hash (label);
+    EXCEPTION WHEN feature_not_supported THEN ok := true;
+    END;
+
+    IF NOT ok THEN
+        RAISE EXCEPTION 'TEST 132 FAILED: index access method not in whitelist was not blocked';
+    END IF;
+
+    DROP TABLE tde_ddl_guard_132;
+    RAISE NOTICE
+        'TEST 132 PASSED: CREATE INDEX USING hash on encrypted_heap correctly rejected (feature_not_supported)';
+END;
+$$;
+
+
+-- ================================================================
+-- TEST 133: DDL guard extends to partitioned tables — a plain parent
+-- with an encrypted_heap leaf still rejects unsafe index AMs
+-- ================================================================
+DO $$
+DECLARE
+    ok boolean;
+
+BEGIN
+    DROP TABLE IF EXISTS tde_ddl_guard_parent_133;
+    DROP TABLE IF EXISTS tde_ddl_guard_leaf_133;
+
+    CREATE TABLE tde_ddl_guard_parent_133(
+        id int,
+        label text
+    ) PARTITION BY RANGE (id);
+
+    CREATE TABLE tde_ddl_guard_leaf_133 
+    PARTITION OF tde_ddl_guard_parent_133 
+    FOR VALUES FROM (0) TO (10) USING encrypted_heap;
+
+    ok := false;
+    BEGIN 
+        CREATE INDEX ON tde_ddl_guard_parent_133 USING hash (label);
+    EXCEPTION WHEN feature_not_supported THEN ok := true;
+    END;
+
+    IF NOT ok THEN
+        RAISE EXCEPTION 'TEST 133 FAILED: CREATE INDEX USING hash on the partitioned '
+            'parent was not blocked despite an encrypted_heap leaf';
+    END IF; 
+
+    RAISE NOTICE
+        'TEST 133 PASSED: CREATE INDEX USING hash on a plain partitioned parent '
+        'correctly rejected — encrypted_heap leaf detected via partition recursion';
+
+    DROP TABLE tde_ddl_guard_leaf_133;
+    DROP TABLE tde_ddl_guard_parent_133;
+    
+END;
+$$;
+
 -- ================================================================
 -- TEST 134: TidRangeScan — exercises scan_getnextslot_tidrange path
 --           (PSQLE-109)
@@ -1162,14 +1250,15 @@ DO $$
   $$;
 
 
+
 -- ================================================================
 -- PHASE SUMMARY
 -- ================================================================
 DO $$
 BEGIN
     RAISE NOTICE '============================================================';
-    RAISE NOTICE 'v1.7 Tests 111-131 — COMPLETE';
-    RAISE NOTICE '   tde_int4_enc_ops + disk forensic check ..... test 111';
+    RAISE NOTICE 'v1.7 Tests 111-133 — COMPLETE';
+    RAISE NOTICE '   tde_int4_enc_ops + disk forensic check ......test 111';
     RAISE NOTICE '   tde_int8_enc_ops equality lookup ........... test 112';
     RAISE NOTICE '   tde_uuid_enc_ops equality lookup ........... test 113';
     RAISE NOTICE '   tde_date_enc_ops equality lookup ........... test 114';
@@ -1190,6 +1279,8 @@ BEGIN
     RAISE NOTICE '   FK encrypted parent + encrypted child ...... test 129';
     RAISE NOTICE '   FK encrypted parent + plain child .......... test 130';
     RAISE NOTICE '   FK plain parent + encrypted child .......... test 131';
+    RAISE NOTICE '   DDL guard — plain table .................... test 132';
+    RAISE NOTICE '   DDL guard — partitioned table (leaf-only) .. test 133';
     RAISE NOTICE '   scan_getnextslot_tidrange .................. test 134';
     RAISE NOTICE '============================================================';
 END;
