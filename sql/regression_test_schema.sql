@@ -150,7 +150,7 @@ DECLARE
 BEGIN
     
     CREATE TABLE private_tde.tde_schema_idx (id int, secret text) USING encrypted_heap;
-    CREATE INDEX ON private_tde.tde_schema_idx (id);
+    CREATE INDEX ON private_tde.tde_schema_idx  USING tde_btree (id);
     INSERT INTO private_tde.tde_schema_idx VALUES (42, 'schema_index_secret');
 
     SET enable_seqscan = off;
@@ -176,7 +176,7 @@ DECLARE
 BEGIN
     
     CREATE TABLE private_tde.tde_schema_bitmap (id int, payload text) USING encrypted_heap;
-    CREATE INDEX ON private_tde.tde_schema_bitmap (id);
+    CREATE INDEX ON private_tde.tde_schema_bitmap USING tde_btree (id);
     INSERT INTO private_tde.tde_schema_bitmap
         SELECT g, 'schema_row_' || g FROM generate_series(1, 100) g;
 
