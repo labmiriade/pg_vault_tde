@@ -231,13 +231,20 @@ $$;
 --
 -- This exercises pg_vault_tde_index_fetch_tuple (previously missing).
 -- Without the override, index scans returned raw ciphertext.
+-- 
+-- USING tde_btree is required explicitly since PSQLE-99: pg_vault_tde now
+-- rejects non-encrypting index access methods on encrypted_heap tables at
+-- DDL time. The AM choice does not affect what this test validates —
+-- index_fetch_tuple is a table AM callback, invoked identically regardless
+-- of which index AM located the TID (see tam.c comment: "Covers ALL
+-- regular index scans").
 -- ================================================================
 DO $$
 DECLARE
     v text;
 BEGIN
     CREATE TABLE tde_idx (id int, secret text) USING encrypted_heap;
-    CREATE INDEX ON tde_idx (id);
+    CREATE INDEX ON tde_idx USING tde_btree (id);
     INSERT INTO tde_idx VALUES (42, 'index_scan_secret');
     -- Force the planner to use the index
     SET enable_seqscan = off;
@@ -419,7 +426,7 @@ DECLARE
     v   text;
 BEGIN
     CREATE TABLE tde_bitmap (id int, payload text) USING encrypted_heap;
-    CREATE INDEX ON tde_bitmap (id);
+    CREATE INDEX ON tde_bitmap USING tde_btree (id);
     INSERT INTO tde_bitmap SELECT g, 'bitmap_' || g FROM generate_series(1, 200) g;
 
     /*
@@ -635,7 +642,7 @@ BEGIN
         id int,
         val text
     ) USING encrypted_heap;
-    CREATE INDEX tde_reindex_idx ON tde_reindex (id);
+    CREATE INDEX tde_reindex_idx ON tde_reindex USING tde_btree(id);
 
     INSERT INTO tde_reindex SELECT g, 'val_' || g FROM generate_series(1, 50) g;
 
@@ -1289,7 +1296,7 @@ BEGIN
         value numeric
     ) USING encrypted_heap;
 
-    CREATE INDEX tde_copy_idx_name ON tde_copy_idx(name);
+    CREATE INDEX tde_copy_idx_name ON tde_copy_idx USING tde_btree (name);
 
     -- Bulk insert
     INSERT INTO tde_copy_idx (id, name, value)
