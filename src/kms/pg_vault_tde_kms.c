@@ -151,7 +151,11 @@ typedef struct
     char   *data;
     size_t  len;
     size_t  alloc;
+    bool    overflow;   /* set by vault_write_cb when response exceeds cap */
 } vault_response_buf;
+
+/* Hard cap on Vault HTTP response size. 64 KB is ample for any Transit API key op. */
+#define VAULT_RESPONSE_MAX  (64 * 1024)
 
 /* --- forward declarations --- */
 static size_t           vault_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata);
@@ -187,16 +191,39 @@ PG_FUNCTION_INFO_V1(pg_vault_tde_vault_status);
  *
  * Appends received data to a vault_response_buf.  Uses repalloc for
  * growth (never malloc).
+ *
+ * Never calls ereport() — doing so would longjmp through libcurl's stack
+ * frames, bypassing its internal cleanup.  Instead, sets buf->overflow and
+ * returns 0 (CURLE_WRITE_ERROR) so libcurl aborts cleanly; the caller checks
+ * the flag after curl_easy_cleanup() and raises the error there.
  */
 static size_t
 vault_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
 {
     vault_response_buf *buf = (vault_response_buf *) userdata;
-    size_t bytes = size * nmemb;
+    size_t bytes;
+
+    /* Guard against size_t overflow in size * nmemb */
+    if (size != 0 && nmemb > SIZE_MAX / size)
+    {
+        buf->overflow = true;
+        return 0;
+    }
+    bytes = size * nmemb;
+
+    /* Enforce hard response cap before touching memory */
+    if (buf->len + bytes + 1 > VAULT_RESPONSE_MAX)
+    {
+        buf->overflow = true;
+        return 0;   /* signals CURLE_WRITE_ERROR to libcurl */
+    }
 
     if (buf->len + bytes + 1 > buf->alloc)
     {
-        buf->alloc = (buf->len + bytes + 1) * 2;
+        size_t new_alloc = buf->len + bytes + 1;
+        if (new_alloc <= SIZE_MAX / 2)
+            new_alloc *= 2;
+        buf->alloc = new_alloc;
         buf->data = repalloc(buf->data, buf->alloc);
     }
     memcpy(buf->data + buf->len, ptr, bytes);
@@ -387,9 +414,10 @@ vault_perform_login(void)
         return NULL;
     }
 
-    response.alloc = 2048;
-    response.len = 0;
-    response.data = palloc(response.alloc);
+    response.alloc    = 2048;
+    response.len      = 0;
+    response.overflow = false;
+    response.data     = palloc(response.alloc);
     response.data[0] = '\0';
 
     curl = curl_easy_init();
@@ -467,9 +495,14 @@ vault_perform_login(void)
     else
     {
         tde_audit(KMS_AUTH_FAILURE, NULL, false);
-        ereport(WARNING,
-                (errmsg("pg_vault_tde: Vault login HTTP request failed: %s",
-                        curl_easy_strerror(res))));
+        if (response.overflow)
+            ereport(WARNING,
+                    (errmsg("pg_vault_tde: Vault login response too large (limit %d bytes)",
+                            VAULT_RESPONSE_MAX)));
+        else
+            ereport(WARNING,
+                    (errmsg("pg_vault_tde: Vault login HTTP request failed: %s",
+                            curl_easy_strerror(res))));
     }
 
     /*
@@ -512,10 +545,11 @@ vault_perform_login(void)
                  "{\"secret_id\": \"%s\"}",
                  pg_vault_tde_vault_secret_id);
 
-        destroy_resp.alloc = 512;
-        destroy_resp.len   = 0;
-        destroy_resp.data  = palloc(destroy_resp.alloc);
-        destroy_resp.data[0] = '\0';
+        destroy_resp.alloc    = 512;
+        destroy_resp.len      = 0;
+        destroy_resp.overflow = false;
+        destroy_resp.data     = palloc(destroy_resp.alloc);
+        destroy_resp.data[0]  = '\0';
 
         destroy_curl = curl_easy_init();
         if (destroy_curl != NULL)
@@ -675,8 +709,9 @@ vault_refresh_token_internal(void)
     snprintf(url, sizeof(url), "%s/v1/auth/token/renew-self",
              pg_vault_tde_vault_url);
 
-    response.alloc = 1024;
-    response.len = 0;
+    response.alloc    = 1024;
+    response.len      = 0;
+    response.overflow = false;
     response.data = palloc(response.alloc);
     response.data[0] = '\0';
 
@@ -710,7 +745,11 @@ vault_refresh_token_internal(void)
 
     res = curl_easy_perform(curl);
 
-    if (res == CURLE_OK)
+    if (response.overflow)
+        ereport(WARNING,
+                (errmsg("pg_vault_tde: Vault token renewal response too large (limit %d bytes)",
+                        VAULT_RESPONSE_MAX)));
+    else if (res == CURLE_OK)
     {
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
         if (http_code == 200)
@@ -1304,6 +1343,7 @@ vault_resp_init(vault_response_buf *buf)
     buf->len    = 0;
     buf->data   = palloc(buf->alloc);
     buf->data[0] = '\0';
+    buf->overflow = false;
     return true;
 }
 
@@ -1430,7 +1470,11 @@ static bool vault_transit_request(const char *path,
 
         res = curl_easy_perform(curl);
 
-        if (res == CURLE_OK)
+        if (response->overflow)
+            ereport(ERROR,
+                errmsg("pg_vault_tde: Vault response too large (limit %d bytes)",
+                        VAULT_RESPONSE_MAX));
+        else if (res == CURLE_OK)
         {
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
             if (http_code == 200)

@@ -76,8 +76,19 @@ pg_vault_tde.vault_transit_mount  = 'transit'
 pg_vault_tde.vault_key_name       = 'pg-tde-dek'
 pg_vault_tde.vault_ca_cert        = '/etc/ssl/vault/ca.pem'
 pg_vault_tde.vault_timeout_ms     = 5000
-pg_vault_tde.enabled              = on          # set off to benchmark overhead
+pg_vault_tde.enabled              = on          # PGC_POSTMASTER: requires a full restart to change
 ```
+
+> **⚠️ Warning — do not toggle `pg_vault_tde.enabled` on a live database.**
+> Rows are written using the wire format active at the time of the write
+> (encrypted v4 trailer when `on`, verbatim heap tuple when `off`). Changing
+> the setting and restarting does **not** retroactively convert existing
+> rows: reads use whatever format is currently active for the *entire*
+> table, so any `encrypted_heap` table containing rows written under the
+> other setting will have those old rows misread (silent data corruption,
+> not an error). Only toggle this setting on databases where `encrypted_heap`
+> tables are empty or have been fully migrated (e.g. rewritten via
+> `CREATE TABLE ... AS SELECT` under the target setting) beforehand.
 
 #### b) Local Wallet (keypass locale, v1.6+)
 
@@ -239,11 +250,8 @@ pg_vault_tde.kms_provider = 'vault'   # HashiCorp Vault / OpenBao (default)
 
 ### Per-Database KMS Configuration
 
-Because all `pg_vault_tde` GUC parameters are declared `PGC_SUSET`, a superuser
-can assign **different KMS settings to individual databases** in the same cluster
-without restarting PostgreSQL.  Each connection picks up the effective GUC value
-for its own database, so `postgres` can use a central Vault instance while
-`tenant_a` uses a dedicated transit key and `tenant_b` uses a local wallet:
+Because all `pg_vault_tde` KMS-provider GUC parameters are declared `PGC_SUSET` (the master `enabled` switch and a couple of shared-memory-sizing parameters are `PGC_POSTMASTER` and cannot be scoped per database — see [doc/pg_vault_tde.md](doc/pg_vault_tde.md#guc-parameters)), a superuser can assign **different KMS settings to individual databases** in the same cluster without restarting PostgreSQL.
+Each connection picks up the effective GUC value for its own database, so `postgres` can use a central Vault instance while `tenant_a` uses a dedicated transit key and `tenant_b` uses a local wallet:
 
 ```sql
 -- cluster-level default (postgresql.conf / ALTER SYSTEM)

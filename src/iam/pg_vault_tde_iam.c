@@ -40,6 +40,7 @@
 #include "utils/syscache.h"     /* SearchSysCache1, ReleaseSysCache, CLAOID */
 #include "utils/uuid.h"         /* DatumGetUUIDP, pg_uuid_t */
 #include "catalog/pg_opclass.h" /* Form_pg_opclass */
+#include "catalog/pg_am_d.h"    /* BTREE_AM_OID */
 #include "storage/lwlock.h"
 #include <openssl/evp.h>
 #include <openssl/crypto.h>
@@ -641,8 +642,22 @@ static IndexBuildResult *
 pg_vault_tde_ambuild(Relation heap, Relation index, IndexInfo *index_info)
 {
     IndexBuildResult *result;
-
+    Oid               saved_relam = index->rd_rel->relam;
+      
     Assert(saved_btree_methods_valid);
+    
+    /*
+     * On PG17, tuplesort_begin_index_btree() hard-asserts
+     * indexRel->rd_rel->relam == BTREE_AM_OID before it will build a sort
+     * for the index (removed/relaxed in PG18). Since tde_btree registers
+     * its own AM oid, btbuild() would fail with "unexpected non-btree AM"
+     * for every build. Impersonate BTREE_AM_OID for the duration of the
+     * delegated build call, same pattern used for rd_tableam in
+     * pg_vault_tde_relation_copy_for_cluster (tam.c) — RelationData is
+     * per-backend, so the swap is safe from concurrency.
+     */
+    index->rd_rel->relam = BTREE_AM_OID;
+
 
     /*
      * Signal pg_vault_tde_index_build_range_scan to encrypt index keys.
@@ -657,10 +672,12 @@ pg_vault_tde_ambuild(Relation heap, Relation index, IndexInfo *index_info)
     PG_CATCH();
     {
         tde_iam_build_in_progress = false;
+        index->rd_rel->relam = saved_relam;
         PG_RE_THROW();
     }
     PG_END_TRY();
     tde_iam_build_in_progress = false;
+    index->rd_rel->relam = saved_relam;
 
     return result;
 }

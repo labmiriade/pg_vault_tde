@@ -71,17 +71,20 @@ static TableAmRoutine tde_methods;
  * Saved original heapam callbacks (non-NULL after tam_init).
  *
  * We intercept ALL read paths that deliver a HeapTuple into a slot:
- *  - scan_getnextslot      : sequential scan
- *  - index_fetch_tuple     : index scan (CRITICAL — was missing)
- *  - scan_bitmap_next_tuple: bitmap heap scan (BitmapHeapScan nodes)
- *  - scan_analyze_next_tuple: ANALYZE statistics collection
- *  - scan_sample_next_tuple: TABLESAMPLE clauses
- *  - tuple_fetch_row_version: direct TID fetch (TidScan, lock recheck)
- *  - tuple_lock            : SELECT FOR UPDATE / FOR SHARE
+ *  - scan_getnextslot              : sequential scan
+ *  - scan_getnextslot_tidrange     : Tid range scan
+ *  - index_fetch_tuple             : index scan (CRITICAL — was missing)
+ *  - scan_bitmap_next_tuple        : bitmap heap scan (BitmapHeapScan nodes)
+ *  - scan_analyze_next_tuple       : ANALYZE statistics collection
+ *  - scan_sample_next_tuple        : TABLESAMPLE clauses
+ *  - tuple_fetch_row_version       : direct TID fetch (TidScan, lock recheck)
+ *  - tuple_lock                    : SELECT FOR UPDATE / FOR SHARE
  *
  * Write paths call heap_insert / heap_update / heap_multi_insert directly.
  */
 static bool       (*heapam_scan_getnextslot_cb)(TableScanDesc, ScanDirection,
+                                                 TupleTableSlot *);
+static bool       (*heapam_scan_getnextslot_tidrange_cb)(TableScanDesc, ScanDirection,
                                                  TupleTableSlot *);
 static bool       (*heapam_index_fetch_tuple_cb)(struct IndexFetchTableData *,
                                                   ItemPointer, Snapshot,
@@ -409,7 +412,7 @@ pg_vault_tde_slot_callbacks(Relation rel)
     (void) rel;
     return &TTSOpsBufferHeapTuple;
 }
-/* ---- Sequential scan (SeqScan, TidRangeScan) ---- */
+/* ---- Sequential scan (SeqScan) ---- */
 /*
  * pg_vault_tde_scan_getnextslot
  *
@@ -431,6 +434,28 @@ pg_vault_tde_scan_getnextslot(TableScanDesc scan, ScanDirection direction,
     if (!TupIsNull(slot))
         pg_vault_tde_decode_slot(slot);  /* decode handles TOAST chunks automatically */
     return true;
+}
+/*
+ * pg_vault_tde_scan_getnextslot_tidrange
+ *
+ * TidRangeScan read path.  scan_getnextslot_tidrange is a
+ * SEPARATE TableAmRoutine callback from scan_getnextslot — it is not
+ * covered by overriding scan_getnextslot alone.  Without this wrapper,
+ * queries planned as "Tid Range Scan" (e.g. WHERE ctid BETWEEN ...)
+ * read raw ciphertext from the page into the slot, undecrypted.
+ *
+ * Same delegate-then-decode pattern as pg_vault_tde_scan_getnextslot.
+ */
+
+static bool 
+pg_vault_tde_scan_getnextslot_tidrange(TableScanDesc scan, ScanDirection direction,
+                                            TupleTableSlot *slot)
+{
+    if(!heapam_scan_getnextslot_tidrange_cb(scan, direction, slot))
+        return false;
+    if(!TupIsNull(slot))
+        pg_vault_tde_decode_slot(slot);
+    return true;  
 }
 /*
  * pg_vault_tde_index_fetch_tuple
@@ -1531,22 +1556,17 @@ pg_vault_tde_relation_copy_for_cluster(Relation OldTable,
     PG_TRY();
     {
         /*
-         * Use heap_beginscan directly (not table_beginscan) to bypass our
-         * TAM override.  This gives us:
-         *   - raw ciphertext tuples pointing into pinned buffer pages
-         *   - hscan->rs_cbuf valid for HeapTupleSatisfiesVacuum
-         *
-         * PG18 introduced a mandatory async read stream in heapgettup.
+         * PG17 introduced a mandatory async read stream in heapgettup.
          * heap_fetch_next_buffer asserts scan->rs_read_stream != NULL, and
          * the stream is created in heap_beginscan only when SO_TYPE_SEQSCAN
          * is present.  Without it, every heapgettup call crashes (Assert in
-         * cassert builds, NULL-deref segfault in release builds).
+         * cassert builds, NULL-deref segfault in release builds).  This is
+         * unconditional because it already applies on PG17, the minimum
+         * supported version.
          */
         hscan = (HeapScanDesc) heap_beginscan(OldTable, SnapshotAny, 0, NULL,
                                               NULL,
-#if PG_VERSION_NUM >= 180000
                                               SO_TYPE_SEQSCAN |
-#endif
                                               SO_ALLOW_STRAT | SO_ALLOW_SYNC);
 
         while ((enc_raw = heap_getnext((TableScanDesc) hscan,
@@ -1801,6 +1821,7 @@ pg_vault_tde_tam_init(void)
     memcpy(&tde_methods, heapam, sizeof(TableAmRoutine));
     /* --- Save originals for every read path we wrap --- */
     heapam_scan_getnextslot_cb              = heapam->scan_getnextslot;
+    heapam_scan_getnextslot_tidrange_cb     = heapam->scan_getnextslot_tidrange;
     heapam_index_fetch_tuple_cb             = heapam->index_fetch_tuple;
     heapam_scan_bitmap_next_tuple_cb        = heapam->scan_bitmap_next_tuple;
     heapam_scan_analyze_next_tuple_cb       = heapam->scan_analyze_next_tuple;
@@ -1820,6 +1841,7 @@ pg_vault_tde_tam_init(void)
     tde_methods.tuple_delete                = pg_vault_tde_tuple_delete;
     /* Read paths: delegate to heapam then decrypt the returned slot */
     tde_methods.scan_getnextslot            = pg_vault_tde_scan_getnextslot;
+    tde_methods.scan_getnextslot_tidrange   = pg_vault_tde_scan_getnextslot_tidrange;
     tde_methods.index_fetch_tuple           = pg_vault_tde_index_fetch_tuple;
     tde_methods.scan_bitmap_next_tuple      = pg_vault_tde_scan_bitmap_next_tuple;
     tde_methods.scan_analyze_next_tuple     = pg_vault_tde_scan_analyze_next_tuple;

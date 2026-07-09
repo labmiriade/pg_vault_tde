@@ -48,6 +48,8 @@ the extension API; zero modifications to PostgreSQL core are required.
 | `scan_bitmap_next_tuple` | `(scan, slot, recheck)` | `(scan, slot, recheck, lossy, exact)` | `PG_VERSION_NUM >= 180000` |
 | `shmem_request_hook` | Available | Available | *(none needed)* |
 | `GetHeapamTableAmRoutine()` | Returns `const *` | Returns `const *` | *(none needed)* |
+| `tuplesort_begin_index_btree()` assert on `relam` | Asserts `rd_rel->relam == BTREE_AM_OID` | No such assert | `PG_VERSION_NUM < 180000` — `pg_vault_tde_ambuild()` temporarily impersonates `BTREE_AM_OID` on `index->rd_rel->relam` during the sort |
+| `BuildSpeculativeIndexInfo()` assert on ON CONFLICT | Asserts against non-btree-looking `relam` for unique `tde_btree` indexes | No such assert | `PG_VERSION_NUM < 180000` — `tde_executor_start_hook()` swaps `relam` back to `BTREE_AM_OID` for the duration of the query, restored via a `MemoryContextCallback` |
 
 ### Design Goals
 
@@ -162,9 +164,7 @@ void pg_vault_tde_tam_init(void) {
 }
 ```
 
-All structural operations (VACUUM, CLUSTER, index build, truncate, scan
-state management) delegate to heapam unchanged. Only the four write paths,
-seven read paths, and one rewrite path are overridden.
+All structural operations (VACUUM, CLUSTER, index build, truncate, scan state management) delegate to heapam unchanged. Only the five write paths, eight read paths, two visibility/build paths, and two rewrite path are overridden.
 
 ### Overridden Callbacks
 
@@ -176,6 +176,7 @@ seven read paths, and one rewrite path are overridden.
 | `tuple_insert_speculative` | Speculative INSERT (ON CONFLICT) |
 | `multi_insert` | COPY FROM / bulk INSERT |
 | `tuple_update` | UPDATE |
+| `tuple_delete` | DELETE |
 
 All write paths follow the same pattern:
 1. Materialize the slot into a `HeapTuple` (plaintext)
@@ -191,7 +192,8 @@ buffer-backed `HeapTuple` MUST call `pg_vault_tde_decode_slot()`.
 
 | Callback | Scan Type | Status |
 |---|---|---|
-| `scan_getnextslot` | SeqScan, TidRangeScan | ✅ Override |
+| `scan_getnextslot` | SeqScan | ✅ Override |
+| `scan_getnextslot_tidrange` | TidRangeScan | ✅ Override |
 | `index_fetch_tuple` | Index Scan, Index Only Scan | ✅ Override |
 | `scan_bitmap_next_tuple` | BitmapHeapScan | ✅ Override |
 | `scan_analyze_next_tuple` | ANALYZE | ✅ Override |
@@ -199,11 +201,20 @@ buffer-backed `HeapTuple` MUST call `pg_vault_tde_decode_slot()`.
 | `tuple_fetch_row_version` | TidScan, UPDATE recheck | ✅ Override |
 | `tuple_lock` | SELECT FOR UPDATE/SHARE | ✅ Override |
 
+#### Visibility & Index-Build Paths
+ 
+| Callback | Purpose |
+|---|---|
+| `tuple_satisfies_snapshot` | Visibility recheck for RI foreign-key trigger (`RI_FKey_check`) — heapam's version asserts a live buffer pin, which our decrypt-into-palloc'd-tuple path doesn't hold |
+| `index_build_range_scan` | CREATE INDEX / REINDEX — decrypts each tuple before `FormIndexDatum` extracts key values, otherwise indexes would be built over ciphertext|
+
+
 #### Rewrite Paths (decrypt → process → re-encrypt)
 
 | Callback | Trigger | Notes |
 |---|---|---|
 | `relation_copy_for_cluster` | `VACUUM FULL`, `CLUSTER` | Reads each tuple via `heap_getnext` (with `rd_tableam` impersonation), decrypts, re-encrypts into the new heap via `rewrite_heap_tuple`. Clears `HEAP_HASEXTERNAL` on the encrypted copy before writing; `tde_tuple_has_external_slow` (per-attribute varlena scan) is used on subsequent DELETE to locate TOAST chunks regardless of the infomask flag. |
+| `relation_toast_am` | TOAST table creation | Selects `encrypted_heap` as the TOAST AM when `pg_vault_tde.toast_encryption = on` (default), so TOAST chunks are encrypted through the same `tuple_insert`/`scan_getnextslot` hooks as the main table. |
 
 ### pg_vault_tde_decode_slot
 
@@ -479,8 +490,10 @@ bash bench_tde.sh 100000
 
 The script runs INSERT, SELECT, UPDATE, index scan, and TABLESAMPLE workloads
 on `plain_heap` vs `encrypted_heap`, and prints a comparison table with
-overhead percentages. Use `pg_vault_tde.enabled = off` to isolate pure TAM
-overhead (no crypto) from actual encryption cost.
+overhead percentages. Use `pg_vault_tde.enabled = off` (requires a server
+restart — the GUC is `PGC_POSTMASTER`) to isolate pure TAM overhead (no
+crypto) from actual encryption cost. See the warning in README.md before
+toggling this on any database with existing `encrypted_heap` data.
 
 ```
 ┌────────────────────────────────────────────────────┐
@@ -948,11 +961,15 @@ All parameters are in the `pg_vault_tde` namespace and are registered in
 `_PG_init` via `DefineCustomXxxVariable`.
 
 **Context**: all KMS-related parameters are `PGC_SUSET` — superusers can set
-them at session level or scope them to individual databases with
-`ALTER DATABASE SET` / `ALTER ROLE SET`.  No server restart is needed.
-The only exceptions are `max_encrypted_relations` (controls shared-memory
-sizing, `PGC_POSTMASTER`) and `crypto_provider` (OpenSSL provider selection,
-`PGC_POSTMASTER`).
+  them at session level or scope them to individual databases with
+  `ALTER DATABASE SET` / `ALTER ROLE SET`.  No server restart is needed.
+  The exceptions are `max_encrypted_relations` (controls shared-memory
+  sizing, `PGC_POSTMASTER`), `crypto_provider` (OpenSSL provider selection,
+  `PGC_POSTMASTER`), and `enabled` (master crypto switch, `PGC_POSTMASTER` —
+  its value is baked into the on-disk wire format, so it cannot be toggled
+  without risking silent plaintext/ciphertext mismatches; see the `enabled`
+  row below).
+
 
 #### Per-Database KMS Configuration
 
@@ -1009,7 +1026,7 @@ value; no shared state is changed.
 | `toast_encryption` | boolean | `on` | suset | Encrypt TOAST chunks with the parent relation's DEK |
 | `bgw_enabled` | boolean | `off` | suset | Enable background worker for automatic token renewal. **Requires cluster restart**: the BGW is registered via `RegisterBackgroundWorker()` at postmaster startup; changing via `pg_reload_conf()` updates the value but does not start/stop the worker dynamically. |
 | `token_renewal_interval` | integer | `3600` | suset | Token renewal interval in seconds (60–86400) |
-| `enabled` | boolean | `on` | suset | Master switch: `off` disables crypto for benchmarking overhead. Settable per-database. |
+| `enabled` | boolean | `on` | postmaster | Master switch: `off` disables crypto for benchmarking overhead. Fixed at server startup |
 | `max_encrypted_relations` | integer | `1024` | postmaster | Max per-table DEK entries in shmem (64–65536). **Requires restart** — controls shared-memory allocation. |
 | `crypto_provider` | string | `''` | postmaster | OpenSSL 3.x provider name (`qatprovider`, `fips`; empty = built-in dispatch). **Requires restart**. |
 
@@ -1026,7 +1043,7 @@ and included by any translation unit that needs them (`tam.c`, `kms.c`).
 _PG_init()
   ├── DefineCustomStringVariable("pg_vault_tde.vault_url", ...)      [PGC_SUSET]
   ├── DefineCustomStringVariable("pg_vault_tde.vault_token", ...)    [PGC_SUSET, GUC_NOT_IN_SAMPLE]
-  ├── ... ~20 more GUC parameters (all PGC_SUSET except max_encrypted_relations/crypto_provider) ...
+  ├── ... ~20 more GUC parameters (all PGC_SUSET except max_encrypted_relations/crypto_provider/enabled) ...
   ├── install shmem_request_hook  → pg_vault_tde_shmem_request()
   │       ├── pg_vault_tde_kms_shmem_request()
   │       │       └── RequestAddinShmemSpace(sizeof(pg_vault_tde_kms_cache))
@@ -1044,7 +1061,7 @@ _PG_init()
   │       └── tde_shmem_started = true; tde_active_kms_provider->init()
   ├── pg_vault_tde_tam_init()
   │       └── memcpy(&tde_methods, GetHeapamTableAmRoutine(), sizeof(TableAmRoutine))
-  │           + install 4 write + 7 read + 1 TOAST AM wrappers
+  │           + install 5 write + 8 read + 2 visibility/build + 2 rewrite AM wrappers
   └── register on_proc_exit(tde_backend_cleanup)
           ├── tde_crypto_ctx_cleanup()   ← EVP_CIPHER_CTX_free + OPENSSL_cleanse iv_batch
           └── tde_iam_ctx_cleanup()      ← EVP_CIPHER_CTX_free SIV enc/dec context
@@ -1085,10 +1102,10 @@ sequence, gated on the live extension version:
 | `sql/regression_test.sql` | 1–52 | v1.0–v1.4 baseline: crypto, TAM, TOAST, tde_btree |
 | `sql/regression_test_v15.sql` | 53–72 | v1.5: per-table DEK, online rotation, AAD |
 | `sql/regression_test_v16.sql` | 73–109 | v1.6: local wallet KMS |
-| `sql/regression_test_v17.sql` | 111–128 | v1.7: `enc_ops` indexes, partition trees, HOT/REINDEX |
+| `sql/regression_test_v17.sql` | 111–134 | v1.7: `enc_ops` indexes, partition trees, HOT/REINDEX, FK lifecycle, TidRangeScan|
 
 Test 110 (`WITH HOLD` cursor spill) is permanently deferred. The full suite is therefore
-**127 tests**. The table below details the v1.0–v1.4 baseline file:
+**134 tests**. The table below details the v1.0–v1.4 baseline file:
 
 | Range | Area |
 |---|---|
