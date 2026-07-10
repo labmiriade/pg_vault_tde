@@ -18,7 +18,7 @@ CONTAINER="pg-tde-regress-$$"
 cleanup() { stop_container "$CONTAINER"; }
 trap cleanup EXIT
 
-log_stage "REGRESSION TESTS (52 v1.4 + 20 v1.5 + 38 v1.6 + 23 v1.7  = 133 total)"
+log_stage "REGRESSION TESTS (52 v1.4 + 20 v1.5 + 38 v1.6 + 27 v1.7  = 137 total)"
 
 build_pg_test_image
 
@@ -162,11 +162,11 @@ else
 fi
 
 # ── Phase 6: v1.7 wallet tests (tests 111-131) ────────────────────────────
-log_info "Running v1.7 wallet regression_test_v17.sql (tests 111-131) ..."
+log_info "Running v1.7 wallet regression_test_v17.sql (tests 111-137) ..."
 START=$(timer_start)
 if container_psql "$CONTAINER" -f /tmp/regression_test_v17.sql; then
     ELAPSED=$(timer_elapsed "$START")
-    log_ok "REGRESSION v1.7 wallet: tests 111-133 OK ($(timer_fmt "$ELAPSED"))"
+    log_ok "REGRESSION v1.7 wallet: tests 111-137 OK ($(timer_fmt "$ELAPSED"))"
 else
     ELAPSED=$(timer_elapsed "$START")
     log_error "REGRESSION v1.7 wallet: FAILED after $(timer_fmt "$ELAPSED")"
@@ -174,5 +174,5 @@ else
     exit 2
 fi
 
-log_ok "REGRESSION COMPLETE: ALL 133 TESTS PASSED (v1.4 × 52 + v1.5 × 20 + v1.6 × 38 + v1.7 × 23)"
+log_ok "REGRESSION COMPLETE: ALL 137 TESTS PASSED (v1.4 × 52 + v1.5 × 20 + v1.6 × 38 + v1.7 × 27)"
 exit 0
