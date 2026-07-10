@@ -274,7 +274,13 @@ tde_backup_encrypt_block(const TdeBackupContext* tde_ctx,
     tag_ptr = ct_ptr + block_len;
 
     /* Generate per-block random IV */
-    pg_strong_random(iv_ptr, TDE_GCM_IV_LEN);
+    if (!pg_strong_random(iv_ptr, TDE_GCM_IV_LEN))
+    {
+        OPENSSL_cleanse(out_buf, total);
+        pfree(out_buf);
+        pg_log_error("pg_dump_tde: failed to generate random IV (entropy source unavailable)");
+        return NULL;
+    }
 
     if(dump_evp_ctx == NULL){
         dump_evp_ctx = EVP_CIPHER_CTX_new();

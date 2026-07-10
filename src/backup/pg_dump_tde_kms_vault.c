@@ -657,11 +657,7 @@ vault_wrap_dek(const unsigned char *dek, int dek_len,
     else    
         pg_log_error("pg_dump_tde: HTTP request failed");
 
-    if(b64_dek)
-    {
-        OPENSSL_cleanse(b64_dek, b64_len);
-        pfree(b64_dek);
-    }
+
     if(post_body)
     {
         OPENSSL_cleanse(post_body, strlen(post_body));
@@ -734,11 +730,6 @@ static bool vault_unwrap_dek(const unsigned char* wrapped_dek, int wrapped_len,
     }
     vault_resp_free(&resp);
 
-    if(plaintext_b64)
-    {
-        OPENSSL_cleanse(plaintext_b64, strlen(plaintext_b64));
-        pfree(plaintext_b64);
-    }
     return success;
 }
 
