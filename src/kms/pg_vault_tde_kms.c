@@ -167,7 +167,6 @@ static bool             vault_refresh_token_internal(void);
 static bool             vault_provider_rewrap_dek(const unsigned char *old_wrapped, int old_len,
                                                    unsigned char *new_wrapped, int *new_len);
 static bool             vault_probe_health(void);
-static bool             detect_aes_ni(void);
 static bool             vault_resp_init(vault_response_buf *buf);
 static void             vault_resp_free(vault_response_buf *buf);
 static CURL            *vault_make_curl(vault_response_buf *resp);
@@ -910,22 +909,8 @@ vault_provider_rewrap_dek(const unsigned char *old_wrapped, int old_len,
 
     return success;
 }
-/* ================================================================
- * pg_vault_tde_health_check — unified diagnostic composite (v1.3)
- *
- * Returns a 14-column composite aggregating all subsystem states:
- * DEK, Vault, authentication, OpenSSL, hardware acceleration, and
- * overall health status derived from the component statuses.
- *
- * overall_status rules:
- *   "healthy"  — DEK valid, if Vault configured then reachable + token OK
- *   "degraded" — DEK valid, but Vault unreachable or token stale
- *   "error"    — no DEK available (encrypted tables will fail)
- * ================================================================ */
 
 #include "funcapi.h"                /* get_call_result_type, BlessTupleDesc */
-#include "src/include/pg_vault_tde_hw_accel.h"
-#include <openssl/opensslv.h>       /* OPENSSL_VERSION_TEXT */
 
 /*
  * vault_probe_health — lightweight Vault connectivity probe.
@@ -973,161 +958,6 @@ vault_probe_health(void)
 
     curl_easy_cleanup(curl);
     return reachable;
-}
-
-/*
- * detect_aes_ni — check x86 AES-NI / ARM CE availability at runtime.
- *
- * On x86_64: reads /proc/cpuinfo for the "aes" flag.
- * On aarch64: reads /proc/cpuinfo for the "aes" feature.
- * Falls back to false if /proc/cpuinfo is not readable (e.g. non-Linux).
- */
-static bool
-detect_aes_ni(void)
-{
-#ifdef __linux__
-    FILE *fp = fopen("/proc/cpuinfo", "r");
-    char  line[4096];
-    bool  found = false;
-
-    if (fp == NULL)
-        return false;
-
-    while (fgets(line, sizeof(line), fp) != NULL)
-    {
-        /* x86: "flags" line; ARM: "Features" line — both list "aes" */
-        if ((strncmp(line, "flags", 5) == 0 ||
-             strncmp(line, "Features", 8) == 0) &&
-            strstr(line, " aes") != NULL)
-        {
-            found = true;
-            break;
-        }
-    }
-    fclose(fp);
-    return found;
-#else
-    return false;
-#endif
-}
-
-PG_FUNCTION_INFO_V1(pg_vault_tde_health_check);
-PGDLLEXPORT Datum
-pg_vault_tde_health_check(PG_FUNCTION_ARGS)
-{
-    TupleDesc       tupdesc;
-    Datum           values[15];
-    bool            nulls[15];
-    HeapTuple       result_tup;
-
-    /* State variables */
-    bool            dek_valid = false;
-    uint64          gen = 0;
-    bool            prev_dek_valid_flag = false;
-    bool            vault_configured;
-    bool            vault_reachable = false;
-    bool            token_available;
-    bool            encryption_enabled;
-    bool            aes_ni;
-    const char     *overall;
-
-    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
-        ereport(ERROR,
-                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                 errmsg("function returning record called in context "
-                        "that cannot accept type record")));
-    tupdesc = BlessTupleDesc(tupdesc);
-
-    memset(nulls, 0, sizeof(nulls));
-
-    /* --- Vault state --- */
-    vault_configured = (pg_vault_tde_vault_url != NULL &&
-                        pg_vault_tde_vault_url[0] != '\0');
-    if (vault_configured)
-        vault_reachable = vault_probe_health();
-
-    /* --- Auth / token state --- */
-    token_available = (vault_get_effective_token() != NULL &&
-                       vault_get_effective_token()[0] != '\0');
-
-    /* --- Other flags --- */
-    encryption_enabled = pg_vault_tde_enabled;
-    aes_ni = detect_aes_ni();
-
-    /* --- overall_status derivation --- */
-    if (!dek_valid)
-        overall = "error";
-    else if (vault_configured && (!vault_reachable || !token_available))
-        overall = "degraded";
-    else
-        overall = "healthy";
-
-    /* --- Fill 15-column composite --- */
-    /*  0: overall_status text */
-    values[0] = CStringGetTextDatum(overall);
-    /*  1: dek_valid boolean */
-    values[1] = BoolGetDatum(dek_valid);
-    /*  2: generation bigint */
-    values[2] = Int64GetDatum((int64) gen);
-    /*  3: prev_dek_available boolean */
-    values[3] = BoolGetDatum(prev_dek_valid_flag);
-    /*  4: vault_configured boolean */
-    values[4] = BoolGetDatum(vault_configured);
-    /*  5: vault_url text */
-    if (pg_vault_tde_vault_url != NULL && pg_vault_tde_vault_url[0] != '\0')
-        values[5] = CStringGetTextDatum(pg_vault_tde_vault_url);
-    else
-        nulls[5] = true;
-    /*  6: vault_reachable boolean */
-    values[6] = BoolGetDatum(vault_reachable);
-    /*  7: auth_method text */
-    values[7] = CStringGetTextDatum(
-        pg_vault_tde_vault_auth_method ? pg_vault_tde_vault_auth_method : "token");
-    /*  8: token_available boolean */
-    values[8] = BoolGetDatum(token_available);
-    /*  9: openssl_version text */
-    values[9] = CStringGetTextDatum(OPENSSL_VERSION_TEXT);
-    /* 10: aes_ni_available boolean */
-    values[10] = BoolGetDatum(aes_ni);
-    /* 11: crypto_provider text */
-    {
-        const char *prov = tde_hw_accel_provider_name();
-        values[11] = CStringGetTextDatum(prov != NULL && prov[0] != '\0' ? prov : "default");
-    }
-    /* 12: encryption_enabled boolean */
-    values[12] = BoolGetDatum(encryption_enabled);
-    /* 13: dek_cache_ttl integer */
-    values[13] = Int32GetDatum(pg_vault_tde_dek_cache_ttl);
-
-    /*
-     * 14: wrapped_dek_perms text (v1.4)
-     *
-     * Report the octal permission bits of the wrapped-DEK file so
-     * operators can verify the file is mode 0600.  Returns NULL when
-     * Vault integration is not configured (no path) or the file does
-     * not yet exist (first boot, or Vault never reached).
-     */
-    {
-        char   *dek_path = NULL;
-        struct stat st;
-
-        if (dek_path != NULL && dek_path[0] != '\0' &&
-            stat(dek_path, &st) == 0)
-        {
-            char perm_str[8];
-            snprintf(perm_str, sizeof(perm_str), "%04o",
-                     (int) (st.st_mode & 0777));
-            values[14] = CStringGetTextDatum(perm_str);
-        }
-        else
-            nulls[14] = true;
-
-        if (dek_path != NULL)
-            pfree(dek_path);
-    }
-
-    result_tup = heap_form_tuple(tupdesc, values, nulls);
-    PG_RETURN_DATUM(HeapTupleGetDatum(result_tup));
 }
 
 /* ================================================================
@@ -1617,11 +1447,7 @@ vault_provider_unwrap_dek(const unsigned char *wrapped, int wrapped_len,
         pfree(post_body);
     }
     vault_resp_free(&resp);
-    if (plaintext_b64)
-    {
-        OPENSSL_cleanse(plaintext_b64, strlen(plaintext_b64));
-        pfree(plaintext_b64);
-    }
+    
     return success;
 }
 

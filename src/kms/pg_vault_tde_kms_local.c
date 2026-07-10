@@ -1377,7 +1377,7 @@ pg_vault_tde_wallet_init_sql(PG_FUNCTION_ARGS)
 
     /* Ensure 0600 permissions */
     if (chmod(path, 0600) != 0)
-        ereport(WARNING,
+        ereport(ERROR,
                 errmsg("pg_vault_tde: chmod(wallet, 0600) failed: %m"));
 
     /*
@@ -1493,7 +1493,7 @@ local_create_wallet_file(const char *dest_path, const char *passphrase, const un
     PKCS12_free(p12);
 
     if (chmod(tmp_path, 0600) != 0)
-        ereport(WARNING,
+        ereport(ERROR,
                 errmsg("pg_vault_tde: chmod(\"%s\", 0600) failed: %m",
                        tmp_path));
 
@@ -1896,6 +1896,15 @@ pg_vault_tde_wallet_export_bundle_sql(PG_FUNCTION_ARGS)
     }
     fseek(wf, 0, SEEK_END);
     wallet_size = ftell(wf);
+    if (wallet_size < 0)
+    {
+        fclose(wf);
+        OPENSSL_cleanse(pass, sizeof(pass));
+        ereport(ERROR,
+                errmsg("pg_vault_tde: export_bundle: could not determine size of "
+                        "wallet \"%s\": %m", wallet_path));
+    }  
+    
     fseek(wf, 0, SEEK_SET);
     wallet_bytes = palloc(wallet_size);
     if ((long) fread(wallet_bytes, 1, wallet_size, wf) != wallet_size)
@@ -1948,7 +1957,10 @@ pg_vault_tde_wallet_export_bundle_sql(PG_FUNCTION_ARGS)
                 errmsg("pg_vault_tde: export_bundle: could not open \"%s\" for write: %m",
                        dest));
     }
-    chmod(dest, 0600);
+    /* Ensure 0600 permissions */
+    if (chmod(dest, 0600) != 0)
+        ereport(ERROR,
+                errmsg("pg_vault_tde: chmod(\"%s\", 0600) failed: %m", dest));
 
     /* Initialize HMAC (covers all bytes written) */
     hctx = HMAC_CTX_new();
@@ -2244,7 +2256,12 @@ pg_vault_tde_wallet_import_bundle_sql(PG_FUNCTION_ARGS)
                 errmsg("pg_vault_tde: import_bundle: could not write wallet"));
     }
     fclose(wf);
-    chmod(wallet_path, 0600);
+
+    /* Ensure 0600 permissions */
+    if (chmod(wallet_path, 0600) != 0)
+        ereport(ERROR,
+                errmsg("pg_vault_tde: chmod(\"%s\", 0600) failed: %m", wallet_path));
+
     pos += wallet_sz;
 
     /* catalog_count */

@@ -305,8 +305,7 @@ static bool local_open_wallet(const char* path, const char* passphrase,
     if(ca) sk_X509_pop_free(ca, X509_free);
     
     PKCS12_free(p12);
-   
-    memcpy(kek_out, kek_buffer, kek_len);
+    if(ok) memcpy(kek_out, kek_buffer, kek_len);
 
     OPENSSL_cleanse(kek_buffer, kek_len);
     return ok;
