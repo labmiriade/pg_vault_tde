@@ -1377,8 +1377,12 @@ pg_vault_tde_wallet_init_sql(PG_FUNCTION_ARGS)
 
     /* Ensure 0600 permissions */
     if (chmod(path, 0600) != 0)
+    {
+        OPENSSL_cleanse(passphrase, strlen(passphrase));
+        pfree(passphrase);
         ereport(ERROR,
                 errmsg("pg_vault_tde: chmod(wallet, 0600) failed: %m"));
+    }
 
     /*
      * Open the freshly created wallet to derive and cache the KEK.
@@ -1493,9 +1497,12 @@ local_create_wallet_file(const char *dest_path, const char *passphrase, const un
     PKCS12_free(p12);
 
     if (chmod(tmp_path, 0600) != 0)
+    {
+        unlink(tmp_path);
         ereport(ERROR,
                 errmsg("pg_vault_tde: chmod(\"%s\", 0600) failed: %m",
                        tmp_path));
+    }
 
     if (rename(tmp_path, dest_path) != 0)
     {
@@ -1959,8 +1966,14 @@ pg_vault_tde_wallet_export_bundle_sql(PG_FUNCTION_ARGS)
     }
     /* Ensure 0600 permissions */
     if (chmod(dest, 0600) != 0)
+    {
+        fclose(bf);
+        unlink(dest);
+        SPI_finish();
+        OPENSSL_cleanse(hmac_key, 32);
         ereport(ERROR,
                 errmsg("pg_vault_tde: chmod(\"%s\", 0600) failed: %m", dest));
+    }
 
     /* Initialize HMAC (covers all bytes written) */
     hctx = HMAC_CTX_new();

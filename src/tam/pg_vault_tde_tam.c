@@ -42,6 +42,7 @@
 #include "commands/defrem.h"        /* get_table_am_oid — used by toast_am */
 #include "utils/rel.h"              /* RelationGetRelid */
 #include "utils/memutils.h"
+#include "utils/tuplesort.h"        /* tuplesort_getdatum (index_validate_scan)*/
 #include "utils/snapmgr.h"          /* GetLatestSnapshot, RegisterSnapshot,
                                        UnregisterSnapshot */
 #include "miscadmin.h"              /* CHECK_FOR_INTERRUPTS */
@@ -416,7 +417,7 @@ pg_vault_tde_slot_callbacks(Relation rel)
 /*
  * pg_vault_tde_scan_getnextslot
  *
- * SeqScan / TidRangeScan read path.  Delegates to heapam which fills the
+ * SeqScan read path.  Delegates to heapam which fills the
  * slot with a buffer-backed encrypted tuple, then decrypts in-place via
  * decode_slot.  This is the most commonly exercised read path in OLTP.
  *
@@ -867,6 +868,176 @@ pg_vault_tde_index_build_range_scan(Relation heap_rel,
     FreeExecutorState(estate);
     return reltuples;
 }
+
+/* ---- Index validation (CREATE INDEX CONCURRENTLY / REINDEX CONCURRENTLY) ---- */
+/*
+* pg_vault_tde_index_validate_scan
+*
+* Why a custom scan instead of delegating to heapam_index_validate_scan (as
+* index_fetch_tuple does by impersonating heapam): heapam scans with
+* heap_getnext(), which trips the rd_tableam == GetHeapamTableAmRoutine()
+* guard and, even with impersonation, would feed FormIndexDatum raw ciphertext
+* -- silently indexing garbage keys for concurrently-inserted rows.
+*
+* Why no key pre-encryption here (unlike pg_vault_tde_index_build_range_scan):
+* validation inserts via index_insert -> pg_vault_tde_aminsert, and
+* tde_iam_build_in_progress is false, so aminsert owns the AES-256-SIV
+* encryption -- exactly like a runtime INSERT.
+*/
+static void
+pg_vault_tde_index_validate_scan(Relation heap_rel,
+                                Relation index_rel,
+                                struct IndexInfo *index_info,
+                                Snapshot snapshot,
+                                struct ValidateIndexState *state)
+{   
+    TableScanDesc   scan;
+    HeapScanDesc    hscan;
+    EState         *estate;
+    ExprContext    *econtext;
+    TupleTableSlot *slot;
+    ExprState      *predicate;
+    Datum           values[INDEX_MAX_KEYS];
+    bool            isnull[INDEX_MAX_KEYS];
+    OffsetNumber    root_offsets[MaxHeapTuplesPerPage];
+    bool            in_index[MaxHeapTuplesPerPage];
+    BlockNumber     root_blkno = InvalidBlockNumber;
+    ItemPointer     indexcursor = NULL;
+    ItemPointerData decoded;
+    bool            tuplesort_empty = false;
+    MemoryContext   scan_mcxt;
+
+    estate   = CreateExecutorState();
+    econtext = GetPerTupleExprContext(estate);
+    slot     = table_slot_create(heap_rel, NULL);
+    econtext->ecxt_scantuple = slot;
+    predicate = ExecPrepareQual(index_info->ii_Predicate, estate);
+
+    scan  = table_beginscan_strat(heap_rel, snapshot, 0, NULL, true, false);
+    hscan = (HeapScanDesc) scan;
+
+    /*
+    * decode_slot's decrypted tuple must outlive the per-tuple context we reset
+    * each iteration, or it would be freed under the slot (see
+    * pg_vault_tde_index_build_range_scan).
+    */ 
+    scan_mcxt = CurrentMemoryContext;
+    for (;;)
+    {   
+        HeapTuple       heapTuple;
+        ItemPointerData rootTuple;
+        OffsetNumber    root_offnum;
+        MemoryContext   oldcxt;
+
+        CHECK_FOR_INTERRUPTS();
+
+        ResetExprContext(econtext);
+        ExecClearTuple(slot);
+        
+        oldcxt = MemoryContextSwitchTo(scan_mcxt);
+        if (!table_scan_getnextslot(scan, ForwardScanDirection, slot))
+        {
+            MemoryContextSwitchTo(oldcxt);
+            break;
+        }
+        MemoryContextSwitchTo(oldcxt);
+
+        state->htups += 1;
+        heapTuple = ExecFetchSlotHeapTuple(slot, false, NULL);
+
+        /*
+        * On each new heap page rebuild the root-offset map and clear in_index[]:
+        * we visit tuples by offset but compare against HOT root offsets, so a
+        * page's index TIDs may be consumed out of order and must be remembered.
+        */
+        if (hscan->rs_cblock != root_blkno)
+        {
+            Page page = BufferGetPage(hscan->rs_cbuf);
+            
+            LockBuffer(hscan->rs_cbuf, BUFFER_LOCK_SHARE);
+            heap_get_root_tuples(page, root_offsets);
+            LockBuffer(hscan->rs_cbuf, BUFFER_LOCK_UNLOCK);
+        
+            memset(in_index, 0, sizeof(in_index));
+            root_blkno = hscan->rs_cblock;
+        }
+        
+        /* Index HOT-chain members under their root line pointer. */
+        rootTuple   = heapTuple->t_self;
+        root_offnum = ItemPointerGetOffsetNumber(&heapTuple->t_self);
+        if (HeapTupleIsHeapOnly(heapTuple))
+        {
+            root_offnum = root_offsets[root_offnum - 1];
+            if (!OffsetNumberIsValid(root_offnum))
+                ereport(ERROR,
+                        (errcode(ERRCODE_DATA_CORRUPTED),
+                        errmsg_internal("failed to find parent tuple for heap-only tuple at (%u,%u) in table \"%s\"",
+                                        ItemPointerGetBlockNumber(&heapTuple->t_self),
+                                        ItemPointerGetOffsetNumber(&heapTuple->t_self),
+                                        RelationGetRelationName(heap_rel))));
+            ItemPointerSetOffsetNumber(&rootTuple, root_offnum);
+        }                                
+            
+        while (!tuplesort_empty &&       
+                (indexcursor == NULL ||
+                ItemPointerCompare(indexcursor, &rootTuple) < 0))
+        {
+            Datum ts_val;
+            bool  ts_isnull;
+            
+            /* Remember index TIDs already passed over on the current page. */
+            if (indexcursor != NULL &&
+                ItemPointerGetBlockNumber(indexcursor) == root_blkno)
+                in_index[ItemPointerGetOffsetNumber(indexcursor) - 1] = true;
+                
+            tuplesort_empty = !tuplesort_getdatum(state->tuplesort, true, false,
+                                                &ts_val, &ts_isnull, NULL);
+            Assert(tuplesort_empty || !ts_isnull);
+            if (!tuplesort_empty)
+            {
+                itemptr_decode(&decoded, DatumGetInt64(ts_val));
+                indexcursor = &decoded;
+            }   
+            else
+                indexcursor = NULL;
+        }   
+            
+        if ((tuplesort_empty ||
+            ItemPointerCompare(indexcursor, &rootTuple) > 0) &&
+            !in_index[root_offnum - 1])
+        {    
+            oldcxt = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+        
+            /* Partial index: skip tuples failing the predicate. */
+            if (predicate != NULL && !ExecQual(predicate, econtext))
+            {
+                MemoryContextSwitchTo(oldcxt);
+                continue;
+            }   
+            
+            FormIndexDatum(index_info, slot, estate, values, isnull);
+            
+            index_insert(index_rel, values, isnull, &rootTuple,
+                        heap_rel,
+                        index_info->ii_Unique ? UNIQUE_CHECK_YES
+                                                : UNIQUE_CHECK_NO,
+                        false,          /* indexUnchanged */
+                        index_info);
+                        
+            state->tups_inserted += 1;
+            MemoryContextSwitchTo(oldcxt);
+        }   
+    }       
+        
+    table_endscan(scan);
+    ExecDropSingleTupleTableSlot(slot);
+    FreeExecutorState(estate);
+
+    /* estate is gone; drop the expression states that pointed into it. */
+    index_info->ii_ExpressionsState = NIL;
+    index_info->ii_PredicateState = NULL;
+}
+
 /* ---- Direct TID fetch (TidScan, lock rechecks) ---- */
 /*
  * pg_vault_tde_tuple_fetch_row_version
@@ -1851,6 +2022,7 @@ pg_vault_tde_tam_init(void)
     /* Visibility recheck (RI FK triggers): tolerate decrypted, unpinned slots */
     tde_methods.tuple_satisfies_snapshot    = pg_vault_tde_tuple_satisfies_snapshot;
     /* Index build: bypass rd_tableam identity check inside heap_getnext */
+    tde_methods.index_validate_scan         = pg_vault_tde_index_validate_scan;
     tde_methods.index_build_range_scan      = pg_vault_tde_index_build_range_scan;
     tde_methods.relation_copy_for_cluster   = pg_vault_tde_relation_copy_for_cluster;
     /*

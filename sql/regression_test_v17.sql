@@ -1,4 +1,4 @@
--- regression_test_v17.sql — TDE tests 111-133 for pg_vault_tde v1.7
+-- regression_test_v17.sql — TDE tests 111-137 for pg_vault_tde v1.7
 --
 -- These tests cover the tde_*_enc_ops operator classes introduced in v1.7,
 -- which encrypt fixed-size B-Tree index keys (int4, int8, uuid, date,
@@ -14,7 +14,7 @@
 --   psql -f sql/pg_vault_tde--1.4--1.5.sql
 --   psql -f sql/pg_vault_tde--1.5--1.6.sql
 --   psql -f sql/pg_vault_tde--1.6--1.7.sql
---   psql -f sql/regression_test_v17.sql     (v1.7 tests 111-133)
+--   psql -f sql/regression_test_v17.sql     (v1.7 tests 111-137)
 --
 -- Exit-on-error: any failed assertion aborts the script.
 \set ON_ERROR_STOP on
@@ -1250,6 +1250,138 @@ DO $$
   $$;
 
 
+-- ================================================================
+-- TESTS 135-138: CREATE INDEX CONCURRENTLY on encrypted_heap (PSQLE-114).
+-- index_validate_scan (the validation-phase callback of CONCURRENTLY builds)
+-- was not overridden, so CIC/REINDEX CONCURRENTLY aborted with
+-- "only heap AM is supported". 
+-- CONCURRENTLY cannot run in a transaction block,
+-- so each command is top-level with a following DO block asserting the result.
+-- ================================================================
+
+-- ================================================================
+-- TEST 135: CREATE INDEX CONCURRENTLY on encrypted_heap
+-- ================================================================
+
+DROP TABLE IF EXISTS tde_cic_135;
+CREATE TABLE tde_cic_135 (id int, secret text) USING encrypted_heap;
+INSERT INTO tde_cic_135
+    SELECT g, 'PLAINTEXT_SECRET_' || g FROM generate_series(1, 1000) g;
+CREATE INDEX CONCURRENTLY tde_cic_135_idx ON tde_cic_135 USING tde_btree (id);
+DO $$
+DECLARE
+    valid bool;
+    v     text;
+    cidx  int;
+    cseq  int;
+BEGIN
+    SELECT indisvalid INTO valid
+        FROM pg_index WHERE indexrelid = 'tde_cic_135_idx'::regclass;
+    IF NOT valid THEN
+        RAISE EXCEPTION 'TEST 135a FAILED: CIC left index invalid (indisvalid=false)';
+    END IF;
+    
+    SET enable_seqscan = off; 
+    SELECT secret INTO v FROM tde_cic_135 WHERE id = 250;
+    IF v IS DISTINCT FROM 'PLAINTEXT_SECRET_250' THEN
+        RAISE EXCEPTION 'TEST 135b FAILED: index scan returned "%", expected plaintext', v;
+    END IF;
+    SELECT count(*) INTO cidx FROM tde_cic_135 WHERE id BETWEEN 1 AND 1000;
+    
+    SET enable_seqscan = on;
+    SET enable_indexscan = off;
+    SET enable_bitmapscan = off;
+    SELECT count(*) INTO cseq FROM tde_cic_135 WHERE id BETWEEN 1 AND 1000;
+    RESET enable_seqscan;
+    RESET enable_indexscan;
+    RESET enable_bitmapscan;
+    
+    IF cidx <> cseq OR cidx <> 1000 THEN
+        RAISE EXCEPTION 'TEST 135c FAILED: index count % <> seq count % (expected 1000)', cidx, cseq;
+    END IF;
+    RAISE NOTICE
+        'TEST 135 PASSED: CREATE INDEX CONCURRENTLY builds a valid, correct index';
+    DROP TABLE tde_cic_135;
+END;
+$$;
+
+ -- ================================================================
+-- TEST 136: REINDEX INDEX CONCURRENTLY on encrypted_heap (PSQLE-114).
+-- Same validation-phase path as CIC. The index is created non-concurrently
+-- (that path already works), so only REINDEX INDEX CONCURRENTLY is under test.
+-- ================================================================
+DROP TABLE IF EXISTS tde_cic_136;
+CREATE TABLE tde_cic_136 (id int, secret text) USING encrypted_heap;
+INSERT INTO tde_cic_136
+    SELECT g, 'PLAINTEXT_SECRET_' || g FROM generate_series(1, 1000) g;
+CREATE INDEX tde_cic_136_idx ON tde_cic_136 USING tde_btree (id);
+REINDEX INDEX CONCURRENTLY tde_cic_136_idx;
+DO $$
+DECLARE
+    valid   bool;
+    norphan int;
+    v       text;
+BEGIN
+    SELECT indisvalid INTO valid
+        FROM pg_index WHERE indexrelid = 'tde_cic_136_idx'::regclass;
+    IF NOT valid THEN
+        RAISE EXCEPTION 'TEST 136a FAILED: REINDEX INDEX CONCURRENTLY left index invalid';
+    END IF;
+    SELECT count(*) INTO norphan FROM pg_class WHERE relname LIKE 'tde_cic_136%ccnew%';
+    IF norphan <> 0 THEN
+        RAISE EXCEPTION 'TEST 136b FAILED: % orphan _ccnew index(es) left behind', norphan;
+    END IF;
+
+    SET enable_seqscan = off;
+    SELECT secret INTO v FROM tde_cic_136 WHERE id = 777;
+    RESET enable_seqscan; 
+    IF v IS DISTINCT FROM 'PLAINTEXT_SECRET_777' THEN
+        RAISE EXCEPTION 'TEST 136c FAILED: post-reindex index scan returned "%"', v;
+    END IF;
+    
+    RAISE NOTICE
+        'TEST 136 PASSED: REINDEX INDEX CONCURRENTLY rebuilds a valid, correct index';
+    DROP TABLE tde_cic_136; 
+
+END;
+$$;
+
+-- ================================================================
+-- TEST 137: partial index (WHERE) via CREATE INDEX CONCURRENTLY.
+-- Exercises the ExecQual(predicate) branch of the validate scan.
+-- ================================================================
+DROP TABLE IF EXISTS tde_cic_137;
+CREATE TABLE tde_cic_137 (id int, secret text) USING encrypted_heap;
+INSERT INTO tde_cic_137 
+    SELECT g, 'S_' || g FROM generate_series(1, 200) g;
+CREATE INDEX CONCURRENTLY tde_cic_137_partial
+    ON tde_cic_137 USING tde_btree (id) WHERE id > 100;
+
+DO $$
+DECLARE
+    valid bool;
+    v     text;
+BEGIN
+    SELECT indisvalid INTO valid
+        FROM pg_index WHERE indexrelid = 'tde_cic_137_partial'::regclass;
+    IF NOT valid THEN
+        RAISE EXCEPTION 'TEST 137a FAILED: partial-index CIC left index invalid';
+    END IF;
+    
+    SET enable_seqscan = off;
+    SELECT secret INTO v FROM tde_cic_137 WHERE id = 150;
+    RESET enable_seqscan; 
+    IF v IS DISTINCT FROM 'S_150' THEN
+        RAISE EXCEPTION 'TEST 137b FAILED: partial-index scan returned "%"', v;
+    END IF;
+    
+    RAISE NOTICE
+        'TEST 137 PASSED: partial-index CREATE INDEX CONCURRENTLY works';
+    DROP TABLE tde_cic_137;   
+END;
+$$;
+
+
 
 -- ================================================================
 -- PHASE SUMMARY
@@ -1257,7 +1389,7 @@ DO $$
 DO $$
 BEGIN
     RAISE NOTICE '============================================================';
-    RAISE NOTICE 'v1.7 Tests 111-133 — COMPLETE';
+    RAISE NOTICE 'v1.7 Tests 111-137 — COMPLETE';
     RAISE NOTICE '   tde_int4_enc_ops + disk forensic check ......test 111';
     RAISE NOTICE '   tde_int8_enc_ops equality lookup ........... test 112';
     RAISE NOTICE '   tde_uuid_enc_ops equality lookup ........... test 113';
@@ -1282,6 +1414,9 @@ BEGIN
     RAISE NOTICE '   DDL guard — plain table .................... test 132';
     RAISE NOTICE '   DDL guard — partitioned table (leaf-only) .. test 133';
     RAISE NOTICE '   scan_getnextslot_tidrange .................. test 134';
+    RAISE NOTICE '   CREATE INDEX CONCURRENTLY (index_validate) . test 135';
+    RAISE NOTICE '   REINDEX INDEX CONCURRENTLY ................. test 136';
+    RAISE NOTICE '   partial-index CREATE INDEX CONCURRENTLY .... test 137';
     RAISE NOTICE '============================================================';
 END;
 $$;
