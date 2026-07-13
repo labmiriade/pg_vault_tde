@@ -57,7 +57,7 @@
                                                   TDE_V4_OVERHEAD */
 #include "src/include/pg_vault_tde_tam.h"
 #include "src/include/pg_vault_tde_guc.h"      /* pg_vault_tde_enabled */
-#include "src/include/pg_vault_tde_iam.h"      /* tde_iam_build_in_progress,
+#include "src/include/pg_vault_tde_iam.h"      /* tde_iam_is_tde_btree_index,
                                                   tde_iam_encrypt_index_datum */
 #include "src/include/pg_vault_tde_toast.h"
 #include "src/include/pg_vault_tde_catalog.h"
@@ -808,16 +808,16 @@ pg_vault_tde_index_build_range_scan(Relation heap_rel,
                 ItemPointerSet(&itid, blkno, root_offsets[off-1]);
             }
             /*
-             * If a tde_btree index is being built (signalled by IAM's
-             * ambuild), encrypt each non-null index key value with
-             * AES-256-SIV before passing it to the btree build callback.
+             * If a tde_btree index is being built, encrypt each non-null
+             * index key value with AES-256-SIV before passing it to the
+             * btree build callback.
              *
              * We build a SEPARATE enc_values[] array rather than modifying
              * values[] in-place.  _bt_spool copies the datum bytes into
              * its own IndexTuple buffer immediately, so the palloc'd
              * enc_bytea does not need to outlive the callback call.
              */
-            if (tde_iam_build_in_progress)
+            if (tde_iam_is_tde_btree_index(index_rel))
             {
                 Datum  enc_values[INDEX_MAX_KEYS];
                 bool   enc_isnull[INDEX_MAX_KEYS];
@@ -880,9 +880,8 @@ pg_vault_tde_index_build_range_scan(Relation heap_rel,
 * -- silently indexing garbage keys for concurrently-inserted rows.
 *
 * Why no key pre-encryption here (unlike pg_vault_tde_index_build_range_scan):
-* validation inserts via index_insert -> pg_vault_tde_aminsert, and
-* tde_iam_build_in_progress is false, so aminsert owns the AES-256-SIV
-* encryption -- exactly like a runtime INSERT.
+* validation inserts via index_insert -> pg_vault_tde_aminsert, which owns
+* the AES-256-SIV encryption -- exactly like a runtime INSERT.
 */
 static void
 pg_vault_tde_index_validate_scan(Relation heap_rel,

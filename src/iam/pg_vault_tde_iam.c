@@ -336,6 +336,11 @@ tde_iam_decrypt_key(Oid idx_oid, const char* dek, int dek_len,
  * ================================================================
  */
 
+/* Forward declaration: identity-checked against index_rel->rd_indam->ambuild
+ * by tde_iam_is_tde_btree_index, defined further down in this file. */
+static IndexBuildResult *pg_vault_tde_ambuild(Relation heap, Relation index,
+                                               IndexInfo *index_info);
+
 /* Mutable copy of the btree AM routine, patched with our overrides */
 static IndexAmRoutine  tde_btree_methods;
 
@@ -356,11 +361,19 @@ static IndexAmRoutine  saved_btree_methods;
 static bool            saved_btree_methods_valid = false;
 
 /*
- * tde_iam_build_in_progress — process-local flag (see pg_vault_tde_iam.h).
- * Set while pg_vault_tde_ambuild is executing saved_btree_methods.ambuild
- * so pg_vault_tde_index_build_range_scan (tam.c) knows to encrypt index keys.
+ * tde_iam_is_tde_btree_index (see pg_vault_tde_iam.h for the full rationale).
+ *
+ * index_rel->rd_indam is populated per-backend from the catalog's amhandler
+ * for this index (pg_vault_tde_get_iam_routine, below), which always sets
+ * ->ambuild = pg_vault_tde_ambuild for a tde_btree index — so the identity
+ * check below holds in the leader AND in every parallel build worker.
  */
-bool tde_iam_build_in_progress = false;
+bool
+tde_iam_is_tde_btree_index(Relation index_rel)
+{
+    return index_rel->rd_indam != NULL &&
+           index_rel->rd_indam->ambuild == pg_vault_tde_ambuild;
+}
 
 /*
  * tde_iam_serialize_fixed_type
@@ -496,9 +509,9 @@ tde_iam_encrypt_fixed_type_datum(Relation index_rel, Datum datum, Oid typoid)
  * from the Datum scalar — NOT detoasted as varlena, which would SIGSEGV on
  * small fixed-size types because the datum value is not a pointer.
  *
- * Called from pg_vault_tde_index_build_range_scan (tam.c) when
- * tde_iam_build_in_progress is set, and from pg_vault_tde_aminsert /
- * pg_vault_tde_amrescan for individual INSERTs and index scans.
+ * Called from pg_vault_tde_index_build_range_scan (tam.c) for tde_btree
+ * index builds, and from pg_vault_tde_aminsert / pg_vault_tde_amrescan for
+ * individual INSERTs and index scans.
  *
  * Caller is responsible for pfree'ing the result when done.
  */
@@ -619,9 +632,9 @@ tde_iam_encrypt_index_datum(Relation index_rel, Datum datum, bool typbyval, int1
 /*
  * pg_vault_tde_ambuild
  *
- * Delegates entirely to btree's ambuild but sets tde_iam_build_in_progress
- * first so that pg_vault_tde_index_build_range_scan (tam.c) will encrypt
- * index key values before passing them to btbuildCallback.
+ * Delegates entirely to btree's ambuild. pg_vault_tde_index_build_range_scan
+ * (tam.c) recognises this index via tde_iam_is_tde_btree_index() and
+ * encrypts index key values before passing them to btbuildCallback.
  *
  * This approach avoids the private btree spool API (_bt_spoolinit, etc.) and
  * the single-row aminsert approach (which does not work correctly because
@@ -635,8 +648,14 @@ tde_iam_encrypt_index_datum(Relation index_rel, Datum datum, bool typbyval, int1
  *         → pg_vault_tde_index_build_range_scan (via heap's TableAmRoutine)
  *           → [for each tuple] encrypt values[], then btbuildCallback(...)
  *
- * tde_iam_build_in_progress is a process-local (not thread-local) variable;
- * PostgreSQL is multi-process, so concurrent backends are unaffected.
+ * Parallel build is disabled (amcanbuildparallel = false, set in
+ * tde_iam_init, see https://www.postgresql.org/docs/current/index-functions.html ):
+ * the relam impersonation below only mutates this backend's
+ * in-memory Relation, but a real parallel worker opens its own fresh copy
+ * of the index relation and hits core code (sortsupport.c's
+ * PrepareSortSupportFromIndexRel) that unconditionally errors out on a
+ * non-btree relam. Forcing a single-process build keeps every scan/sort
+ * call inside this (correctly impersonated) backend.
  */
 static IndexBuildResult *
 pg_vault_tde_ambuild(Relation heap, Relation index, IndexInfo *index_info)
@@ -658,25 +677,17 @@ pg_vault_tde_ambuild(Relation heap, Relation index, IndexInfo *index_info)
      */
     index->rd_rel->relam = BTREE_AM_OID;
 
-
-    /*
-     * Signal pg_vault_tde_index_build_range_scan to encrypt index keys.
-     * PG_TRY ensures the flag is cleared even if btbuild raises an error.
-     */
-    tde_iam_build_in_progress = true;
-
+    /* PG_TRY ensures relam is restored even if btbuild raises an error. */
     PG_TRY();
     {
         result = saved_btree_methods.ambuild(heap, index, index_info);
     }
     PG_CATCH();
     {
-        tde_iam_build_in_progress = false;
         index->rd_rel->relam = saved_relam;
         PG_RE_THROW();
     }
     PG_END_TRY();
-    tde_iam_build_in_progress = false;
     index->rd_rel->relam = saved_relam;
 
     return result;
@@ -905,6 +916,20 @@ tde_iam_init(void)
 
     /* Encrypted tuples are unencryptable only if they comes from the table */
     tde_btree_methods.amcanreturn = NULL;
+
+    /*
+     * Disable parallel index build.  pg_vault_tde_ambuild delegates to
+     * btree's ambuild by impersonating index->rd_rel->relam = BTREE_AM_OID
+     * for the duration of the call — but that impersonation only mutates
+     * the LEADER's in-memory Relation. Real parallel workers open their own
+     * fresh copy of the index relation (nbtsort.c's _bt_parallel_build_main
+     * calling index_open()), which reports the true tde_btree AM oid. That
+     * reaches core code we cannot hook (sortsupport.c's
+     * PrepareSortSupportFromIndexRel), which unconditionally
+     * ereport(ERROR)s on a non-btree relam. Forcing a single-process build
+     * keeps every scan/sort call inside the (correctly impersonated) leader.
+     */
+    tde_btree_methods.amcanbuildparallel = false;
 
     /*
      * Allow STORAGE type ≠ opcintype for tde_*_enc_ops operator classes.

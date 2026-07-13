@@ -34,9 +34,16 @@ $node->append_conf('postgresql.conf',
     "shared_preload_libraries = 'pg_vault_tde'\n" .
     "pg_vault_tde.kms_provider = 'local'\n" .
     "pg_vault_tde.wallet_passphrase_command = 'echo test-password'\n" .
-    # Serial build only: parallel index build on encrypted_heap crashes in a
-    # worker (separate pre-existing bug); keep it out of this test.
-    "max_parallel_maintenance_workers = 0\n");
+    # tde_btree opts out of parallel index build (amcanbuildparallel = false,
+    # see pg_vault_tde_iam.c tde_iam_init): a real parallel worker opens its
+    # own uncoerced copy of the index relation, and core code (sortsupport.c
+    # PrepareSortSupportFromIndexRel) errors out on the non-btree relam.
+    # Bias hard towards parallel workers here anyway, so this test would
+    # catch a regression if that opt-out is ever accidentally removed.
+    "max_parallel_maintenance_workers = 4\n" .
+    "min_parallel_table_scan_size = 0\n" .
+    "parallel_setup_cost = 0\n" .
+    "parallel_tuple_cost = 0\n");
 $node->start;
 
 $node->safe_psql('postgres', 'CREATE EXTENSION pg_vault_tde;');
