@@ -934,6 +934,10 @@ See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
    window. See [doc/pg_vault_tde.md](doc/pg_vault_tde.md) § Known Limitations for the full
    analysis (including the v3 bug this resolved).
 
+7. **Disable Parallel Index Rebuild by design** : the parallel workers on postgresql  
+   that rebuild the indexes, are not intercepted by the wrapper, so it's actually impossibile to implement this feature. We disabled it with flag amcanbuildparallel  setted to false. 
+
+
 ---
 
 ## License
