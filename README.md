@@ -302,8 +302,6 @@ SELECT pg_vault_tde_wallet_unlock('my_passphrase');
 SELECT pg_vault_tde_wallet_lock();
 -- Rotate KEK: generates a new KEK and re-wraps all per-table DEKs (works for both providers):
 SELECT pg_vault_tde_rotate_kek();
--- Export wallet backup bundle:
-SELECT pg_vault_tde_wallet_export_bundle('/backup/wallet_bundle.bin', 'daily-backup');
 ```
 
 ### Production (HashiCorp Vault / OpenBao)
@@ -521,8 +519,9 @@ log stream without any extension-level configuration.
 | `pg_vault_tde_wallet_unlock(text)` | void | Interactive wallet unlock without PG restart **(v1.6)** |
 | `pg_vault_tde_wallet_lock()` | void | Evict all DEKs from shmem, mark wallet closed **(v1.6)** |
 | `pg_vault_tde_rotate_kek()` | void | Rotate the KEK and re-wrap all per-table DEKs under a new key; works for both `local` and `vault` providers; no tuple data re-encrypted **(v1.7)** |
-| `pg_vault_tde_wallet_export_bundle(text, text)` | void | Export HMAC-signed wallet backup bundle **(v1.6)** |
-| `pg_vault_tde_wallet_import_bundle(text, text)` | void | Import and verify wallet backup bundle **(v1.6)** |
+| `pg_vault_tde_seal_keys(text, text, text)` | void | Write an HMAC-SHA256-signed bundle of **all** wrapped DEKs (every provider) to a file, to accompany a physical backup (`pg_basebackup`); the KEK is never included **(v1.7)** |
+| `pg_vault_tde_seal_keys_bytea(text, text)` | bytea | Same signed bundle as `pg_vault_tde_seal_keys()`, returned as `bytea` instead of written server-side — used by `pg_basebackup_tde` to store the bundle on the client host **(v1.7)** |
+| `pg_vault_tde_unseal_keys(text, text)` | void | Verify (HMAC) and re-import a bundle written by `pg_vault_tde_seal_keys()`; rejects a tampered file or wrong passphrase before writing anything **(v1.7)** |
 | `pg_vault_tde_migrate_vault_to_wallet(text)` | void | Online Vault→local wallet migration **(v1.6)** |
 | `pg_vault_tde_kms_health_check()` | composite | Active provider connectivity and key access test **(v1.5)** |
 
@@ -623,7 +622,6 @@ Test coverage (109 tests = 52 v1.4 + 20 v1.5 + 37 v1.6):
 - Tests 70-72: Online key rotation BGW — concurrent SELECTs, progress tracking, BGW completion **(v1.5)**
 - Tests 73-77: Wallet provider — init/unlock/lock, `wallet_status()` 5-col schema (`wallet_exists`, `wallet_open`, `kek_algorithm`, `last_opened`, `file_perms`), DEK round-trip with wallet KEK **(v1.6)**
 - Tests 78-79: Wallet `change_passphrase` re-wraps under new KEK; `rotate_kek` re-wraps all per-table DEKs (catalog ciphertext changes; both tables remain readable) **(v1.6 patch)**
-- Test 80: Wallet `export_bundle`/`import_bundle` round-trip — SKIPS gracefully if `pg_vault_tde.wallet_passphrase_env` source is not configured (export needs the passphrase string to derive the bundle HMAC key) **(v1.6)**
 - Test 81: DDL hook registers BOTH parent and `reltoastrelid` in `pg_vault_tde_catalog`; DROP deregisters both **(v1.6)**
 - Test 82: 64 KB compressible payload (pglz keeps it inline) — heap-level pre-TOAST + encrypt round-trip **(v1.6)**
 - Test 83: Transactional rollback after pre-TOAST + encrypt keeps the table consistent and restores `reltoastrelid` **(v1.6)**
@@ -806,13 +804,74 @@ It's possible to use `pg_basebackup` to create a base backup of the cluster and 
 
 #### Primary configuration
 
-Configure like it's not encrypted 
+No special configuration is needed on the primary: encrypted relations are copied as-is by `pg_basebackup`, and the wrapped DEKs travel inside `pg_vault_tde_catalog` (part of the data directory). The **KEK never travels with the backup** — it stays in the KMS/wallet, exactly as with Oracle RMAN, SQL Server and Percona pg_tde.
 
-#### Standby configuration
-Need the same `wallet.p12` of the primary if the KMS provider used is `local` and the same configuration (basebackup does it already) if the `Vault` is used as KMS provider.
+#### Standby / restore configuration
 
->Current limitation: DEK or KEK rotation make primary and standby disalign on keys
+The wrapped DEKs arrive with the base backup, but the KEK must be made available on the target separately:
 
+- **`local` provider** — copy the primary's `wallet.p12` to the standby (it lives outside `PGDATA`, so it is *not* in the base backup).
+- **`vault` provider** — point the standby at the **same** Vault; nothing to copy.
+
+#### Sealing the DEK catalog (key sealing)
+
+`pg_vault_tde_seal_keys()` writes a signed, point-in-time snapshot of every wrapped DEK to accompany the backup `pg_vault_tde_unseal_keys()` verifies and re-imports it on the target. This makes the key state **tamper-evident** and guards against key-rotation drift between primary and standby.
+
+```sql
+-- On the primary, before pg_basebackup:
+SELECT pg_vault_tde_seal_keys('/backup/keys.sealed', 'a-seal-passphrase');
+```
+```bash
+pg_basebackup -h primary -D /backup/data -X stream
+# local provider only: also transport the wallet, e.g.
+#   scp /path/to/wallet.p12 standby:/path/to/wallet.p12
+```
+```sql
+-- On the standby, after restoring the data dir and providing the KEK:
+SELECT pg_vault_tde_unseal_keys('/backup/keys.sealed', 'a-seal-passphrase');
+```
+The HMAC key is derived from the seal passphrase (PBKDF2-SHA256); it isindependent of the KMS provider, so the same bundle works for local and vault. unseal_keys verifies the HMAC before touching the catalog: a tampered bundle or wrong passphrase is rejected and nothing is written.
+
+> Key-rotation note: if the KEK/DEK is rotated after a backup, primary and standby can drift. Re-running seal_keys after a rotation (and unseal_keys on the standby) realigns the sealed key state with the data.
+
+> Concurrency note: don't run `unseal_keys()` while `pg_vault_tde_rotate_online()` is rotating the same table. Postgres's own MVCC checks make this fail safely — you'll see a `tuple concurrently updated` or duplicate-key error and nothing will have been imported — just re-run `unseal_keys()` once the rotation finishes.
+
+#### `pg_basebackup_tde` (automatic key sealing)
+
+`pg_basebackup_tde` wraps `pg_basebackup` and performs the sealing step
+automatically, for **every database** in the cluster that has the extension
+(the DEK catalog is per-database, while `pg_basebackup` is cluster-wide):
+
+```bash
+# passphrase from a 0600 file (the ~/.pgpass pattern) ...
+pg_basebackup_tde -h primary -D /backup/data -X stream \
+    --seal-passphrase-file /etc/pg_vault_tde/seal.pass
+# ... or from the environment
+export PG_VAULT_TDE_SEAL_PASSPHRASE='a-seal-passphrase'
+pg_basebackup_tde -h primary -D /backup/data -X stream
+```
+
+The passphrase is never accepted as a command-line value: it would leak in
+`ps` output and shell history. `--seal-passphrase-file` reads the first line
+of the file and takes precedence over the environment variable.
+
+All options are forwarded verbatim to `pg_basebackup`. For each database with
+`pg_vault_tde`, the wrapper calls `pg_vault_tde_seal_keys_bytea()` **before**
+the backup starts (point-in-time key snapshot) and, **only if the backup
+succeeds**, writes one bundle per database next to it:
+
+```
+/backup/data/pg_vault_tde_keys.<datname>.sealed   (mode 0600)
+```
+
+Use `--keys-dir DIR` to store the bundles elsewhere (e.g. outside `PGDATA`).
+Databases without the extension are skipped; a failed backup leaves no bundle
+files behind. The tar format (`-Ft`) is not supported — use the plain format
+or run `pg_vault_tde_seal_keys()` manually.
+
+Restore stays manual, exactly as above: restore the data dir, provision the
+KEK, then per database
+`SELECT pg_vault_tde_unseal_keys('/backup/data/pg_vault_tde_keys.<db>.sealed', '...');`
 
 ### How it works
 

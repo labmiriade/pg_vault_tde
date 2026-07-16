@@ -262,12 +262,6 @@ tests that already called `wallet_unlock` no longer need to configure
 `pg_vault_tde.wallet_passphrase_env` to call `rotate_kek`.  Under the `vault`
 provider the function calls Vault Transit key rotation and re-wraps all DEKs.
 
-`pg_vault_tde_wallet_export_bundle()` deliberately keeps the
-GUC-passphrase requirement: the bundle's HMAC key is derived via PBKDF2
-from the passphrase string itself, and `import_bundle` must regenerate
-the same key from the user-supplied passphrase.  Switching to the cached
-KEK would yield a different HMAC key and break the import path.
-
 This contract applies symmetrically to `unwrap_dek(wrapped, wrapped_len, dek_out, dek_len)`:
 `dek_len` here is **input-only capacity** because the unwrapped output is
 always exactly `TDE_DEK_LEN`. Providers MAY assert `dek_len >= TDE_DEK_LEN`.

@@ -427,34 +427,6 @@ COMMENT ON FUNCTION pg_vault_tde_wallet_lock() IS
 'server.  After this call, any access to an encrypted table will attempt an '
 'unwrap — which will fail if no passphrase source is configured.';
 
--- Write an HMAC-authenticated backup bundle
-CREATE FUNCTION pg_vault_tde_wallet_export_bundle(dest_path text,
-                                                   label     text DEFAULT 'backup')
-    RETURNS void
-    LANGUAGE C STRICT SECURITY DEFINER
-    AS 'MODULE_PATHNAME', 'pg_vault_tde_wallet_export_bundle_sql';
-
-REVOKE ALL ON FUNCTION pg_vault_tde_wallet_export_bundle(text, text) FROM PUBLIC;
-
-COMMENT ON FUNCTION pg_vault_tde_wallet_export_bundle(text, text) IS
-'Write an HMAC-SHA256-authenticated binary bundle containing the PKCS#12 '
-'wallet and all local-provider catalog entries to dest_path.  The HMAC key '
-'is derived from the current wallet passphrase via PBKDF2-SHA256.  '
-'dest_path is written with 0600 permissions.';
-
--- Restore wallet and DEK catalog from a bundle
-CREATE FUNCTION pg_vault_tde_wallet_import_bundle(src_path   text,
-                                                   passphrase text)
-    RETURNS void
-    LANGUAGE C STRICT SECURITY DEFINER
-    AS 'MODULE_PATHNAME', 'pg_vault_tde_wallet_import_bundle_sql';
-
-REVOKE ALL ON FUNCTION pg_vault_tde_wallet_import_bundle(text, text) FROM PUBLIC;
-
-COMMENT ON FUNCTION pg_vault_tde_wallet_import_bundle(text, text) IS
-'Restore a wallet and per-table DEK catalog from a bundle created by '
-'pg_vault_tde_wallet_export_bundle().  Verifies the HMAC trailer with the '
-'supplied passphrase before writing any data; fails cleanly if wrong.';
 
 -- Migrate all Vault-wrapped DEKs to a new local PKCS#12 wallet
 CREATE FUNCTION pg_vault_tde_migrate_vault_to_wallet(new_passphrase text)
@@ -469,6 +441,59 @@ COMMENT ON FUNCTION pg_vault_tde_migrate_vault_to_wallet(text) IS
 'provider under a new local PKCS#12 wallet with new_passphrase.  Updates '
 'kms_provider = ''local'' for each migrated row.  The local wallet must '
 'already exist (call pg_vault_tde_wallet_init() first).';
+
+-- ============================================================================
+-- Physical backup key sealing
+-- ============================================================================
+-- Seal all wrapped DEKs (any provider) into an HMAC-signed bundle to accompany
+-- a pg_basebackup.  The KEK is NOT included: it stays in the KMS/wallet and is
+-- provisioned on the standby separately.
+
+CREATE FUNCTION pg_vault_tde_seal_keys(dest_path       text,
+                                       seal_passphrase text,
+                                       label           text DEFAULT 'basebackup')
+    RETURNS void
+    LANGUAGE C STRICT SECURITY DEFINER
+    AS 'MODULE_PATHNAME', 'pg_vault_tde_seal_keys_sql';
+
+REVOKE ALL ON FUNCTION pg_vault_tde_seal_keys(text, text, text) FROM PUBLIC;
+
+COMMENT ON FUNCTION pg_vault_tde_seal_keys(text, text, text) IS
+'Write an HMAC-SHA256-signed bundle of all wrapped DEKs (every kms_provider) '
+'to dest_path, to accompany a physical backup (pg_basebackup).  The HMAC key '
+'is derived from seal_passphrase via PBKDF2-SHA256.  The KEK is never included. '
+'dest_path is written with 0600 permissions.';
+
+-- Same bundle as pg_vault_tde_seal_keys, returned as bytea instead of being
+-- written server-side.  Lets a remote client (pg_basebackup_tde) store the
+-- bundle next to the backup on the client host.
+CREATE FUNCTION pg_vault_tde_seal_keys_bytea(seal_passphrase text,
+                                             label           text DEFAULT 'basebackup')
+    RETURNS bytea
+    LANGUAGE C STRICT SECURITY DEFINER
+    AS 'MODULE_PATHNAME', 'pg_vault_tde_seal_keys_bytea_sql';
+
+REVOKE ALL ON FUNCTION pg_vault_tde_seal_keys_bytea(text, text) FROM PUBLIC;
+
+COMMENT ON FUNCTION pg_vault_tde_seal_keys_bytea(text, text) IS
+'Return an HMAC-SHA256-signed bundle of all wrapped DEKs (every kms_provider) '
+'as bytea, to accompany a physical backup (pg_basebackup).  Same format as '
+'pg_vault_tde_seal_keys(); the client is responsible for storing the bytes. '
+'The KEK is never included.';
+
+-- unseal the wrapped dek bundle
+CREATE FUNCTION pg_vault_tde_unseal_keys(src_path        text,
+                                         seal_passphrase text)
+    RETURNS void
+    LANGUAGE C STRICT SECURITY DEFINER
+    AS 'MODULE_PATHNAME', 'pg_vault_tde_unseal_keys_sql';
+
+REVOKE ALL ON FUNCTION pg_vault_tde_unseal_keys(text, text) FROM PUBLIC;
+
+COMMENT ON FUNCTION pg_vault_tde_unseal_keys(text, text) IS
+'Verify and re-import a wrapped-DEK bundle created by pg_vault_tde_seal_keys(). '
+'Checks the HMAC trailer with seal_passphrase before writing anything; on '
+'success UPSERTs the catalog rows and evicts the shmem cache.';
 
 -- ============================================================================
 -- Online key rotation

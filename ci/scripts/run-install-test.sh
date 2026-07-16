@@ -134,8 +134,9 @@ DECLARE
         '"'"'pg_vault_tde_wallet_change_passphrase(text,text)'"'"',
         '"'"'pg_vault_tde_wallet_unlock(text)'"'"',
         '"'"'pg_vault_tde_wallet_lock()'"'"',
-        '"'"'pg_vault_tde_wallet_export_bundle(text,text)'"'"',
-        '"'"'pg_vault_tde_wallet_import_bundle(text,text)'"'"',
+        '"'"'pg_vault_tde_seal_keys(text,text,text)'"'"',
+        '"'"'pg_vault_tde_seal_keys_bytea(text,text)'"'"',
+        '"'"'pg_vault_tde_unseal_keys(text,text)'"'"',
         '"'"'pg_vault_tde_migrate_vault_to_wallet(text)'"'"'
     ];
 BEGIN

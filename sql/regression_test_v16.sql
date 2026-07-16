@@ -67,18 +67,16 @@ BEGIN
         'pg_vault_tde_wallet_unlock',
         'pg_vault_tde_wallet_lock',
         'pg_vault_tde_rotate_kek',
-        'pg_vault_tde_wallet_export_bundle',
-        'pg_vault_tde_wallet_import_bundle',
         'pg_vault_tde_wallet_change_passphrase'
       );
 
-    IF fn_count < 6 THEN
+    IF fn_count < 4 THEN
         RAISE EXCEPTION
-            'TEST 73 FAILED: expected 6 v1.6 wallet functions, found % '
+            'TEST 73 FAILED: expected 4 v1.6 wallet functions, found % '
             '(did you run the 1.5→1.6 upgrade script?)', fn_count;
     END IF;
 
-    RAISE NOTICE 'TEST 73 PASSED: all 6 v1.6 wallet SQL functions registered';
+    RAISE NOTICE 'TEST 73 PASSED: all 4 v1.6 wallet SQL functions registered';
 END;
 $$;
 
@@ -557,93 +555,8 @@ BEGIN
 END;
 $$;
 
--- ================================================================
--- TEST 80: wallet_export_bundle + wallet_import_bundle round-trip
---
--- Export the wallet to a file, then import it back.  After import +
--- fresh unlock, encrypted tables must remain readable.
---
--- Requires: kms_provider = 'local'  (skips on other providers)
--- ================================================================
-DO $$
-DECLARE
-    v_provider     text;
-    v_passenv      text;
-    v_bundle       text := '/tmp/tde_test_wallet_bundle_80.bin';
-    v_val          text;
-BEGIN
-    v_provider := current_setting('pg_vault_tde.kms_provider', true);
-    IF v_provider IS DISTINCT FROM 'local' THEN
-        RAISE NOTICE
-            'TEST 80 SKIPPED: kms_provider=% (need ''local'' — run: make ci-wallet)',
-            COALESCE(v_provider, 'vault');
-        RETURN;
-    END IF;
-
-    /*
-     * pg_vault_tde_wallet_export_bundle derives the bundle HMAC key from
-     * the wallet passphrase via PBKDF2 of the configured GUC source.
-     * In the CI container the GUC pg_vault_tde.wallet_passphrase_env points
-     * to an env var that is NOT exported, so the export call ERRORs out.
-     * The test guards against this by attempting the export inside a
-     * BEGIN/EXCEPTION block and SKIPPING gracefully on the known
-     * "passphrase unavailable" message.
-     *
-     * To actually run this test in CI, export the env var named by
-     * pg_vault_tde.wallet_passphrase_env (default PG_TDE_WALLET_PASS)
-     * with value 'tde_regression_pass_2026' before starting postgres.
-     */
-    DROP TABLE IF EXISTS tde_wallet_regression_80;
-
-    BEGIN
-        PERFORM pg_vault_tde_wallet_init('tde_regression_pass_2026');
-    EXCEPTION WHEN OTHERS THEN
-        NULL;
-    END;
-    PERFORM pg_vault_tde_wallet_unlock('tde_regression_pass_2026');
-
-    CREATE TABLE tde_wallet_regression_80 (id int, val text)
-        USING encrypted_heap;
-    INSERT INTO tde_wallet_regression_80 VALUES (1, 'export_import_ok');
-
-    -- Export: writes HMAC-signed bundle to /tmp.  Skip the test if the
-    -- passphrase GUC source is not wired up in this container (the env
-    -- var named by pg_vault_tde.wallet_passphrase_env must be exported).
-    BEGIN
-        PERFORM pg_vault_tde_wallet_export_bundle(v_bundle, 'ci-regression-test-80');
-    EXCEPTION WHEN OTHERS THEN
-        IF SQLERRM LIKE '%passphrase unavailable%' THEN
-            RAISE NOTICE
-                'TEST 80 SKIPPED: passphrase GUC source not configured; '
-                'export env var named by pg_vault_tde.wallet_passphrase_env '
-                'before running this test';
-            DROP TABLE IF EXISTS tde_wallet_regression_80;
-            RETURN;
-        END IF;
-        RAISE;  -- re-raise unexpected errors
-    END;
-
-    -- Import: replaces in-memory wallet state from the bundle
-    PERFORM pg_vault_tde_wallet_import_bundle(v_bundle, 'tde_regression_pass_2026');
-
-    -- Re-open after import (import may reset open state)
-    PERFORM pg_vault_tde_wallet_unlock('tde_regression_pass_2026');
-
-    -- Verify existing encrypted data is still accessible
-    SELECT val INTO v_val FROM tde_wallet_regression_80 WHERE id = 1;
-    IF v_val IS DISTINCT FROM 'export_import_ok' THEN
-        RAISE EXCEPTION
-            'TEST 80 FAILED: val=''%'' after export+import (expected ''export_import_ok'')',
-            COALESCE(v_val, '<NULL>');
-    END IF;
-
-    DROP TABLE tde_wallet_regression_80;
-
-    RAISE NOTICE
-        'TEST 80 PASSED: wallet_export_bundle + wallet_import_bundle round-trip OK';
-END;
-$$;
-
+-- TEST 80: removed in v1.7 (wallet_export_bundle/import_bundle superseded
+-- by pg_vault_tde_seal_keys/unseal_keys — see tap/14 and tap/15)
 
 -- ================================================================
 -- TEST 81: Large TOAST round-trip across INSERT/UPDATE/DELETE
@@ -2719,7 +2632,6 @@ BEGIN
     RAISE NOTICE '   wallet_status 6-column SRF .......... test 77  *';
     RAISE NOTICE '   wallet_change_passphrase ............ test 78  *';
     RAISE NOTICE '   rotate_kek multi-table .............. test 79  *';
-    RAISE NOTICE '   wallet_export/import_bundle ......... test 80  *';
     RAISE NOTICE '   Large TOAST round-trip (inline) ..... test 81';
     RAISE NOTICE '   Subtransaction rollback semantics ... test 82';
     RAISE NOTICE '   STORAGE EXTERNAL round-trip ......... test 83';

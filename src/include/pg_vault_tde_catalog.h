@@ -152,4 +152,36 @@ uint64 pg_vault_tde_catalog_get_rel_generation(Oid relid);
 
 bool pg_vault_tde_catalog_rewrap_all(void);
 
+
+/*
+* Row snapshot used by the physical-backup key sealing (seal/unseal).
+* wrapped_dek and kms_provider are palloc'd copies owned by the caller.
+*/
+typedef struct TdeCatalogSealRow
+{
+    Oid     relid;
+    uint64  generation;
+    bytea  *wrapped_dek;
+    char   *kms_provider;
+} TdeCatalogSealRow;
+
+/*
+* pg_vault_tde_catalog_read_all_wrapped:
+*   Materialize every catalog row having a non-NULL wrapped_dek, ordered by
+*   relid (pkey index order).  Native systable scan — no SQL, no search_path.
+*   Returns the row count; *rows_out is a palloc'd array (NULL if count 0).
+*/
+int pg_vault_tde_catalog_read_all_wrapped(TdeCatalogSealRow **rows_out);
+
+/*
+* pg_vault_tde_catalog_upsert_row:
+*   Insert or update (by relid) a catalog row with the given generation,
+*   wrapped DEK and provider.  Used by unseal_keys to re-import a sealed
+*   bundle.  Native CatalogTupleInsert/Update — no SQL, no search_path.
+*/
+void pg_vault_tde_catalog_upsert_row(Oid relid, uint64 generation,
+                                    bytea *wrapped_dek,
+                                    const char *kms_provider);
+
+
 #endif /* PG_VAULT_TDE_CATALOG_H */

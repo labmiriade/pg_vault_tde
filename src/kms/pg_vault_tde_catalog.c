@@ -1064,6 +1064,179 @@ pg_vault_tde_catalog_rewrap_all(void)
     return true;
 }
 
+/* -------------------------------------------------------------------------
+ * pg_vault_tde_catalog_read_all_wrapped — snapshot of all wrapped DEKs
+ * for the physical-backup key sealing (see pg_vault_tde_seal.c).
+ * -------------------------------------------------------------------------*/
+
+int
+pg_vault_tde_catalog_read_all_wrapped(TdeCatalogSealRow **rows_out)
+{
+    Oid          ext_ns;
+    Oid          catalog_oid;
+    Oid          catalog_idx;
+    Relation     catalog_rel;
+    TupleDesc    tupdesc;
+    SysScanDesc  scan;
+    HeapTuple    tuple;
+    TdeCatalogSealRow *rows;
+    int          nrows = 0;
+    int          cap = 16;
+    
+    ext_ns = get_extension_schema(
+                get_extension_oid(pg_vault_tde_extension_name, true));
+    if (!OidIsValid(ext_ns))
+        ereport(ERROR, errmsg("pg_vault_tde: extension schema not found"));
+
+    catalog_oid = get_relname_relid("pg_vault_tde_catalog", ext_ns);
+    if (!OidIsValid(catalog_oid))
+        ereport(ERROR, errmsg("pg_vault_tde_catalog not found"));
+    catalog_idx = get_relname_relid("pg_vault_tde_catalog_pkey", ext_ns);
+
+    rows = palloc(cap * sizeof(TdeCatalogSealRow));
+
+    catalog_rel = table_open(catalog_oid, AccessShareLock);
+    tupdesc     = RelationGetDescr(catalog_rel);
+
+    /* 0 scan keys on the pkey index = full scan in relid order */
+    scan = systable_beginscan(catalog_rel, catalog_idx, true,
+                            GetTransactionSnapshot(), 0, NULL);
+
+    while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+    {
+        Datum  d;
+        bool   isnull;
+        bytea *wdek_src;
+        TdeCatalogSealRow *row;
+
+        d = heap_getattr(tuple, Anum_pg_vault_tde_wrapped_dek,
+                        tupdesc, &isnull);
+        if (isnull)
+            continue;               /* no wrapped DEK yet: skip */
+
+        if (nrows == cap)
+        {
+            cap *= 2;
+            rows = repalloc(rows, cap * sizeof(TdeCatalogSealRow));
+        }
+        row = &rows[nrows];
+
+        /* Copy while the buffer page is still pinned by the scan. */
+        wdek_src = DatumGetByteaPP(d);
+        row->wrapped_dek = (bytea *) palloc(VARHDRSZ + VARSIZE_ANY_EXHDR(wdek_src));
+        SET_VARSIZE(row->wrapped_dek, VARHDRSZ + VARSIZE_ANY_EXHDR(wdek_src));
+        memcpy(VARDATA(row->wrapped_dek), VARDATA_ANY(wdek_src),
+                VARSIZE_ANY_EXHDR(wdek_src));
+    
+        d = heap_getattr(tuple, Anum_pg_vault_tde_relid, tupdesc, &isnull);
+        row->relid = DatumGetObjectId(d);
+
+        d = heap_getattr(tuple, Anum_pg_vault_tde_generation, tupdesc, &isnull);
+        row->generation = isnull ? 0 : (uint64) DatumGetInt64(d);
+
+        d = heap_getattr(tuple, Anum_pg_vault_tde_kms_provider, tupdesc, &isnull);
+        row->kms_provider = isnull ? pstrdup("") : text_to_cstring(DatumGetTextPP(d));
+    
+        nrows++;
+    }
+
+    systable_endscan(scan);
+    table_close(catalog_rel, AccessShareLock);
+
+    *rows_out = (nrows > 0) ? rows : NULL;
+    if (nrows == 0)
+        pfree(rows);
+    return nrows;
+}
+
+/* -------------------------------------------------------------------------
+ * pg_vault_tde_catalog_upsert_row — import one sealed-bundle row
+ * (insert by relid, or in-place update of an existing entry).
+ *
+ * Not safe to run concurrently with another writer on the SAME relid (an
+ * online rotation via pg_vault_tde_rotate_online(), or the DDL hook
+ * registering a brand-new table): this is scan-then-branch, not an atomic
+ * upsert, so two concurrent writers can both miss each other's row and
+ * collide.  Postgres's own MVCC checks catch it — heap_update()/the unique
+ * index raise "tuple concurrently updated" or a duplicate-key error rather
+ * than silently losing a write — so unseal_keys() aborts cleanly and can be
+ * re-run once the other writer is done.  Deliberately not retried here: see
+ * the README "Key-rotation note".
+ * -------------------------------------------------------------------------*/
+void
+pg_vault_tde_catalog_upsert_row(Oid relid, uint64 generation,
+                                bytea *wrapped_dek, const char *kms_provider)
+{   
+    Oid          ext_ns;
+    Oid          catalog_oid;
+    Oid          catalog_idx;
+    Relation     rel;
+    TupleDesc    tup_desc;
+    ScanKeyData  scan_key;
+    SysScanDesc  scan;
+    HeapTuple    old_tuple;
+    HeapTuple    new_tuple;
+    Datum        values[CATALOG_NATTS];
+    bool         isnull[CATALOG_NATTS];
+    
+    ext_ns = get_extension_schema(
+                get_extension_oid(pg_vault_tde_extension_name, true));
+    if (!OidIsValid(ext_ns))
+        ereport(ERROR, errmsg("pg_vault_tde: extension schema not found"));
+    
+    catalog_oid = get_relname_relid("pg_vault_tde_catalog", ext_ns);
+    if (!OidIsValid(catalog_oid))
+        ereport(ERROR, errmsg("pg_vault_tde_catalog not found"));
+    catalog_idx = get_relname_relid("pg_vault_tde_catalog_pkey", ext_ns);
+    
+    rel = table_open(catalog_oid, RowExclusiveLock);
+    tup_desc = RelationGetDescr(rel);
+    
+    ScanKeyInit(&scan_key, Anum_pg_vault_tde_relid, BTEqualStrategyNumber,
+                F_OIDEQ, ObjectIdGetDatum(relid));
+    scan = systable_beginscan(rel, catalog_idx, true,
+                            GetTransactionSnapshot(), 1, &scan_key);
+    old_tuple = systable_getnext(scan);
+
+    memset(values, 0,     sizeof(values));
+    memset(isnull, false, sizeof(isnull));
+
+    values[Anum_pg_vault_tde_generation-1]   = Int64GetDatum((int64) generation);
+    values[Anum_pg_vault_tde_wrapped_dek-1]  = PointerGetDatum(wrapped_dek);
+    values[Anum_pg_vault_tde_kms_provider-1] = CStringGetTextDatum(kms_provider);
+    values[Anum_pg_vault_tde_updated_at-1]   =
+        TimestampTzGetDatum(GetCurrentTransactionStartTimestamp());
+    
+    if (HeapTupleIsValid(old_tuple))
+    {
+        bool do_replace[CATALOG_NATTS];
+    
+        memset(do_replace, false, sizeof(do_replace));
+        do_replace[Anum_pg_vault_tde_generation-1]   = true;
+        do_replace[Anum_pg_vault_tde_wrapped_dek-1]  = true;
+        do_replace[Anum_pg_vault_tde_kms_provider-1] = true;
+        do_replace[Anum_pg_vault_tde_updated_at-1]   = true;
+
+        new_tuple = heap_modify_tuple(old_tuple, tup_desc,
+                                    values, isnull, do_replace);
+        CatalogTupleUpdate(rel, &old_tuple->t_self, new_tuple);
+    }
+    else
+    {
+        values[Anum_pg_vault_tde_relid-1] = ObjectIdGetDatum(relid);
+        values[Anum_pg_vault_tde_created_at-1] =
+            TimestampTzGetDatum(GetCurrentTransactionStartTimestamp());
+            
+        new_tuple = heap_form_tuple(tup_desc, values, isnull);
+        CatalogTupleInsert(rel, new_tuple);
+    }
+
+    systable_endscan(scan);
+    table_close(rel, RowExclusiveLock);
+    heap_freetuple(new_tuple);
+}
+
+
 PG_FUNCTION_INFO_V1(pg_vault_tde_rotate_kek_sql);
 PGDLLEXPORT Datum
 pg_vault_tde_rotate_kek_sql(PG_FUNCTION_ARGS)
