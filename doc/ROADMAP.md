@@ -93,9 +93,11 @@ AppRole response-wrapping. Wallet SQL stubs registered (not functional). Tests 5
 
 | Feature | Status |
 |---------|--------|
-| `pg_vault_tde_wallet_export_bundle(dest, label)` — HMAC-SHA256-signed binary bundle | ✅ Done |
-| `pg_vault_tde_wallet_import_bundle(src, passphrase)` — HMAC verify, idempotent catalog UPSERT | ✅ Done |
-| Bundle format: `[magic(4) | version(2) | label_len(2) | label | timestamp(8) | wallet_len(4) | wallet_bytes | catalog_entries | HMAC-SHA256(32)]` | ✅ Done |
+| `pg_vault_tde_wallet_export_bundle(dest, label)` — HMAC-SHA256-signed binary bundle | ❌ Removed in v1.7 — 
+  superseded by pg_vault_tde_seal_keys |
+| `pg_vault_tde_wallet_import_bundle(src, passphrase)` — HMAC verify, idempotent catalog UPSERT | ❌ Removed in v1.7 — 
+  superseded by pg_vault_tde_unseal_keys |
+| Bundle format: `[magic(4)  version(2)  label_len(2)  label  timestamp(8)  wallet_len(4)  wallet_bytes  catalog_entries  HMAC-SHA256(32)]` | ❌ Removed in v1.7 |
 
 #### 6. Vault-to-Wallet Migration
 
@@ -255,12 +257,6 @@ Covered by tests 81, 84, and 85.
   available (so tests don't need GUC config), falls back to the GUC
   passphrase source otherwise.
 
-- `pg_vault_tde_wallet_export_bundle()` — still requires the passphrase
-  via GUC (env / file / command) because the bundle's HMAC key is derived
-  via PBKDF2 from the passphrase string and import_bundle must regenerate
-  the same key from the user-supplied passphrase.  Test 80 SKIPS gracefully
-  when `pg_vault_tde.wallet_passphrase_env` is not wired up; export an env
-  var with the passphrase before starting postgres to enable it.
 
 ### TAM read-path RELKIND_TOASTVALUE bypass (v1.6 patch)
 
@@ -354,9 +350,9 @@ GUC `pg_vault_tde.dump_plaintext_warning = on`.
 (`tde_backup_decrypt_block()` with block_seq as AAD), and pipes plaintext to
 `pg_restore -Fc`.
 
-Longer term: `pg_vault_tde_backup_prepare()`/`backup_restore()` — signed bundle of all
-`wrapped_dek` entries; `BackupState` hook integration for automatic bundling with
-`pg_basebackup`.
+`pg_vault_tde_seal_keys()`/`pg_vault_tde_seal_keys_bytea()`/`pg_vault_tde_unseal_keys()` (`src/kms/pg_vault_tde_seal.c`) — signed bundle of all `wrapped_dek` entries (KEK excluded), for `pg_basebackup`; TAP `tap/14_seal_keys.t`.
+`pg_basebackup_tde` (`src/backup/pg_basebackup_tde.c`) — pg_basebackup wrapper: seals every database's keys via `seal_keys_bytea` before the backup and writes one `pg_vault_tde_keys.<datname>.sealed` bundle per database after it succeeds; TAP `tap/15_basebackup_tde.t`.
+A core-side `BackupState`/`bbsink` hook was evaluated and discarded: PostgreSQL exposes no extension hook to inject files into the `pg_basebackup` stream, and a custom `bbsink` runs in the walsender without SPI.
 
 ---
 

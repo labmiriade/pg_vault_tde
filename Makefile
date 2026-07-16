@@ -64,6 +64,7 @@ OBJS = \
 	src/kms/pg_vault_tde_kms_local.o \
 	src/kms/pg_vault_tde_catalog.o \
 	src/kms/pg_vault_tde_rotation_bgw.o \
+	src/kms/pg_vault_tde_seal.o \
 	src/crypto/pg_vault_tde_crypto.o \
 	src/crypto/pg_vault_tde_hw_accel.o \
 	src/tam/pg_vault_tde_tam.o \
@@ -202,6 +203,13 @@ PG_RESTORE_TDE_SRCS = \
 PG_DUMP_TDE_OBJS = $(PG_DUMP_TDE_SRCS:.c=_bin.o)
 PG_RESTORE_TDE_OBJS = $(PG_RESTORE_TDE_SRCS:.c=_bin.o)
 
+# pg_basebackup_tde: pg_basebackup wrapper that also stores one sealed
+# wrapped-DEK bundle per database (via pg_vault_tde_seal_keys_bytea).
+# libpq only: no frontend KMS, no block encryption — the physical files are
+# already encrypted on disk.
+PG_BASEBACKUP_TDE_SRCS = src/backup/pg_basebackup_tde.c
+PG_BASEBACKUP_TDE_OBJS = $(PG_BASEBACKUP_TDE_SRCS:.c=_bin.o)
+
 # pkg-config fallback: if not available, use well-known paths.
 HAS_PKG_CONFIG := $(shell command -v pkg-config 2>/dev/null)
 
@@ -250,21 +258,26 @@ pg_dump_tde: $(PG_DUMP_TDE_OBJS)
 pg_restore_tde: $(PG_RESTORE_TDE_OBJS)
 	$(CC) -o $@ $^ $(PG_DUMP_TDE_LDFLAGS)
 
-# Hook into the standard PGXS targets so pg_dump_tde is always built,
-# installed, and cleaned together with the extension.
-all: pg_dump_tde pg_restore_tde
+pg_basebackup_tde: $(PG_BASEBACKUP_TDE_OBJS)
+	$(CC) -o $@ $^ $(PG_DUMP_TDE_LDFLAGS)
+
+# Hook into the standard PGXS targets so the frontend tools are always
+# built, installed, and cleaned together with the extension.
+all: pg_dump_tde pg_restore_tde pg_basebackup_tde
 
 bindir := $(shell $(PG_CONFIG) --bindir)
 
 .PHONY: install-pg-dump-tde
-install-pg-dump-tde: pg_dump_tde pg_restore_tde
+install-pg-dump-tde: pg_dump_tde pg_restore_tde pg_basebackup_tde
 	install -m 755 pg_dump_tde $(bindir)/pg_dump_tde
 	install -m 755 pg_restore_tde $(bindir)/pg_restore_tde
+	install -m 755 pg_basebackup_tde $(bindir)/pg_basebackup_tde
 
 install: install-pg-dump-tde
 
 .PHONY: clean-pg-dump-tde
 clean-pg-dump-tde:
-	rm -f pg_dump_tde pg_restore_tde $(PG_DUMP_TDE_OBJS) $(PG_RESTORE_TDE_OBJS)
+	rm -f pg_dump_tde pg_restore_tde pg_basebackup_tde \
+	    $(PG_DUMP_TDE_OBJS) $(PG_RESTORE_TDE_OBJS) $(PG_BASEBACKUP_TDE_OBJS)
 
 clean: clean-pg-dump-tde
