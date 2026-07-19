@@ -1,13 +1,13 @@
 # DevOps & Packaging Instructions — @DevOps
 
-> **Scope**: `.github/workflows/`, `packaging/`, `Containerfile`,
+> **Scope**: `packaging/`, `Containerfile`,
 > `bitbucket-pipelines.yml`, `ci/`
 
 ---
 
 ## CI Pipeline Architecture
 
-### GitHub Actions (`.github/workflows/ci.yml`)
+### Bitbucket Pipelines (`bitbucket-pipelines.yml`)
 
 5 jobs, against PostgreSQL 17 and 18 on Ubuntu 24.04:
 
@@ -19,11 +19,6 @@
 | `tap` | Run TAP tests with mock Vault | 17, 18 | `build` |
 | `isolation` | Run isolation tests (concurrency / MVCC) | 17, 18 | `build` |
 | `memcheck` | Valgrind + AddressSanitizer | 17, 18 | `build` |
-
-### Bitbucket Pipelines (`bitbucket-pipelines.yml`)
-
-Mirror of GitHub Actions for Bitbucket-hosted repositories.
-Uses the same test commands and validation gates.
 
 ### Local CI Pipeline (`ci/`)
 

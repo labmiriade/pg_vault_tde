@@ -85,7 +85,7 @@ done
 # ---------------------------------------------------------------------------
 # Stage definitions
 # ---------------------------------------------------------------------------
-ALL_STAGES=(regress checksums tap isolation vault openbao wallet schema install-test bench)
+ALL_STAGES=(regress checksums tap isolation vault openbao wallet pkcs11 schema install-test bench)
 
 should_run() {
     local stage="$1"

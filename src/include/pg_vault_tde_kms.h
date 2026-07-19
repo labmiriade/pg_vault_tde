@@ -36,6 +36,15 @@ void pg_vault_tde_kms_shmem_request(void);
 void pg_vault_tde_kms_shmem_init(void);
 
 /*
+ * pkcs11 provider's shared-memory KEK-version beacon (v1.7+).
+ * Same shmem_request_hook / shmem_startup_hook chain as above, defined in
+ * pg_vault_tde_kms_pkcs11.c (owns the Pkcs11SharedState struct and the
+ * pkcs11_shared static pointer — both file-scope there).
+ */
+void pg_vault_tde_kms_pkcs11_shmem_request(void);
+void pg_vault_tde_kms_pkcs11_shmem_init(void);
+
+/*
  * Background worker registration (v1.3).
  * Registers the token renewal BGW if pg_vault_tde.bgw_enabled = true.
  * Must be called from _PG_init() before postmaster fork.

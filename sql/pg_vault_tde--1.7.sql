@@ -496,6 +496,24 @@ COMMENT ON FUNCTION pg_vault_tde_unseal_keys(text, text) IS
 'success UPSERTs the catalog rows and evicts the shmem cache.';
 
 -- ============================================================================
+-- PKCS#11 / HSM SQL functions (v1.7)
+-- ============================================================================
+
+-- One-time KEK provisioning on the PKCS#11 token
+CREATE FUNCTION pg_vault_tde_pkcs11_keygen()
+    RETURNS void
+    LANGUAGE C STRICT SECURITY DEFINER
+    AS 'MODULE_PATHNAME', 'pg_vault_tde_pkcs11_keygen_sql';
+
+REVOKE ALL ON FUNCTION pg_vault_tde_pkcs11_keygen() FROM PUBLIC;
+
+COMMENT ON FUNCTION pg_vault_tde_pkcs11_keygen() IS
+'Generate the AES-256 KEK on the PKCS#11 token (CKA_SENSITIVE, '
+'CKA_EXTRACTABLE=FALSE, CKA_WRAP/CKA_UNWRAP) under the label '
+'pg_vault_tde.pkcs11_key_label.  Fails if a key with that label already '
+'exists.  Requires pg_vault_tde.kms_provider = ''pkcs11''.';
+
+-- ============================================================================
 -- Online key rotation
 -- ============================================================================
 
@@ -575,6 +593,7 @@ COMMENT ON FUNCTION pg_vault_tde_rotate_kek() IS
 'Re-wrap all per-table DEKs under a new KEK without touching encrypted tuple data. '
 'For the local wallet provider: generates a fresh random KEK and rewrites the wallet file. '
 'For the Vault provider: rotates the Transit key and re-wraps all DEKs. '
+'For the PKCS#11 provider: regenerate KEK on token with a new version <label>.vN+1'
 'Requires superuser. Flushes the shared-memory DEK cache after completion.';
 
 -- ============================================================================

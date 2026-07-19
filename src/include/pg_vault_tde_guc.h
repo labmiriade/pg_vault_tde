@@ -97,11 +97,11 @@ extern int         pg_vault_tde_token_renewal_interval;
  * -----------------------------------------------------------------------*/
 
 /*
- * KMS provider selector (PGC_POSTMASTER).
- * Valid values: "vault" (default), "local".
- * Future: "pkcs11" (v1.7), "kmip" (v1.8).
+ * KMS provider selector (PGC_SUSET, per-database via ALTER DATABASE SET).
+ * Valid values: "vault", "local", "pkcs11" (v1.7).
+ * Future: "kmip" (v1.8).
  * Controls which TdeKmsProvider vtable is loaded into
- * tde_active_kms_provider at startup.
+ * tde_active_kms_provider by the GUC assign hook.
  */
 extern char       *pg_vault_tde_kms_provider;
 
@@ -197,6 +197,44 @@ extern char       *pg_vault_tde_wallet_dev_mode_passphrase;
  * When true, ereport(WARNING) is emitted on every dev-mode passphrase use.
  */
 extern bool        pg_vault_tde_dev_mode;
+
+/* -----------------------------------------------------------------------
+ * v1.7 GUCs — PKCS#11 / HSM provider
+ * -----------------------------------------------------------------------*/
+
+/*
+ * Absolute path to the vendor PKCS#11 module (PGC_SUSET).
+ * dlopen()ed lazily per backend; never loaded in the postmaster because
+ * PKCS#11 state does not survive fork().
+ * Used only when kms_provider = 'pkcs11'.
+ */
+extern char       *pg_vault_tde_pkcs11_library;
+
+/*
+ * Token label for slot discovery (PGC_SUSET).
+ * Preferred over pkcs11_slot_id: slot IDs are not stable across restarts
+ * on some modules (SoftHSM2 randomizes them per token).
+ */
+extern char       *pg_vault_tde_pkcs11_token_label;
+
+/*
+ * Explicit slot ID, used only when pkcs11_token_label is empty
+ * (PGC_SUSET, default -1 = unset).
+ */
+extern int         pg_vault_tde_pkcs11_slot_id;
+
+/*
+ * Environment variable NAME that holds the token user PIN (PGC_SUSET).
+ * NEVER the PIN itself — same rule as wallet_passphrase_env.
+ * Default: "PG_TDE_PKCS11_PIN".
+ */
+extern char       *pg_vault_tde_pkcs11_pin_env;
+
+/*
+ * CKA_LABEL of the AES-256 KEK object on the token (PGC_SUSET).
+ * Default: "pg_vault_tde_kek".
+ */
+extern char       *pg_vault_tde_pkcs11_key_label;
 
 extern char*       pg_vault_tde_extension_name;
 

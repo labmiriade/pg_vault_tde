@@ -176,5 +176,6 @@ extern const TdeKmsProvider *tde_active_kms_provider;
  */
 const TdeKmsProvider *pg_vault_tde_kms_vault_provider(void);   /* vault */
 const TdeKmsProvider *pg_vault_tde_kms_local_provider(void);   /* local wallet */
+const TdeKmsProvider *pg_vault_tde_kms_pkcs11_provider(void);  /* pkcs11 HSM */
 
 #endif /* PG_VAULT_TDE_KMS_PROVIDER_H */

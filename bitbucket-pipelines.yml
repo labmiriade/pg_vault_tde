@@ -2,7 +2,6 @@
 # bitbucket-pipelines.yml
 #
 # CI/CD Pipeline for pg_vault_tde — Bitbucket Cloud
-# Mirror of .github/workflows/ci.yml
 #
 # Tests against PostgreSQL 17 AND 18 (update when adding PG 19+).
 #
@@ -122,7 +121,7 @@ pipelines:
             - *install-pg17
             - apt-get install -y --no-install-recommends
                 perl cpanminus libipc-run-perl
-                libhttp-daemon-perl libhttp-message-perl
+                libhttp-daemon-perl libhttp-message-perl softhsm2
             - make PG_CONFIG=$(which pg_config)
             - make install PG_CONFIG=$(which pg_config)
             - prove -v tap/*.t
@@ -240,7 +239,7 @@ pipelines:
             - *install-pg18
             - apt-get install -y --no-install-recommends
                 perl cpanminus libipc-run-perl
-                libhttp-daemon-perl libhttp-message-perl
+                libhttp-daemon-perl libhttp-message-perl softhsm2
             - make PG_CONFIG=$(which pg_config)
             - make install PG_CONFIG=$(which pg_config)
             - prove -v tap/*.t

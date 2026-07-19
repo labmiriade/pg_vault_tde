@@ -80,7 +80,7 @@ char *pg_vault_tde_extension_name       = "pg_vault_tde";
 /* -----------------------------------------------------------------------
  * v1.5 GUC definitions
  * ----------------------------------------------------------------------- */
-char *pg_vault_tde_kms_provider           = NULL; /* "vault" | "local" */
+char *pg_vault_tde_kms_provider           = NULL; /* "vault" | "local" | "pkcs11" */
 char *pg_vault_tde_wallet_path            = NULL; /* path to wallet.p12 */
 char *pg_vault_tde_wallet_passphrase_env  = NULL; /* env var NAME */
 bool  pg_vault_tde_wallet_auto_open       = true;
@@ -95,6 +95,15 @@ char *pg_vault_tde_wallet_passphrase_file    = NULL; /* path to passphrase file 
 char *pg_vault_tde_wallet_passphrase_command = NULL; /* shell command → passphrase */
 char *pg_vault_tde_wallet_dev_mode_passphrase = NULL;/* dev-mode only; never prod */
 bool  pg_vault_tde_dev_mode                  = false;/* enables dev conveniences */
+
+/* -----------------------------------------------------------------------
+ * v1.7 GUC definitions — PKCS#11 / HSM provider
+ * ----------------------------------------------------------------------- */
+char *pg_vault_tde_pkcs11_library     = NULL; /* path to vendor PKCS#11 module */
+char *pg_vault_tde_pkcs11_token_label = NULL; /* token label for slot discovery */
+int   pg_vault_tde_pkcs11_slot_id     = -1;   /* used when token_label empty; -1 = unset */
+char *pg_vault_tde_pkcs11_pin_env     = NULL; /* env var NAME holding the user PIN */
+char *pg_vault_tde_pkcs11_key_label   = NULL; /* CKA_LABEL of the KEK on the token */
 
 /*
  * tde_active_kms_provider — selected KMS backend (set in _PG_init).
@@ -132,7 +141,9 @@ tde_audit_hook audit_hook_ptr = NULL;
  *
  * Frees per-backend EVP_CIPHER_CTX objects, wipes the IV batch buffer, and
  * frees the IAM SIV contexts.  Runs for every backend exit (normal,
- * SIGTERM, etc.) via the proc_exit() callback chain.
+ * SIGTERM, etc.) via the proc_exit() callback chain.  Also gives the active
+ * KMS provider a chance for orderly per-backend teardown (e.g. the pkcs11
+ * provider logs out and finalizes Cryptoki).
  */
 static void
 tde_backend_cleanup(int code, Datum arg)
@@ -141,6 +152,8 @@ tde_backend_cleanup(int code, Datum arg)
     tde_crypto_ctx_cleanup();
     tde_iam_ctx_cleanup();
     tde_hw_accel_cleanup();
+    if (tde_active_kms_provider)
+        tde_active_kms_provider->shutdown();
 }
 
 PG_FUNCTION_INFO_V1(pg_vault_tde_tableam_handler);
@@ -160,6 +173,30 @@ pg_vault_tde_iam_handler(PG_FUNCTION_ARGS)
 
 void _PG_init(void);
 
+/*
+ * tde_kms_provider_check — GUC check hook for pg_vault_tde.kms_provider.
+ *
+ * Runs BEFORE tde_kms_provider_assign, on every SET / ALTER DATABASE SET /
+ * postgresql.conf load.  Rejects any value that is not one of the known
+ * provider names (or the empty string, meaning "not yet configured") so a
+ * typo is reported as a GUC error instead of silently degrading
+ * tde_active_kms_provider to NULL.
+ */
+
+static bool
+tde_kms_provider_check(char **newval, void **extra, GucSource source)
+{
+    if ((*newval)[0] == '\0')
+        return true;                       /* unset is valid */
+    
+    if (strcmp(*newval,"vault") == 0   ||
+        strcmp(*newval,"pkcs11") == 0  ||
+        strcmp(*newval,"local") == 0  ) 
+        return true;                      /* vault,pkcs11 and local are valid */
+
+    GUC_check_errdetail("Valid values are \"vault\", \"local\", \"pkcs11\", or the empty string.");
+    return false;
+}       
 /*
  * tde_kms_provider_assign — GUC assign hook for pg_vault_tde.kms_provider.
  *
@@ -193,9 +230,14 @@ tde_kms_provider_assign(const char *newval, void *extra)
         new_provider = pg_vault_tde_kms_local_provider();
     else if (strcmp(newval, "vault") == 0)
         new_provider = pg_vault_tde_kms_vault_provider();
+    else if (strcmp(newval, "pkcs11") == 0)
+        new_provider = pg_vault_tde_kms_pkcs11_provider();
     else
     {
-        /* Unknown value — check_hook should have rejected it; be defensive */
+        /*
+        * Unreachable in practice: tde_kms_provider_check() validates newval
+        * before this hook ever runs.  Kept as a defensive fallback.
+        */
         tde_active_kms_provider = NULL;
         return;
     }
@@ -1070,6 +1112,10 @@ pg_vault_tde_shmem_request(void)
      * Size determined by pg_vault_tde.max_encrypted_relations GUC.
      */
     pg_vault_tde_catalog_shmem_request();
+    /*
+     * ask for pkcs11
+     */
+    pg_vault_tde_kms_pkcs11_shmem_request();
 }
 
 /*
@@ -1091,6 +1137,14 @@ pg_vault_tde_shmem_startup(void)
      * pg_vault_tde_kms_shmem_init (KMS shmem must exist first).
      */
     pg_vault_tde_catalog_shmem_init();
+
+    /*
+     * v1.7+: map the pkcs11 provider's KEK-version beacon.  Must be
+     * pg_vault_tde_kms_pkcs11_shmem_init() here (startup/map phase), NOT
+     * _shmem_request() again — that call belongs only in
+     * pg_vault_tde_shmem_request() (sizing phase, above).
+     */
+    pg_vault_tde_kms_pkcs11_shmem_init();
 
     /*
      * Mark shmem as available.  The kms_provider assign hook checks this flag
@@ -1317,13 +1371,15 @@ _PG_init(void)
      * The provider is re-evaluated per connection from the effective GUC value.
      */
     DefineCustomStringVariable("pg_vault_tde.kms_provider",
-        "KMS provider backend: vault or local (PKCS#12 wallet)",
+        "KMS provider backend: vault, local (PKCS#12 wallet) or pkcs11 (HSM)",
         "Selects which Key Management Service backend is active.  "
         "'vault': uses HashiCorp Vault / OpenBao Transit API.  "
         "'local': uses a PKCS#12 wallet at pg_vault_tde.wallet_path.  "
+        "'pkcs11': uses an HSM through the PKCS#11 module at "
+        "pg_vault_tde.pkcs11_library.  "
         "Settable per-database via ALTER DATABASE SET.",
         &pg_vault_tde_kms_provider, "", PGC_SUSET,
-        GUC_SUPERUSER_ONLY, NULL, tde_kms_provider_assign, NULL);
+        GUC_SUPERUSER_ONLY, tde_kms_provider_check, tde_kms_provider_assign, NULL);
 
     /* Local wallet path (v1.5) — default resolved at runtime from $PGDATA */
     DefineCustomStringVariable("pg_vault_tde.wallet_path",
@@ -1439,6 +1495,63 @@ _PG_init(void)
         "as the wallet passphrase.  Always false in production.",
         &pg_vault_tde_dev_mode, false, PGC_SUSET,
         GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+
+    /* ----------------------------------------------------------------
+     * v1.7 GUC registrations — PKCS#11 / HSM provider
+     * ---------------------------------------------------------------- */
+
+    /*
+     * pkcs11_library — absolute path to the vendor PKCS#11 module.
+     * The module is dlopen()ed lazily per backend, never in the postmaster:
+     * PKCS#11 state does not survive fork() (see pg_vault_tde_kms_pkcs11.c).
+     */
+    DefineCustomStringVariable("pg_vault_tde.pkcs11_library",
+        "Absolute path to the PKCS#11 module (.so) of the HSM",
+        "Used only when pg_vault_tde.kms_provider = 'pkcs11'.  "
+        "Example: /usr/lib/softhsm/libsofthsm2.so",
+        &pg_vault_tde_pkcs11_library, "", PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+
+    /*
+     * pkcs11_token_label — locate the token by its label.  Preferred over
+     * pkcs11_slot_id because slot IDs are not stable across restarts on
+     * some modules (SoftHSM2 randomizes them per token).
+     */
+    DefineCustomStringVariable("pg_vault_tde.pkcs11_token_label",
+        "Label of the PKCS#11 token holding the KEK",
+        "When set, slots are scanned for a token with this label.  "
+        "Takes priority over pg_vault_tde.pkcs11_slot_id.",
+        &pg_vault_tde_pkcs11_token_label, "", PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+
+    /*
+     * pkcs11_slot_id — explicit slot selection, used only when
+     * pkcs11_token_label is empty.  -1 means unset.
+     */
+    DefineCustomIntVariable("pg_vault_tde.pkcs11_slot_id",
+        "PKCS#11 slot ID (used only when pkcs11_token_label is empty)",
+        "Explicit slot to open the session against.  Prefer "
+        "pg_vault_tde.pkcs11_token_label: slot IDs are not stable across "
+        "restarts on some modules.  -1 = unset.",
+        &pg_vault_tde_pkcs11_slot_id, -1, -1, INT_MAX,
+        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+
+    /* PIN env var NAME — never the PIN itself (same rule as the wallet) */
+    DefineCustomStringVariable("pg_vault_tde.pkcs11_pin_env",
+        "Name of the environment variable holding the token user PIN",
+        "The PIN is read from getenv(pkcs11_pin_env) at session setup.  "
+        "NEVER put the PIN in postgresql.conf directly.",
+        &pg_vault_tde_pkcs11_pin_env, "PG_TDE_PKCS11_PIN",
+        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+
+    /* CKA_LABEL of the AES-256 KEK object on the token */
+    DefineCustomStringVariable("pg_vault_tde.pkcs11_key_label",
+        "CKA_LABEL of the AES-256 KEK object on the token",
+        "The wrap/unwrap key looked up at session setup.  Create it with "
+        "pg_vault_tde_pkcs11_keygen() or with the HSM vendor tooling "
+        "(CKA_WRAP, CKA_UNWRAP, CKA_EXTRACTABLE=FALSE).",
+        &pg_vault_tde_pkcs11_key_label, "pg_vault_tde_kek",
+        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /* Chain hooks so other extensions coexist correctly. */
     prev_shmem_request_hook = shmem_request_hook;

@@ -100,6 +100,17 @@ bool tde_backup_init(ConnParams* params)
     {
         dump_tde_active_provider = pg_dump_tde_kms_local_provider();
     }
+    else if(strcmp(kms_provider, PKCS11_PROVIDER) == 0)
+    {
+        /*
+         * The in-server pkcs11 provider (v1.7) has no FRONTEND shim yet:
+         * the standalone tools would need their own PKCS#11 session and PIN
+         * handling.  Fail with a clear message instead of "unknown".
+         */
+        fprintf(stderr, "pg_dump_tde: kms_provider 'pkcs11' is not yet "
+                        "supported by the standalone backup tools\n");
+        return false;
+    }
     else{
         fprintf(stderr, "pg_dump_tde: unknown KMS provider %s", kms_provider);
         return false;

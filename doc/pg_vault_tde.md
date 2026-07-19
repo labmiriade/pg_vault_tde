@@ -15,15 +15,16 @@
 4. [KMS and Key Caching](#kms-and-key-caching)
 5. [Index Access Method (IAM)](#index-access-method)
 6. [Logical Decoding and Replication](#logical-decoding-and-replication)
-7. [Known Limitations](#known-limitations)
-8. [Security Considerations](#security-considerations)
-9. [Wire Format Reference](#wire-format-reference)
-10. [SQL API Reference](#sql-api-reference)
-11. [Extension Initialization](#extension-initialization)
-12. [Testing Strategy](#testing-strategy)
-13. [Packaging](#packaging)
-14. [Roadmap](#roadmap)
-15. [Contributing](#contributing)
+7. [PKCS#11 / HSM Provider](#pkcs11--hsm-provider)
+8. [Known Limitations](#known-limitations)
+9. [Security Considerations](#security-considerations)
+10. [Wire Format Reference](#wire-format-reference)
+11. [SQL API Reference](#sql-api-reference)
+12. [Extension Initialization](#extension-initialization)
+13. [Testing Strategy](#testing-strategy)
+14. [Packaging](#packaging)
+15. [Roadmap](#roadmap)
+16. [Contributing](#contributing)
 
 ---
 
@@ -772,6 +773,136 @@ they follow from the tuple being an opaque ciphertext blob to the core.
 This ciphertext-as-opaque-blob conflict — every place the core reads a single
 column (e.g. replica identity) sees ciphertext — is the motivation for the
 column-level encryption alternative on the v1.8 roadmap.
+
+---
+
+## PKCS#11 / HSM Provider
+
+The `pkcs11` KMS provider (v1.7, `src/kms/pg_vault_tde_kms_pkcs11.c`) keeps
+the KEK inside a hardware security module. It talks the Cryptoki API
+directly: the vendor's PKCS#11 module (`pg_vault_tde.pkcs11_library`) is
+`dlopen()`ed at runtime and every DEK is wrapped/unwrapped with
+`C_WrapKey`/`C_UnwrapKey` using `CKM_AES_KEY_WRAP` (RFC 3394, the same
+algorithm the local wallet provider uses in software), with a runtime
+fallback to `CKM_AES_KEY_WRAP_PAD`. No OpenSSL involvement and no
+build/runtime dependency: the OASIS interface headers are vendored under
+`src/include/pkcs11/` (include them only through
+`src/include/pg_vault_tde_cryptoki.h`).
+
+### Key Hierarchy and Threat Model
+
+```
+HSM token (user PIN via env var)
+  └── KEK: AES-256, CKO_SECRET_KEY, CKA_SENSITIVE, CKA_EXTRACTABLE=FALSE
+        └── C_WrapKey (CKM_AES_KEY_WRAP) → per-table DEK  (40-byte blob
+              │                             in pg_vault_tde_catalog)
+              └── encrypts tuple data (AES-256-GCM, in-process)
+```
+
+Only the **KEK** is confined to the HSM: tuple crypto runs in-process, so
+the plaintext DEK necessarily transits backend memory (stack buffers,
+`OPENSSL_cleanse`d after use) — the same model as the Vault Transit
+provider. An attacker with the disk (or a catalog dump) holds only
+DEKs wrapped by a key that exists exclusively inside the device.
+
+### Setup
+
+1. `pg_vault_tde.kms_provider = 'pkcs11'`, `pkcs11_library`, and
+   `pkcs11_token_label` (preferred; `pkcs11_slot_id` is the fallback —
+   slot IDs are not stable across restarts on some modules).
+2. Export the token user PIN in the environment variable named by
+   `pkcs11_pin_env` (default `PG_TDE_PKCS11_PIN`) before starting
+   PostgreSQL. The GUC holds the env var *name* — never put the PIN in
+   `postgresql.conf`.
+3. `SELECT pg_vault_tde_pkcs11_keygen();` (superuser, once) generates the
+   AES-256 KEK on the token under `pkcs11_key_label`. It refuses to
+   overwrite an existing key. Alternatively provision the key with the HSM
+   tooling (`CKA_WRAP`, `CKA_UNWRAP`, `CKA_EXTRACTABLE=FALSE`).
+
+Per-database HSM isolation works like every other provider: all `pkcs11_*`
+GUCs are `PGC_SUSET`, so different databases can use different tokens or
+key labels via `ALTER DATABASE ... SET`.
+
+### Process Model and Fork Safety
+
+PKCS#11 (§6.6 of the spec) makes Cryptoki state unusable across `fork()`.
+Because every PostgreSQL backend is forked from the postmaster:
+
+- `C_Initialize` is **never** called in the postmaster — `init()` there
+  only validates the GUCs;
+- each backend attaches lazily on first use (dlopen → `C_Initialize` →
+  slot discovery → `C_OpenSession` → `C_Login` → KEK lookup), and a
+  `getpid()` guard discards any state inherited across fork without
+  calling into the module;
+- on session/device loss (`CKR_SESSION_HANDLE_INVALID`,
+  `CKR_DEVICE_ERROR`, ...) operations retry exactly once through a fresh
+  session;
+- the vendor module is never `dlclose()`d (many modules crash on unload).
+
+### KEK Rotation
+
+Each KEK generation lives forever under its own immutable token label
+`<label>.v<N>` (N monotonically increasing) — rotation never renames or
+destroys a key. "Current" is simply the highest `N` found on the token, and
+every wrapped DEK stored in the catalog carries a 4-byte version tag
+identifying exactly which `<label>.v<N>` produced it. Unwrap always looks
+up that exact version, regardless of which one is "current" at the time.
+
+`SELECT pg_vault_tde_rotate_kek();` drives:
+
+1. **prepare** — generates a fresh KEK as `<label>.v<current+1>`;
+2. **rewrap** — every catalog DEK is unwrapped with the KEK version tagged
+   in its own blob and re-wrapped with the new version, tagging the new
+   blob accordingly (transactional catalog UPDATEs);
+3. **commit** — purely an in-backend cache update (the new version is
+   already durably on the token and every rewrapped row already carries its
+   own version tag), so there is nothing left to make durable and no
+   crash window: whatever the catalog transaction ends up committing is
+   self-describing and always resolves to the right KEK.
+
+Because no KEK generation is ever renamed or destroyed, a crash or a rolled
+back rotation at any point simply leaves an unused `<label>.v<N+1>` key on
+the token (harmless — the next rotation attempt reuses or supersedes it)
+with the catalog untouched, still tagged with the old version and still
+fully readable.
+
+**Cross-backend propagation.** `commit_kek_rotation` only updates the
+cache of the ONE backend that ran `pg_vault_tde_rotate_kek()`. Without more,
+every OTHER already-connected backend would keep wrapping new DEKs under
+the pre-rotation KEK indefinitely. A small shared-memory beacon (one
+`LWLock` + a `uint32` KEK version, same dynamic-tranche pattern as the
+Vault token cache) fixes this: `commit_kek_rotation` (and the initial
+keygen) publish the new version there; every backend checks it
+opportunistically on its own next wrap/unwrap/rewrap call and, if stale,
+resolves its own `CK_OBJECT_HANDLE` locally via a label lookup. Only the
+version NUMBER crosses the process boundary — never the object handle
+itself, which PKCS#11 only guarantees meaningful within the session that
+resolved it. Staleness for an already-attached backend is therefore bounded
+by "its own next operation", not by wall-clock time or a reconnect.
+
+### Testing with SoftHSM2
+
+`tap/16_pkcs11.t` is fully self-contained: it provisions a throwaway
+SoftHSM2 token in a tempdir (`SOFTHSM2_CONF` + `softhsm2-util
+--init-token`, no root needed) and exercises keygen, round-trip, on-disk
+ciphertext, restart, health check, KEK rotation, cross-backend rotation
+propagation (a long-lived session picking up a rotation committed by a
+different connection, via `background_psql`), and clean failure paths
+(wrong token label, wrong PIN, unprovisioned key label, invalid
+`pkcs11_library` path) — 19 assertions in total.
+Run it via `make ci-pkcs11` (containerized) or `prove tap/16_pkcs11.t`
+where the `softhsm2` package is installed; it skips itself otherwise.
+`pkcs11-tool` (package `opensc`) is handy for inspecting the token:
+`pkcs11-tool --module /usr/lib/softhsm/libsofthsm2.so --login --list-objects`.
+
+### Limitations
+
+- The standalone backup tools (`pg_dump_tde`/`pg_restore_tde`) do not
+  support `kms_provider = 'pkcs11'` yet; they exit with a clear error.
+- `health_check()` may exceed its usual latency budget on first touch of
+  a *network* HSM (the lazy attach performs the full login sequence).
+- PKCS#11 labels are not unique: keep exactly one KEK under
+  `pkcs11_key_label` (the provider warns and picks the first match).
 
 ---
 

@@ -69,6 +69,8 @@ RUN apt-get update -qq && \
         libipc-run-perl \
         libhttp-daemon-perl \
         libhttp-message-perl \
+        # PKCS#11 provider test (tap/16): SoftHSM2 module + CLI
+        softhsm2 \
         # Debug tools (useful for failures)
         procps \
         less && \

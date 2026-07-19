@@ -62,6 +62,7 @@ OBJS = \
 	src/pg_vault_tde.o \
 	src/kms/pg_vault_tde_kms.o \
 	src/kms/pg_vault_tde_kms_local.o \
+	src/kms/pg_vault_tde_kms_pkcs11.o \
 	src/kms/pg_vault_tde_catalog.o \
 	src/kms/pg_vault_tde_rotation_bgw.o \
 	src/kms/pg_vault_tde_seal.o \
@@ -98,7 +99,9 @@ override CFLAGS  += -Wall -Wextra -std=c99 \
                     $(TDE_ARCH_CFLAGS) \
                     $(TDE_OPT_CFLAGS) \
                     $(shell pkg-config --cflags openssl libcurl)
-override SHLIB_LINK += $(shell pkg-config --libs openssl libcurl)
+# -ldl: dlopen() of the vendor PKCS#11 module (pkcs11 KMS provider).
+# No-op on glibc >= 2.34 (dlopen lives in libc) but required for portability.
+override SHLIB_LINK += $(shell pkg-config --libs openssl libcurl) -ldl
 
 # ---------------------------------------------------------------------------
 # check-cpu: print CPU hardware encryption capabilities
@@ -128,7 +131,7 @@ bench-cpu:
 # All targets delegate to ci/scripts/ which auto-detect podman/docker.
 # Override container runtime:  make ci-all CONTAINER_RT=docker
 # ===========================================================================
-.PHONY: ci-all ci-regress ci-checksums ci-tap ci-isolation ci-vault ci-wallet ci-schema ci-bench ci-install-test ci-clean
+.PHONY: ci-all ci-regress ci-checksums ci-tap ci-isolation ci-vault ci-wallet ci-pkcs11 ci-schema ci-bench ci-install-test ci-clean
 
 ci-all:
 	@bash ci/scripts/run-all.sh
@@ -150,6 +153,9 @@ ci-vault:
 
 ci-wallet:
 	@bash ci/scripts/run-wallet.sh
+
+ci-pkcs11:
+	@bash ci/scripts/run-pkcs11.sh
 
 ci-schema:
 	@bash ci/scripts/run-schema.sh
