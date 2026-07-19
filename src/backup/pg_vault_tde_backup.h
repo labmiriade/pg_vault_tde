@@ -39,6 +39,7 @@
 #define TDE_BACKUP_MAGIC          "PGVAULTTDE"
 #define VAULT_PROVIDER            "vault"
 #define LOCAL_PROVIDER            "local"
+#define PKCS11_PROVIDER           "pkcs11"
 
 /*
  * TDE_V2_VERSION_BYTE — discriminator written as byte 0 of every encrypted

@@ -1246,6 +1246,10 @@ pg_vault_tde_rotate_kek_sql(PG_FUNCTION_ARGS)
                 (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
                  errmsg("pg_vault_tde_rotate_kek requires superuser")));
 
+    if (!tde_active_kms_provider)
+        ereport(ERROR,
+                errmsg("pg_vault_tde: no active KMS provider — cannot rotate KEK"));
+
     if (!tde_active_kms_provider->prepare_kek_rotation())
         ereport(ERROR,
                 (errmsg("pg_vault_tde: prepare_kek_rotation failed")));

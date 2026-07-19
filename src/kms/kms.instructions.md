@@ -291,8 +291,17 @@ else if (strcmp(guc_kms_provider, "kmip") == 0)
 | `src/kms/pg_vault_tde_kms_vault.c` | `vault` | v1.0 (refactored in v1.5) |
 | `src/kms/pg_vault_tde_kms_local.c` | `local` | v1.5 (v1.6 patch: wrap_dek capacity-init bug fixed in `change_passphrase` + `rotate_kek`; v1.7: `wallet_rotate_kek` renamed to unified `pg_vault_tde_rotate_kek`) |
 | `src/kms/pg_vault_tde_catalog.c` | dispatch / catalog access | v1.5 (v1.6 patch: wrap_dek capacity-init bug fixed at line 488 — was blocking `CREATE TABLE` under Vault provider) |
-| `src/kms/pg_vault_tde_kms_pkcs11.c` | `pkcs11` | v1.7 |
+| `src/kms/pg_vault_tde_kms_pkcs11.c` | `pkcs11` | v1.7 — IMPLEMENTED (direct Cryptoki via dlopen; see "PKCS#11 Provider Rules" below) |
 | `src/kms/pg_vault_tde_kms_kmip.c` | `kmip` | v1.8 |
+
+> **⚠️ STALE SECTIONS NOTICE:** the vtable snippet at the top of this
+> chapter and the "Provider Registration" snippet below predate the frozen
+> v1.5+ interface.  The AUTHORITATIVE vtable is
+> `src/kms/pg_vault_tde_kms_provider.h` (no `Oid relid` args, no
+> `generate_dek`/`delete_key`, `health_check(void)`, plus `rewrap_dek`,
+> `prepare_kek_rotation`, `commit_kek_rotation`, `shutdown`).  Provider
+> registration happens in the GUC **assign hook**
+> `tde_kms_provider_assign()` in `pg_vault_tde.c` — NOT in `_PG_init`.
 
 ### Local Wallet Provider Rules (`local`)
 
@@ -307,6 +316,62 @@ else if (strcmp(guc_kms_provider, "kmip") == 0)
   DEK to caller's stack frame; `OPENSSL_cleanse(kek, 32)` immediately after
 - Wallet file permissions MUST be `0600` — enforced at create time and in `health_check()`
 - PKCS#11 (HSM-backed keys) is a separate `pkcs11` provider — `local` is software-only
+
+### PKCS#11 Provider Rules (`pkcs11`, v1.7)
+
+- Vendor module from GUC `pg_vault_tde.pkcs11_library`, `dlopen()`ed lazily
+  per backend; **never `dlclose()`d** (vendor modules crash on unload).
+- Slot resolution: `pkcs11_token_label` (preferred — matched against
+  `C_GetTokenInfo().label`, space-padded 32 bytes) or, when unset, the
+  numeric `pkcs11_slot_id` GUC directly (`pkcs11_find_slot()`). At least one
+  of the two MUST be set.
+- **FORK SAFETY (PKCS#11 §6.6)**: `C_Initialize` MUST NEVER run in the
+  postmaster — `init()` there only validates GUCs.  Each backend attaches
+  on first use; a `getpid()` guard discards state inherited across
+  `fork()` WITHOUT calling into the module (handles are stale garbage).
+- PIN from environment ONLY — GUC `pkcs11_pin_env` holds the env var NAME.
+  The PIN transits a stack buffer, `OPENSSL_cleanse`d right after `C_Login`.
+- KEK: AES-256 `CKO_SECRET_KEY` on-token, `CKA_SENSITIVE`,
+  `CKA_EXTRACTABLE=FALSE`, `CKA_WRAP`/`CKA_UNWRAP`, label from
+  `pkcs11_key_label`.  Provisioned once via `pg_vault_tde_pkcs11_keygen()`.
+- Wrap mechanism: `CKM_AES_KEY_WRAP` (RFC 3394 — same algorithm as the
+  local provider's `EVP_aes_256_wrap`), runtime fallback
+  `CKM_AES_KEY_WRAP_PAD`.  Wrapped DEK = 4-byte BE KEK version tag + 40
+  bytes = 44 bytes.
+- The DEK transits the token as a transient SESSION object
+  (`CKA_TOKEN=FALSE`), destroyed on every exit path.
+- Session/device loss (`CKR_SESSION_HANDLE_INVALID`, `CKR_DEVICE_ERROR`,
+  ...) ⇒ exactly one retry through a fresh session; semantic errors never
+  retry.
+- KEK rotation: each generation is an immutable token object labelled
+  `<label>.v<N>` — never renamed, never destroyed.  "Current" = highest `N`
+  found on the token (`pkcs11_find_current_version()`).  Every wrapped_dek
+  blob is tagged with the exact version that produced it, so unwrap always
+  resolves the right key regardless of what's current.  `commit_kek_rotation`
+  is a pure in-backend cache update — no token-side promotion, hence no
+  crash window.
+- **Cross-backend rotation propagation**: `commit_kek_rotation` is per-
+  backend cache state (`Pkcs11State`, a file-scope `static`) — without more,
+  an already-connected sibling backend would keep wrapping new DEKs under
+  the pre-rotation KEK indefinitely. A tiny shared-memory beacon
+  (`Pkcs11SharedState`: one `LWLock` + `uint32 current_kek_version`, same
+  dynamic-tranche pattern as `pg_vault_tde_kms_cache` in
+  `pg_vault_tde_kms.c` — see `pg_vault_tde_kms_pkcs11_shmem_request`/
+  `_shmem_init`) fixes this WITHOUT ever sharing a raw `CK_OBJECT_HANDLE`
+  across processes (PKCS#11 handles are only meaningful within the
+  Cryptoki session that resolved them — not portable across processes, per
+  §2.5.2/§2.6.8 of the spec). Only the version number is shared; every
+  backend still resolves its own handle locally via
+  `pkcs11_find_key_by_label()`. Written ONLY from `pkcs11_commit_kek_rotation()`
+  and the one-time keygen (never from `prepare_kek_rotation`, which would
+  leak an armed-but-uncommitted rotation cluster-wide); read
+  opportunistically via `pkcs11_refresh_kek_if_stale()`, folded into
+  `pkcs11_attach()`'s already-attached fast path, so every wrap/unwrap/
+  rewrap call is a chance to notice a newer version — staleness is bounded
+  by "this backend's next operation", not wall-clock time.
+- Headers: include ONLY `src/include/pg_vault_tde_cryptoki.h` (wraps the
+  vendored OASIS v3.2 headers in `src/include/pkcs11/` — keep those
+  byte-identical to the published OASIS files).
 
 #### GUC context: all KMS parameters are PGC_SUSET
 
@@ -374,7 +439,7 @@ have a `pg_vault_tde_catalog` entry.
 - This module MUST NOT include `pg_vault_tde_tam.h`, `pg_vault_tde_iam.h`, or `pg_vault_tde_crypto.h`
 - This module MUST NOT call any TAM, IAM, or crypto functions
 - This module is the bottom of the dependency chain
-- Only PostgreSQL shmem/LWLock APIs, libcurl (vault provider), and OpenSSL PKCS12 API (local provider) are permitted external dependencies
+- Only PostgreSQL shmem/LWLock APIs, libcurl (vault provider), OpenSSL PKCS12 API (local provider), and dlfcn + the vendored OASIS pkcs11 headers (pkcs11 provider) are permitted external dependencies
 - `tde_active_kms_provider` is the ONLY global dispatch point — no `if (provider == vault)` outside `pg_vault_tde.c`
 
 ---
