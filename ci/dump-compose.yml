@@ -21,7 +21,7 @@ services:
       VAULT_MOCK_TOKEN: ${VAULT_MOCK_TOKEN:-test-token}
       VAULT_MOCK_MOUNT: ${VAULT_MOCK_MOUNT:-transit}
       VAULT_MOCK_KEY_NAME: ${VAUL_MOCK_KEY_NAME:-pg-tde-dek}
-      VAULT_API_ADDR: http://127.0.0.1:${VAULT_MOCK_PORT}
+      #VAULT_API_ADDR: http://127.0.0.1:${VAULT_MOCK_PORT}
       SKIP_SETCAP: 1
       VAULT_DISABLE_MLOCK: "true"
     ports:

@@ -39,7 +39,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=ci/scripts/lib.sh
 source "$SCRIPT_DIR/lib.sh"
 
-COMPOSE_FILE="$CI_DIR/compose-openbao.yml"
+if [ -n "${BITBUCKET_CLONE_DIR:-}" ]; then
+    COMPOSE_FILE="$CI_DIR/compose-openbao-bitbucket.yml"
+else
+    COMPOSE_FILE="$CI_DIR/compose-openbao.yml"
+fi
 BAO_ROOT_TOKEN="${BAO_ROOT_TOKEN:-bao-root-token}"
 BAO_MOUNT="${BAO_MOUNT:-transit}"
 BAO_KEY_NAME="${BAO_KEY_NAME:-pg-tde-dek}"

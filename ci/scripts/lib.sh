@@ -113,7 +113,7 @@ wait_pg_ready() {
     local timeout="${2:-${PG_STARTUP_TIMEOUT:-30}}"
     log_info "Waiting for PostgreSQL ($container) ..."
     for i in $(seq 1 "$timeout"); do
-        if $RT exec "$container" pg_isready -U postgres -q 2>/dev/null; then
+        if $RT exec "$container" pg_isready -U postgres -h 127.0.0.1 -q 2>/dev/null; then
             log_ok "PostgreSQL ($container) is ready (${i}s)"
             return 0
         fi

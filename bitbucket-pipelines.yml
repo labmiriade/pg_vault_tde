@@ -3,311 +3,107 @@
 #
 # CI/CD Pipeline for pg_vault_tde — Bitbucket Cloud
 #
-# Tests against PostgreSQL 17 AND 18 (update when adding PG 19+).
+# Delegates all build and test logic to the containerised local pipeline
+# (ci/scripts/run-all.sh) via `make ci-all`.
 #
-# Jobs (per PG version):
-#   1. build        – Compile extension (zero warnings gate)
-#   2. regress      – Run pg_regress 24-test regression suite
-#   3. tap          – Run TAP tests with mock Vault (HTTP::Daemon)
-#   4. isolation    – Run isolation tests (MVCC, key rotation concurrency)
-#   5. memcheck     – Valgrind + AddressSanitizer memory safety check
-#
-# CRITICAL: pg_vault_tde MUST be loaded via shared_preload_libraries.
-# Every test step must initialize its own cluster with this setting.
-#
-# ── Multi-PG Version ─────────────────────────────────────────────────────
-# Bitbucket pipelines do not support matrix strategies. Each PG version
-# is tested via explicit duplicate steps. When adding PG 19:
-#   1. Add install-pg19 / init-cluster-19 anchors
-#   2. Duplicate each step block with PG 19 references
-#   3. Update TDE_PG_MAX in the Makefile
 ##############################################################################
 image: ubuntu:24.04
 
 definitions:
   caches:
     apt-pgdg: /var/cache/apt
+  services:
+    docker:
+      memory: 7128
 
-  # ── PG 17 install ──────────────────────────────────────────────────────
-  install-pg17: &install-pg17
-    - apt-get update -qq
-    - apt-get install -y --no-install-recommends
-        build-essential libssl-dev libcurl4-openssl-dev
-        pkg-config curl ca-certificates gnupg lsb-release
-    - curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc
-        | gpg --dearmor -o /usr/share/keyrings/postgresql.gpg
-    - echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg]
-        https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main"
-        | tee /etc/apt/sources.list.d/pgdg.list
-    - apt-get update -qq
-    - apt-get install -y postgresql-17 postgresql-server-dev-17
-    - export PATH="/usr/lib/postgresql/17/bin:$PATH"
+  steps:
+    - step: &test-pg-17
+        name: Testing — PostgreSQL 17
+        size: 2x
+        services:
+          - docker
+        script:
+          - apt-get update -qq
+          - apt-get install -y --no-install-recommends ca-certificates curl wget
+          # Docker Compose
+          - curl -fsSL https://github.com/docker/compose/releases/download/v5.1.2/docker-compose-linux-x86_64 -o /usr/local/bin/docker-compose
+          - chmod +x /usr/local/bin/docker-compose
+          # Run test
+          - export PG_VERSION=17
+          - bash ci/scripts/run-all.sh $TEST_RUNALL_OPTIONS
 
-  # ── PG 18 install ──────────────────────────────────────────────────────
-  install-pg18: &install-pg18
-    - apt-get update -qq
-    - apt-get install -y --no-install-recommends
-        build-essential libssl-dev libcurl4-openssl-dev
-        pkg-config curl ca-certificates gnupg lsb-release
-    - curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc
-        | gpg --dearmor -o /usr/share/keyrings/postgresql.gpg
-    - echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg]
-        https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main"
-        | tee /etc/apt/sources.list.d/pgdg.list
-    - apt-get update -qq
-    - apt-get install -y postgresql-18 postgresql-server-dev-18
-    - export PATH="/usr/lib/postgresql/18/bin:$PATH"
+    - step: &test-pg-18
+        name: Testing — PostgreSQL 18
+        size: 2x
+        services:
+          - docker
+        script:
+          - apt-get update -qq
+          - apt-get install -y --no-install-recommends ca-certificates curl wget
+          # Docker Compose
+          - curl -fsSL https://github.com/docker/compose/releases/download/v5.1.2/docker-compose-linux-x86_64 -o /usr/local/bin/docker-compose
+          - chmod +x /usr/local/bin/docker-compose
+          # Run test
+          - export PG_VERSION=18
+          - bash ci/scripts/run-all.sh $TEST_RUNALL_OPTIONS
 
-  # ── Cluster init (version-agnostic, uses $PG_MAJOR) ────────────────────
-  init-cluster: &init-cluster
-    - export PGPORT=15432
-    - export PGDATA=/tmp/tde_test_data
-    - pg_ctlcluster $PG_MAJOR main stop 2>/dev/null || true
-    - su - postgres -c "initdb -D $PGDATA --no-locale -E UTF8" || initdb -D "$PGDATA" --no-locale -E UTF8
-    - |
-      cat >> "$PGDATA/postgresql.conf" <<EOF
-      shared_preload_libraries = 'pg_vault_tde'
-      port = $PGPORT
-      log_min_messages = warning
-      EOF
-    - pg_ctl -D "$PGDATA" -l "$PGDATA/logfile" start
-    - pg_isready -p $PGPORT -t 30
+    - step: &package
+        name: Build and Package Artifacts
+        size: 2x
+        services:
+          - docker
+        script:
+          - bash packaging/build_in_container.sh --all
+        artifacts:
+          - dist/**
+
+    - step: &inspect-artifacts
+        name: Inspect Artifacts
+        script:
+          - ls -la dist/
+
+    - step: &github-synchronization
+        # NB: usare solo con il branch che poi si vorrà replicare
+        name:
+        script:
+          - apt-get update && apt-get install -y rsync git openssh-client
+          - git clone --depth 1 $GITHUB_REPO_URL github-repo
+          # Sincronizza file o directory di interesse
+          - >
+            rsync -av --delete 
+            --exclude='.git/' 
+            --exclude='github-repo/' 
+            --exclude='tmp_pgext/' 
+            --exclude='ci/' 
+            --exclude='packaging/' 
+            --exclude='bitbucket-pipelines.yml' 
+            ./ github-repo/
+          # Git config
+          - cd github-repo
+          - git config user.name "Bitbucket Service Sync"
+          - git config user.email "bitbucket-sync@miriade.it"
+          # Git commit and push
+          - git add .
+          - git diff-index --quiet HEAD || git commit -m "Sync directory da Bitbucket"
+          - git push origin main
+
 
 pipelines:
   branches:
     feature/pipeline-ci:
-      # ══════════════════════════════════════════════════════════════════════
-      # PostgreSQL 17
-      # ══════════════════════════════════════════════════════════════════════
-      - step:
-          name: Build (PG 17)
-          caches: [apt-pgdg]
-          script:
-            - export PG_MAJOR=17
-            - *install-pg17
-            - make PG_CONFIG=$(which pg_config) 2>&1 | tee /tmp/build.log
-            - |
-              if grep -qE ': warning:' /tmp/build.log; then
-                echo "FATAL: Compilation produced warnings — zero-warning policy violated"
-                grep ': warning:' /tmp/build.log
-                exit 1
-              fi
-            - make install PG_CONFIG=$(which pg_config)
+      # - parallel:
+      #     - step: *test-pg-17
+      #     - step: *test-pg-18
+      # - step: *package
+      # - step: *inspect-artifacts
+      - step: *github-synchronization
 
-      - step:
-          name: Regression Tests (PG 17)
-          caches: [apt-pgdg]
-          script:
-            - export PG_MAJOR=17
-            - *install-pg17
-            - make PG_CONFIG=$(which pg_config)
-            - make install PG_CONFIG=$(which pg_config)
-            - *init-cluster
-            - createdb -p $PGPORT regression_tde
-            - make installcheck
-                PGPORT=$PGPORT
-                PGDATABASE=regression_tde
-                PG_CONFIG=$(which pg_config)
-                REGRESS_OPTS="--dbname=regression_tde --port=$PGPORT"
-          after-script:
-            - cat "$PGDATA/logfile" 2>/dev/null || true
-            - pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true
+    develop:
+      - parallel:
+          - step: *test-pg-17
+          - step: *test-pg-18
 
-      - step:
-          name: TAP Tests (PG 17)
-          caches: [apt-pgdg]
-          script:
-            - export PG_MAJOR=17
-            - *install-pg17
-            - apt-get install -y --no-install-recommends
-                perl cpanminus libipc-run-perl
-                libhttp-daemon-perl libhttp-message-perl softhsm2
-            - make PG_CONFIG=$(which pg_config)
-            - make install PG_CONFIG=$(which pg_config)
-            - prove -v tap/*.t
-          after-script:
-            - cat /tmp/tde_test_data/logfile 2>/dev/null || true
-
-      - step:
-          name: Isolation Tests (PG 17)
-          caches: [apt-pgdg]
-          script:
-            - export PG_MAJOR=17
-            - *install-pg17
-            - make PG_CONFIG=$(which pg_config)
-            - make install PG_CONFIG=$(which pg_config)
-            - export PGPORT=15433
-            - export PGDATA=/tmp/tde_isolation_data
-            - pg_ctlcluster $PG_MAJOR main stop 2>/dev/null || true
-            - su - postgres -c "initdb -D $PGDATA --no-locale -E UTF8" || initdb -D "$PGDATA" --no-locale -E UTF8
-            - |
-              cat >> "$PGDATA/postgresql.conf" <<EOF
-              shared_preload_libraries = 'pg_vault_tde'
-              port = $PGPORT
-              max_prepared_transactions = 10
-              log_min_messages = warning
-              EOF
-            - pg_ctl -D "$PGDATA" -l "$PGDATA/logfile" start
-            - pg_isready -p $PGPORT -t 30
-            - createdb -p $PGPORT isolation_tde
-            - make installcheck-isolation
-                PGPORT=$PGPORT
-                PG_CONFIG=$(which pg_config)
-                ISOLATION_OPTS="--dbname=isolation_tde --port=$PGPORT"
-          after-script:
-            - cat "$PGDATA/logfile" 2>/dev/null || true
-            - pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true
-
-      - step:
-          name: Memory Safety (PG 17)
-          caches: [apt-pgdg]
-          script:
-            - export PG_MAJOR=17
-            - *install-pg17
-            - apt-get install -y --no-install-recommends valgrind
-            - export PGPORT=15434
-            - export PGDATA=/tmp/tde_memcheck_data
-            - make clean
-            - make PG_CONFIG=$(which pg_config)
-                CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g -O1"
-                SHLIB_LINK="-lasan"
-            - make install PG_CONFIG=$(which pg_config)
-            - pg_ctlcluster $PG_MAJOR main stop 2>/dev/null || true
-            - su - postgres -c "initdb -D $PGDATA --no-locale -E UTF8" || initdb -D "$PGDATA" --no-locale -E UTF8
-            - |
-              cat >> "$PGDATA/postgresql.conf" <<EOF
-              shared_preload_libraries = 'pg_vault_tde'
-              port = $PGPORT
-              log_min_messages = warning
-              EOF
-            - pg_ctl -D "$PGDATA" -l "$PGDATA/logfile" start
-            - pg_isready -p $PGPORT -t 30
-            - createdb -p $PGPORT memcheck_tde
-            - >
-              ASAN_OPTIONS="detect_leaks=1:abort_on_error=1"
-              make installcheck
-                PGPORT=$PGPORT
-                PGDATABASE=memcheck_tde
-                PG_CONFIG=$(which pg_config)
-                REGRESS_OPTS="--dbname=memcheck_tde --port=$PGPORT"
-          after-script:
-            - cat "$PGDATA/logfile" 2>/dev/null || true
-            - pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true
-
-      # ══════════════════════════════════════════════════════════════════════
-      # PostgreSQL 18
-      # ══════════════════════════════════════════════════════════════════════
-      - step:
-          name: Build (PG 18)
-          caches: [apt-pgdg]
-          script:
-            - export PG_MAJOR=18
-            - *install-pg18
-            - make PG_CONFIG=$(which pg_config) 2>&1 | tee /tmp/build.log
-            - |
-              if grep -qE ': warning:' /tmp/build.log; then
-                echo "FATAL: Compilation produced warnings — zero-warning policy violated"
-                grep ': warning:' /tmp/build.log
-                exit 1
-              fi
-            - make install PG_CONFIG=$(which pg_config)
-
-      - step:
-          name: Regression Tests (PG 18)
-          caches: [apt-pgdg]
-          script:
-            - export PG_MAJOR=18
-            - *install-pg18
-            - make PG_CONFIG=$(which pg_config)
-            - make install PG_CONFIG=$(which pg_config)
-            - *init-cluster
-            - createdb -p $PGPORT regression_tde
-            - make installcheck
-                PGPORT=$PGPORT
-                PGDATABASE=regression_tde
-                PG_CONFIG=$(which pg_config)
-                REGRESS_OPTS="--dbname=regression_tde --port=$PGPORT"
-          after-script:
-            - cat "$PGDATA/logfile" 2>/dev/null || true
-            - pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true
-
-      - step:
-          name: TAP Tests (PG 18)
-          caches: [apt-pgdg]
-          script:
-            - export PG_MAJOR=18
-            - *install-pg18
-            - apt-get install -y --no-install-recommends
-                perl cpanminus libipc-run-perl
-                libhttp-daemon-perl libhttp-message-perl softhsm2
-            - make PG_CONFIG=$(which pg_config)
-            - make install PG_CONFIG=$(which pg_config)
-            - prove -v tap/*.t
-          after-script:
-            - cat /tmp/tde_test_data/logfile 2>/dev/null || true
-
-      - step:
-          name: Isolation Tests (PG 18)
-          caches: [apt-pgdg]
-          script:
-            - export PG_MAJOR=18
-            - *install-pg18
-            - make PG_CONFIG=$(which pg_config)
-            - make install PG_CONFIG=$(which pg_config)
-            - export PGPORT=15433
-            - export PGDATA=/tmp/tde_isolation_data
-            - pg_ctlcluster $PG_MAJOR main stop 2>/dev/null || true
-            - su - postgres -c "initdb -D $PGDATA --no-locale -E UTF8" || initdb -D "$PGDATA" --no-locale -E UTF8
-            - |
-              cat >> "$PGDATA/postgresql.conf" <<EOF
-              shared_preload_libraries = 'pg_vault_tde'
-              port = $PGPORT
-              max_prepared_transactions = 10
-              log_min_messages = warning
-              EOF
-            - pg_ctl -D "$PGDATA" -l "$PGDATA/logfile" start
-            - pg_isready -p $PGPORT -t 30
-            - createdb -p $PGPORT isolation_tde
-            - make installcheck-isolation
-                PGPORT=$PGPORT
-                PG_CONFIG=$(which pg_config)
-                ISOLATION_OPTS="--dbname=isolation_tde --port=$PGPORT"
-          after-script:
-            - cat "$PGDATA/logfile" 2>/dev/null || true
-            - pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true
-
-      - step:
-          name: Memory Safety (PG 18)
-          caches: [apt-pgdg]
-          script:
-            - export PG_MAJOR=18
-            - *install-pg18
-            - apt-get install -y --no-install-recommends valgrind
-            - export PGPORT=15434
-            - export PGDATA=/tmp/tde_memcheck_data
-            - make clean
-            - make PG_CONFIG=$(which pg_config)
-                CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g -O1"
-                SHLIB_LINK="-lasan"
-            - make install PG_CONFIG=$(which pg_config)
-            - pg_ctlcluster $PG_MAJOR main stop 2>/dev/null || true
-            - su - postgres -c "initdb -D $PGDATA --no-locale -E UTF8" || initdb -D "$PGDATA" --no-locale -E UTF8
-            - |
-              cat >> "$PGDATA/postgresql.conf" <<EOF
-              shared_preload_libraries = 'pg_vault_tde'
-              port = $PGPORT
-              log_min_messages = warning
-              EOF
-            - pg_ctl -D "$PGDATA" -l "$PGDATA/logfile" start
-            - pg_isready -p $PGPORT -t 30
-            - createdb -p $PGPORT memcheck_tde
-            - >
-              ASAN_OPTIONS="detect_leaks=1:abort_on_error=1"
-              make installcheck
-                PGPORT=$PGPORT
-                PGDATABASE=memcheck_tde
-                PG_CONFIG=$(which pg_config)
-                REGRESS_OPTS="--dbname=memcheck_tde --port=$PGPORT"
-          after-script:
-            - cat "$PGDATA/logfile" 2>/dev/null || true
-            - pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true
+    master:
+      - parallel:
+          - step: *test-pg-17
+          - step: *test-pg-18
