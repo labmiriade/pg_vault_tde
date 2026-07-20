@@ -63,29 +63,61 @@ definitions:
           - ls -la dist/
 
     - step: &github-synchronization
-        # NB: usare solo con il branch che poi si vorrà replicare
-        name:
+        # Sincronizza su GitHub: master->main, develop->develop, tag di versione (v*)->tag omonimo
+        name: GitHub Synchronization
         script:
           - apt-get update && apt-get install -y rsync git openssh-client
-          - git clone --depth 1 $GITHUB_REPO_URL github-repo
+          # Determina il ref di destinazione su GitHub in base al trigger Bitbucket
+          - |
+            if [ -n "$BITBUCKET_TAG" ]; then
+              export TARGET_TYPE="tag"
+              export TARGET_REF="$BITBUCKET_TAG"
+            elif [ "$BITBUCKET_BRANCH" = "master" ]; then
+              export TARGET_TYPE="branch"
+              export TARGET_REF="main"
+            else
+              export TARGET_TYPE="branch"
+              export TARGET_REF="$BITBUCKET_BRANCH"
+            fi
+            echo "Sync -> $TARGET_TYPE $TARGET_REF"
+          # Prepara il clone GitHub agganciando il ref di base corretto (se già esiste)
+          - |
+            BASE_BRANCH="$TARGET_REF"
+            [ "$TARGET_TYPE" = "tag" ] && BASE_BRANCH="main"
+            git init -q github-repo
+            cd github-repo
+            git remote add origin "$GITHUB_REPO_URL"
+            if git fetch --depth 1 origin "$BASE_BRANCH" 2>/dev/null; then
+              git checkout -B "$BASE_BRANCH" FETCH_HEAD
+            else
+              git checkout --orphan "$BASE_BRANCH"
+              git rm -rf . 2>/dev/null || true
+            fi
+            cd ..
           # Sincronizza file o directory di interesse
           - >
-            rsync -av --delete 
-            --exclude='.git/' 
-            --exclude='github-repo/' 
-            --exclude='tmp_pgext/' 
-            --exclude='ci/' 
-            --exclude='packaging/' 
-            --exclude='bitbucket-pipelines.yml' 
+            rsync -av --delete
+            --exclude='.git/'
+            --exclude='github-repo/'
+            --exclude='tmp_pgext/'
+            --exclude='ci/'
+            --exclude='packaging/'
+            --exclude='bitbucket-pipelines.yml'
             ./ github-repo/
-          # Git config
-          - cd github-repo
-          - git config user.name "Bitbucket Service Sync"
-          - git config user.email "bitbucket-sync@miriade.it"
-          # Git commit and push
-          - git add .
-          - git diff-index --quiet HEAD || git commit -m "Sync directory da Bitbucket"
-          - git push origin main
+          # Git config, commit e push sul ref corretto
+          - |
+            cd github-repo
+            git config user.name "Bitbucket Service Sync"
+            git config user.email "bitbucket-sync@miriade.it"
+            git add -A
+            if [ "$TARGET_TYPE" = "branch" ]; then
+              git commit -m "Sync $TARGET_REF da Bitbucket ($BITBUCKET_COMMIT)" || echo "Nessuna modifica da sincronizzare"
+              git push origin "HEAD:refs/heads/$TARGET_REF"
+            else
+              git commit -m "Sync versione $TARGET_REF da Bitbucket ($BITBUCKET_COMMIT)" || echo "Nessuna modifica da sincronizzare"
+              git tag -f "$TARGET_REF"
+              git push origin "refs/tags/$TARGET_REF" --force
+            fi
 
 
 pipelines:
@@ -102,8 +134,14 @@ pipelines:
       - parallel:
           - step: *test-pg-17
           - step: *test-pg-18
+      - step: *github-synchronization
 
     master:
       - parallel:
           - step: *test-pg-17
           - step: *test-pg-18
+      - step: *github-synchronization
+
+  tags:
+    'v*':
+      - step: *github-synchronization

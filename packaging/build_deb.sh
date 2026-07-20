@@ -8,24 +8,17 @@
 #
 # Usage:
 #   bash packaging/build_deb.sh [--no-sign]
-#     Build the generic (portable) package for PG18.
+#     Build the package for PG18.
 #
 #   bash packaging/build_deb.sh --pg-version 17 [--no-sign]
 #     Build for PostgreSQL 17.
 #
-#   bash packaging/build_deb.sh --arch-variant aesni [--no-sign]
-#     Build with TDE_TARGET_ARCH=x86_64-aesni TDE_OPTIMIZE=max.
-#     Package name: postgresql-PG-pg-vault-tde-aesni
+# There is a single package. Hardware-accelerated AES (AES-NI, VAES, ARM
+# Crypto Extensions, SVE2) is provided automatically at runtime by OpenSSL's
+# EVP layer — no CPU-specific build variant is needed or offered. See
+# wiki/Performance-and-Tuning.md.
 #
-#   bash packaging/build_deb.sh --arch-variant armce [--no-sign]
-#     Build with TDE_TARGET_ARCH=aarch64-ce TDE_OPTIMIZE=max.
-#     Package name: postgresql-PG-pg-vault-tde-armce
-#
-#   bash packaging/build_deb.sh --arch-variant vaes [--no-sign]
-#     Build with TDE_TARGET_ARCH=x86_64-vaes TDE_OPTIMIZE=max.
-#     Package name: postgresql-PG-pg-vault-tde-vaes
-#
-# Output: ../postgresql-PG-pg-vault-tde[_variant]_1.7-1_<arch>.deb
+# Output: ../postgresql-PG-pg-vault-tde_1.7-1_<arch>.deb
 #
 # Copyright (c) 2026 Miriade Srl — PostgreSQL License
 
@@ -39,7 +32,6 @@ ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 # ---------------------------------------------------------------------------
 # Parse arguments
 # ---------------------------------------------------------------------------
-ARCH_VARIANT=""
 NO_SIGN=""
 PG_MAJOR="18"  # default; override with --pg-version
 
@@ -49,61 +41,24 @@ while [[ $# -gt 0 ]]; do
             PG_MAJOR="$2"
             shift 2
             ;;
-        --arch-variant)
-            ARCH_VARIANT="$2"
-            shift 2
-            ;;
         --no-sign)
             NO_SIGN="yes"
             shift
             ;;
         *)
             echo "ERROR: Unknown argument '$1'"
-            echo "Usage: $0 [--pg-version 17|18] [--arch-variant aesni|armce|vaes] [--no-sign]"
+            echo "Usage: $0 [--pg-version 17|18] [--no-sign]"
             exit 1
             ;;
     esac
 done
 
-# ---------------------------------------------------------------------------
-# Resolve variant-specific settings
-# ---------------------------------------------------------------------------
-case "$ARCH_VARIANT" in
-    aesni)
-        TDE_TARGET_ARCH="x86_64-aesni"
-        TDE_OPTIMIZE="max"
-        PKG_SUFFIX="-aesni"
-        CONTROL_EXTRA="packaging/debian/control.aesni"
-        ;;
-    armce)
-        TDE_TARGET_ARCH="aarch64-ce"
-        TDE_OPTIMIZE="max"
-        PKG_SUFFIX="-armce"
-        CONTROL_EXTRA="packaging/debian/control.arm"
-        ;;
-    vaes)
-        TDE_TARGET_ARCH="x86_64-vaes"
-        TDE_OPTIMIZE="max"
-        PKG_SUFFIX="-vaes"
-        CONTROL_EXTRA="packaging/debian/control.vaes"
-        ;;
-    "")
-        TDE_TARGET_ARCH="generic"
-        TDE_OPTIMIZE="standard"
-        PKG_SUFFIX=""
-        CONTROL_EXTRA=""
-        ;;
-    *)
-        echo "ERROR: Unknown --arch-variant '$ARCH_VARIANT'. Supported: aesni, armce, vaes"
-        exit 1
-        ;;
-esac
-
-DEB_NAME="postgresql-${PG_MAJOR}-pg-vault-tde${PKG_SUFFIX}_${PKG_VERSION}_${ARCH}.deb"
+TDE_OPTIMIZE="standard"
+DEB_NAME="postgresql-${PG_MAJOR}-pg-vault-tde_${PKG_VERSION}_${ARCH}.deb"
 
 echo "========================================================"
 echo "  Building DEB package: $DEB_NAME"
-echo "  PG_MAJOR=${PG_MAJOR}  TDE_TARGET_ARCH=${TDE_TARGET_ARCH}  TDE_OPTIMIZE=${TDE_OPTIMIZE}"
+echo "  PG_MAJOR=${PG_MAJOR}  TDE_OPTIMIZE=${TDE_OPTIMIZE}"
 echo "========================================================"
 
 # ---------------------------------------------------------------------------
@@ -143,19 +98,11 @@ fi
 # Having both causes a debhelper error; the Build-Depends method is the modern approach.
 rm -f debian/compat
 
-# For variant builds, append the supplemental control stanza so dpkg-buildpackage
-# knows about the extra binary package.
-if [ -n "$CONTROL_EXTRA" ] && [ -f "$CONTROL_EXTRA" ]; then
-    echo "" >> debian/control
-    # Also substitute PGMAJOR in the variant stanza
-    sed "s/PGMAJOR/${PG_MAJOR}/g; s/postgresql-18/postgresql-${PG_MAJOR}/g" "$CONTROL_EXTRA" >> debian/control
-fi
-
 # Ensure rules is executable
 chmod +x debian/rules
 
 # Export make variables so debian/rules can pick them up
-export TDE_TARGET_ARCH TDE_OPTIMIZE PG_MAJOR
+export TDE_OPTIMIZE PG_MAJOR
 
 # ---------------------------------------------------------------------------
 # Build the package
