@@ -737,47 +737,40 @@ Test coverage (109 tests = 52 v1.4 + 20 v1.5 + 37 v1.6):
 
 ## Building
 
-### Generic (portable)
-
 ```bash
 make && sudo make install
+
+# Optional: -O3 -funroll-loops -fomit-frame-pointer instead of -O2
+make TDE_OPTIMIZE=max && sudo make install
 ```
 
-### Hardware-Accelerated Variants
+There is a single build. Hardware-accelerated AES (AES-NI, VAES, ARM Crypto
+Extensions, SVE2) is provided automatically at runtime by OpenSSL's own
+default provider, based on the CPU the server is actually running on — this
+requires no special compiler flags and no separate build. pg_vault_tde never
+implements AES itself; it always calls into OpenSSL's EVP API
+(`src/crypto/pg_vault_tde_hw_accel.c`), which does its own CPUID/HWCAP
+detection independent of how pg_vault_tde.so was compiled. Confirm what's
+actually active at runtime with:
 
 ```bash
-# Intel / AMD AES-NI (SSE4.2)
-make TDE_TARGET_ARCH=x86_64-aesni
-
-# AMD VAES + AVX2 (Zen 4+, Intel IceLake+)
-make TDE_TARGET_ARCH=x86_64-vaes TDE_OPTIMIZE=max
-
-# ARM Crypto Extensions (ARMv8-A, Graviton, Apple M-series)
-make TDE_TARGET_ARCH=aarch64-ce
-
-# ARM SVE2 (ARMv9-A, Neoverse V2)
-make TDE_TARGET_ARCH=aarch64-sve2 TDE_OPTIMIZE=max
-
-# Detect CPU capabilities
-make check-cpu
-
-# OpenSSL AES throughput benchmark
-make bench-cpu
+make check-cpu     # detect this machine's available CPU crypto extensions
+make bench-cpu     # OpenSSL AES throughput microbenchmark
 ```
 
-All variants are ABI-compatible — the `.so` name is always `pg_vault_tde.so`.
-Hardware dispatch is via OpenSSL 3.x provider; the `TDE_TARGET_ARCH` flag
-enables the matching compiler intrinsics to ensure the provider is available.
+```sql
+SELECT * FROM pg_vault_tde_hw_accel_info();
+```
 
 ### Packages
 
 The easiest way — no local build toolchain required (only `podman` or `docker`):
 
 ```bash
-# Build all four generic packages (deb+rpm × pg17+pg18) into ./dist/
+# Build all four packages (deb+rpm × pg17+pg18) into ./dist/
 bash packaging/build_in_container.sh --all
 
-# Single package (defaults: DEB, PG18, Ubuntu 22.04, generic/portable)
+# Single package (defaults: DEB, PG18, Ubuntu 22.04)
 bash packaging/build_in_container.sh
 bash packaging/build_in_container.sh --format rpm             # RPM PG18
 bash packaging/build_in_container.sh --pg-version 17          # DEB PG17
@@ -802,58 +795,25 @@ bash packaging/build_in_container.sh --format rpm --os-version almalinux:9    # 
 bash packaging/build_in_container.sh --format rpm --os-version almalinux:8    # EL8 (AlmaLinux)
 ```
 
-#### Hardware acceleration variants
-
-pg_vault_tde ships a **generic** package (works everywhere) and optional
-**hardware-accelerated** packages for platforms that support AES CPU extensions.
-OpenSSL 3.x dispatches to the matching provider automatically at runtime when the
-compiler intrinsics have been enabled.
-
-| Variant | Target CPUs | Flag |
-|---------|-------------|------|
-| `generic` | All x86-64 / AArch64 (default) | *(none)* |
-| `aesni`   | Intel Westmere/Core 2010+ · AMD Bulldozer+ | `-maes -mpclmul -msse4.2 -O3` |
-| `vaes`    | AMD Zen 4+ · Intel Ice Lake+ (VAES + AVX2) | `-mvaes -mavx2 -maes -O3` |
-| `armce`   | ARMv8-A: AWS Graviton 2/3, Ampere Altra, Apple M-series | `-march=armv8-a+crypto+crc -O3` |
-| `sve2`    | ARMv9-A: NVIDIA Grace, Neoverse V2 | `-march=armv9-a+crypto+sve2 -O3` |
-
-```bash
-# AES-NI — Intel/AMD desktop & server (most common)
-bash packaging/build_in_container.sh --arch-variant aesni
-
-# VAES — AMD Zen 4+ / Intel Ice Lake+ (wider vectorised AES)
-bash packaging/build_in_container.sh --arch-variant vaes
-
-# ARM Crypto Extensions
-bash packaging/build_in_container.sh --arch-variant armce
-
-# ARM SVE2 (next-gen ARM servers)
-bash packaging/build_in_container.sh --arch-variant sve2
-```
-
 Options compose freely:
 
 ```bash
-# AES-NI RPM for PG17 on Rocky Linux 8
+# RPM for PG17 on Rocky Linux 8
 bash packaging/build_in_container.sh \
-    --format rpm --pg-version 17 --os-version rockylinux:8 --arch-variant aesni
+    --format rpm --pg-version 17 --os-version rockylinux:8
 
-# ARM CE DEB for PG18 on Debian 12
-bash packaging/build_in_container.sh --os-version debian:12 --arch-variant armce
+# DEB for PG18 on Debian 12
+bash packaging/build_in_container.sh --os-version debian:12
 ```
 
 If you have a local build environment, invoke the underlying scripts directly:
 
 ```bash
 # Debian / Ubuntu
-bash packaging/build_deb.sh --no-sign                   # generic
-bash packaging/build_deb.sh --arch-variant aesni        # AES-NI optimised
-bash packaging/build_deb.sh --arch-variant armce        # ARM CE optimised
+bash packaging/build_deb.sh --no-sign
 
 # RHEL / Rocky / Fedora
-bash packaging/build_rpm.sh                             # generic
-rpmbuild -ba packaging/rpm/pg_vault_tde-aesni.spec      # AES-NI optimised
-rpmbuild -ba packaging/rpm/pg_vault_tde-arm.spec        # ARM CE optimised
+bash packaging/build_rpm.sh
 ```
 
 ---

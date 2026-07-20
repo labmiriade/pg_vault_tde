@@ -20,21 +20,16 @@ OpenSSL 3.x is required in every case — pg_vault_tde uses the EVP/provider
 API for AES-256-GCM and AES-256-SIV dispatch, including hardware-acceleration
 selection (see [Performance and Tuning](Performance-and-Tuning)).
 
-## Package Variants
+## Packages
 
-Every release is built for both supported PostgreSQL majors, as a generic
-(portable) package plus optional hardware-accelerated variants:
+Every release is built for both supported PostgreSQL majors as a single DEB
+and a single RPM package — there is no CPU-specific package variant.
+Hardware-accelerated AES dispatch (AES-NI/VAES/ARM CE/SVE2) is provided
+automatically by OpenSSL on this one package; see
+[Performance and Tuning](Performance-and-Tuning) for why a CPU-specific build
+would not add anything.
 
-| Variant | Package suffix |
-|---|---|
-| Generic (portable) | *(none)* |
-| AES-NI (Intel/AMD) | `-aesni` |
-| VAES + AVX2 (AMD Zen 4+ / Intel Ice Lake+) | `-vaes` |
-| ARM Crypto Extensions | `-armce` (separate `.so`, can coexist with generic) |
-| ARM SVE2 | `-sve2` |
-
-See [Installation](Installation) for install commands and
-[Performance and Tuning](Performance-and-Tuning) for which variant to choose.
+See [Installation](Installation) for install commands.
 
 ## Upgrading pg_vault_tde Itself
 

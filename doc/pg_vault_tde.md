@@ -1345,19 +1345,18 @@ dnf install ~/rpmbuild/RPMS/x86_64/postgresql18-pg_vault_tde-1.0-1.*.rpm
 rpm -qi postgresql18-pg_vault_tde
 ```
 
-### Hardware-Accelerated Variants
+### Hardware Acceleration
 
-| Variant | Flag | Package suffix |
-|---|---|---|
-| Generic (portable) | `TDE_TARGET_ARCH=generic` | *(default)* |
-| AES-NI (Intel/AMD) | `TDE_TARGET_ARCH=x86_64-aesni` | `-aesni` |
-| VAES + AVX2 | `TDE_TARGET_ARCH=x86_64-vaes` | `-vaes` |
-| ARM Crypto (ARMv8-A) | `TDE_TARGET_ARCH=aarch64-ce` | `-armce` |
-| ARM SVE2 (ARMv9-A) | `TDE_TARGET_ARCH=aarch64-sve2` | `-sve2` |
-
-The ARM CE variant is packaged as a separate `.so` (`pg_vault_tde_armce.so`)
-and RPM (`postgresql18-pg_vault_tde-armce`) that can coexist with the
-generic build. See `packaging/rpm/pg_vault_tde-arm.spec`.
+There is a single build/package — no `TDE_TARGET_ARCH` variant. Hardware-
+accelerated AES dispatch (AES-NI, VAES, ARM CE, SVE2) is provided by
+OpenSSL's EVP layer automatically at runtime on this one build; see
+"Hardware acceleration" above and `src/crypto/pg_vault_tde_hw_accel.c`.
+A previous version of this codebase shipped `TDE_TARGET_ARCH`-selected
+compiler flags and matching `-aesni`/`-vaes`/`-armce` package variants, but
+none of the corresponding preprocessor defines (`TDE_HW_AES_NI`,
+`TDE_HW_VAES`, `TDE_HW_ARM_CE`, `TDE_HW_ARM_SVE2`) were ever referenced by
+any `#ifdef`/`#if defined` in `src/`, so those variants never produced a
+measurably faster `.so` — they were removed.
 
 ### Version Matrix
 

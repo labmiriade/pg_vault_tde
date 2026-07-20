@@ -45,38 +45,32 @@ The container MUST:
 
 ## Packaging Matrix
 
+There is a single package per (format, PG major):
+
 | Format | Script | Package Name Pattern | Spec | PG Versions |
 |--------|--------|---------------------|------|-------------|
-| DEB (generic) | `packaging/build_deb.sh` | `postgresql-${PG_MAJOR}-pg-vault-tde` | `packaging/debian/` | 17, 18 |
-| DEB (AES-NI) | `packaging/build_deb.sh --arch-variant aesni` | `...-aesni` | `packaging/debian/control.aesni` | 17, 18 |
-| DEB (ARM CE) | `packaging/build_deb.sh --arch-variant armce` | `...-armce` | `packaging/debian/control.arm` | 17, 18 |
-| RPM (generic) | `packaging/build_rpm.sh` | `postgresql${PG_MAJOR}-pg_vault_tde` | `packaging/rpm/pg_vault_tde.spec` | 17, 18 |
-| RPM (AES-NI) | `rpmbuild -ba ...` | `...-aesni` | `packaging/rpm/pg_vault_tde-aesni.spec` | 17, 18 |
-| RPM (ARM CE) | `rpmbuild -ba ...` | `...-armce` | `packaging/rpm/pg_vault_tde-arm.spec` | 17, 18 |
+| DEB | `packaging/build_deb.sh` | `postgresql-${PG_MAJOR}-pg-vault-tde` | `packaging/debian/` | 17, 18 |
+| RPM | `packaging/build_rpm.sh` | `postgresql${PG_MAJOR}-pg_vault_tde` | `packaging/rpm/pg_vault_tde.spec` | 17, 18 |
+
+There used to be additional CPU-specific package variants (`-aesni`, `-vaes`,
+`-armce`, an unpackaged `sve2`). They were removed: hardware-accelerated AES
+(AES-NI, VAES, ARM Crypto Extensions, SVE2) is provided automatically at
+runtime by OpenSSL's EVP layer on this single package — the removed
+`TDE_TARGET_ARCH` compiler flags/defines were never referenced by any
+`#ifdef`/`#if defined` in `src/`, so the variant builds never produced a
+measurably faster `.so`. See `wiki/Performance-and-Tuning.md` and
+`src/crypto/pg_vault_tde_hw_accel.c`. Do not reintroduce a CPU-specific build
+without first adding actual `#ifdef`-gated code that uses it — otherwise it's
+dead weight in the packaging matrix again.
 
 ### Release Checklist
 
 When bumping version:
 - [ ] Update `packaging/debian/changelog` (version + date)
-- [ ] Update `Version:` in ALL RPM `.spec` files
+- [ ] Update `Version:` in `packaging/rpm/pg_vault_tde.spec`
 - [ ] Update `pg_vault_tde.control` (`default_version`)
 - [ ] Verify `sql/pg_vault_tde--1.0.sql` filename matches control version
 - [ ] Tag the release commit
-
----
-
-## Hardware Architecture Flags
-
-| `TDE_TARGET_ARCH` | Compiler Flags | Preprocessor Define |
-|-------------------|---------------|-------------------|
-| `generic` (default) | *(none)* | *(none)* |
-| `x86_64-aesni` | `-maes -mpclmul -msse4.1 -msse4.2` | `TDE_HW_AES_NI` |
-| `x86_64-vaes` | `-maes -mpclmul -msse4.1 -msse4.2 -mvaes -mavx -mavx2` | `TDE_HW_VAES` |
-| `aarch64-ce` | `-march=armv8-a+crypto+crc` | `TDE_HW_ARM_CE` |
-| `aarch64-sve2` | `-march=armv9-a+crypto+sve2` | `TDE_HW_ARM_SVE2` |
-
-All variants produce the same `.so` filename (`pg_vault_tde.so`). ABI is
-compatible across variants — the difference is in OpenSSL provider selection.
 
 ---
 
