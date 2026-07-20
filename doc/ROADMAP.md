@@ -525,6 +525,7 @@ These gaps **cannot be closed without modifying PostgreSQL core**.
 | **General GiST** (range, geometric) | Penalty/picksplit requires ordering; AES-SIV destroys it. (Equality-only GiST is *not* in this category — tracked separately, see v1.8 §6.) |
 | **pg_upgrade transparent migration** | `pg_upgrade` copies files without TAM; manual `reencrypt_table()` required |
 | **Full-text phrase search on encrypted tsvector** | `<->` proximity requires positional ordering |
+| **`WITH HOLD` cursor temp file encryption** | The held-cursor tuplestore is written by the executor's storage layer directly, bypassing the TAM — no hook exists anywhere in the `WITH HOLD` cursor lifecycle to intercept it. See README.md § Limitations item 6. |
 
 ---
 

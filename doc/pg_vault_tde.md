@@ -920,6 +920,7 @@ where the `softhsm2` package is installed; it skips itself otherwise.
 | 6 | **Range scans on tde_btree** — `WHERE col > x` returns empty (AES-SIV not order-preserving) | By design, permanent |
 | 7 | **BRIN on encrypted columns** — min/max of AES-SIV ciphertexts is meaningless | By design, permanent |
 | 8 | **HOT updates disabled** — `heap_update` reject to use HOT updates because the wire format portion considerd by TupDesc for the comparison between old and new tuple is non-deterministic aka changes at every encryption | v1.8 ⚠️ |
+| 9 | **`WITH HOLD` cursor plaintext temp file** — a held cursor's result set is materialized into a tuplestore at `COMMIT` and spills to a plain temp file on disk past `work_mem`, bypassing the TAM entirely; no extension hook exists anywhere in the `WITH HOLD` cursor lifecycle to intercept it. See README.md § Limitations item 6. | Permanently deferred |
 
 ### HOT updates are disabled by design (v4 IV-first wire format)
 
