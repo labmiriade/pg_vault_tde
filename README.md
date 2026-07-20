@@ -64,11 +64,14 @@ CREATE EXTENSION pg_vault_tde;
 ### 3. Configure Key Access
 
 
-#### a) HashiCorp Vault / OpenBao (default)
+#### a) HashiCorp Vault / OpenBao
 
-Set GUC parameters in `postgresql.conf` (or `ALTER SYSTEM`) to point at your Vault / OpenBao instance:
+`kms_provider` has no built-in default — it must be set explicitly. Set GUC
+parameters in `postgresql.conf` (or `ALTER SYSTEM`) to point at your Vault /
+OpenBao instance:
 
 ```ini
+pg_vault_tde.kms_provider          = 'vault'
 pg_vault_tde.vault_url            = 'https://vault.example.com:8200'
 pg_vault_tde.vault_namespace      = ''          # leave empty for community edition
 pg_vault_tde.vault_token          = 'hvs.TOKEN' # or use AppRole (1.1)
@@ -98,7 +101,7 @@ To use a local PKCS#12 wallet (no external KMS, suitable for offline/air-gapped/
 
 ```ini
 pg_vault_tde.kms_provider          = 'local'
-# wallet_path defaults to $PGDATA/base/<DB_OID>/pg_vault_tde/wallet.p12 — omit unless overriding:
+# wallet_path defaults to /var/lib/pg_vault_tde/<DB_OID>/wallet.p12 — omit unless overriding:
 # pg_vault_tde.wallet_path         = '/custom/path/to/wallet.p12'
 pg_vault_tde.wallet_passphrase_env = 'TDE_WALLET_PASSPHRASE'   # env var name only
 pg_vault_tde.wallet_auto_open      = on
@@ -290,10 +293,12 @@ Authenticated Data (AAD) — zero wire overhead; prevents cross-table ciphertext
 ### KMS Provider Selection
 
 pg_vault_tde supports multiple KMS backends via a provider abstraction layer
-(introduced in v1.5). Select the provider with:
+(introduced in v1.5). `kms_provider` has **no built-in default** — it is an
+empty string until set, which the extension treats as "not yet configured."
+Select the provider explicitly with:
 
 ```ini
-pg_vault_tde.kms_provider = 'vault'   # HashiCorp Vault / OpenBao (default)
+pg_vault_tde.kms_provider = 'vault'   # HashiCorp Vault / OpenBao
 # pg_vault_tde.kms_provider = 'local'  # Local wallet (PKCS#12, no external service) (v1.6)
 # pg_vault_tde.kms_provider = 'pkcs11' # HSM via a PKCS#11 module (v1.7)
 # pg_vault_tde.kms_provider = 'kmip'   # KMIP 1.2 (v1.8, not implemented yet)
@@ -330,12 +335,14 @@ that does not override a parameter.
 ### Local Wallet Provider (v1.6 — Offline, No External Service)
 
 A PKCS#12-based encrypted file at
-`$PGDATA/base/<DB_OID>/pg_vault_tde/wallet.p12` protects the KEK. No network dependency.
+`/var/lib/pg_vault_tde/<DB_OID>/wallet.p12` protects the KEK — deliberately
+outside `PGDATA`, so a plain `pg_basebackup` does not copy it alongside the
+wrapped DEKs it protects. No network dependency.
 Suitable for single-server deployments, air-gapped environments, and development.
 
 ```ini
 pg_vault_tde.kms_provider          = 'local'
-# wallet_path defaults to $PGDATA/base/<DB_OID>/pg_vault_tde/wallet.p12 — omit unless overriding:
+# wallet_path defaults to /var/lib/pg_vault_tde/<DB_OID>/wallet.p12 — omit unless overriding:
 # pg_vault_tde.wallet_path         = '/custom/path/to/wallet.p12'
 pg_vault_tde.wallet_passphrase_env = 'TDE_WALLET_PASSPHRASE'   # env var, never postgresql.conf
 pg_vault_tde.wallet_auto_open      = on
@@ -450,8 +457,8 @@ startup.
 
 | Parameter | Type | Default | Context | Description |
 |---|---|---|---|---|
-| `kms_provider` | string | `vault` | suset | Active KMS backend: `vault`, `local` (v1.6), `pkcs11` (v1.7), `kmip` (v1.8). Settable per-database via `ALTER DATABASE SET`. |
-| `wallet_path` | string | `$PGDATA/base/<DB_OID>/pg_vault_tde/wallet.p12` | suset | Local wallet PKCS#12 file path (`kms_provider = 'local'`). Default computed at runtime — `SHOW` returns the effective path even when not set in `postgresql.conf`. |
+| `kms_provider` | string | `''` (unset — must be configured) | suset | Active KMS backend: `vault`, `local` (v1.6), `pkcs11` (v1.7), `kmip` (v1.8). No default is shipped; encrypted tables cannot be used until this is set. Settable per-database via `ALTER DATABASE SET`. |
+| `wallet_path` | string | `/var/lib/pg_vault_tde/<DB_OID>/wallet.p12` | suset | Local wallet PKCS#12 file path (`kms_provider = 'local'`). Default computed at runtime — `SHOW` returns the effective path even when not set in `postgresql.conf`. Deliberately outside `PGDATA` so a plain `pg_basebackup` does not copy it. |
 | `wallet_passphrase_env` | string | `''` | suset | Env var name holding wallet passphrase — env var NAME only, never the value |
 | `wallet_passphrase_file` | string | `''` | suset | File path containing wallet passphrase (trimmed; `0400` permission enforced) **(v1.6)** |
 | `wallet_passphrase_command` | string | `''` | suset | Shell command to retrieve passphrase (analogous to PG's `ssl_passphrase_command`) **(v1.6)** |

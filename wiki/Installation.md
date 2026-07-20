@@ -1,0 +1,126 @@
+# Installation
+
+pg_vault_tde supports **PostgreSQL 17 and 18** (19 is planned). It ships as
+pre-built DEB/RPM packages, or can be built from source.
+
+## Prerequisites
+
+pg_vault_tde is a `shared_preload_libraries` extension: it must be loaded at
+server start, and it links against OpenSSL 3.x and libcurl.
+
+| Requirement | Notes |
+|---|---|
+| PostgreSQL | 17.x or 18.x, with server development headers |
+| OpenSSL | 3.x (AES-256-GCM / AES-256-SIV via the EVP / provider API) |
+| libcurl | Required for the HashiCorp Vault / OpenBao provider |
+| CPU | Any x86-64 or AArch64; hardware-accelerated builds available — see [Performance and Tuning](Performance-and-Tuning) |
+
+## Option A — Install From Package (Recommended)
+
+Pre-built DEB and RPM packages are produced for both PostgreSQL 17 and 18, in
+a generic (portable) build and several hardware-accelerated variants. See
+[Compatibility and Versioning](Compatibility-and-Versioning) for the full
+package/version matrix.
+
+### Debian / Ubuntu
+
+```bash
+dpkg -i postgresql-18-pg-vault-tde_<version>_amd64.deb
+dpkg -l | grep pg-vault-tde   # verify
+```
+
+### RHEL / Rocky / AlmaLinux
+
+```bash
+dnf install postgresql18-pg_vault_tde-<version>.rpm
+rpm -qi postgresql18-pg_vault_tde   # verify
+```
+
+> **Wallet base directory.** If you plan to use the
+> [local wallet KMS provider](KMS-Local-Wallet), the package installer
+> automatically creates `/var/lib/pg_vault_tde/`, owned by the `postgres` OS
+> user with mode `0700`. Source builds (Option B) must create this directory
+> manually — see the note at the end of this page.
+
+Hardware-accelerated packages (AES-NI, VAES, ARM Crypto Extensions, ARM SVE2)
+install alongside or instead of the generic build — see
+[Performance and Tuning](Performance-and-Tuning#hardware-acceleration) for the
+full variant table and when each applies.
+
+## Option B — Build From Source
+
+```bash
+git clone https://github.com/miriade/pg_vault_tde.git
+cd pg_vault_tde
+```
+
+**Debian / Ubuntu, PostgreSQL 18:**
+```bash
+apt-get install -y postgresql-server-dev-18 libssl-dev libcurl4-openssl-dev pkg-config
+make && sudo make install
+```
+
+**Debian / Ubuntu, PostgreSQL 17:**
+```bash
+apt-get install -y postgresql-server-dev-17 libssl-dev libcurl4-openssl-dev pkg-config
+make PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config && sudo make install
+```
+
+**RHEL / Rocky, PostgreSQL 18:**
+```bash
+dnf install -y postgresql18-devel openssl-devel libcurl-devel
+make PG_CONFIG=/usr/pgsql-18/bin/pg_config && make install
+```
+
+**RHEL / Rocky, PostgreSQL 17:**
+```bash
+dnf install -y postgresql17-devel openssl-devel libcurl-devel
+make PG_CONFIG=/usr/pgsql-17/bin/pg_config && make install
+```
+
+For a hardware-accelerated build (AES-NI, VAES, ARM CE, ARM SVE2), see
+[Performance and Tuning](Performance-and-Tuning#hardware-acceleration).
+
+> **Wallet base directory (source builds only).** Package installers create
+> `/var/lib/pg_vault_tde/` automatically; a source build does not. If you
+> intend to use the local wallet provider, create it once as root before
+> calling `pg_vault_tde_wallet_init()`:
+> ```bash
+> mkdir -p /var/lib/pg_vault_tde
+> chown postgres:postgres /var/lib/pg_vault_tde
+> chmod 0700 /var/lib/pg_vault_tde
+> ```
+> This directory must **not** live inside `PGDATA` — see
+> [Security Considerations](Security-Considerations).
+
+## Load and Enable the Extension
+
+1. Add to `postgresql.conf`:
+
+   ```
+   shared_preload_libraries = 'pg_vault_tde'
+   ```
+
+2. **Restart** PostgreSQL — this GUC is `PGC_POSTMASTER` and cannot be
+   reloaded with `pg_reload_conf()`.
+
+3. Create the extension in each database that needs it:
+
+   ```sql
+   CREATE EXTENSION pg_vault_tde;
+   ```
+
+4. Verify:
+
+   ```sql
+   SELECT * FROM pg_vault_tde_health_check();
+   ```
+
+At this point the extension is loaded but has **no key backend configured
+yet** — go to [Key Management Overview](Key-Management-Overview) to choose
+and configure one before creating any encrypted table.
+
+## See Also
+- [Getting Started](Getting-Started)
+- [Key Management Overview](Key-Management-Overview)
+- [Compatibility and Versioning](Compatibility-and-Versioning)
