@@ -1,0 +1,59 @@
+name: Mirror PR to Bitbucket
+
+# Il repo Bitbucket (miriadesrl/pg_vault_tde) è l'unica fonte autoritativa.
+# Questo workflow inoltra il branch di una PR aperta qui su GitHub verso Bitbucket,
+# su un branch dedicato github-pr/<numero>-<slug>, cosicché il team interno possa
+# revisionarla e mergiarla con i propri strumenti standard.
+#
+# IMPORTANTE: usa pull_request_target (necessario per avere accesso al secret anche
+# per PR da fork), ma NON esegue mai codice del contributor: solo checkout + git push
+# dei commit così come sono. Non aggiungere qui step di build/test/install dal
+# contenuto della PR: quello vanificherebbe la sicurezza di questa scelta.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+    branches:
+      - develop
+      - main
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Push branch to Bitbucket
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          BITBUCKET_SYNC_TOKEN: ${{ secrets.BITBUCKET_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          SLUG=$(printf '%s' "$HEAD_REF" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-50)
+          BRANCH="github-pr/${PR_NUMBER}-${SLUG}"
+          echo "BITBUCKET_TARGET_BRANCH=${BRANCH}" >> "$GITHUB_ENV"
+          git push "https://x-token-auth:${BITBUCKET_SYNC_TOKEN}@bitbucket.org/miriadesrl/pg_vault_tde.git" "HEAD:refs/heads/${BRANCH}"
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const branch = process.env.BITBUCKET_TARGET_BRANCH;
+            const body = `Questo branch è stato sincronizzato internamente su Bitbucket come \`${branch}\` per la revisione da parte del team. Questa PR si chiuderà automaticamente non appena verrà mergiato lì.`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body,
+            });
