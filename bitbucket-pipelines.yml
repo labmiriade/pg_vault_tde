@@ -64,9 +64,15 @@ definitions:
 
     - step: &github-synchronization
         # Sincronizza su GitHub: master->main, develop->develop, tag di versione (v*)->tag omonimo
+        # Mirror reale (storia, autori, messaggi preservati), filtrando via git-filter-repo i path
+        # non destinati al repo pubblico (ci/, packaging/, bitbucket-pipelines.yml).
         name: GitHub Synchronization
+        clone:
+          depth: full
         script:
-          - apt-get update && apt-get install -y rsync git openssh-client
+          - apt-get update -qq
+          - apt-get install -y --no-install-recommends git openssh-client ca-certificates python3-pip
+          - pip install --break-system-packages --quiet git-filter-repo
           # Determina il ref di destinazione su GitHub in base al trigger Bitbucket
           - |
             if [ -n "$BITBUCKET_TAG" ]; then
@@ -80,43 +86,21 @@ definitions:
               export TARGET_REF="$BITBUCKET_BRANCH"
             fi
             echo "Sync -> $TARGET_TYPE $TARGET_REF"
-          # Prepara il clone GitHub agganciando il ref di base corretto (se già esiste)
+          # Riscrive la storia rimuovendo i path interni, mantenendo autori/messaggi/date reali.
+          # Deterministico: a parità di storia sorgente produce sempre gli stessi SHA filtrati,
+          # quindi il push verso GitHub resta un fast-forward, senza bisogno di un commit-map persistito.
           - |
-            BASE_BRANCH="$TARGET_REF"
-            [ "$TARGET_TYPE" = "tag" ] && BASE_BRANCH="main"
-            git init -q github-repo
-            cd github-repo
-            git remote add origin "$GITHUB_REPO_URL"
-            if git fetch --depth 1 origin "$BASE_BRANCH" 2>/dev/null; then
-              git checkout -B "$BASE_BRANCH" FETCH_HEAD
-            else
-              git checkout --orphan "$BASE_BRANCH"
-              git rm -rf . 2>/dev/null || true
-            fi
-            cd ..
-          # Sincronizza file o directory di interesse
-          - >
-            rsync -av --delete
-            --exclude='.git/'
-            --exclude='github-repo/'
-            --exclude='tmp_pgext/'
-            --exclude='ci/'
-            --exclude='packaging/'
-            --exclude='bitbucket-pipelines.yml'
-            ./ github-repo/
-          # Git config, commit e push sul ref corretto
+            git filter-repo --force --invert-paths \
+              --path ci \
+              --path packaging \
+              --path bitbucket-pipelines.yml
+          - git remote add github "$GITHUB_REPO_URL"
+          # Push del ref reale (storia intatta) verso GitHub
           - |
-            cd github-repo
-            git config user.name "Bitbucket Service Sync"
-            git config user.email "bitbucket-sync@miriade.it"
-            git add -A
             if [ "$TARGET_TYPE" = "branch" ]; then
-              git commit -m "Sync $TARGET_REF da Bitbucket ($BITBUCKET_COMMIT)" || echo "Nessuna modifica da sincronizzare"
-              git push origin "HEAD:refs/heads/$TARGET_REF"
+              git push github "HEAD:refs/heads/$TARGET_REF"
             else
-              git commit -m "Sync versione $TARGET_REF da Bitbucket ($BITBUCKET_COMMIT)" || echo "Nessuna modifica da sincronizzare"
-              git tag -f "$TARGET_REF"
-              git push origin "refs/tags/$TARGET_REF" --force
+              git push github --force "refs/tags/$BITBUCKET_TAG:refs/tags/$TARGET_REF"
             fi
 
 
