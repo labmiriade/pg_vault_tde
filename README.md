@@ -1040,14 +1040,24 @@ See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
 5. **WAL unencrypted** (permanently deferred): Full WAL encryption requires a hook in
    `XLogInsert()` / `XLogWrite()` — not achievable as a PostgreSQL extension.
 
-6. **`WITH HOLD` cursor temporary file is unencrypted** (permanently deferred): When a `CURSOR WITH HOLD`
-   spills its result set to a temporary file on disk (e.g. when `work_mem` is exhausted),
-   the file is written in **plaintext**. PostgreSQL writes the materialized tuples directly
-   through the executor's tuplestore layer, bypassing the TAM write path, so
-   `pg_vault_tde` has no opportunity to encrypt the data before it reaches disk.
+6. **`WITH HOLD` cursor temporary file is unencrypted** (permanently deferred): PostgreSQL
+   materializes a `CURSOR WITH HOLD`'s entire result set into a tuplestore when the declaring
+   transaction commits, so the cursor can still be fetched from afterward. Once that result set
+   exceeds `work_mem`, the tuplestore spills to a temporary file on disk, and that file is written
+   in **plaintext**. The tuplestore is populated directly by the executor, bypassing the table
+   access method write path entirely, so `pg_vault_tde` never gets a chance to encrypt the data
+   before it reaches disk — there is no extension hook anywhere in the `WITH HOLD` cursor
+   lifecycle (parse, plan, portal start, commit-time persist) that can intercept it. This is the
+   same class of gap documented for other TDE implementations (e.g. Percona's `pg_tde`): temporary
+   files produced by query execution that exceed `work_mem` are not covered by table-level
+   encryption. The spilled file can outlive the query that created it — it persists for as long as
+   the held cursor remains open, and, like any other PostgreSQL temp file, is not guaranteed to be
+   cleaned up if the server crashes before the owning session ends normally.
 
-   **Mitigation:** set `work_mem` large enough to keep cursor data in memory,
-   or avoid `WITH HOLD` cursors on encrypted tables in memory-constrained environments.
+   **Mitigation:** set `work_mem` large enough that cursor result sets are expected to stay
+   in memory, and avoid declaring `WITH HOLD` cursors over queries that touch `encrypted_heap`
+   tables (directly or through a view) in memory-constrained environments or wherever the
+   result set size can't be bounded in advance.
 
 7. **HOT updates are disabled by design** (so that updating an indexed column always
    maintains the index): On an `encrypted_heap` table `heap_update` never chooses a HOT
