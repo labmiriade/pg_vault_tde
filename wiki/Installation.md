@@ -13,12 +13,14 @@ server start, and it links against OpenSSL 3.x and libcurl.
 | PostgreSQL | 17.x or 18.x, with server development headers |
 | OpenSSL | 3.x (AES-256-GCM / AES-256-SIV via the EVP / provider API) |
 | libcurl | Required for the HashiCorp Vault / OpenBao provider |
-| CPU | Any x86-64 or AArch64; hardware-accelerated builds available — see [Performance and Tuning](Performance-and-Tuning) |
+| CPU | Any x86-64 or AArch64 — AES hardware acceleration (AES-NI/VAES/ARM CE/SVE2) is automatic via OpenSSL on every build; see [Performance and Tuning](Performance-and-Tuning) |
 
 ## Option A — Install From Package (Recommended)
 
-Pre-built DEB and RPM packages are produced for both PostgreSQL 17 and 18, in
-a generic (portable) build and several hardware-accelerated variants. See
+Pre-built DEB and RPM packages are produced for both PostgreSQL 17 and 18.
+There is a single package per (format, PG major) — hardware-accelerated AES
+is automatic via OpenSSL on it, no CPU-specific variant is needed (see
+[Performance and Tuning](Performance-and-Tuning)). See
 [Compatibility and Versioning](Compatibility-and-Versioning) for the full
 package/version matrix.
 
@@ -41,11 +43,6 @@ rpm -qi postgresql18-pg_vault_tde   # verify
 > automatically creates `/var/lib/pg_vault_tde/`, owned by the `postgres` OS
 > user with mode `0700`. Source builds (Option B) must create this directory
 > manually — see the note at the end of this page.
-
-Hardware-accelerated packages (AES-NI, VAES, ARM Crypto Extensions, ARM SVE2)
-install alongside or instead of the generic build — see
-[Performance and Tuning](Performance-and-Tuning#hardware-acceleration) for the
-full variant table and when each applies.
 
 ## Option B — Build From Source
 
@@ -78,7 +75,8 @@ dnf install -y postgresql17-devel openssl-devel libcurl-devel
 make PG_CONFIG=/usr/pgsql-17/bin/pg_config && make install
 ```
 
-For a hardware-accelerated build (AES-NI, VAES, ARM CE, ARM SVE2), see
+Hardware-accelerated crypto (AES-NI, VAES, ARM CE, SVE2) is automatic via
+OpenSSL on this same build — see
 [Performance and Tuning](Performance-and-Tuning#hardware-acceleration).
 
 > **Wallet base directory (source builds only).** Package installers create
