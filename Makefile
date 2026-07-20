@@ -3,32 +3,17 @@
 # All source modules are listed here. Extension compiles as a single .so.
 # PGXS handles the include paths, DESTDIR, and make installcheck wiring.
 #
-# Hardware acceleration variants:
-#   make TDE_TARGET_ARCH=generic          (default — portable)
-#   make TDE_TARGET_ARCH=x86_64-aesni     (AES-NI on Intel/AMD)
-#   make TDE_TARGET_ARCH=x86_64-vaes      (VAES + AVX2 on Intel Ice Lake+ / AMD Zen4+)
-#   make TDE_TARGET_ARCH=aarch64-ce       (ARM Crypto Extensions, ARMv8-A)
-#   make TDE_TARGET_ARCH=aarch64-sve2     (ARM SVE2 + Crypto, ARMv9-A)
+# Hardware-accelerated AES (AES-NI, VAES, ARM Crypto Extensions, SVE2) is
+# provided automatically at runtime by OpenSSL's EVP layer — see
+# src/crypto/pg_vault_tde_hw_accel.c and `make check-cpu` / `make bench-cpu`
+# below. There is no separate CPU-specific build: it would not make the
+# crypto path any faster, since pg_vault_tde never implements AES itself.
 #
 # Optimization level:
 #   make TDE_OPTIMIZE=standard            (default — -O2)
 #   make TDE_OPTIMIZE=max                 (-O3 -funroll-loops -fomit-frame-pointer)
 
-TDE_TARGET_ARCH ?= generic
 TDE_OPTIMIZE    ?= standard
-
-# Arch-specific flags
-ifeq ($(TDE_TARGET_ARCH),x86_64-aesni)
-   TDE_ARCH_CFLAGS := -maes -mpclmul -msse4.1 -msse4.2 -DTDE_HW_AES_NI
-else ifeq ($(TDE_TARGET_ARCH),x86_64-vaes)
-   TDE_ARCH_CFLAGS := -maes -mpclmul -msse4.1 -msse4.2 -mvaes -mavx -mavx2 -DTDE_HW_VAES
-else ifeq ($(TDE_TARGET_ARCH),aarch64-ce)
-   TDE_ARCH_CFLAGS := -march=armv8-a+crypto+crc -DTDE_HW_ARM_CE
-else ifeq ($(TDE_TARGET_ARCH),aarch64-sve2)
-   TDE_ARCH_CFLAGS := -march=armv9-a+crypto+sve2 -DTDE_HW_ARM_SVE2
-else
-   TDE_ARCH_CFLAGS :=
-endif
 
 # Optimization flags
 ifeq ($(TDE_OPTIMIZE),max)
@@ -53,7 +38,7 @@ $(if $(shell [ $(TDE_PG_MAJOR) -lt $(TDE_PG_MIN) ] && echo fail), \
 $(if $(shell [ $(TDE_PG_MAJOR) -gt $(TDE_PG_MAX) ] && echo fail), \
   $(warning pg_vault_tde is untested on PostgreSQL $(TDE_PG_MAJOR) — max tested is $(TDE_PG_MAX)))
 
-$(info === pg_vault_tde build: ARCH=$(TDE_TARGET_ARCH) OPT=$(TDE_OPTIMIZE) PG=$(TDE_PG_MAJOR) ===)
+$(info === pg_vault_tde build: OPT=$(TDE_OPTIMIZE) PG=$(TDE_PG_MAJOR) ===)
 
 EXTENSION   = pg_vault_tde
 MODULE_big  = pg_vault_tde
@@ -96,7 +81,6 @@ include $(PGXS)
 override CFLAGS  += -Wall -Wextra -std=c99 \
                     -Wno-unused-parameter \
                     -I$(srcdir)/src \
-                    $(TDE_ARCH_CFLAGS) \
                     $(TDE_OPT_CFLAGS) \
                     $(shell pkg-config --cflags openssl libcurl)
 # -ldl: dlopen() of the vendor PKCS#11 module (pkcs11 KMS provider).
@@ -104,7 +88,9 @@ override CFLAGS  += -Wall -Wextra -std=c99 \
 override SHLIB_LINK += $(shell pkg-config --libs openssl libcurl) -ldl
 
 # ---------------------------------------------------------------------------
-# check-cpu: print CPU hardware encryption capabilities
+# check-cpu: print CPU hardware encryption capabilities. This does not affect
+# the build — OpenSSL detects and uses these instructions automatically at
+# runtime regardless of how pg_vault_tde.so was compiled.
 # ---------------------------------------------------------------------------
 .PHONY: check-cpu
 check-cpu:
@@ -233,7 +219,6 @@ endif
 
 PG_DUMP_TDE_CFLAGS = \
 	$(TDE_OPT_CFLAGS) \
-	$(TDE_ARCH_CFLAGS) \
 	-Wall -Wextra -std=c99 \
 	-Wno-unused-parameter \
 	-DFRONTEND \

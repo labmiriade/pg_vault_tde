@@ -13,47 +13,26 @@ shape and row size:
 | Sequential scan (1M rows, read-only) | **20–35%** | Decrypt + palloc copy per tuple |
 | Index scan (point lookups) | **< 5%** | Single tuple decrypt per fetch |
 
-These figures assume the **generic** (portable) build; a hardware-accelerated
-build closes most of this gap on supported CPUs (see below).
+These figures were measured on pg_vault_tde's one and only build, which
+already gets OpenSSL's automatic hardware-accelerated AES dispatch on
+supported CPUs (see below).
 
 ## Hardware Acceleration
 
-pg_vault_tde ships a **generic** package that runs everywhere, plus optional
-hardware-accelerated variants. OpenSSL 3.x's EVP/provider dispatch
-automatically selects the matching CPU crypto instructions at runtime, once
-the binary has been built with the matching compiler intrinsics enabled —
-all variants are ABI-compatible and produce a `.so` still named
-`pg_vault_tde.so`.
-
-| Variant | Target CPUs | Build flag |
-|---------|-------------|------|
-| `generic` (default) | All x86-64 / AArch64 | *(none)* |
-| `aesni` | Intel Westmere/Core 2010+, AMD Bulldozer+ | `TDE_TARGET_ARCH=x86_64-aesni` |
-| `vaes` | AMD Zen 4+, Intel Ice Lake+ (wider vectorized AES) | `TDE_TARGET_ARCH=x86_64-vaes TDE_OPTIMIZE=max` |
-| `armce` | AWS Graviton 2/3, Ampere Altra, Apple M-series (ARMv8-A) | `TDE_TARGET_ARCH=aarch64-ce` |
-| `sve2` | NVIDIA Grace, Neoverse V2 (ARMv9-A) | `TDE_TARGET_ARCH=aarch64-sve2 TDE_OPTIMIZE=max` |
-
-Building from source:
+pg_vault_tde ships a single package for each (format, PostgreSQL major)
+combination — there is no CPU-specific build variant. Hardware-accelerated
+AES (AES-NI, VAES, ARM Crypto Extensions, SVE2) is provided automatically at
+runtime by OpenSSL 3.x's EVP/provider layer, based on the CPU the server is
+actually running on. This is a property of the OpenSSL library installed on
+the host, not of how pg_vault_tde.so was compiled: pg_vault_tde never
+implements AES itself, it only calls OpenSSL's EVP API
+(`src/crypto/pg_vault_tde_hw_accel.c`), so there is nothing a CPU-specific
+compile flag could speed up.
 
 ```bash
-make TDE_TARGET_ARCH=x86_64-aesni
 make check-cpu     # detect this machine's available CPU crypto extensions
 make bench-cpu     # OpenSSL AES throughput microbenchmark
 ```
-
-Building packages for a specific hardware variant:
-
-```bash
-bash packaging/build_in_container.sh --arch-variant aesni
-bash packaging/build_in_container.sh --arch-variant vaes
-bash packaging/build_in_container.sh --arch-variant armce
-bash packaging/build_in_container.sh --arch-variant sve2
-```
-
-The ARM Crypto Extensions variant packages as a **separate** `.so`
-(`pg_vault_tde_armce.so`) and RPM that can coexist with the generic build on
-the same host — see [Installation](Installation) and
-[Compatibility and Versioning](Compatibility-and-Versioning).
 
 Confirm which provider is actually active at runtime:
 
