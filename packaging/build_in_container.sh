@@ -13,9 +13,11 @@
 #   --format deb|rpm          Package format  (default: deb)
 #   --pg-version 17|18        PostgreSQL major version  (default: 18)
 #   --os-version VERSION      OS base image for the build container:
-#                               DEB:  ubuntu:22.04 (default), ubuntu:24.04,
+#                               DEB:  ubuntu:26.04 (default),
+#                                     ubuntu:22.04, ubuntu:24.04,
 #                                     debian:12, debian:11
-#                               RPM:  rockylinux:9 (default), rockylinux:8,
+#                               RPM:  rockylinux:10 (default),
+#                                     rockylinux:9, rockylinux:8,
 #                                     almalinux:9, almalinux:8
 #   --all                     Build all combinations: deb+rpm × pg17+pg18
 #                             (uses default OS versions)
@@ -125,12 +127,12 @@ fi
 # ---------------------------------------------------------------------------
 # OS version validation and defaults
 # ---------------------------------------------------------------------------
-VALID_DEB_OS=("ubuntu:22.04" "ubuntu:24.04" "debian:12" "debian:11")
-VALID_RPM_OS=("rockylinux:9" "rockylinux:8" "almalinux:9" "almalinux:8")
+VALID_DEB_OS=("ubuntu:22.04" "ubuntu:24.04" "ubuntu:26.04" "debian:13" "debian:12" "debian:11")
+VALID_RPM_OS=("rockylinux:10" "rockylinux:9" "rockylinux:8" "almalinux:10" "almalinux:9" "almalinux:8")
 
 # Set format defaults
-DEB_OS_IMAGE="ubuntu:22.04"
-RPM_OS_IMAGE="rockylinux:9"
+DEB_OS_IMAGE="ubuntu:26.04"
+RPM_OS_IMAGE="rockylinux:10"
 
 if [[ -n "$OS_VERSION_ARG" ]]; then
     case "$FORMAT" in
@@ -191,9 +193,25 @@ OUTPUT_DIR="$(realpath "$OUTPUT_DIR")"
 _el_version_from_image() {
     local img="$1"
     case "$img" in
+        rockylinux:10|almalinux:10) echo "10" ;;
         rockylinux:9|almalinux:9) echo "9" ;;
         rockylinux:8|almalinux:8) echo "8" ;;
         *) echo "9" ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Helper: resolve an --os-version tag to its full pullable image reference.
+# Rocky Linux stopped publishing to the Docker "library" (official images)
+# namespace after 9.3/8.9 — rockylinux:10 (and current 9.x/8.x builds) only
+# exist under the project's own namespace, docker.io/rockylinux/rockylinux.
+# Every other distro (ubuntu, debian, almalinux) still publishes to library/.
+# ---------------------------------------------------------------------------
+_container_image_ref() {
+    local img="$1"
+    case "$img" in
+        rockylinux:*) echo "docker.io/rockylinux/rockylinux:${img#rockylinux:}" ;;
+        *)            echo "docker.io/library/${img}" ;;
     esac
 }
 
@@ -210,13 +228,16 @@ build_deb() {
     echo "  DEB build  |  PG${pg}  |  ${os_image}"
     echo "════════════════════════════════════════════════════════"
 
+    local image_ref
+    image_ref="$(_container_image_ref "$os_image")"
+
     # $PULL_FLAG is intentionally unquoted: either empty or "--pull=always".
     # Quoting an empty string would pass a literal "" argument to the runtime.
     # shellcheck disable=SC2086
     $RUNTIME run --rm $PULL_FLAG \
         -v "$(pwd)":/src:ro \
         -v "$OUTPUT_DIR":/dist \
-        "docker.io/library/${os_image}" bash -c "
+        "$image_ref" bash -c "
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
@@ -280,6 +301,9 @@ build_rpm() {
     local el_ver
     el_ver="$(_el_version_from_image "$os_image")"
 
+    local image_ref
+    image_ref="$(_container_image_ref "$os_image")"
+
     echo ""
     echo "════════════════════════════════════════════════════════"
     echo "  RPM build  |  PG${pg}  |  ${os_image} (EL${el_ver})"
@@ -289,7 +313,7 @@ build_rpm() {
     $RUNTIME run --rm $PULL_FLAG \
         -v "$(pwd)":/src:ro \
         -v "$OUTPUT_DIR":/dist \
-        "docker.io/library/${os_image}" bash -c "
+        "$image_ref" bash -c "
 set -euo pipefail
 
 # ── Verify the buffer pin fix is present in the mounted source ────────────
@@ -313,7 +337,7 @@ dnf -y module disable postgresql 2>/dev/null || true
 dnf install -y -q \\
     perl-IPC-Run postgresql${pg}-devel \\
     openssl-devel libcurl-devel pkgconfig \\
-    gcc make rsync rpm-build
+    gcc make rsync rpm-build chrpath
 
 # ── Build ─────────────────────────────────────────────────────────────────
 export PATH=\"/usr/pgsql-${pg}/bin:\$PATH\"
