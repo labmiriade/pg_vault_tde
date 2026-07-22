@@ -17,7 +17,6 @@
  * Licensed under the PostgreSQL License.
  */
 #include "postgres.h"
-#include "executor/spi.h"
 #include "access/heapam.h"          /* heap_insert, heap_update, heap_multi_insert,
                                        heap_getnextslot */
 #include "access/heaptoast.h"       /* TOAST_TUPLE_THRESHOLD, TOAST_MAX_CHUNK_SIZE */
@@ -2307,7 +2306,7 @@ pg_vault_tde_verify_integrity(PG_FUNCTION_ARGS)
  * 1-byte version + 8-byte generation + 12-byte IV + 16-byte GCM tag.
  * The total overhead is simply total_tuples × 37.
  *
- * Uses SPI to count live rows (which also validates readability).
+ * Uses direct api to count live rows (which also validates readability).
  */
 PG_FUNCTION_INFO_V1(pg_vault_tde_encrypted_size);
 PGDLLEXPORT Datum
@@ -2315,39 +2314,41 @@ pg_vault_tde_encrypted_size(PG_FUNCTION_ARGS)
 {
     Oid             relid = PG_GETARG_OID(0);
     char           *relname;
-    StringInfoData  cmd;
-    int             ret;
-    int64           total;
+    Relation        rel;
+    TupleTableSlot *slot;
+    TableScanDesc   scan;
+    int64           total = 0;
     TupleDesc       tupdesc;
     Datum           values[2];
     bool            nulls[2] = {false, false};
     HeapTuple       result_tup;
+
     if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
         ereport(ERROR,
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                  errmsg("function returning record called in context "
                         "that cannot accept type record")));
+
     tupdesc = BlessTupleDesc(tupdesc);
+
     relname = get_rel_name(relid);
     if (relname == NULL)
         ereport(ERROR,
                 (errcode(ERRCODE_UNDEFINED_TABLE),
                  errmsg("relation with OID %u does not exist", relid)));
-    SPI_connect();
-    initStringInfo(&cmd);
-    appendStringInfo(&cmd, "SELECT count(*) FROM %s", quote_identifier(relname));
-    ret = SPI_execute(cmd.data, true, 0);
-    if (ret != SPI_OK_SELECT)
-        ereport(ERROR,
-                (errcode(ERRCODE_INTERNAL_ERROR),
-                 errmsg("pg_vault_tde_encrypted_size: count query failed")));
-    {
-        bool isnull;
-        total = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
-                                            SPI_tuptable->tupdesc, 1, &isnull));
-    }
-    pfree(cmd.data);
-    SPI_finish();
+
+    rel = table_open(relid, AccessShareLock);
+    slot = table_slot_create(rel, NULL);
+    scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL);
+
+    while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+        total++;
+
+    table_endscan(scan);
+    ExecDropSingleTupleTableSlot(slot);
+    table_close(rel, AccessShareLock);
+
+    /* Each encrypted tuple carries TDE_V4_OVERHEAD bytes of overhead. */
     values[0] = Int64GetDatum(total);
     values[1] = Int64GetDatum(total * (int64) TDE_V4_OVERHEAD);
     result_tup = heap_form_tuple(tupdesc, values, nulls);
