@@ -20,6 +20,7 @@ samples.
 | `crypto_provider` | string | `''` | postmaster | OpenSSL 3.x provider name for hardware crypto offload. Empty (default) uses built-in AES-NI/ARM CE auto-dispatch; set to `qatprovider` for Intel QAT, `fips` for FIPS mode. |
 | `max_encrypted_relations` | integer | `1024` | postmaster | Maximum number of independently-keyed `encrypted_heap` relations in the shared-memory DEK cache (range 64–65536). Increase if you have more than 1024 encrypted tables. |
 | `dek_cache_ttl` | integer | `0` | suset | Per-backend DEK cache time-to-live in seconds (range 0–86400). `0` = no expiry. When set, each backend re-reads the DEK from shared memory after this interval, even without a rotation. |
+| `allow_plaintext_index` | boolean | `off` | suset | When `off` (default), `CREATE INDEX`/`CREATE UNIQUE INDEX` with a non-`tde_btree` access method (`btree`, `gin`, `gist`, `hash`, `brin`) against an `encrypted_heap` table is rejected with `ERROR`. When `on`, allowed after a `WARNING` — the indexed value is then stored in plaintext on disk in that index. Does not affect `PRIMARY KEY`/`UNIQUE` table constraints, which always warn-and-allow regardless — see [Encrypted Tables and Indexes](Encrypted-Tables-and-Indexes). |
 
 ## KMS Provider Selection
 

@@ -106,6 +106,12 @@ char *pg_vault_tde_pkcs11_pin_env     = NULL; /* env var NAME holding the user P
 char *pg_vault_tde_pkcs11_key_label   = NULL; /* CKA_LABEL of the KEK on the token */
 
 /*
+ * allow_plaintext_index — opt-in relaxation of the encrypted_heap index AM
+ * whitelist (v1.7). See tde_is_safe_index_am() below.
+ */
+bool  pg_vault_tde_allow_plaintext_index = false;
+
+/*
  * tde_active_kms_provider — selected KMS backend (set in _PG_init).
  * All callers that need KMS operations go through this pointer.
  * Declared extern in pg_vault_tde_kms_provider.h.
@@ -169,6 +175,27 @@ PGDLLEXPORT Datum
 pg_vault_tde_iam_handler(PG_FUNCTION_ARGS)
 {
     PG_RETURN_POINTER(pg_vault_tde_get_iam_routine());
+}
+
+#ifndef PG_VAULT_TDE_BUILD_VERSION
+#define PG_VAULT_TDE_BUILD_VERSION "unknown"
+#endif
+
+/*
+ * pg_vault_tde_build_version
+ *
+ * Returns the compiled-in build version (from the top-level VERSION file,
+ * baked in via -DPG_VAULT_TDE_BUILD_VERSION at build time), independent of
+ * pg_extension.extversion. extversion only changes when the installed SQL
+ * script changes; this reports which actual binary build of pg_vault_tde.so
+ * is loaded, so a C-only bugfix release (no SQL/catalog change) is still
+ * distinguishable from the original build that shipped the same extversion.
+ */
+PG_FUNCTION_INFO_V1(pg_vault_tde_build_version);
+PGDLLEXPORT Datum
+pg_vault_tde_build_version(PG_FUNCTION_ARGS)
+{
+    PG_RETURN_TEXT_P(cstring_to_text(PG_VAULT_TDE_BUILD_VERSION));
 }
 
 void _PG_init(void);
@@ -291,7 +318,7 @@ static const char *tde_safe_index_ams[] = {
     NULL
 };
 
-static bool 
+static bool
 tde_is_safe_index_am(const char *am_name)
 {
     int i;
@@ -301,6 +328,89 @@ tde_is_safe_index_am(const char *am_name)
             return true;
     }
     return false;
+}
+
+/*
+ * tde_rel_or_inheritors_use_encrypted_heap
+ *
+ * True if relid, or any of its inheritors (partitions/children), uses the
+ * encrypted_heap access method.  Shared by the DDL guards that must apply
+ * to a partitioned table regardless of which specific partition ends up
+ * storing the data.
+ */
+static bool
+tde_rel_or_inheritors_use_encrypted_heap(Oid relid)
+{
+    bool  found = false;
+    List *inheritors_oids = find_all_inheritors(relid, NoLock, NULL);
+
+    foreach_oid(irid, inheritors_oids)
+    {
+        Relation irel = try_relation_open(irid, NoLock);
+        if (irel != NULL)
+        {
+            if (OidIsValid(irel->rd_rel->relam) &&
+                strcmp(get_am_name(irel->rd_rel->relam), "encrypted_heap") == 0)
+            {
+                found = true;
+                relation_close(irel, NoLock);
+                break;
+            }
+            relation_close(irel, NoLock);
+        }
+    }
+    return found;
+}
+
+/*
+ * tde_warn_plaintext_constraint_columns
+ *
+ * Emits the "will be backed by a standard (unencrypted) btree index"
+ * WARNING for a list of column-name String nodes on an encrypted_heap
+ * table.  Shared by the CREATE TABLE (inline PRIMARY KEY/UNIQUE) and
+ * ALTER TABLE ADD CONSTRAINT paths: PostgreSQL core always backs a
+ * declarative PRIMARY KEY/UNIQUE constraint with a native btree index, so
+ * this case can only ever be warned about, never blocked (unlike a
+ * standalone CREATE INDEX, see tde_is_safe_index_am()).
+ */
+static void
+tde_warn_plaintext_constraint_columns(List *offending_cols, const char *relname)
+{
+    StringInfoData buf;
+    ListCell *lc1;
+    bool first = true;
+
+    if (offending_cols == NIL)
+        return;
+
+    initStringInfo(&buf);
+    foreach(lc1, offending_cols)
+    {
+        char* colname = strVal(lfirst_node(String, lc1));
+        if(!first)
+            appendStringInfoString(&buf, _(", "));
+        first = false;
+        appendStringInfo(&buf, _("\"%s\""), colname);
+    }
+
+    ereport(WARNING,
+            (errmsg_plural("pg_vault_tde: the constraints on column %s "
+                    "of encrypted_heap table \"%s\" will be backed "
+                    "by a standard (unencrypted) btree index",
+                    "pg_vault_tde: the constraints on columns %s "
+                    "of encrypted_heap table \"%s\" will be backed "
+                    "by a standard (unencrypted) btree index",
+                    list_length(offending_cols),
+                    buf.data, relname),
+            errdetail("PostgreSQL requires PRIMARY KEY/UNIQUE constraints "
+                      "to use the native btree access methods; the indexed "
+                      "column's plaintext value will be stored on disk in the index."),
+            errhint("Consider a surrogate non-sensitive key, or enforce "
+                    "uniqueness separately with "
+                    "\"CREATE UNIQUE INDEX ... USING tde_btree\".")
+            )
+    );
+    pfree(buf.data);
 }
 
 /*
@@ -598,6 +708,7 @@ tde_process_utility_hook(PlannedStmt *pstmt,
     bool        alter_tam_into = false; /* converting TO encrypted_heap FROM another TAM */
     List       *drop_encrypted_oids = NIL;  /* OIDs of encrypted tables being dropped */
     List       *evict_only_oids     = NIL;  /* OIDs to evict from shmem only (no catalog row) */
+    List       *alter_pk_offending_cols = NIL; /* ADD CONSTRAINT PK/UNIQUE cols needing the plaintext-btree warning */
 
     /*
      * Pre-processing: determine if this is a CREATE TABLE USING encrypted_heap.
@@ -675,16 +786,51 @@ tde_process_utility_hook(PlannedStmt *pstmt,
             foreach(lc, stmt->cmds) {
                 AlterTableCmd* cmd = lfirst_node(AlterTableCmd, lc);
 
-                if(cmd->subtype == AT_SetAccessMethod) {   
-                    if(strcmp(cmd->name, "encrypted_heap") == 0) {
+                if(cmd->subtype == AT_SetAccessMethod) {
+                    if(strcmp(cmd->name, "encrypted_heap") == 0)
                         alter_tam_into = true;
-                        break;
-                    }
-                    else {
+                    else
                         alter_tam_away = true;
-                        break;  
-                    }     
                 }
+                else if (cmd->subtype == AT_AddConstraint)
+                {
+                    /*
+                     * ADD CONSTRAINT ... {PRIMARY KEY|UNIQUE} (col, ...) — PG
+                     * will build a brand-new native btree index for this.
+                     * con->indexname != NULL means USING INDEX <existing>:
+                     * that index was already created (and already guarded,
+                     * successfully or not) by its own CREATE INDEX statement,
+                     * so it is NOT re-checked here.
+                     */
+                    Constraint *con = castNode(Constraint, cmd->def);
+
+                    if ((con->contype == CONSTR_PRIMARY || con->contype == CONSTR_UNIQUE) &&
+                        con->indexname == NULL)
+                    {
+                        ListCell *lc2;
+
+                        foreach(lc2, con->keys)
+                        {
+                            String *colnode = lfirst_node(String, lc2);
+
+                            if (!list_member(alter_pk_offending_cols, colnode))
+                                alter_pk_offending_cols = lappend(alter_pk_offending_cols, colnode);
+                        }
+                    }
+                }
+            }
+
+            /*
+             * Only warn if the target table (or an inheritor/partition) is
+             * actually encrypted_heap — ADD CONSTRAINT on a plain heap table
+             * needs no warning.
+             */
+            if (alter_pk_offending_cols != NIL)
+            {
+                Oid rid = RangeVarGetRelid(stmt->relation, NoLock, true /* missing_ok */);
+
+                if (!OidIsValid(rid) || !tde_rel_or_inheritors_use_encrypted_heap(rid))
+                    alter_pk_offending_cols = NIL;
             }
         }
     }
@@ -710,29 +856,22 @@ tde_process_utility_hook(PlannedStmt *pstmt,
                 Relation rel = try_relation_open(rid, NoLock);
                 if (rel != NULL)
                 {
-                    bool guard = false;
-                    List *inheritors_oids = find_all_inheritors(rid, NoLock, NULL);
-                        
-                    foreach_oid(irid, inheritors_oids)
-                    {
-                        Relation irel = try_relation_open(irid, NoLock);
-                        if (irel != NULL)
-                        {
-                            if (OidIsValid(irel->rd_rel->relam) &&
-                                strcmp(get_am_name(irel->rd_rel->relam), "encrypted_heap") == 0)
-                            {
-                                guard = true;
-                                relation_close(irel, NoLock);
-                                break;
-                            }
-                            relation_close(irel, NoLock);
-                        }
-                    }
-                    
+                    bool guard = tde_rel_or_inheritors_use_encrypted_heap(rid);
 
-                    if (guard)
-                    {   
-                        if (!tde_is_safe_index_am(stmt->accessMethod))
+                    if (guard && !tde_is_safe_index_am(stmt->accessMethod))
+                    {
+                        if (pg_vault_tde_allow_plaintext_index)
+                            ereport(WARNING,
+                                (errmsg("pg_vault_tde: index access method \"%s\" on "
+                                        "encrypted_heap table \"%s\" is not encrypted",
+                                        stmt->accessMethod, stmt->relation->relname),
+                                errdetail("The indexed column's plaintext value will be "
+                                          "stored on disk in this index."),
+                                errhint("Allowed because pg_vault_tde.allow_plaintext_index "
+                                        "is on.  Use \"CREATE INDEX ... USING tde_btree\" "
+                                        "with an encrypted operator class instead to avoid "
+                                        "this exposure.")));
+                        else
                             ereport(ERROR,
                                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                                 errmsg("pg_vault_tde: index access method \"%s\" is not supported "
@@ -740,13 +879,14 @@ tde_process_utility_hook(PlannedStmt *pstmt,
                                         stmt->accessMethod, stmt->relation->relname),
                                 errhint("Use \"CREATE INDEX ... USING tde_btree\" with an "
                                         "encrypted operator class (e.g. tde_text_ops, "
-                                        "tde_int4_enc_ops) instead.")));
-
+                                        "tde_int4_enc_ops) instead, or set "
+                                        "pg_vault_tde.allow_plaintext_index = on to allow "
+                                        "this with a WARNING.")));
                     }
                     relation_close(rel, NoLock);
                 }
             }
-            
+
         }
     }
 
@@ -801,6 +941,16 @@ tde_process_utility_hook(PlannedStmt *pstmt,
     else
         standard_ProcessUtility(pstmt, queryString, readOnlyTree,
                                 context, params, queryEnv, dest, qc);
+
+    /*
+     * Post-processing for ALTER TABLE ADD CONSTRAINT ... {PRIMARY KEY|UNIQUE}
+     * on an encrypted_heap table: same "backed by a standard (unencrypted)
+     * btree index" warning as the CREATE TABLE path below, fired only after
+     * the ALTER has actually succeeded.
+     */
+    if (alter_pk_offending_cols != NIL)
+        tde_warn_plaintext_constraint_columns(alter_pk_offending_cols,
+                                              ((AlterTableStmt *) parsetree)->relation->relname);
 
     /*
      * Post-processing for CREATE TABLE USING encrypted_heap:
@@ -864,43 +1014,7 @@ tde_process_utility_hook(PlannedStmt *pstmt,
             
         }
         
-        if(offending_cols != NIL)
-        {
-            StringInfoData buf;
-            ListCell *lc1;
-            bool first = true;
-
-            initStringInfo(&buf);
-
-            foreach(lc1, offending_cols)
-            {
-                char* colname = strVal(lfirst_node(String, lc1));
-                if(!first)
-                    appendStringInfoString(&buf, _(", "));
-                first = false;
-                appendStringInfo(&buf, _("\"%s\""), colname);
-            }
-        
-            
-            ereport(WARNING, 
-                    (errmsg_plural("pg_vault_tde: the constraints on column %s "
-                            "of encrypted_heap table \"%s\" will be backed " 
-                            "by a standard (unencrypted) btree index",
-                            "pg_vault_tde: the constraints on columns %s "
-                            "of encrypted_heap table \"%s\" will be backed " 
-                            "by a standard (unencrypted) btree index",
-                            list_length(offending_cols),
-                            buf.data, stmt->relation->relname),
-                    errdetail("PostgreSQL requires PRIMARY KEY/UNIQUE constraints "
-                              "to use the native btree access methods; the indexed "
-                              "column's plaintext value will be stored on disk in the index."),
-                    errhint("Consider a surrogate non-sensitive key, or enforce " 
-                            "uniqueness separately with "
-                            "\"CREATE UNIQUE INDEX ... USING tde_btree\".")
-                    )
-            );
-            pfree(buf.data);
-        }
+        tde_warn_plaintext_constraint_columns(offending_cols, stmt->relation->relname);
 
         relid = RangeVarGetRelid(stmt->relation, NoLock, true /* missing_ok */);
         if (!OidIsValid(relid))
@@ -1495,6 +1609,25 @@ _PG_init(void)
         "as the wallet passphrase.  Always false in production.",
         &pg_vault_tde_dev_mode, false, PGC_SUSET,
         GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+
+    /*
+     * allow_plaintext_index — opt-in relaxation of the encrypted_heap index
+     * AM whitelist (v1.7).  Default false preserves the existing hard ERROR
+     * on CREATE INDEX ... USING <non-tde_btree> against an encrypted_heap
+     * table.  Same PGC_SUSET/no-SUPERUSER_ONLY footing as toast_encryption:
+     * a per-database security-relaxation toggle, not a cluster-wide one.
+     */
+    DefineCustomBoolVariable("pg_vault_tde.allow_plaintext_index",
+        "Allow non-tde_btree index access methods on encrypted_heap tables",
+        "When false (default), CREATE INDEX / CREATE UNIQUE INDEX with an "
+        "access method other than tde_btree against an encrypted_heap table "
+        "is rejected with ERROR (the indexed column's plaintext value would "
+        "be stored unencrypted on disk).  When true, the same statement is "
+        "allowed after emitting a WARNING.  Does not affect PRIMARY KEY / "
+        "UNIQUE table constraints, which PostgreSQL core always backs with "
+        "a native btree index and which already warn-and-allow unconditionally.",
+        &pg_vault_tde_allow_plaintext_index, false, PGC_SUSET,
+        0, NULL, NULL, NULL);
 
     /* ----------------------------------------------------------------
      * v1.7 GUC registrations — PKCS#11 / HSM provider

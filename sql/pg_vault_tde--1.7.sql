@@ -550,9 +550,21 @@ $$;
 -- Health check (v1.7)
 -- ============================================================================
 
+CREATE FUNCTION pg_vault_tde_build_version()
+    RETURNS text
+    LANGUAGE C STRICT
+    AS 'MODULE_PATHNAME', 'pg_vault_tde_build_version';
+
+COMMENT ON FUNCTION pg_vault_tde_build_version() IS
+'Compiled-in build version (from the VERSION file at build time), '
+'independent of pg_extension.extversion. Distinguishes binary builds '
+'that share the same extversion (e.g. a C-only bugfix with no SQL '
+'script change).';
+
 CREATE FUNCTION pg_vault_tde_health_check()
     RETURNS TABLE (
         version           text,
+        build_version     text,
         enabled           bool,
         kms_provider      text,
         enc_ops_available bool,
@@ -561,6 +573,7 @@ CREATE FUNCTION pg_vault_tde_health_check()
     LANGUAGE SQL STABLE AS $$
     SELECT
         (SELECT extversion FROM pg_extension WHERE extname='pg_vault_tde') AS version,
+        pg_vault_tde_build_version()                            AS build_version,
         current_setting('pg_vault_tde.enabled', true)::bool     AS enabled,
         current_setting('pg_vault_tde.kms_provider', true)      AS kms_provider,
         EXISTS (
@@ -574,7 +587,7 @@ $$;
 
 COMMENT ON FUNCTION pg_vault_tde_health_check() IS
 'Return a single-row diagnostic snapshot of the pg_vault_tde extension. '
-'Columns: version, enabled, kms_provider, enc_ops_available '
+'Columns: version, build_version, enabled, kms_provider, enc_ops_available '
 '(true when tde_*_enc_ops operator classes are installed), checked_at.';
 
 -- ============================================================================

@@ -1,7 +1,10 @@
 setup
 {
     CREATE EXTENSION IF NOT EXISTS pg_vault_tde;
-    ALTER DATABASE tde_isolation SET client_min_messages = error;
+    DO $$
+    BEGIN
+        EXECUTE format('ALTER DATABASE %I SET client_min_messages = error', current_database());
+    END $$;
     DO $$
     BEGIN
         PERFORM pg_vault_tde_wallet_init('tde_isolation');

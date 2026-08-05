@@ -11,6 +11,10 @@ automatic rotation.
 
 **Current release: v1.7** — 109 regression tests (52 v1.4 + 20 v1.5 + 37 v1.6), zero compiler warnings on PG 17 + PG 18.
 
+### Professional Support
+
+
+
 ### PostgreSQL Version Compatibility
 
 | PG Major | Status | Notes |
@@ -46,6 +50,18 @@ make PG_CONFIG=/usr/pgsql-18/bin/pg_config && make install
 dnf install -y postgresql17-devel openssl-devel libcurl-devel
 make PG_CONFIG=/usr/pgsql-17/bin/pg_config && make install
 ```
+
+**Or via [PGXN](https://pgxn.org/dist/pg_vault_tde/)** (same OS build
+dependencies as above are still required — `pgxn install` just runs the
+build for you):
+
+```bash
+pip install pgxnclient   # or: apt-get install pgxnclient / dnf install pgxnclient
+pgxn install pg_vault_tde
+```
+
+See [wiki: Installation](https://github.com/miriade/pg_vault_tde/wiki/Installation)
+for package-based (`.deb`/`.rpm`) installs and full per-OS prerequisites.
 
 ### 2. Configure PostgreSQL
 
@@ -224,6 +240,16 @@ SELECT email, ssn FROM users WHERE id = 1;
 
 > **Column-level**: Only tables created with `USING encrypted_heap` are
 > encrypted. Regular `heap` tables are unaffected.
+
+> **Index access method whitelist**: `CREATE INDEX`/`CREATE UNIQUE INDEX`
+> with any access method other than `tde_btree` (so also `gin`, `gist`,
+> `hash`, `brin`) against an `encrypted_heap` table is rejected with `ERROR`
+> by default — the indexed column's plaintext value would otherwise sit
+> unencrypted on disk. Set `pg_vault_tde.allow_plaintext_index = on` to allow
+> it anyway (with a `WARNING`) until GIN/Hash/GiST encryption ships in v1.8.
+> `PRIMARY KEY`/`UNIQUE` **table constraints** are a separate, unavoidable
+> case — PostgreSQL core always backs them with a native btree index — and
+> are always allowed with a `WARNING`, regardless of this setting.
 
 ---
 
@@ -510,6 +536,7 @@ All parameters are `suset` — settable per-database with `ALTER DATABASE SET`.
 | Parameter | Type | Default | Context | Description |
 |---|---|---|---|---|
 | `enabled` | boolean | `on` | suset | Master switch — set `off` to measure TAM overhead without crypto. Settable per-database. |
+| `allow_plaintext_index` | boolean | `off` | suset | When `off` (default), `CREATE INDEX`/`CREATE UNIQUE INDEX` with a non-`tde_btree` access method on an `encrypted_heap` table is rejected with `ERROR`. When `on`, allowed after a `WARNING` — the indexed column's plaintext value is then stored unencrypted on disk. Does not affect `PRIMARY KEY`/`UNIQUE` table constraints (always allowed, always warned — see "What Gets Encrypted" above). |
 
 ---
 
@@ -644,6 +671,7 @@ CREATE INDEX ON secrets USING tde_btree (id);
 | TOAST (large values > ≈2 kB) | ✅ Full | Heap-level round-trips functional; per-chunk storage encryption |
 | Logical replication (TOAST columns) | ✅ Full (v1.7) | Custom WAL rmgr (`toast_custom_rmgr`) routes encrypted chunks past the reorder buffer; stitched in `change_cb`. UPDATE/DELETE need `REPLICA IDENTITY FULL` + PK |
 | Range scans on TDE indexes | ⚠️ By design | `tde_btree` (GIN/Hash/GiST planned for v1.8, same AES-SIV pattern) — equality only; ranges return empty |
+| `CREATE INDEX USING gin/gist/hash/brin/btree` on `encrypted_heap` | ⚠️ `ERROR` by default | Not encrypted AMs; rejected unless `pg_vault_tde.allow_plaintext_index = on` (then allowed with `WARNING`) |
 | Column-level encryption | 🔜 v1.8 | Per-column `ENABLE COLUMN ENCRYPTION` DDL |
 
 ---
@@ -1045,6 +1073,101 @@ See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
    as if it were plaintext. This is disabled via `amcanbuildparallel = false` on
    `tde_btree`.
 
+9. **Only `tde_btree` is an encrypted index AM** (→ v1.8 for GIN/Hash/GiST): `CREATE
+   INDEX`/`CREATE UNIQUE INDEX USING gin/gist/hash/brin/btree` against an
+   `encrypted_heap` table is rejected with `ERROR` by default, because none of those
+   access methods encrypt the key they store — only `tde_btree` (AES-256-SIV) does.
+   Set `pg_vault_tde.allow_plaintext_index = on` to allow it anyway (with a
+   `WARNING`) when you need trigram/full-text/spatial search or a plain range-scan
+   index on an encrypted table and have accepted that the indexed values will sit in
+   plaintext on disk in that one index. This has caught out users trying to build a
+   `PRIMARY KEY`/`UNIQUE` index as two separate steps (`CREATE UNIQUE INDEX ... USING
+   btree` then `ALTER TABLE ... ADD CONSTRAINT ... USING INDEX`, the pattern used with
+   `CREATE INDEX CONCURRENTLY`): the first statement fails outright, so the table ends
+   up with **no index at all** — not a broken one — and duplicate inserts go through
+   unblocked simply because there is nothing left to enforce them. `PRIMARY
+   KEY`/`UNIQUE` declared as a normal table constraint (inline in `CREATE TABLE`, or
+   `ALTER TABLE ... ADD CONSTRAINT ... PRIMARY KEY (col)` without `USING INDEX`) is
+   unaffected by this setting and always works — PostgreSQL core forces those onto a
+   native btree index regardless, so pg_vault_tde can only warn about it, never block
+   it.
+
+
+---
+
+## Releasing to PGXN
+
+pg_vault_tde's distribution metadata lives in [META.json](META.json)
+(mandatory for [PGXN](https://pgxn.org/), the PostgreSQL Extension Network)
+and [Changes](Changes) (release history). This section is for maintainers
+cutting a new release, not for end users installing the extension — see
+"1. Install" above or [wiki: Installation](https://github.com/miriade/pg_vault_tde/wiki/Installation)
+for that.
+
+### One-time setup
+
+Register a PGXN Manager account at
+<https://manager.pgxn.org/account/register> if you don't already have one.
+No API token/CLI upload path is offered by PGXN Manager — every release is
+uploaded by hand through its web UI.
+
+### Every release
+
+1. **Bump the version in lockstep**, in three places that must agree:
+   - `pg_vault_tde.control` → `default_version = 'X.Y'` — PostgreSQL's own
+     extension version, tied 1:1 to the `sql/pg_vault_tde--X.Y.sql` filename
+     and to `extversion` in `pg_extension`. Stays 2-part; nothing outside
+     PostgreSQL reads this file, so it does not need to follow semver.
+   - `VERSION` and `META.json` (top-level `"version"` **and**
+     `provides.pg_vault_tde.version`) → `X.Y.0` — PGXN requires a 3-part
+     semantic version (`https://pgxn.org/spec/` — "three-part dotted
+     integers, such as `1.2.0`"). `VERSION` is also compiled into the
+     extension itself (the Makefile embeds its content as
+     `-DPG_VAULT_TDE_BUILD_VERSION`, returned by
+     `pg_vault_tde_build_version()` / the `build_version` column of
+     `pg_vault_tde_health_check()`) — it distinguishes binary builds that
+     share the same `extversion` (e.g. a C-only bugfix with no SQL script
+     change), so it must always mirror `META.json`'s `"version"` exactly,
+     and a plain `make` after bumping it needs a preceding `make clean` for
+     the new string to actually take effect (CFLAGS changes alone don't
+     invalidate already-built `.o` files).
+     Both map 1:1 to the control file's `X.Y` with a trailing `.0`.
+   - Add the corresponding `sql/pg_vault_tde--X.Y.sql` (and, if upgrading an
+     already-installed extension in place, an
+     `sql/pg_vault_tde--<old>--X.Y.sql` migration script) and point
+     `META.json`'s `provides.pg_vault_tde.file` at the new SQL file.
+2. **Add an entry to [Changes](Changes)** for the new version.
+3. **Build and smoke-test the exact bundle PGXN will receive**:
+   ```bash
+   make dist                       # → dist/pg_vault_tde-X.Y.zip (git archive of HEAD;
+                                    #   commit the version bump first, or it won't be in the zip)
+   cd /tmp && unzip -o /path/to/dist/pg_vault_tde-X.Y.zip && cd pg_vault_tde-X.Y
+
+   # PGXN's own build/test recipe — must pass before uploading:
+   make USE_PGXS=1
+   make USE_PGXS=1 install
+   make USE_PGXS=1 installcheck PGDATABASE=postgres   # needs a running server with
+                                                       # shared_preload_libraries=pg_vault_tde;
+                                                       # see ci/scripts/run-regress.sh /
+                                                       # run-isolation.sh for the required GUCs
+   ```
+4. **Validate META.json** before uploading (catches schema mistakes PGXN
+   Manager would otherwise reject at upload time):
+   ```bash
+   pip install pgxnclient
+   pgxn validate-meta META.json   # or: validate_pgxn_meta META.json, if you have
+                                   # the Perl PGXN::Meta::Validator tooling installed
+   ```
+5. **Upload**: log in at <https://manager.pgxn.org/>, click "Upload" in the
+   side navigation, and submit `dist/pg_vault_tde-X.Y.zip`. PGXN Manager
+   parses `META.json` from the zip, so double-check the version inside the
+   zip matches what you intend to release before submitting — once a
+   version is published it cannot be re-uploaded under the same number.
+6. **Tag the release** in git (`git tag vX.Y && git push --tags`) — this
+   repo currently has only a `v1.6` tag; `default_version` in the control
+   file had already moved on to later versions in-tree before being tagged,
+   so don't assume the control file version and the latest git tag are the
+   same thing when preparing a release.
 
 ---
 

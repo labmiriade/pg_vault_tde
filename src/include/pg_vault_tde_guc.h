@@ -236,6 +236,20 @@ extern char       *pg_vault_tde_pkcs11_pin_env;
  */
 extern char       *pg_vault_tde_pkcs11_key_label;
 
+/*
+ * Opt-in relaxation of the encrypted_heap index AM whitelist (PGC_SUSET,
+ * default false).  When false (default), CREATE INDEX / CREATE UNIQUE INDEX
+ * with a non-whitelisted access method (i.e. anything other than tde_btree)
+ * on an encrypted_heap table is rejected with ERROR, because the indexed
+ * column's plaintext value would be stored unencrypted on disk.  When true,
+ * the same statement is allowed to proceed after emitting a WARNING.  Does
+ * NOT affect PRIMARY KEY / UNIQUE table constraints, which PostgreSQL core
+ * always backs with a native (unencrypted) btree index regardless of this
+ * setting — that case already always warns-and-allows (see
+ * tde_process_utility_hook).
+ */
+extern bool        pg_vault_tde_allow_plaintext_index;
+
 extern char*       pg_vault_tde_extension_name;
 
 #endif /* PG_VAULT_TDE_GUC_H */

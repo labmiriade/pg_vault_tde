@@ -65,12 +65,31 @@ DATA = sql/pg_vault_tde--1.7.sql
 # pg_regress test targets (filenames without .sql suffix)
 REGRESS = pg_vault_tde_init
 
-# Isolation test specs
-ISOLATION = dek_rotation
-ISOLATION_OPTS = --spec-dir=isolation
+# Isolation test specs (test/isolation/{specs,expected}/per_table_dek_rotation.*)
+ISOLATION = per_table_dek_rotation
+ISOLATION_OPTS = --inputdir=test/isolation
 
 PGXS        := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+
+TDE_BUILD_VERSION := $(shell cat VERSION)
+
+# ---------------------------------------------------------------------------
+# dist: build a PGXN-ready release zip (dist/pg_vault_tde-<version>.zip) from
+# the current git HEAD. Requires META.json's "version" and the .control
+# file's "default_version" to have been bumped together beforehand.
+# See README.md § "Releasing to PGXN" for the full upload procedure.
+# Lands in dist/ alongside the packaging/ .deb+.rpm build output — both are
+# git-ignored release artifacts, never committed.
+# ---------------------------------------------------------------------------
+EXTVERSION := $(shell grep default_version $(EXTENSION).control | \
+                sed -e "s/default_version[[:space:]]*=[[:space:]]*'\([^']*\)'/\1/")
+
+.PHONY: dist
+dist:
+	mkdir -p dist
+	git archive --format zip --prefix=$(EXTENSION)-$(EXTVERSION)/ \
+	    --output ./dist/$(EXTENSION)-$(EXTVERSION).zip HEAD
 
 # Extra compiler/linker flags — must come AFTER include $(PGXS) so they
 # append to PGXS defaults rather than being overwritten by them.
@@ -78,11 +97,17 @@ include $(PGXS)
 # OpenSSL 3.x and libcurl are required. pkg-config locates them.
 # -std=c99 enforces the language standard mandated by copilot-instructions.md.
 # -Wall -Wextra catch common PostgreSQL extension pitfalls early.
+# VERSION must be a single line with no trailing content; note that changing
+# VERSION does not force a rebuild of already-compiled .o files under plain
+# incremental `make` — a `make clean` is needed after bumping VERSION for the
+# embedded build-version string to update (accepted limitation, not solved
+# via fancier Make dependency tracking).
 override CFLAGS  += -Wall -Wextra -std=c99 \
                     -Wno-unused-parameter \
                     -I$(srcdir)/src \
                     $(TDE_OPT_CFLAGS) \
-                    $(shell pkg-config --cflags openssl libcurl)
+                    $(shell pkg-config --cflags openssl libcurl) \
+                    -DPG_VAULT_TDE_BUILD_VERSION='"$(TDE_BUILD_VERSION)"'
 # -ldl: dlopen() of the vendor PKCS#11 module (pkcs11 KMS provider).
 # No-op on glibc >= 2.34 (dlopen lives in libc) but required for portability.
 override SHLIB_LINK += $(shell pkg-config --libs openssl libcurl) -ldl

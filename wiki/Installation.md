@@ -91,6 +91,32 @@ OpenSSL on this same build — see
 > This directory must **not** live inside `PGDATA` — see
 > [Security Considerations](Security-Considerations).
 
+## Option C — Install via PGXN
+
+pg_vault_tde is distributed on the
+[PostgreSQL Extension Network](https://pgxn.org/) (PGXN). This is
+essentially a source build (Option B) driven for you by the PGXN client, so
+the same OS packages (`postgresql-server-dev-<ver>`, `libssl-dev`,
+`libcurl4-openssl-dev`, `pkg-config` / their RHEL equivalents) must already
+be installed.
+
+```bash
+# Install the client once, if you don't already have it
+pip install pgxnclient    # or: apt-get install pgxnclient / dnf install pgxnclient
+
+pgxn install pg_vault_tde
+pgxn load    pg_vault_tde -d yourdatabase   # runs CREATE EXTENSION
+```
+
+`pgxn install` downloads the latest release from PGXN, then runs
+`make USE_PGXS=1 && make USE_PGXS=1 install` against whichever `pg_config`
+is first on `PATH` — pass `--pg_config /path/to/pg_config` explicitly if you
+need to target a specific PostgreSQL 17/18 install. `pgxn load` only runs
+`CREATE EXTENSION`; you still need to add `pg_vault_tde` to
+`shared_preload_libraries` and restart PostgreSQL yourself (below) before
+`CREATE EXTENSION` will succeed — `pgxn load` does not edit
+`postgresql.conf`.
+
 ## Load and Enable the Extension
 
 1. Add to `postgresql.conf`:

@@ -97,6 +97,91 @@ encryption wrappers, so a parallel worker would read raw ciphertext as if it
 were plaintext. Index builds and `REINDEX` always run single-process on
 `tde_btree`.
 
+## Index Access Method Whitelist
+
+`tde_btree` is, today, the **only** index access method that encrypts the
+key it stores. Because of that, `CREATE INDEX` / `CREATE UNIQUE INDEX` with
+any other access method — `btree`, `gin`, `gist`, `hash`, `brin` — against an
+`encrypted_heap` table is rejected outright:
+
+```sql
+CREATE TABLE docs (id int, body text) USING encrypted_heap;
+
+CREATE INDEX ON docs USING gin (body gin_trgm_ops);
+-- ERROR:  pg_vault_tde: index access method "gin" is not supported on
+--         encrypted_heap table "docs"
+-- HINT:   Use "CREATE INDEX ... USING tde_btree" with an encrypted operator
+--         class instead, or set pg_vault_tde.allow_plaintext_index = on to
+--         allow this with a WARNING.
+```
+
+This is a whitelist, not a `tde_btree`-specific carve-out — it blocks GIN
+trigram/full-text indexes and GiST indexes exactly the same way it blocks a
+plain `btree` index, because none of them have an encrypted variant yet
+(GIN/Hash/GiST encryption is planned for v1.8 — see [Known Limitations and
+Troubleshooting](Known-Limitations-and-Troubleshooting)).
+
+### Escape Hatch: `pg_vault_tde.allow_plaintext_index`
+
+If you need trigram search, full-text search, a spatial GiST index, or a
+plain range-scanning index on an `encrypted_heap` table today, set:
+
+```sql
+SET pg_vault_tde.allow_plaintext_index = on;   -- default: off
+CREATE INDEX ON docs USING gin (body gin_trgm_ops);
+-- WARNING:  pg_vault_tde: index access method "gin" on encrypted_heap
+--           table "docs" is not encrypted
+-- DETAIL:   The indexed column's plaintext value will be stored on disk
+--           in this index.
+```
+
+The index is created and works exactly like a normal PostgreSQL index —
+`gin_trgm_ops`, `gist_trgm_ops`, `hash`, `brin` and plain `btree` all build
+and scan correctly against the decrypted values the TAM hands the index AM
+during the build/insert path. The trade-off is exactly what the `WARNING`
+says: whatever that access method stores internally (trigrams, tsvector
+lexemes, raw keys, block min/max…) is **plaintext on disk**, unlike
+`tde_btree`'s AES-256-SIV ciphertext. Prefer `tde_btree` for anything
+security-sensitive; reach for this GUC only for non-sensitive columns, or
+as a stop-gap until v1.8 ships encrypted GIN/Hash/GiST.
+
+`allow_plaintext_index` has **no effect** on `PRIMARY KEY`/`UNIQUE` table
+constraints (inline in `CREATE TABLE`, or `ALTER TABLE ... ADD CONSTRAINT
+... PRIMARY KEY`/`UNIQUE` without `USING INDEX`) — those are always allowed
+with a `WARNING` regardless of this setting, because PostgreSQL core always
+backs a declarative constraint with a native btree index and gives
+pg_vault_tde no way to block that. See the next section.
+
+### `PRIMARY KEY` / `UNIQUE` Constraints Always Work — With a Caveat
+
+```sql
+CREATE TABLE accounts (id int PRIMARY KEY, balance numeric) USING encrypted_heap;
+-- WARNING:  pg_vault_tde: the constraints on column "id" of encrypted_heap
+--           table "accounts" will be backed by a standard (unencrypted)
+--           btree index
+```
+
+Both spellings — inline in `CREATE TABLE`, and `ALTER TABLE ... ADD
+CONSTRAINT ... PRIMARY KEY (col)` / `... UNIQUE (col)` added after the fact —
+emit this `WARNING` and then work exactly like on a plain heap table:
+duplicate inserts are rejected, the index stays in sync, `ON CONFLICT`
+works. The `id` column's value sits in plaintext in that one btree index;
+everything else about the row is still encrypted.
+
+**What does *not* work this way**: building the unique index as two separate
+steps — `CREATE UNIQUE INDEX ... USING btree (id)` followed by `ALTER TABLE
+... ADD CONSTRAINT ... PRIMARY KEY USING INDEX <name>` (the pattern most
+tools use for `CREATE INDEX CONCURRENTLY`-based, low-lock PK creation). The
+first statement is a standalone `CREATE INDEX`, not a constraint, so it hits
+the whitelist above and is rejected — and because it never created anything,
+the second statement then fails too (`index "..." does not exist`). If
+either failure goes unnoticed (non-interactive script, no `ON_ERROR_STOP`),
+the table ends up with **no index and no constraint at all**, and duplicate
+`INSERT`s go through silently — not because indexes "aren't updated", but
+because there is no index to update. Either build the index with `USING
+tde_btree` instead, or set `pg_vault_tde.allow_plaintext_index = on` before
+the `CREATE UNIQUE INDEX ... USING btree` step so it actually succeeds.
+
 ## Compatibility Matrix
 
 | Feature | Status | Notes |
@@ -120,7 +205,7 @@ were plaintext. Index builds and `REINDEX` always run single-process on
 | Range scans on `tde_btree` | ⚠️ By design, empty results | Use sequential scan, or a plain (unencrypted) index if range queries are required on that column |
 | HOT **updates** | ⚠️ Disabled by design | See below |
 | Column-level encryption | 🔜 Planned (v1.8) | Currently all-or-nothing per table |
-| GIN / Hash / GiST index encryption | 🔜 Planned (v1.8) | Only `tde_btree` exists today |
+| GIN / Hash / GiST index encryption | 🔜 Planned (v1.8) | Only `tde_btree` exists today; a plaintext GIN/GiST/Hash/BRIN/btree index is available meanwhile via `allow_plaintext_index = on` |
 
 ### Why HOT Updates Are Disabled
 
