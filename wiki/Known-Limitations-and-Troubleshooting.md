@@ -14,6 +14,7 @@
 | 8 | **BRIN on encrypted columns** — min/max of AES-SIV ciphertext is meaningless | By design, permanent |
 | 9 | **`WITH HOLD` cursor temp-file spill is unencrypted** | Permanently deferred — see below |
 | 10 | **PKCS#11 provider unsupported by `pg_dump_tde`/`pg_restore_tde`** | Planned; use `pg_basebackup_tde` meanwhile |
+| 11 | **`CREATE INDEX USING <non-tde_btree>` on `encrypted_heap` is rejected by default** — `btree`, `gin`, `gist`, `hash`, `brin` all store the key unencrypted | Escape hatch: `pg_vault_tde.allow_plaintext_index = on` (see below); real encryption planned (v1.8, item 5) |
 
 ### `WITH HOLD` Cursor Plaintext Spill — Read Before Relying on Held Cursors
 
@@ -92,6 +93,37 @@ If the target uses a different local wallet (or the source database — and
 therefore its wallet — was dropped), restore cannot succeed without the
 original KEK. See the "Current Limitations" section of
 [Backup and Restore](Backup-and-Restore).
+
+### A `PRIMARY KEY`/`UNIQUE` index seems to silently not exist — duplicate rows go in with no error
+
+This happens when the unique index was built as two separate steps:
+`CREATE UNIQUE INDEX ... USING btree (col)` followed by `ALTER TABLE ... ADD
+CONSTRAINT ... PRIMARY KEY USING INDEX <name>` — the pattern most migration
+tools and `CREATE INDEX CONCURRENTLY` workflows use to avoid a long-held
+lock. The first statement is a standalone `CREATE INDEX`, not a table
+constraint, so it hits the index-AM whitelist (limitation #11 above) and is
+rejected with `ERROR: index access method "btree" is not supported on
+encrypted_heap table ...`. Because it created nothing, the second statement
+then fails too (`index "..." does not exist`). If either error scrolled past
+unnoticed — a non-interactive script without `ON_ERROR_STOP`, a migration
+runner that doesn't halt on error — the table is left with **no index and
+no constraint at all**, and every subsequent `INSERT` of a "duplicate" key
+succeeds, simply because there is nothing left to reject it. This is not a
+write-path/TAM bug: the table access method's `INSERT`/`UPDATE`/`DELETE`
+callbacks were never involved, because there was never an index for them to
+maintain.
+
+**Fix:** confirm the index actually exists (`\d tablename`, or `SELECT *
+FROM pg_indexes WHERE tablename = '...'`) before trusting the constraint.
+To build it correctly, either use `CREATE UNIQUE INDEX ... USING tde_btree`
+instead of `btree`, or set `pg_vault_tde.allow_plaintext_index = on` before
+the `CREATE UNIQUE INDEX ... USING btree` step so it actually succeeds (see
+[Encrypted Tables and Indexes](Encrypted-Tables-and-Indexes)). A `PRIMARY
+KEY`/`UNIQUE` declared directly as a table constraint — inline in `CREATE
+TABLE`, or `ALTER TABLE ... ADD CONSTRAINT ... PRIMARY KEY (col)` without
+`USING INDEX` — does not have this failure mode: PostgreSQL core always
+backs it with a real, working native btree index, and pg_vault_tde only
+emits a `WARNING` about the plaintext exposure, never blocks it.
 
 ### An index still shows up in `pg_vault_tde_check_plaintext_index_keys()`
 

@@ -1,0 +1,57 @@
+{
+   "name": "pg_vault_tde",
+   "abstract": "Transparent Data Encryption (TDE) for PostgreSQL via a custom Table Access Method",
+   "description": "pg_vault_tde encrypts every tuple with AES-256-GCM at the Table Access Method layer (encrypted_heap), transparently to applications: data is encrypted before it reaches the storage manager and decrypted after it leaves. An optional encrypted B-Tree index access method (tde_btree, AES-256-SIV) supports equality lookups on encrypted columns without exposing plaintext key values. Encryption keys are managed by HashiCorp Vault / OpenBao, a PKCS#11 / HSM token, or a local PKCS#12 wallet, and are cached in shared memory with support for online rotation.",
+   "version": "1.7.0",
+   "maintainer": [
+      "Miriade S.r.l. <supportodb@miriade.it>"
+   ],
+   "license": "postgresql",
+   "provides": {
+      "pg_vault_tde": {
+         "abstract": "Transparent Data Encryption (TDE) for PostgreSQL via a custom Table Access Method",
+         "file": "sql/pg_vault_tde--1.7.sql",
+         "docfile": "doc/pg_vault_tde.md",
+         "version": "1.7.0"
+      }
+   },
+   "prereqs": {
+      "runtime": {
+         "requires": {
+            "PostgreSQL": "17.0.0"
+         }
+      }
+   },
+   "resources": {
+      "homepage": "https://www.miriade.it/en/products/pg-vault-tde-it",
+      "bugtracker": {
+         "web": "https://github.com/labmiriade/pg_vault_tde/issues"
+      },
+      "repository": {
+         "url": "https://github.com/labmiriade/pg_vault_tde.git",
+         "web": "https://github.com/labmiriade/pg_vault_tde",
+         "type": "git"
+      }
+   },
+   "generated_by": "Matteo Durighetto",
+   "meta-spec": {
+      "version": "1.0.0",
+      "url": "https://pgxn.org/meta/spec.txt"
+   },
+   "tags": [
+      "encryption",
+      "tde",
+      "transparent data encryption",
+      "aes",
+      "aes-256-gcm",
+      "security",
+      "table access method",
+      "encrypted_heap",
+      "kms",
+      "vault",
+      "hsm",
+      "pkcs11",
+      "pkcs12"
+   ],
+   "release_status": "stable"
+}
