@@ -13,6 +13,7 @@
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h" /* object_access_hook, OAT_POST_CREATE */
 #include "catalog/pg_class.h"     /* RelationRelationId, Form_pg_class, ClassOidIndexId */
+#include "catalog/pg_inherits.h"  /* find_all_inheritors */
 #include "utils/fmgroids.h"     /* F_OIDEQ */
 #include "utils/snapmgr.h"      /* SnapshotSelf */
 #include "commands/defrem.h"
@@ -29,6 +30,13 @@
 #include "utils/builtins.h"
 #include "access/table.h"
 #include "commands/extension.h"
+#if PG_VERSION_NUM < 180000
+#include "executor/executor.h"   /* ExecutorStart_hook, standard_ExecutorStart */
+#include "nodes/plannodes.h"     /* ModifyTable, arbiterIndexes */
+#include "access/genam.h"        /* index_open, index_close */
+#include "catalog/pg_am_d.h"     /* BTREE_AM_OID */
+#include "parser/parsetree.h"    /* rt_fetch */
+#endif
 
 #include "src/include/pg_vault_tde_kms.h"
 #include "src/include/pg_vault_tde_tam.h"
@@ -37,6 +45,8 @@
 #include "src/include/pg_vault_tde_hw_accel.h"
 #include "src/include/pg_vault_tde_guc.h"
 #include "src/include/pg_vault_tde_catalog.h"
+#include "src/include/pg_vault_tde_audit.h"
+#include "src/include/pg_vault_tde_rmgr.h"
 #include "src/kms/pg_vault_tde_kms_provider.h"
 
 #ifdef PG_MODULE_MAGIC
@@ -70,12 +80,13 @@ char *pg_vault_tde_extension_name       = "pg_vault_tde";
 /* -----------------------------------------------------------------------
  * v1.5 GUC definitions
  * ----------------------------------------------------------------------- */
-char *pg_vault_tde_kms_provider           = NULL; /* "vault" | "local" */
+char *pg_vault_tde_kms_provider           = NULL; /* "vault" | "local" | "pkcs11" */
 char *pg_vault_tde_wallet_path            = NULL; /* path to wallet.p12 */
 char *pg_vault_tde_wallet_passphrase_env  = NULL; /* env var NAME */
 bool  pg_vault_tde_wallet_auto_open       = true;
 int   pg_vault_tde_max_encrypted_relations = 1024;
 bool  pg_vault_tde_toast_encryption       = true;
+bool  pg_vault_tde_toast_custom_rmgr      = false;  /* gated off by default */
 
 /* -----------------------------------------------------------------------
  * v1.6 GUC definitions — flexible passphrase ingestion
@@ -85,6 +96,21 @@ char *pg_vault_tde_wallet_passphrase_command = NULL; /* shell command → passph
 char *pg_vault_tde_wallet_dev_mode_passphrase = NULL;/* dev-mode only; never prod */
 bool  pg_vault_tde_dev_mode                  = false;/* enables dev conveniences */
 
+/* -----------------------------------------------------------------------
+ * v1.7 GUC definitions — PKCS#11 / HSM provider
+ * ----------------------------------------------------------------------- */
+char *pg_vault_tde_pkcs11_library     = NULL; /* path to vendor PKCS#11 module */
+char *pg_vault_tde_pkcs11_token_label = NULL; /* token label for slot discovery */
+int   pg_vault_tde_pkcs11_slot_id     = -1;   /* used when token_label empty; -1 = unset */
+char *pg_vault_tde_pkcs11_pin_env     = NULL; /* env var NAME holding the user PIN */
+char *pg_vault_tde_pkcs11_key_label   = NULL; /* CKA_LABEL of the KEK on the token */
+
+/*
+ * allow_plaintext_index — opt-in relaxation of the encrypted_heap index AM
+ * whitelist (v1.7). See tde_is_safe_index_am() below.
+ */
+bool  pg_vault_tde_allow_plaintext_index = false;
+
 /*
  * tde_active_kms_provider — selected KMS backend (set in _PG_init).
  * All callers that need KMS operations go through this pointer.
@@ -92,24 +118,48 @@ bool  pg_vault_tde_dev_mode                  = false;/* enables dev conveniences
  */
 const TdeKmsProvider *tde_active_kms_provider = NULL;
 
+/*
+ * tde_shmem_started — true after pg_vault_tde_shmem_startup() completes.
+ *
+ * Used by the kms_provider GUC assign hook to decide whether it is safe to
+ * call provider->init() immediately (shmem is ready) or defer until the
+ * shmem_startup_hook runs (postmaster pre-shmem phase).
+ *
+ * This is a plain static (process-local); each backend inherits the true value
+ * from the postmaster after it has been forked post-startup.
+ */
+static bool tde_shmem_started = false;
+
 /* Hook chain pointers — we save the previous hook so we compose correctly. */
 static shmem_request_hook_type    prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type    prev_shmem_startup_hook = NULL;
 static ProcessUtility_hook_type   prev_process_utility_hook = NULL;
 static object_access_hook_type    prev_object_access_hook = NULL;
+#if PG_VERSION_NUM < 180000
+static ExecutorStart_hook_type    prev_executor_start_hook = NULL;
+#endif
+
+/* Audit hook — NULL unless an external audit module installs one. */
+tde_audit_hook audit_hook_ptr = NULL;
+
 /*
  * tde_backend_cleanup -- on_proc_exit callback.
  *
  * Frees per-backend EVP_CIPHER_CTX objects, wipes the IV batch buffer, and
  * frees the IAM SIV contexts.  Runs for every backend exit (normal,
- * SIGTERM, etc.) via the proc_exit() callback chain.
+ * SIGTERM, etc.) via the proc_exit() callback chain.  Also gives the active
+ * KMS provider a chance for orderly per-backend teardown (e.g. the pkcs11
+ * provider logs out and finalizes Cryptoki).
  */
 static void
 tde_backend_cleanup(int code, Datum arg)
 {
+    tde_audit(AUDIT_LOG_STOP, NULL, true);
     tde_crypto_ctx_cleanup();
-    tde_iam_siv_ctx_cleanup();
+    tde_iam_ctx_cleanup();
     tde_hw_accel_cleanup();
+    if (tde_active_kms_provider)
+        tde_active_kms_provider->shutdown();
 }
 
 PG_FUNCTION_INFO_V1(pg_vault_tde_tableam_handler);
@@ -127,7 +177,110 @@ pg_vault_tde_iam_handler(PG_FUNCTION_ARGS)
     PG_RETURN_POINTER(pg_vault_tde_get_iam_routine());
 }
 
+#ifndef PG_VAULT_TDE_BUILD_VERSION
+#define PG_VAULT_TDE_BUILD_VERSION "unknown"
+#endif
+
+/*
+ * pg_vault_tde_build_version
+ *
+ * Returns the compiled-in build version (from the top-level VERSION file,
+ * baked in via -DPG_VAULT_TDE_BUILD_VERSION at build time), independent of
+ * pg_extension.extversion. extversion only changes when the installed SQL
+ * script changes; this reports which actual binary build of pg_vault_tde.so
+ * is loaded, so a C-only bugfix release (no SQL/catalog change) is still
+ * distinguishable from the original build that shipped the same extversion.
+ */
+PG_FUNCTION_INFO_V1(pg_vault_tde_build_version);
+PGDLLEXPORT Datum
+pg_vault_tde_build_version(PG_FUNCTION_ARGS)
+{
+    PG_RETURN_TEXT_P(cstring_to_text(PG_VAULT_TDE_BUILD_VERSION));
+}
+
 void _PG_init(void);
+
+/*
+ * tde_kms_provider_check — GUC check hook for pg_vault_tde.kms_provider.
+ *
+ * Runs BEFORE tde_kms_provider_assign, on every SET / ALTER DATABASE SET /
+ * postgresql.conf load.  Rejects any value that is not one of the known
+ * provider names (or the empty string, meaning "not yet configured") so a
+ * typo is reported as a GUC error instead of silently degrading
+ * tde_active_kms_provider to NULL.
+ */
+
+static bool
+tde_kms_provider_check(char **newval, void **extra, GucSource source)
+{
+    if ((*newval)[0] == '\0')
+        return true;                       /* unset is valid */
+    
+    if (strcmp(*newval,"vault") == 0   ||
+        strcmp(*newval,"pkcs11") == 0  ||
+        strcmp(*newval,"local") == 0  ) 
+        return true;                      /* vault,pkcs11 and local are valid */
+
+    GUC_check_errdetail("Valid values are \"vault\", \"local\", \"pkcs11\", or the empty string.");
+    return false;
+}       
+/*
+ * tde_kms_provider_assign — GUC assign hook for pg_vault_tde.kms_provider.
+ *
+ * Fires whenever the GUC changes value: during postgresql.conf processing at
+ * postmaster startup, when per-database settings from ALTER DATABASE SET are
+ * applied at backend connect time (inside InitPostgres), and on SET inside a
+ * session.
+ *
+ * The hook updates tde_active_kms_provider to the new provider vtable.  If
+ * shmem is already ready (tde_shmem_started == true) it also calls init() so
+ * the provider can open its wallet / restore its DEK.  In the postmaster
+ * pre-shmem phase tde_shmem_started is false, so init() is deferred until
+ * pg_vault_tde_shmem_startup().
+ *
+ * This is the ONLY place that sets tde_active_kms_provider; the previous
+ * assignment block in pg_vault_tde_shmem_startup() has been removed.
+ */
+static void
+tde_kms_provider_assign(const char *newval, void *extra)
+{
+    const TdeKmsProvider *new_provider = NULL;
+
+    if (newval == NULL || newval[0] == '\0')
+    {
+        /* Empty/unset: clear the pointer, leave init for later */
+        tde_active_kms_provider = NULL;
+        return;
+    }
+
+    if (strcmp(newval, "local") == 0)
+        new_provider = pg_vault_tde_kms_local_provider();
+    else if (strcmp(newval, "vault") == 0)
+        new_provider = pg_vault_tde_kms_vault_provider();
+    else if (strcmp(newval, "pkcs11") == 0)
+        new_provider = pg_vault_tde_kms_pkcs11_provider();
+    else
+    {
+        /*
+        * Unreachable in practice: tde_kms_provider_check() validates newval
+        * before this hook ever runs.  Kept as a defensive fallback.
+        */
+        tde_active_kms_provider = NULL;
+        return;
+    }
+
+    tde_active_kms_provider = new_provider;
+
+    /*
+     * Call init() only once shmem is available.  In the postmaster config-load
+     * phase tde_shmem_started is still false; init() will be called from
+     * pg_vault_tde_shmem_startup() instead.  In a backend (after fork) shmem
+     * is already attached, so we can initialise immediately — this is the path
+     * that makes ALTER DATABASE SET pg_vault_tde.kms_provider work.
+     */
+    if (tde_shmem_started && new_provider->init)
+        (void) new_provider->init();
+}
 
 /*
  * tde_get_tableam_name_for_rel
@@ -144,6 +297,120 @@ tde_get_tableam_name_for_create(CreateStmt *create_stmt)
     if (create_stmt->accessMethod != NULL)
         return create_stmt->accessMethod;
     return NULL;
+}
+
+
+/*
+ * tde_safe_index_ams / tde_is_safe_index_am
+ *
+ * Whitelist of index access methods considered safe on encrypted_heap
+ * tables (i.e. access methods that guarantee the indexed value is stored
+ * encrypted on disk). We deliberately use a whitelist rather than a
+ * blacklist of "unsafe" AMs: an unknown/future access method (from core
+ * PostgreSQL or another extension) must be rejected by default, not
+ * silently allowed because we forgot to blacklist it. Extend this array
+ * when the extension gains additional encrypting index AMs (e.g. a
+ * future tde_gin).
+ */
+
+static const char *tde_safe_index_ams[] = {
+    "tde_btree", 
+    NULL
+};
+
+static bool
+tde_is_safe_index_am(const char *am_name)
+{
+    int i;
+    for(i = 0; tde_safe_index_ams[i] != NULL; i++)
+    {
+        if(strcmp(tde_safe_index_ams[i], am_name) == 0)
+            return true;
+    }
+    return false;
+}
+
+/*
+ * tde_rel_or_inheritors_use_encrypted_heap
+ *
+ * True if relid, or any of its inheritors (partitions/children), uses the
+ * encrypted_heap access method.  Shared by the DDL guards that must apply
+ * to a partitioned table regardless of which specific partition ends up
+ * storing the data.
+ */
+static bool
+tde_rel_or_inheritors_use_encrypted_heap(Oid relid)
+{
+    bool  found = false;
+    List *inheritors_oids = find_all_inheritors(relid, NoLock, NULL);
+
+    foreach_oid(irid, inheritors_oids)
+    {
+        Relation irel = try_relation_open(irid, NoLock);
+        if (irel != NULL)
+        {
+            if (OidIsValid(irel->rd_rel->relam) &&
+                strcmp(get_am_name(irel->rd_rel->relam), "encrypted_heap") == 0)
+            {
+                found = true;
+                relation_close(irel, NoLock);
+                break;
+            }
+            relation_close(irel, NoLock);
+        }
+    }
+    return found;
+}
+
+/*
+ * tde_warn_plaintext_constraint_columns
+ *
+ * Emits the "will be backed by a standard (unencrypted) btree index"
+ * WARNING for a list of column-name String nodes on an encrypted_heap
+ * table.  Shared by the CREATE TABLE (inline PRIMARY KEY/UNIQUE) and
+ * ALTER TABLE ADD CONSTRAINT paths: PostgreSQL core always backs a
+ * declarative PRIMARY KEY/UNIQUE constraint with a native btree index, so
+ * this case can only ever be warned about, never blocked (unlike a
+ * standalone CREATE INDEX, see tde_is_safe_index_am()).
+ */
+static void
+tde_warn_plaintext_constraint_columns(List *offending_cols, const char *relname)
+{
+    StringInfoData buf;
+    ListCell *lc1;
+    bool first = true;
+
+    if (offending_cols == NIL)
+        return;
+
+    initStringInfo(&buf);
+    foreach(lc1, offending_cols)
+    {
+        char* colname = strVal(lfirst_node(String, lc1));
+        if(!first)
+            appendStringInfoString(&buf, _(", "));
+        first = false;
+        appendStringInfo(&buf, _("\"%s\""), colname);
+    }
+
+    ereport(WARNING,
+            (errmsg_plural("pg_vault_tde: the constraints on column %s "
+                    "of encrypted_heap table \"%s\" will be backed "
+                    "by a standard (unencrypted) btree index",
+                    "pg_vault_tde: the constraints on columns %s "
+                    "of encrypted_heap table \"%s\" will be backed "
+                    "by a standard (unencrypted) btree index",
+                    list_length(offending_cols),
+                    buf.data, relname),
+            errdetail("PostgreSQL requires PRIMARY KEY/UNIQUE constraints "
+                      "to use the native btree access methods; the indexed "
+                      "column's plaintext value will be stored on disk in the index."),
+            errhint("Consider a surrogate non-sensitive key, or enforce "
+                    "uniqueness separately with "
+                    "\"CREATE UNIQUE INDEX ... USING tde_btree\".")
+            )
+    );
+    pfree(buf.data);
 }
 
 /*
@@ -223,12 +490,15 @@ tde_object_access_hook(ObjectAccessType access, Oid classId, Oid objectId,
 
     table_close(rel, NoLock);
 
-    /* Only handle plain heap tables; skip TOAST, indexes, sequences, etc. */
-    if (relkind != RELKIND_RELATION || !OidIsValid(relam))
+    /* Only handle plain heap and index tables; skip TOAST, sequences, etc. */
+    if ((relkind != RELKIND_RELATION && relkind != RELKIND_INDEX))
+        return;
+
+    if(!OidIsValid(relam))
         return;
 
     amname = get_am_name(relam);
-    if (amname == NULL || strcmp(amname, "encrypted_heap") != 0)
+    if (amname == NULL || (strcmp(amname, "encrypted_heap") != 0 && strcmp(amname, "tde_btree") != 0))
         return;
 
     /*
@@ -237,7 +507,7 @@ tde_object_access_hook(ObjectAccessType access, Oid classId, Oid objectId,
      * is idempotent: if the entry already exists it returns immediately
      * without overwriting the existing DEK.
      */
-    pg_vault_tde_catalog_register_rel(objectId, pg_vault_tde_vault_key_name);
+    pg_vault_tde_catalog_register_rel(objectId);
 
     ereport(DEBUG1,
             errmsg("pg_vault_tde: [object_access] registered DEK for new "
@@ -258,6 +528,170 @@ tde_object_access_hook(ObjectAccessType access, Oid classId, Oid objectId,
  * ACCESS METHOD from using encrypted_heap — those paths also trigger TAM
  * callbacks and the catalog is updated lazily on first DEK access.
  */
+#if PG_VERSION_NUM < 180000
+/*
+ * tde_executor_start_hook
+ *
+ * PG17's BuildSpeculativeIndexInfo() (catalog/index.c) hard-asserts
+ * index->rd_rel->relam == BTREE_AM_OID before building unique-check info
+ * for an ON CONFLICT arbiter index — a safety gate PG18 later removed by
+ * generalising the function to any AM (via IndexAmTranslateCompareType).
+ * tde_btree registers its own AM oid, so on PG17 every
+ * INSERT ... ON CONFLICT against a tde_btree unique index fails with
+ * "unexpected non-btree speculative unique index".
+ *
+ * BuildSpeculativeIndexInfo() is NOT called during ExecutorStart: it runs
+ * lazily inside ExecInsert() (nodeModifyTable.c), on the FIRST row of the
+ * query, via ExecOpenIndices(resultRelInfo, speculative) where speculative
+ * is simply (onConflictAction != ONCONFLICT_NONE) — not limited to the
+ * planner-inferred arbiterIndexes, and not limited to ExecutorStart's
+ * window.  ExecOpenIndices calls BuildSpeculativeIndexInfo() for *every*
+ * unique index on the target relation(s) (ii_Unique), so "ON CONFLICT DO
+ * NOTHING" with no explicit conflict target (arbiterIndexes == NIL) still
+ * hits every unique index, and the check fires sometime during
+ * ExecutorRun, not ExecutorStart.
+ *
+ * We therefore impersonate BTREE_AM_OID on every unique tde_btree index of
+ * every result relation starting here, but defer the restore to a
+ * MemoryContextCallback tied to the query's own EState (es_query_cxt),
+ * which is guaranteed to fire once when that context is deleted at
+ * ExecutorEnd (success) or transaction abort (error) — covering the whole
+ * ExecutorRun window during which ExecOpenIndices/BuildSpeculativeIndexInfo
+ * actually executes.  This mirrors the per-backend RelationData swap
+ * pattern already used for rd_tableam in
+ * pg_vault_tde_relation_copy_for_cluster (tam.c), just scoped to a whole
+ * query instead of a single call.  The fields BuildSpeculativeIndexInfo
+ * fills in (ii_UniqueOps/Strats) are derived from rd_opfamily, not from
+ * relam, so the swap has no effect on their correctness — it exists
+ * purely to pass the version-specific gate.  rd_indam (the actual AM
+ * dispatch table used for aminsert) is cached at relcache-build time and
+ * is untouched by this relam poke, so real inserts still route through
+ * our AES-256-SIV tde_btree wrappers, not real btree.
+ */
+typedef struct TdeSpeculativeSwapCtx
+{
+    List   *swapped;    /* open Relation* (AccessShareLock) to restore/close */
+    Oid     real_amoid;   /* tde_btree's real AM oid to restore relam to */
+} TdeSpeculativeSwapCtx;
+
+static void
+tde_restore_speculative_relam(void *arg)
+{
+    TdeSpeculativeSwapCtx *ctx = (TdeSpeculativeSwapCtx *) arg;
+    ListCell *lc;
+
+    foreach(lc, ctx->swapped)
+    {
+        Relation idxrel = (Relation) lfirst(lc);
+
+        idxrel->rd_rel->relam = ctx->real_amoid;
+        index_close(idxrel, AccessShareLock);
+    }
+}
+
+static void
+tde_executor_start_hook(QueryDesc *queryDesc, int eflags)
+{
+    List       * volatile swapped = NIL; /* open Relation* whose relam we swapped */
+    ModifyTable *mt = NULL;
+    volatile Oid tde_btree_amoid = InvalidOid;
+
+    if (queryDesc->plannedstmt->planTree != NULL &&
+        IsA(queryDesc->plannedstmt->planTree, ModifyTable))
+        mt = (ModifyTable *) queryDesc->plannedstmt->planTree;
+
+    if (mt != NULL &&
+        mt->operation == CMD_INSERT &&
+        mt->onConflictAction != ONCONFLICT_NONE)
+    {
+        ListCell *lc_rel;
+
+        tde_btree_amoid = get_index_am_oid("tde_btree", true);
+
+        if (OidIsValid(tde_btree_amoid))
+        {
+            foreach(lc_rel, mt->resultRelations)
+            {
+                Index            rti = lfirst_int(lc_rel);
+                RangeTblEntry   *rte = rt_fetch(rti, queryDesc->plannedstmt->rtable);
+                Relation         heapRel;
+                List            *idxoids;
+                ListCell        *lc_idx;
+
+                heapRel = table_open(rte->relid, AccessShareLock);
+                idxoids = RelationGetIndexList(heapRel);
+
+                foreach(lc_idx, idxoids)
+                {
+                    Oid         idxoid = lfirst_oid(lc_idx);
+                    Relation    idxrel = index_open(idxoid, AccessShareLock);
+
+                    if (idxrel->rd_index->indisunique &&
+                        idxrel->rd_rel->relam == tde_btree_amoid)
+                    {
+                        idxrel->rd_rel->relam = BTREE_AM_OID;
+                        swapped = lappend(swapped, idxrel);
+                    }
+                    else
+                        index_close(idxrel, AccessShareLock);
+                }
+
+                list_free(idxoids);
+                table_close(heapRel, AccessShareLock);
+            }
+        }
+    }
+
+    PG_TRY();
+    {
+        if (prev_executor_start_hook)
+            prev_executor_start_hook(queryDesc, eflags);
+        else
+            standard_ExecutorStart(queryDesc, eflags);
+    }
+    PG_CATCH();
+    {
+        /*
+         * ExecutorStart itself failed before the query ever got an EState
+         * we could hang a deferred callback off of — restore immediately.
+         */
+        ListCell *lc;
+
+        foreach(lc, swapped)
+        {
+            Relation idxrel = (Relation) lfirst(lc);
+
+            idxrel->rd_rel->relam = tde_btree_amoid;
+            index_close(idxrel, AccessShareLock);
+        }
+        list_free(swapped);
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+
+    if (swapped != NIL)
+    {
+        MemoryContext           oldcxt;
+        TdeSpeculativeSwapCtx  *ctx;
+        MemoryContextCallback  *cb;
+
+        oldcxt = MemoryContextSwitchTo(queryDesc->estate->es_query_cxt);
+
+        ctx = palloc(sizeof(TdeSpeculativeSwapCtx));
+        ctx->swapped = list_copy(swapped);
+        ctx->real_amoid = tde_btree_amoid;
+
+        cb = palloc(sizeof(MemoryContextCallback));
+        cb->func = tde_restore_speculative_relam;
+        cb->arg = ctx;
+        MemoryContextRegisterResetCallback(queryDesc->estate->es_query_cxt, cb);
+
+        MemoryContextSwitchTo(oldcxt);
+        list_free(swapped);
+    }
+}
+#endif                          /* PG_VERSION_NUM < 180000 */
+
 static void
 tde_process_utility_hook(PlannedStmt *pstmt,
                          const char *queryString,
@@ -274,6 +708,7 @@ tde_process_utility_hook(PlannedStmt *pstmt,
     bool        alter_tam_into = false; /* converting TO encrypted_heap FROM another TAM */
     List       *drop_encrypted_oids = NIL;  /* OIDs of encrypted tables being dropped */
     List       *evict_only_oids     = NIL;  /* OIDs to evict from shmem only (no catalog row) */
+    List       *alter_pk_offending_cols = NIL; /* ADD CONSTRAINT PK/UNIQUE cols needing the plaintext-btree warning */
 
     /*
      * Pre-processing: determine if this is a CREATE TABLE USING encrypted_heap.
@@ -351,17 +786,107 @@ tde_process_utility_hook(PlannedStmt *pstmt,
             foreach(lc, stmt->cmds) {
                 AlterTableCmd* cmd = lfirst_node(AlterTableCmd, lc);
 
-                if(cmd->subtype == AT_SetAccessMethod) {   
-                    if(strcmp(cmd->name, "encrypted_heap") == 0) {
+                if(cmd->subtype == AT_SetAccessMethod) {
+                    if(strcmp(cmd->name, "encrypted_heap") == 0)
                         alter_tam_into = true;
-                        break;
-                    }
-                    else {
+                    else
                         alter_tam_away = true;
-                        break;  
-                    }     
+                }
+                else if (cmd->subtype == AT_AddConstraint)
+                {
+                    /*
+                     * ADD CONSTRAINT ... {PRIMARY KEY|UNIQUE} (col, ...) — PG
+                     * will build a brand-new native btree index for this.
+                     * con->indexname != NULL means USING INDEX <existing>:
+                     * that index was already created (and already guarded,
+                     * successfully or not) by its own CREATE INDEX statement,
+                     * so it is NOT re-checked here.
+                     */
+                    Constraint *con = castNode(Constraint, cmd->def);
+
+                    if ((con->contype == CONSTR_PRIMARY || con->contype == CONSTR_UNIQUE) &&
+                        con->indexname == NULL)
+                    {
+                        ListCell *lc2;
+
+                        foreach(lc2, con->keys)
+                        {
+                            String *colnode = lfirst_node(String, lc2);
+
+                            if (!list_member(alter_pk_offending_cols, colnode))
+                                alter_pk_offending_cols = lappend(alter_pk_offending_cols, colnode);
+                        }
+                    }
                 }
             }
+
+            /*
+             * Only warn if the target table (or an inheritor/partition) is
+             * actually encrypted_heap — ADD CONSTRAINT on a plain heap table
+             * needs no warning.
+             */
+            if (alter_pk_offending_cols != NIL)
+            {
+                Oid rid = RangeVarGetRelid(stmt->relation, NoLock, true /* missing_ok */);
+
+                if (!OidIsValid(rid) || !tde_rel_or_inheritors_use_encrypted_heap(rid))
+                    alter_pk_offending_cols = NIL;
+            }
+        }
+    }
+
+    else if (IsA(parsetree, IndexStmt))
+    {
+        IndexStmt *stmt = (IndexStmt *) parsetree;
+
+        /* 
+         * For CREATE INDEX (non-constraint), reject any index access method
+         * other than the ones in our whitelist when the target table uses
+         * encrypted_heap — otherwise the indexed column's plaintext value
+         * would be stored unencrypted in the index.
+         */
+
+        if (!stmt->isconstraint)
+        {
+
+            Oid rid = RangeVarGetRelid(stmt->relation, NoLock, true /* missing_ok */);
+
+            if (OidIsValid(rid))
+            {
+                Relation rel = try_relation_open(rid, NoLock);
+                if (rel != NULL)
+                {
+                    bool guard = tde_rel_or_inheritors_use_encrypted_heap(rid);
+
+                    if (guard && !tde_is_safe_index_am(stmt->accessMethod))
+                    {
+                        if (pg_vault_tde_allow_plaintext_index)
+                            ereport(WARNING,
+                                (errmsg("pg_vault_tde: index access method \"%s\" on "
+                                        "encrypted_heap table \"%s\" is not encrypted",
+                                        stmt->accessMethod, stmt->relation->relname),
+                                errdetail("The indexed column's plaintext value will be "
+                                          "stored on disk in this index."),
+                                errhint("Allowed because pg_vault_tde.allow_plaintext_index "
+                                        "is on.  Use \"CREATE INDEX ... USING tde_btree\" "
+                                        "with an encrypted operator class instead to avoid "
+                                        "this exposure.")));
+                        else
+                            ereport(ERROR,
+                                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                errmsg("pg_vault_tde: index access method \"%s\" is not supported "
+                                        "on encrypted_heap table \"%s\"",
+                                        stmt->accessMethod, stmt->relation->relname),
+                                errhint("Use \"CREATE INDEX ... USING tde_btree\" with an "
+                                        "encrypted operator class (e.g. tde_text_ops, "
+                                        "tde_int4_enc_ops) instead, or set "
+                                        "pg_vault_tde.allow_plaintext_index = on to allow "
+                                        "this with a WARNING.")));
+                    }
+                    relation_close(rel, NoLock);
+                }
+            }
+
         }
     }
 
@@ -401,7 +926,8 @@ tde_process_utility_hook(PlannedStmt *pstmt,
             return;
         }
 
-        pg_vault_tde_catalog_register_rel(relid, pg_vault_tde_vault_key_name);
+        pg_vault_tde_catalog_register_rel(relid);
+        tde_audit(RELATION_ENCRYPT, psprintf("%u", relid), true);
 
         ereport(DEBUG1,
                 (errmsg("pg_vault_tde: registered relid=%u in DEK catalog",
@@ -417,13 +943,22 @@ tde_process_utility_hook(PlannedStmt *pstmt,
                                 context, params, queryEnv, dest, qc);
 
     /*
+     * Post-processing for ALTER TABLE ADD CONSTRAINT ... {PRIMARY KEY|UNIQUE}
+     * on an encrypted_heap table: same "backed by a standard (unencrypted)
+     * btree index" warning as the CREATE TABLE path below, fired only after
+     * the ALTER has actually succeeded.
+     */
+    if (alter_pk_offending_cols != NIL)
+        tde_warn_plaintext_constraint_columns(alter_pk_offending_cols,
+                                              ((AlterTableStmt *) parsetree)->relation->relname);
+
+    /*
      * Post-processing for CREATE TABLE USING encrypted_heap:
      * After the table is committed we can look it up by name and register
      * it in the catalog.
      *
-     * We use SPI to INSERT into pg_vault_tde_catalog.  The vault_key_name
-     * defaults to pg_vault_tde.vault_key_name GUC (or "local" for wallet
-     * provider).  The wrapped_dek column is populated lazily on first access
+     * We use SPI to INSERT into pg_vault_tde_catalog. 
+     * The wrapped_dek column is populated lazily on first access
      * by the catalog hot-path.
      */
     if (is_create_encrypted)
@@ -431,6 +966,55 @@ tde_process_utility_hook(PlannedStmt *pstmt,
         CreateStmt *stmt   = (CreateStmt *) parsetree;
         Oid         relid;
         Oid         ext_ns;
+
+
+                ListCell *lc;
+        List *offending_cols = NIL;
+
+
+        foreach(lc, stmt->tableElts)
+        {
+            Node *elt = (Node*) lfirst(lc);
+            if (IsA(elt, ColumnDef))
+            {
+                ColumnDef *coldef = (ColumnDef*) elt;
+                ListCell* lc2;
+
+                foreach(lc2, coldef->constraints)
+                {
+                    Constraint* con = (Constraint*) lfirst(lc2);
+                    
+                    if (con->contype == CONSTR_PRIMARY || con->contype == CONSTR_UNIQUE)
+                    {
+                        String *colnode = makeString(coldef->colname);
+
+                        if(!list_member(offending_cols, colnode))
+                            offending_cols = lappend(offending_cols, colnode);
+                    }
+                        
+                }
+
+            }
+            else if (IsA(elt, Constraint))
+            {
+                Constraint *con = (Constraint*) elt;
+                if (con->contype == CONSTR_PRIMARY || con->contype == CONSTR_UNIQUE)
+                {
+                    ListCell *lc3;
+                    foreach(lc3, con->keys)
+                    {
+                        String *colnode = lfirst_node(String, lc3);
+
+                        if(!list_member(offending_cols, colnode))
+                            offending_cols = lappend(offending_cols, colnode);
+                    }
+                }
+            }
+
+            
+        }
+        
+        tde_warn_plaintext_constraint_columns(offending_cols, stmt->relation->relname);
 
         relid = RangeVarGetRelid(stmt->relation, NoLock, true /* missing_ok */);
         if (!OidIsValid(relid))
@@ -443,10 +1027,8 @@ tde_process_utility_hook(PlannedStmt *pstmt,
             return;
         }
         /*
-         * Guard: pg_vault_tde_catalog is created by the v1.5 upgrade script
-         * (pg_vault_tde--1.4--1.5.sql).  On a v1.0 deployment that has not
-         * yet been upgraded, the table does not exist and we skip the INSERT
-         * gracefully.  Encrypted tables still work using the global DEK.
+         * Guard: pg_vault_tde_catalog is created by the v1.5 upgrade script.
+         * On a pre-v1.5 deployment skip the INSERT gracefully.
          */
         ext_ns = get_extension_schema(get_extension_oid(pg_vault_tde_extension_name, true));
         if (!OidIsValid(ext_ns) ||
@@ -466,11 +1048,14 @@ tde_process_utility_hook(PlannedStmt *pstmt,
          * pg_vault_tde_catalog_register_rel() manages its own SPI connection
          * and calls OPENSSL_cleanse() on the plaintext DEK after wrapping.
          */
-        pg_vault_tde_catalog_register_rel(relid, pg_vault_tde_vault_key_name);
+        pg_vault_tde_catalog_register_rel(relid);
+        tde_audit(RELATION_ENCRYPT, psprintf("%u", relid), true);
 
         ereport(DEBUG1,
                 (errmsg("pg_vault_tde: registered relid=%u in DEK catalog",
                         relid)));
+
+
     }
 
     /*
@@ -571,6 +1156,7 @@ tde_process_utility_hook(PlannedStmt *pstmt,
         }
 
         pg_vault_tde_catalog_deregister_rel(relid);
+        tde_audit(RELATION_DECRYPT, psprintf("%u", relid), true);
 
         ereport(DEBUG1,
                 (errmsg("pg_vault_tde: deregistered relid=%u in DEK catalog",
@@ -578,6 +1164,48 @@ tde_process_utility_hook(PlannedStmt *pstmt,
     }
 }
 
+static const char *
+tde_event_string(TdeAuditEvent event)
+{
+    switch (event)
+    {
+        case KMS_DEK_ACCESS:        return "DEK_ACCESS";
+        case KMS_DEK_CREATE:        return "DEK_CREATE";
+        case KMS_DEK_UPDATE:        return "DEK_UPDATE";
+        case KMS_DEK_ROTATE:        return "DEK_ROTATE";
+        case KMS_DEK_DELETE:        return "DEK_DELETE";
+        case KMS_KEK_ROTATE:        return "KEK_ROTATE";
+        case KMS_AUTH_SUCCESS:      return "KMS_AUTH_SUCCESS";
+        case KMS_AUTH_FAILURE:      return "KMS_AUTH_FAILURE";
+        case WALLET_OPEN:           return "WALLET_OPEN";
+        case WALLET_CLOSE:          return "WALLET_CLOSE";
+        case RELATION_ENCRYPT:      return "RELATION_ENCRYPT";
+        case RELATION_DECRYPT:      return "RELATION_DECRYPT";
+        case ACCESS_DENIED:         return "ACCESS_DENIED";
+        case AUDIT_LOG_START:       return "AUDIT_LOG_START";
+        case AUDIT_LOG_STOP:        return "AUDIT_LOG_STOP";
+        case INTEGRITY_VIOLATION:   return "INTEGRITY_VIOLATION";
+        default:                    return "UNKNOWN";
+    }
+}
+
+static void tde_audit_handler(TdeAuditEvent event, const char* reloid, bool success)
+{
+    const char *rolname = OidIsValid(GetUserId())
+                          ? GetUserNameFromId(GetUserId(), true)
+                          : "(system)";
+    ereport(LOG,
+        (errmsg("AUDIT: event=%s, oid=%s, user=%s, success=%s, pid=%d",
+                tde_event_string(event),
+                reloid != NULL ? reloid : "-",
+                rolname != NULL ? rolname : "(unknown)",
+                success ? "t" : "f",
+                MyProcPid),
+            errhidestmt(true),
+            errhidecontext(true)
+        )
+    );
+}
 /*
  * pg_vault_tde_shmem_request
  *
@@ -598,6 +1226,10 @@ pg_vault_tde_shmem_request(void)
      * Size determined by pg_vault_tde.max_encrypted_relations GUC.
      */
     pg_vault_tde_catalog_shmem_request();
+    /*
+     * ask for pkcs11
+     */
+    pg_vault_tde_kms_pkcs11_shmem_request();
 }
 
 /*
@@ -615,33 +1247,44 @@ pg_vault_tde_shmem_startup(void)
     pg_vault_tde_kms_shmem_init();
 
     /*
-     * v1.5: initialise the per-table DEK shmem cache.  Must run after
-     * the global KMS shmem (pg_vault_tde_kms_shmem_init) since the catalog
-     * cache may call the global DEK path as a fallback for v1.4 tables.
+     * v1.5+: initialise the per-table DEK shmem cache.  Must run after
+     * pg_vault_tde_kms_shmem_init (KMS shmem must exist first).
      */
     pg_vault_tde_catalog_shmem_init();
 
     /*
-     * v1.5: activate the KMS provider selected by pg_vault_tde.kms_provider.
-     * Providers call their init() function here so they can access shmem.
+     * v1.7+: map the pkcs11 provider's KEK-version beacon.  Must be
+     * pg_vault_tde_kms_pkcs11_shmem_init() here (startup/map phase), NOT
+     * _shmem_request() again — that call belongs only in
+     * pg_vault_tde_shmem_request() (sizing phase, above).
      */
-    if (pg_vault_tde_kms_provider &&
-        strcmp(pg_vault_tde_kms_provider, "local") == 0)
-    {
-        tde_active_kms_provider = pg_vault_tde_kms_local_provider();
-    }
-    else
-    {
-        /*
-         * Default: vault provider.  The vault provider's init() sets up the
-         * curl handle and attempts the configured auth method.
-         */
-        tde_active_kms_provider = pg_vault_tde_kms_vault_provider();
-    }
+    pg_vault_tde_kms_pkcs11_shmem_init();
 
+    /*
+     * Mark shmem as available.  The kms_provider assign hook checks this flag
+     * before calling provider->init(); from this point on any GUC change (e.g.
+     * ALTER DATABASE SET applied at backend connect) will trigger init()
+     * directly in the assign hook rather than requiring a second startup path.
+     */
+    tde_shmem_started = true;
+
+    /*
+     * tde_active_kms_provider was already set by the GUC assign hook when
+     * postgresql.conf was processed during startup.  Call init() now that
+     * shmem is available.  If no provider was configured at the cluster level
+     * (per-database-only setup) tde_active_kms_provider is NULL here and
+     * each backend will activate its provider via the assign hook.
+     */
     if (tde_active_kms_provider && tde_active_kms_provider->init)
         (void) tde_active_kms_provider->init();
+    else if (!tde_active_kms_provider)
+        ereport(LOG,
+                errmsg("pg_vault_tde: no cluster-level KMS provider configured; "
+                       "per-database provider (ALTER DATABASE SET "
+                       "pg_vault_tde.kms_provider) will be activated on first "
+                       "connection"));
 }
+
 
 /*
  * _PG_init
@@ -660,54 +1303,92 @@ _PG_init(void)
     /*
      * GUC parameter registration must happen in _PG_init, before any shmem
      * or hook setup.
+     *
+     * WHY PGC_SUSET FOR ALMOST EVERYTHING:
+     * All KMS-related GUCs use PGC_SUSET (superuser-settable) rather than
+     * PGC_POSTMASTER.  This enables per-database KMS configuration without
+     * a server restart: a superuser can run
+     *
+     *   ALTER DATABASE tenant_a SET pg_vault_tde.vault_key_name = 'tde-a';
+     *   ALTER DATABASE tenant_b SET pg_vault_tde.kms_provider   = 'local';
+     *
+     * and each new connection picks up the effective value for its database.
+     * This is the primary mechanism for multi-tenant key isolation within a
+     * single PostgreSQL cluster.
      */
 
-    /* Vault endpoint URL */
+    /*
+     * vault_url — PGC_SUSET so different databases can target separate Vault
+     * clusters or namespaced endpoints without restarting the server.
+     */
     DefineCustomStringVariable("pg_vault_tde.vault_url",
         "HashiCorp Vault / OpenBao URL (e.g. https://vault.example.com:8200)",
-        NULL, &pg_vault_tde_vault_url, "", PGC_POSTMASTER,
-        0, NULL, NULL, NULL);
+        NULL, &pg_vault_tde_vault_url, "", PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
-    /* Vault namespace */
+    /*
+     * vault_namespace — PGC_SUSET so databases can be isolated into separate
+     * Vault Enterprise namespaces (e.g. tenant_a vs. tenant_b) via
+     * ALTER DATABASE SET without a restart.
+     */
     DefineCustomStringVariable("pg_vault_tde.vault_namespace",
         "Vault namespace (enterprise only, empty for community)",
-        NULL, &pg_vault_tde_vault_namespace, "", PGC_POSTMASTER,
-        0, NULL, NULL, NULL);
+        NULL, &pg_vault_tde_vault_namespace, "", PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
-    /* Vault token — secret, not shown in pg_settings */
+    /* Vault token — secret, not shown in pg_settings (GUC_NOT_IN_SAMPLE) */
     DefineCustomStringVariable("pg_vault_tde.vault_token",
         "Vault token for authentication",
-        NULL, &pg_vault_tde_vault_token, "", PGC_POSTMASTER,
+        NULL, &pg_vault_tde_vault_token, "", PGC_SUSET,
         GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 
-    /* Transit engine mount path */
+    /*
+     * vault_transit_mount — PGC_SUSET so databases can use dedicated Transit
+     * engine mounts (e.g. "transit/tenant-a") for key isolation without restart.
+     */
     DefineCustomStringVariable("pg_vault_tde.vault_transit_mount",
         "Vault Transit secrets engine mount path",
-        NULL, &pg_vault_tde_vault_transit_mount, "transit", PGC_POSTMASTER,
-        0, NULL, NULL, NULL);
+        NULL, &pg_vault_tde_vault_transit_mount, "transit", PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
-    /* Transit key name for DEK wrapping */
+    /*
+     * vault_key_name — PGC_SUSET to enable per-database key isolation: each
+     * tenant database can point to a dedicated Transit key (e.g. "tde-dek-a",
+     * "tde-dek-b") via ALTER DATABASE SET without requiring a restart.
+     */
     DefineCustomStringVariable("pg_vault_tde.vault_key_name",
         "Vault Transit key name for DEK wrapping",
-        NULL, &pg_vault_tde_vault_key_name, "pg-tde-dek", PGC_POSTMASTER,
-        0, NULL, NULL, NULL);
+        NULL, &pg_vault_tde_vault_key_name, "pg-tde-dek", PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
-    /* TLS CA certificate bundle path */
+    /*
+     * vault_ca_cert — PGC_SUSET so databases routed to different Vault
+     * clusters (with different CAs) can supply the correct trust anchor.
+     */
     DefineCustomStringVariable("pg_vault_tde.vault_ca_cert",
         "Path to CA certificate bundle for Vault TLS verification",
-        NULL, &pg_vault_tde_vault_ca_cert, "", PGC_POSTMASTER,
-        0, NULL, NULL, NULL);
+        NULL, &pg_vault_tde_vault_ca_cert, "", PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
-    /* Vault HTTP request timeout */
+    /*
+     * vault_timeout_ms — PGC_SUSET so high-latency secondary Vault clusters
+     * can get a longer timeout without affecting the cluster-wide default.
+     */
     DefineCustomIntVariable("pg_vault_tde.vault_timeout_ms",
         "Vault HTTP request timeout in milliseconds (0 = no timeout)",
         NULL, &pg_vault_tde_vault_timeout_ms, 5000, 0, 300000,
-        PGC_POSTMASTER, 0, NULL, NULL, NULL);
+        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
-    /* Master on/off switch — useful for benchmarking overhead */
+    /*
+     * enabled — PGC_POSTMASTER: fixed at server startup, cannot change at
+     * runtime. The value is encoded per-tuple on disk (plaintext header vs.
+     * encrypted v4 wire trailer): if the GUC were runtime-togglable, rows
+     * written with enabled=on and later read with enabled=off would return
+     * raw ciphertext as plaintext — silent data-integrity loss.
+     */
     DefineCustomBoolVariable("pg_vault_tde.enabled",
         "Enable AES-256-GCM encryption for encrypted_heap tables",
-        NULL, &pg_vault_tde_enabled, true, PGC_SUSET,
+        NULL, &pg_vault_tde_enabled, true, PGC_POSTMASTER,
         0, NULL, NULL, NULL);
 
     /* DEK cache TTL in seconds (v1.1) — 0 disables time-based expiry */
@@ -716,24 +1397,31 @@ _PG_init(void)
         "When > 0, each backend re-reads the DEK from shared memory "
         "after this many seconds, even if key rotation has not occurred.",
         &pg_vault_tde_dek_cache_ttl, 0, 0, 86400,
-        PGC_SIGHUP, 0, NULL, NULL, NULL);
+        PGC_SUSET, 0, NULL, NULL, NULL);
 
-    /* Vault auth method (v1.1): token, approle, or kubernetes */
+    /*
+     * vault_auth_method — PGC_SUSET so databases on different Kubernetes
+     * namespaces or with different credential stores can use different auth
+     * methods (e.g. one uses 'approle', another uses 'kubernetes').
+     */
     DefineCustomStringVariable("pg_vault_tde.vault_auth_method",
         "Vault authentication method: token, approle, or kubernetes",
-        NULL, &pg_vault_tde_vault_auth_method, "token", PGC_POSTMASTER,
-        0, NULL, NULL, NULL);
+        NULL, &pg_vault_tde_vault_auth_method, "token", PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
-    /* AppRole role_id (v1.1) */
+    /*
+     * vault_role_id / vault_secret_id — PGC_SUSET + GUC_NOT_IN_SAMPLE so each
+     * database can supply its own AppRole credentials without the secrets
+     * appearing in pg_settings, pg_file_settings, or config file samples.
+     */
     DefineCustomStringVariable("pg_vault_tde.vault_role_id",
         "Vault AppRole role_id for authentication",
-        NULL, &pg_vault_tde_vault_role_id, "", PGC_POSTMASTER,
+        NULL, &pg_vault_tde_vault_role_id, "", PGC_SUSET,
         GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 
-    /* AppRole secret_id (v1.1) */
     DefineCustomStringVariable("pg_vault_tde.vault_secret_id",
         "Vault AppRole secret_id for authentication",
-        NULL, &pg_vault_tde_vault_secret_id, "", PGC_POSTMASTER,
+        NULL, &pg_vault_tde_vault_secret_id, "", PGC_SUSET,
         GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 
     /* AppRole role name (v1.4) — used for secret_id rotation after login */
@@ -743,20 +1431,23 @@ _PG_init(void)
         "successful AppRole login, implementing the response_wrapping "
         "single-use pattern.  Must match the role name in "
         "`vault write auth/approle/role/<name> ...`.",
-        &pg_vault_tde_vault_role_name, "", PGC_POSTMASTER,
-        0, NULL, NULL, NULL);
+        &pg_vault_tde_vault_role_name, "", PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
-    /* Kubernetes auth role (v1.1) */
+    /*
+     * vault_k8s_role / vault_k8s_mount — PGC_SUSET so each database (or
+     * Kubernetes namespace) can bind to a distinct K8s auth role and mount
+     * path without restarting the server.
+     */
     DefineCustomStringVariable("pg_vault_tde.vault_k8s_role",
         "Vault Kubernetes auth role name",
-        NULL, &pg_vault_tde_vault_k8s_role, "", PGC_POSTMASTER,
-        0, NULL, NULL, NULL);
+        NULL, &pg_vault_tde_vault_k8s_role, "", PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
-    /* Kubernetes auth mount path (v1.1) */
     DefineCustomStringVariable("pg_vault_tde.vault_k8s_mount",
         "Vault Kubernetes auth engine mount path",
-        NULL, &pg_vault_tde_vault_k8s_mount, "kubernetes", PGC_POSTMASTER,
-        0, NULL, NULL, NULL);
+        NULL, &pg_vault_tde_vault_k8s_mount, "kubernetes", PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /* OpenSSL 3.x crypto provider for hardware acceleration (v1.1) */
     DefineCustomStringVariable("pg_vault_tde.crypto_provider",
@@ -772,8 +1463,8 @@ _PG_init(void)
         "When true, a background worker periodically renews the Vault "
         "token and stores it in shared memory for all backends.  "
         "Only useful with AppRole or Kubernetes auth methods.",
-        &pg_vault_tde_bgw_enabled, false, PGC_POSTMASTER,
-        0, NULL, NULL, NULL);
+        &pg_vault_tde_bgw_enabled, false, PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /* Token renewal interval in seconds (v1.3) */
     DefineCustomIntVariable("pg_vault_tde.token_renewal_interval",
@@ -781,36 +1472,44 @@ _PG_init(void)
         "How often the background worker renews the Vault token.  "
         "Ignored if bgw_enabled is false.",
         &pg_vault_tde_token_renewal_interval, 3600, 60, 86400,
-        PGC_POSTMASTER, 0, NULL, NULL, NULL);
+        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /* ----------------------------------------------------------------
      * v1.5 GUC registrations
      * ---------------------------------------------------------------- */
 
-    /* KMS provider selector (v1.5) */
+    /*
+     * kms_provider — PGC_SUSET so each database can independently use a
+     * different KMS backend (e.g. cluster-default 'vault' but one offline
+     * database uses 'local') via ALTER DATABASE SET pg_vault_tde.kms_provider.
+     * The provider is re-evaluated per connection from the effective GUC value.
+     */
     DefineCustomStringVariable("pg_vault_tde.kms_provider",
-        "KMS provider backend: vault (default) or local (PKCS#12 wallet)",
+        "KMS provider backend: vault, local (PKCS#12 wallet) or pkcs11 (HSM)",
         "Selects which Key Management Service backend is active.  "
-        "'vault' (default): uses HashiCorp Vault / OpenBao Transit API.  "
-        "'local': uses a PKCS#12 wallet at pg_vault_tde.wallet_path.",
-        &pg_vault_tde_kms_provider, "vault", PGC_POSTMASTER,
-        0, NULL, NULL, NULL);
+        "'vault': uses HashiCorp Vault / OpenBao Transit API.  "
+        "'local': uses a PKCS#12 wallet at pg_vault_tde.wallet_path.  "
+        "'pkcs11': uses an HSM through the PKCS#11 module at "
+        "pg_vault_tde.pkcs11_library.  "
+        "Settable per-database via ALTER DATABASE SET.",
+        &pg_vault_tde_kms_provider, "", PGC_SUSET,
+        GUC_SUPERUSER_ONLY, tde_kms_provider_check, tde_kms_provider_assign, NULL);
 
     /* Local wallet path (v1.5) — default resolved at runtime from $PGDATA */
     DefineCustomStringVariable("pg_vault_tde.wallet_path",
         "Absolute path to the PKCS#12 local wallet file",
         "Used only when pg_vault_tde.kms_provider = 'local'.  "
-        "Default: $PGDATA/base/<DB_OID>/pg_vault_tde/wallet.p12",
-        &pg_vault_tde_wallet_path, "", PGC_POSTMASTER,
-        0, NULL, NULL, NULL);
+        "Default: /var/lib/pg_vault_tde/<DB_OID>/wallet.p12",
+        &pg_vault_tde_wallet_path, "", PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /* Passphrase env var NAME — never the passphrase itself (v1.5) */
     DefineCustomStringVariable("pg_vault_tde.wallet_passphrase_env",
         "Name of the environment variable holding the wallet passphrase",
         "The passphrase is read from getenv(wallet_passphrase_env) at "
         "startup.  NEVER put the passphrase in postgresql.conf directly.",
-        &pg_vault_tde_wallet_passphrase_env, "PG_TDE_WALLET_PASS",
-        PGC_POSTMASTER, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+        &pg_vault_tde_wallet_passphrase_env, "",
+        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /* Auto-open wallet on startup (v1.5) */
     DefineCustomBoolVariable("pg_vault_tde.wallet_auto_open",
@@ -818,8 +1517,8 @@ _PG_init(void)
         "When true (default), opens the wallet during shmem_startup_hook "
         "if the passphrase env var is set.  When false, defers opening "
         "until the first encrypted relation access.",
-        &pg_vault_tde_wallet_auto_open, true, PGC_POSTMASTER,
-        0, NULL, NULL, NULL);
+        &pg_vault_tde_wallet_auto_open, true, PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /* Max encrypted relations in shmem cache (v1.5) */
     DefineCustomIntVariable("pg_vault_tde.max_encrypted_relations",
@@ -837,7 +1536,19 @@ _PG_init(void)
         "When true (default in v1.5), TOAST tables for encrypted_heap "
         "relations use encrypted_heap AM and encrypt each chunk with "
         "AES-256-GCM.  Set to false only for debugging or migration.",
-        &pg_vault_tde_toast_encryption, true, PGC_SIGHUP,
+        &pg_vault_tde_toast_encryption, true, PGC_SUSET,
+        0, NULL, NULL, NULL);
+
+    /* Custom WAL resource manager for TOAST chunks (logical replication) */
+    DefineCustomBoolVariable("pg_vault_tde.toast_custom_rmgr",
+        "WAL-log encrypted TOAST chunks under the custom pg_vault_tde rmgr",
+        "When true, encrypted TOAST chunks are written via the custom WAL "
+        "resource manager (TDE_RMGR_ID) so the logical decoder routes them "
+        "away from the reorder buffer's toast_hash, enabling logical "
+        "replication of encrypted_heap tables with TOASTed columns.  Requires "
+        "the rmgr to be registered at preload time, hence PGC_POSTMASTER.  "
+        "Default off.",
+        &pg_vault_tde_toast_custom_rmgr, false, PGC_POSTMASTER,
         0, NULL, NULL, NULL);
 
     /* ----------------------------------------------------------------
@@ -856,7 +1567,7 @@ _PG_init(void)
         "Incompatible with wallet_passphrase_env if both are set.  "
         "wallet_passphrase_command takes priority if set.",
         &pg_vault_tde_wallet_passphrase_file, "",
-        PGC_POSTMASTER, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /*
      * wallet_passphrase_command — shell command whose stdout is the
@@ -872,7 +1583,7 @@ _PG_init(void)
         "and wallet_passphrase_file.  Never use in production without "
         "securing the command output.",
         &pg_vault_tde_wallet_passphrase_command, "",
-        PGC_POSTMASTER, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /*
      * wallet_dev_mode_passphrase — literal plaintext passphrase for
@@ -884,7 +1595,7 @@ _PG_init(void)
         "Convenience for CI pipelines.  Never set in production.  "
         "Emits a WARNING on every use.  Ignored when dev_mode = off.",
         &pg_vault_tde_wallet_dev_mode_passphrase, "",
-        PGC_USERSET, GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE,
+        PGC_SUSET, GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE,
         NULL, NULL, NULL);
 
     /*
@@ -896,8 +1607,84 @@ _PG_init(void)
         "Enable development-only conveniences (insecure in production)",
         "When true, pg_vault_tde.wallet_dev_mode_passphrase may be used "
         "as the wallet passphrase.  Always false in production.",
-        &pg_vault_tde_dev_mode, false, PGC_POSTMASTER,
+        &pg_vault_tde_dev_mode, false, PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+
+    /*
+     * allow_plaintext_index — opt-in relaxation of the encrypted_heap index
+     * AM whitelist (v1.7).  Default false preserves the existing hard ERROR
+     * on CREATE INDEX ... USING <non-tde_btree> against an encrypted_heap
+     * table.  Same PGC_SUSET/no-SUPERUSER_ONLY footing as toast_encryption:
+     * a per-database security-relaxation toggle, not a cluster-wide one.
+     */
+    DefineCustomBoolVariable("pg_vault_tde.allow_plaintext_index",
+        "Allow non-tde_btree index access methods on encrypted_heap tables",
+        "When false (default), CREATE INDEX / CREATE UNIQUE INDEX with an "
+        "access method other than tde_btree against an encrypted_heap table "
+        "is rejected with ERROR (the indexed column's plaintext value would "
+        "be stored unencrypted on disk).  When true, the same statement is "
+        "allowed after emitting a WARNING.  Does not affect PRIMARY KEY / "
+        "UNIQUE table constraints, which PostgreSQL core always backs with "
+        "a native btree index and which already warn-and-allow unconditionally.",
+        &pg_vault_tde_allow_plaintext_index, false, PGC_SUSET,
         0, NULL, NULL, NULL);
+
+    /* ----------------------------------------------------------------
+     * v1.7 GUC registrations — PKCS#11 / HSM provider
+     * ---------------------------------------------------------------- */
+
+    /*
+     * pkcs11_library — absolute path to the vendor PKCS#11 module.
+     * The module is dlopen()ed lazily per backend, never in the postmaster:
+     * PKCS#11 state does not survive fork() (see pg_vault_tde_kms_pkcs11.c).
+     */
+    DefineCustomStringVariable("pg_vault_tde.pkcs11_library",
+        "Absolute path to the PKCS#11 module (.so) of the HSM",
+        "Used only when pg_vault_tde.kms_provider = 'pkcs11'.  "
+        "Example: /usr/lib/softhsm/libsofthsm2.so",
+        &pg_vault_tde_pkcs11_library, "", PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+
+    /*
+     * pkcs11_token_label — locate the token by its label.  Preferred over
+     * pkcs11_slot_id because slot IDs are not stable across restarts on
+     * some modules (SoftHSM2 randomizes them per token).
+     */
+    DefineCustomStringVariable("pg_vault_tde.pkcs11_token_label",
+        "Label of the PKCS#11 token holding the KEK",
+        "When set, slots are scanned for a token with this label.  "
+        "Takes priority over pg_vault_tde.pkcs11_slot_id.",
+        &pg_vault_tde_pkcs11_token_label, "", PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+
+    /*
+     * pkcs11_slot_id — explicit slot selection, used only when
+     * pkcs11_token_label is empty.  -1 means unset.
+     */
+    DefineCustomIntVariable("pg_vault_tde.pkcs11_slot_id",
+        "PKCS#11 slot ID (used only when pkcs11_token_label is empty)",
+        "Explicit slot to open the session against.  Prefer "
+        "pg_vault_tde.pkcs11_token_label: slot IDs are not stable across "
+        "restarts on some modules.  -1 = unset.",
+        &pg_vault_tde_pkcs11_slot_id, -1, -1, INT_MAX,
+        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+
+    /* PIN env var NAME — never the PIN itself (same rule as the wallet) */
+    DefineCustomStringVariable("pg_vault_tde.pkcs11_pin_env",
+        "Name of the environment variable holding the token user PIN",
+        "The PIN is read from getenv(pkcs11_pin_env) at session setup.  "
+        "NEVER put the PIN in postgresql.conf directly.",
+        &pg_vault_tde_pkcs11_pin_env, "PG_TDE_PKCS11_PIN",
+        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+
+    /* CKA_LABEL of the AES-256 KEK object on the token */
+    DefineCustomStringVariable("pg_vault_tde.pkcs11_key_label",
+        "CKA_LABEL of the AES-256 KEK object on the token",
+        "The wrap/unwrap key looked up at session setup.  Create it with "
+        "pg_vault_tde_pkcs11_keygen() or with the HSM vendor tooling "
+        "(CKA_WRAP, CKA_UNWRAP, CKA_EXTRACTABLE=FALSE).",
+        &pg_vault_tde_pkcs11_key_label, "pg_vault_tde_kek",
+        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /* Chain hooks so other extensions coexist correctly. */
     prev_shmem_request_hook = shmem_request_hook;
@@ -914,6 +1701,17 @@ _PG_init(void)
     prev_process_utility_hook = ProcessUtility_hook;
     ProcessUtility_hook = tde_process_utility_hook;
 
+#if PG_VERSION_NUM < 180000
+    /*
+     * Executor start hook: temporarily impersonate BTREE_AM_OID on
+     * ON CONFLICT arbiter indexes backed by tde_btree, working around a
+     * PG17-only core safety check removed in PG18 — see
+     * tde_executor_start_hook for the full explanation.
+     */
+    prev_executor_start_hook = ExecutorStart_hook;
+    ExecutorStart_hook = tde_executor_start_hook;
+#endif
+
     /*
      * Object access hook: register the DEK for newly created encrypted_heap
      * tables BEFORE any data is inserted (critical for CTAS).  Fires after
@@ -922,6 +1720,9 @@ _PG_init(void)
     prev_object_access_hook = object_access_hook;
     object_access_hook = tde_object_access_hook;
 
+    audit_hook_ptr = tde_audit_handler;
+    tde_audit(AUDIT_LOG_START, NULL, true);
+
     /*
      * Wire the mutable tde_methods copy: copy heapam's TableAmRoutine and
      * override the 6 data-touching callbacks with AES-256-GCM wrappers.
@@ -929,6 +1730,15 @@ _PG_init(void)
      * initialised before any actual crypto is attempted.
      */
     pg_vault_tde_tam_init();
+
+    /*
+     * Register the custom WAL resource manager for encrypted TOAST chunks.
+     * RegisterCustomRmgr() must run during shared_preload_libraries loading,
+     * which is guaranteed here (_PG_init bails out early otherwise).  The rmgr
+     * is always registered; the GUC pg_vault_tde.toast_custom_rmgr only gates
+     * whether the write path actually uses it.
+     */
+    tde_rmgr_register();
 
     /*
      * Wire the mutable tde_btree_methods copy: copy btree's IndexAmRoutine

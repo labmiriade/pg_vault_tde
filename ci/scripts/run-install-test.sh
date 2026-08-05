@@ -12,7 +12,7 @@
 #   3. Installs the built package
 #   4. Starts PostgreSQL with shared_preload_libraries = 'pg_vault_tde'
 #   5. CREATE EXTENSION pg_vault_tde  ← main gate
-#   6. Asserts extversion = '1.6'
+#   6. Asserts extversion = '1.7'
 #   7. Asserts every expected function/AM/table exists in pg_catalog
 #   8. Smoke-test: SET_TEST_DEK → CREATE TABLE USING encrypted_heap
 #      → INSERT → SELECT → compare plaintext → DROP TABLE
@@ -53,7 +53,7 @@ if [[ "$RUN_ALL" -eq 1 ]]; then
     PG_VERSIONS=(17 18)
     FORMATS=(deb rpm)
 fi
-[[ ${#PG_VERSIONS[@]} -eq 0 ]] && PG_VERSIONS=(18)
+[[ ${#PG_VERSIONS[@]} -eq 0 ]] && PG_VERSIONS=("${PG_VERSION:-18}")
 [[ ${#FORMATS[@]} -eq 0 ]]    && FORMATS=(deb)
 
 # ---------------------------------------------------------------------------
@@ -88,8 +88,8 @@ log_stage()  { echo -e "\n${BOLD}═══════════════�
 # Must ALL succeed; any error causes psql -v ON_ERROR_STOP=1 to exit ≠0.
 # ---------------------------------------------------------------------------
 #  § 1  CREATE EXTENSION — tests the full upgrade-script chain
-#  § 2  Version assertion — extversion must equal '1.6'
-#  § 3  Function catalogue — every function that shipped in 1.0–1.6 must exist
+#  § 2  Version assertion — extversion must equal '1.7'
+#  § 3  Function catalogue — every function that shipped in 1.0–1.7 must exist
 #  § 4  Access-method catalogue — encrypted_heap and tde_btree must be registered
 #  § 5  Catalog tables — pg_vault_tde_catalog and rotation progress must exist
 #  § 6  Smoke round-trip — inject DEK, encrypt a row, decrypt, compare
@@ -97,7 +97,7 @@ log_stage()  { echo -e "\n${BOLD}═══════════════�
 SMOKE_SQL='
 \set ON_ERROR_STOP on
 
--- §1 ─ CREATE EXTENSION (traverses the full 1.0→1.4→1.5→1.6 chain)
+-- §1 ─ CREATE EXTENSION (installs directly from pg_vault_tde--1.7.sql)
 CREATE EXTENSION pg_vault_tde;
 
 -- §2 ─ version
@@ -106,8 +106,8 @@ DECLARE ver text;
 BEGIN
     SELECT extversion INTO ver
     FROM pg_extension WHERE extname = '"'"'pg_vault_tde'"'"';
-    IF ver IS DISTINCT FROM '"'"'1.6'"'"' THEN
-        RAISE EXCEPTION '"'"'expected extversion 1.6, got %'"'"', ver;
+    IF ver IS DISTINCT FROM '"'"'1.7'"'"' THEN
+        RAISE EXCEPTION '"'"'expected extversion 1.7, got %'"'"', ver;
     END IF;
     RAISE NOTICE '"'"'version OK: %'"'"', ver;
 END;
@@ -123,12 +123,6 @@ DECLARE
         -- v1.0 base
         '"'"'pg_vault_tde_tableam_handler(internal)'"'"',
         '"'"'pg_vault_tde_iam_handler(internal)'"'"',
-        '"'"'pg_vault_tde_backup_status()'"'"',
-        '"'"'pg_vault_tde_rotate_key()'"'"',
-        '"'"'pg_vault_tde_key_generation()'"'"',
-        '"'"'pg_vault_tde_set_test_dek()'"'"',
-        '"'"'pg_vault_tde_encrypt_test(text)'"'"',
-        '"'"'pg_vault_tde_decrypt_test(bytea)'"'"',
         '"'"'pg_vault_tde_reencrypt_table(regclass,integer)'"'"',
         '"'"'pg_vault_tde_verify_integrity(regclass)'"'"',
         '"'"'pg_vault_tde_health_check()'"'"',
@@ -140,9 +134,9 @@ DECLARE
         '"'"'pg_vault_tde_wallet_change_passphrase(text,text)'"'"',
         '"'"'pg_vault_tde_wallet_unlock(text)'"'"',
         '"'"'pg_vault_tde_wallet_lock()'"'"',
-        '"'"'pg_vault_tde_wallet_rotate_kek(text)'"'"',
-        '"'"'pg_vault_tde_wallet_export_bundle(text,text)'"'"',
-        '"'"'pg_vault_tde_wallet_import_bundle(text,text)'"'"',
+        '"'"'pg_vault_tde_seal_keys(text,text,text)'"'"',
+        '"'"'pg_vault_tde_seal_keys_bytea(text,text)'"'"',
+        '"'"'pg_vault_tde_unseal_keys(text,text)'"'"',
         '"'"'pg_vault_tde_migrate_vault_to_wallet(text)'"'"'
     ];
 BEGIN
@@ -193,8 +187,11 @@ BEGIN
 END;
 $$;
 
--- §6 ─ smoke round-trip (encrypted_heap INSERT → SELECT)
-SELECT pg_vault_tde_set_test_dek();
+SET pg_vault_tde.kms_provider = '"'"'local'"'"';
+SET pg_vault_tde.wallet_passphrase_command = '"'"'echo test-install'"'"';
+
+SELECT pg_vault_tde_wallet_init('"'"'test-install'"'"');
+
 
 CREATE TABLE _tde_smoke_test (
     id   serial PRIMARY KEY,
@@ -263,6 +260,11 @@ echo '--- Installing DEB ---'
 dpkg -i \"\$DEB\"
 apt-get install -f -y -q 2>/dev/null || true   # resolve any deps
 
+# ── Create wallet base directory ──────────────────────────────────────
+mkdir -p /var/lib/pg_vault_tde
+chown postgres:postgres /var/lib/pg_vault_tde
+chmod 0700 /var/lib/pg_vault_tde
+
 # ── Configure PostgreSQL ───────────────────────────────────────────────
 echo '--- Configuring PostgreSQL ---'
 pg_ctlcluster ${pg} main start 2>/dev/null || true
@@ -290,6 +292,8 @@ echo 'DEB PG${pg}: PASS'
 test_rpm() {
     local pg="$1"
     log_stage "INSTALL TEST  RPM  PG${pg}  (Rocky Linux 9)"
+    PGDATA="/var/lib/pgsql/${pg}/data"
+    PGBIN="/usr/pgsql-${pg}/bin"
 
     $RT run --rm \
         -v "${REPO_ROOT}":/src:ro \
@@ -320,17 +324,22 @@ echo \"Built: \$(basename \$RPM)\"
 echo '--- Installing RPM ---'
 dnf install -y -q \"\$RPM\"
 
+# ── Create wallet base directory ──────────────────────────────────────
+mkdir -p /var/lib/pg_vault_tde
+chown postgres:postgres /var/lib/pg_vault_tde
+chmod 0700 /var/lib/pg_vault_tde
+
 # ── Initialize and configure PostgreSQL ──────────────────────────────
 echo '--- Initializing PostgreSQL cluster ---'
-/usr/pgsql-${pg}/bin/postgresql-${pg}-setup initdb
-systemctl start postgresql-${pg} 2>/dev/null || \
-    su postgres -c '/usr/pgsql-${pg}/bin/pg_ctl start -D /var/lib/pgsql/${pg}/data -w' || true
 
-# In containers systemd is usually absent; start directly
-su postgres -c '/usr/pgsql-${pg}/bin/pg_ctl start \
-    -D /var/lib/pgsql/${pg}/data \
-    -o \"-c shared_preload_libraries=pg_vault_tde\" \
-    -w -t 20' || true
+# 1. Direct initdb without RPM wrapper (container needs)
+su postgres -c \"${PGBIN}/initdb -D ${PGDATA} --encoding=UTF8 --auth=trust\"
+
+systemctl start postgresql-${pg} 2>/dev/null || \
+    su postgres -c \"${PGBIN}/pg_ctl start \
+        -D ${PGDATA} \
+        -o '-c shared_preload_libraries=pg_vault_tde' \
+        -w -t 20\"
 
 # Wait for PG
 for i in \$(seq 1 20); do

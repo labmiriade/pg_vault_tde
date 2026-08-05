@@ -1,6 +1,6 @@
 # pg_vault_tde Technical Reference
 
-**Version**: 1.6  
+**Version**: 1.7  
 **PostgreSQL**: 17.x, 18.x (19.x planned)  
 **License**: BSD (PostgreSQL License)  
 **Copyright**: © 2026 Miriade S.r.l.
@@ -14,15 +14,17 @@
 3. [Crypto Layer](#crypto-layer)
 4. [KMS and Key Caching](#kms-and-key-caching)
 5. [Index Access Method (IAM)](#index-access-method)
-6. [Known Limitations](#known-limitations)
-7. [Security Considerations](#security-considerations)
-8. [Wire Format Reference](#wire-format-reference)
-9. [SQL API Reference](#sql-api-reference)
-10. [Extension Initialization](#extension-initialization)
-11. [Testing Strategy](#testing-strategy)
-12. [Packaging](#packaging)
-13. [Roadmap](#roadmap)
-14. [Contributing](#contributing)
+6. [Logical Decoding and Replication](#logical-decoding-and-replication)
+7. [PKCS#11 / HSM Provider](#pkcs11--hsm-provider)
+8. [Known Limitations](#known-limitations)
+9. [Security Considerations](#security-considerations)
+10. [Wire Format Reference](#wire-format-reference)
+11. [SQL API Reference](#sql-api-reference)
+12. [Extension Initialization](#extension-initialization)
+13. [Testing Strategy](#testing-strategy)
+14. [Packaging](#packaging)
+15. [Roadmap](#roadmap)
+16. [Contributing](#contributing)
 
 ---
 
@@ -47,6 +49,8 @@ the extension API; zero modifications to PostgreSQL core are required.
 | `scan_bitmap_next_tuple` | `(scan, slot, recheck)` | `(scan, slot, recheck, lossy, exact)` | `PG_VERSION_NUM >= 180000` |
 | `shmem_request_hook` | Available | Available | *(none needed)* |
 | `GetHeapamTableAmRoutine()` | Returns `const *` | Returns `const *` | *(none needed)* |
+| `tuplesort_begin_index_btree()` assert on `relam` | Asserts `rd_rel->relam == BTREE_AM_OID` | No such assert | `PG_VERSION_NUM < 180000` — `pg_vault_tde_ambuild()` temporarily impersonates `BTREE_AM_OID` on `index->rd_rel->relam` during the sort |
+| `BuildSpeculativeIndexInfo()` assert on ON CONFLICT | Asserts against non-btree-looking `relam` for unique `tde_btree` indexes | No such assert | `PG_VERSION_NUM < 180000` — `tde_executor_start_hook()` swaps `relam` back to `BTREE_AM_OID` for the duration of the query, restored via a `MemoryContextCallback` |
 
 ### Design Goals
 
@@ -74,57 +78,77 @@ PostgreSQL Core
       ├── Crypto                       src/crypto/pg_vault_tde_crypto.c
       │    ├─ tde_gcm_encrypt()        AES-256-GCM via OpenSSL 3.x EVP
       │    └─ tde_gcm_decrypt()        Authenticated decryption
-      ├── KMS                          src/kms/pg_vault_tde_kms.c
-      │    ├─ Shared-memory DEK cache  pg_vault_tde_dek_cache (shmem)
-      │    ├─ Per-backend local cache  pg_vault_tde_local_dek (TopMemCtx)
-      │    └─ Rotation epoch counter   generation (uint64)
+      ├── Per-relation DEK cache       src/kms/pg_vault_tde_catalog.c
+      │    ├─ DEK cache (shmem HTAB)    TdeRelDekMap (one shared LWLock)
+      │    └─ get DEK for a relation    pg_vault_tde_kms_get_rel_dek(relid)
+      ├── KMS provider vtable           src/kms/pg_vault_tde_kms.c
+      │    └─ Vault provider (libcurl)  vault_provider_{wrap,unwrap,rewrap}_dek()
+      ├── Local wallet provider        src/kms/pg_vault_tde_kms_local.c (PKCS#12)
+      ├── DEK catalog (on-disk)        src/kms/pg_vault_tde_catalog.c (wrapped_dek)
+      ├── Rotation background worker   src/kms/pg_vault_tde_rotation_bgw.c
+      ├── HW acceleration              src/crypto/pg_vault_tde_hw_accel.c
+      ├── Logical decoding plugin      src/logical/pg_vault_tde_pgoutput.c
       ├── Backup                       src/backup/pg_vault_tde_backup.c
+      │                                (+ pg_dump_tde.c / pg_restore_tde.c)
       └── Entry point                  src/pg_vault_tde.c (_PG_init)
 ```
 
 ### Key Lifecycle
 
 ```
-Vault / OpenBao (KEK owner)
+Vault / OpenBao (KEK owner)  ──or──  Local wallet (PKCS#12, KEK-on-disk)
         │
-        │  HTTP(S) via libcurl (async, non-blocking)
+        │  unwrap wrapped_dek via active provider vtable (synchronous;
+        │  libcurl HTTP(S) for Vault, AES-256-WRAP for local)
         ▼
-pg_vault_tde_kms_request_async()       [src/kms/pg_vault_tde_kms.c]
-        │
-        │  Writes DEK (32 bytes) under LW_EXCLUSIVE
+pg_vault_tde_kms_get_rel_dek(relid)    [src/kms/pg_vault_tde_catalog.c]
+        │   fast path: LW_SHARED hash_search of TdeRelDekMap (cache hit)
+        │   slow path: read pg_vault_tde_catalog.wrapped_dek → provider
+        │              unwrap → hash_search(HASH_ENTER) under LW_EXCLUSIVE
         ▼
-pg_vault_tde_dek_cache (shmem)         [LWLockPair, generation counter]
-        │
-        │  Copied under LW_SHARED to per-backend
-        ▼
-pg_vault_tde_local_dek (TopMemCtx)     [OPENSSL_cleanse on rotation]
-        │
-        │  Passed to EVP encrypt/decrypt context
+TdeRelDekMap (shmem HTAB)              [one entry per relid; single shared
+        │                               LWLock; generation + prev_dek window]
+        │  DEK (32 bytes) copied into a stack buffer on every call; the crypto
+        │  layer caches the AES key schedule keyed by (relid, generation)
         ▼
 tde_gcm_encrypt() / tde_gcm_decrypt()  [src/crypto/pg_vault_tde_crypto.c]
         │
         ▼
-Disk: [HeapTupleHeader | IV(12) | Ciphertext | GCM-TAG(16)]
+Disk: [HeapTupleHeader | IV(12) | Ciphertext | GCM-TAG(16) | VER(1) | GEN(8)]
 ```
 
 ### Shared Memory Layout
 
+Since v1.7 the cache is a shared-memory **hash table** (`HTAB`) keyed by
+`relid`, not a fixed array scanned linearly. Each entry is one `TdeRelDekMap`:
+
 ```c
-typedef struct TdeKmsSharedState {
-    LWLock      lock;               /* protects dek + generation */
-    uint64      generation;         /* bumped on each rotate_key() */
-    bool        dek_valid;          /* false until first key injection */
-    char        dek[TDE_DEK_LEN];   /* 32-byte AES-256 key */
-} TdeKmsSharedState;
+/* Per-relation DEK entry — value type of the TdeRelDekMap HTAB (v1.5+) */
+typedef struct TdeRelDekMap {
+    Oid     relid;                   /* hash key */
+    char    dek[TDE_DEK_LEN];        /* current AES-256 DEK, 32 bytes */
+    char    prev_dek[TDE_DEK_LEN];   /* previous DEK (valid during rotation) */
+    uint64  generation;              /* rotation epoch for this relation */
+    bool    dek_valid;               /* true iff dek[] holds a live key */
+    bool    prev_dek_valid;          /* true iff prev_dek[] is populated */
+} TdeRelDekMap;
 ```
 
 - `TDE_DEK_LEN` is defined **only** in `src/include/pg_vault_tde_kms.h`.
-- The LWLock is embedded by VALUE (not pointer) — safe across fork.
-- The LWLock tranche ID is allocated via `LWLockNewTrancheId()` inside
-  `shmem_startup_hook` — that is the earliest safe call point in PG18
-  because `WaitEventCustomCounterLock` (used internally by
-  `LWLockNewTrancheId`) is a shared-memory spinlock that does not exist
-  until after the segment is mapped.
+- The HTAB lives in `src/kms/pg_vault_tde_catalog.c`, created with
+  `ShmemInitHash("TdeRelDekMap", capacity, capacity, &info, HASH_ELEM | HASH_BLOBS)`
+  where `capacity = pg_vault_tde.max_encrypted_relations`. The segment is sized
+  with `hash_estimate_size(capacity, sizeof(TdeRelDekMap))`.
+- There is **no per-entry lock**. A single `LWLock` (file-scope `rel_dek_lock`)
+  from a **named** tranche guards the whole table:
+  `RequestNamedLWLockTranche("TdeRelDekMap", 1)` in the `shmem_request_hook`,
+  then `&GetNamedLWLockTranche("TdeRelDekMap")[0].lock` in the
+  `shmem_startup_hook`. The lock is taken `LW_SHARED` for lookups and
+  `LW_EXCLUSIVE` for insert/evict/rotate.
+- A second, fixed-size shmem struct (`pg_vault_tde_kms_cache`, in
+  `pg_vault_tde_kms.c`) holds the shared Vault token. Its lock uses a **dynamic**
+  tranche (`LWLockNewTrancheId()`), which is why that call lives in the
+  `shmem_startup_hook` and not `_PG_init` — see [Extension Initialization](#extension-initialization).
 
 ---
 
@@ -141,9 +165,7 @@ void pg_vault_tde_tam_init(void) {
 }
 ```
 
-All structural operations (VACUUM, HOT, CLUSTER, index build, truncate, scan
-state management) delegate to heapam unchanged. Only the four write paths,
-seven read paths, and one rewrite path are overridden.
+All structural operations (VACUUM, CLUSTER, index build, truncate, scan state management) delegate to heapam unchanged. Only the five write paths, eight read paths, two visibility/build paths, and two rewrite path are overridden.
 
 ### Overridden Callbacks
 
@@ -155,6 +177,7 @@ seven read paths, and one rewrite path are overridden.
 | `tuple_insert_speculative` | Speculative INSERT (ON CONFLICT) |
 | `multi_insert` | COPY FROM / bulk INSERT |
 | `tuple_update` | UPDATE |
+| `tuple_delete` | DELETE |
 
 All write paths follow the same pattern:
 1. Materialize the slot into a `HeapTuple` (plaintext)
@@ -170,7 +193,8 @@ buffer-backed `HeapTuple` MUST call `pg_vault_tde_decode_slot()`.
 
 | Callback | Scan Type | Status |
 |---|---|---|
-| `scan_getnextslot` | SeqScan, TidRangeScan | ✅ Override |
+| `scan_getnextslot` | SeqScan | ✅ Override |
+| `scan_getnextslot_tidrange` | TidRangeScan | ✅ Override |
 | `index_fetch_tuple` | Index Scan, Index Only Scan | ✅ Override |
 | `scan_bitmap_next_tuple` | BitmapHeapScan | ✅ Override |
 | `scan_analyze_next_tuple` | ANALYZE | ✅ Override |
@@ -178,11 +202,20 @@ buffer-backed `HeapTuple` MUST call `pg_vault_tde_decode_slot()`.
 | `tuple_fetch_row_version` | TidScan, UPDATE recheck | ✅ Override |
 | `tuple_lock` | SELECT FOR UPDATE/SHARE | ✅ Override |
 
+#### Visibility & Index-Build Paths
+ 
+| Callback | Purpose |
+|---|---|
+| `tuple_satisfies_snapshot` | Visibility recheck for RI foreign-key trigger (`RI_FKey_check`) — heapam's version asserts a live buffer pin, which our decrypt-into-palloc'd-tuple path doesn't hold |
+| `index_build_range_scan` | CREATE INDEX / REINDEX — decrypts each tuple before `FormIndexDatum` extracts key values, otherwise indexes would be built over ciphertext|
+
+
 #### Rewrite Paths (decrypt → process → re-encrypt)
 
 | Callback | Trigger | Notes |
 |---|---|---|
 | `relation_copy_for_cluster` | `VACUUM FULL`, `CLUSTER` | Reads each tuple via `heap_getnext` (with `rd_tableam` impersonation), decrypts, re-encrypts into the new heap via `rewrite_heap_tuple`. Clears `HEAP_HASEXTERNAL` on the encrypted copy before writing; `tde_tuple_has_external_slow` (per-attribute varlena scan) is used on subsequent DELETE to locate TOAST chunks regardless of the infomask flag. |
+| `relation_toast_am` | TOAST table creation | Selects `encrypted_heap` as the TOAST AM when `pg_vault_tde.toast_encryption = on` (default), so TOAST chunks are encrypted through the same `tuple_insert`/`scan_getnextslot` hooks as the main table. |
 
 ### pg_vault_tde_decode_slot
 
@@ -190,47 +223,55 @@ This function is the core of the read path. It:
 
 1. Casts the slot to `BufferHeapTupleTableSlot` (known buffer-backed after heapam)
 2. **Guards against double-decode**: checks `bslot->buffer == InvalidBuffer`
-3. Saves `bslot->base.tuple->t_self` (physical TID from buffer page header)
-4. Calls `heap_copytuple(bslot->base.tuple)` while buffer pin is held
-5. Calls `ExecClearTuple(slot)` to release the buffer pin
-6. Calls `tde_decrypt_heap_tuple(enc_copy)` (verifies GCM tag via OpenSSL)
-7. Stamps `plain->t_self = saved_tid`, `plain->t_tableOid = saved_tableoid`
-8. Calls `ExecForceStoreHeapTuple(plain, slot, true)`
-9. **Manually sets `slot->tts_tid = saved_tid`** — `ExecForceStoreHeapTuple`
-   does NOT restore `tts_tid` for virtual/minimal slots; it must be set explicitly
+3. Saves `bslot->base.tuple->t_self` (physical TID) and `t_tableOid` (relation OID) from the buffer page
+4. Calls `tde_decrypt_heap_tuple(bslot->base.tuple, saved_tableoid)` — decrypts the
+   buffer-backed tuple directly (verifies GCM tag via OpenSSL). **No `heap_copytuple`
+   and no explicit `ExecClearTuple`**: the buffer pin must stay held until the
+   force-store below. Releasing it early forces O(rows) buffer re-pins during a
+   sequential scan instead of O(pages) (see performance note in the function header).
+5. Stamps `plain->t_self = saved_tid`, `plain->t_tableOid = saved_tableoid`
+6. Calls `ExecForceStoreHeapTuple(plain, slot, true)` — this performs the single
+   internal `ExecClearTuple` that releases the buffer pin (the only release point)
+7. **Manually sets `slot->tts_tid = saved_tid`** — `ExecForceStoreHeapTuple`
+   does NOT restore `tts_tid` for buffer slots; it must be set explicitly
 
 ```c
 static void pg_vault_tde_decode_slot(TupleTableSlot *slot)
 {
     BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) slot;
+    HeapTuple   plain;
+    ItemPointerData saved_tid;
+    Oid         saved_tableoid;
 
     /*
      * Guard against double-decode: after ExecForceStoreHeapTuple the buffer
      * is released (buffer == InvalidBuffer) but base.tuple is still set.
      * Re-entering here would try to decrypt already-plain data.
      */
-    if (bslot->buffer == InvalidBuffer) return;
+    if (bslot->buffer == InvalidBuffer)
+        return;
 
     /*
-     * Read TID from the buffer-backed pointer directly, NOT from
+     * Read TID + relation OID from the buffer-backed pointer directly, NOT from
      * ExecFetchSlotHeapTuple(slot, false, ...) which returns the tupdata
      * workspace with an uninitialized t_self.
      */
-    ItemPointerData saved_tid;
     ItemPointerCopy(&bslot->base.tuple->t_self, &saved_tid);
+    saved_tableoid = bslot->base.tuple->t_tableOid;
 
-    /* Copy encrypted data while the buffer pin is still held. */
-    HeapTuple enc_copy = heap_copytuple(bslot->base.tuple);
-    ExecClearTuple(slot);   /* releases buffer pin */
+    /*
+     * Decrypt the buffer-backed tuple in place (verifies GCM tag; ereport(ERROR)
+     * on tamper).  Do NOT call heap_copytuple/ExecClearTuple first: the pin must
+     * stay held until ExecForceStoreHeapTuple, which releases it exactly once per
+     * tuple.  Releasing early causes O(rows) buffer hits on sequential scans.
+     */
+    plain = tde_decrypt_heap_tuple(bslot->base.tuple, saved_tableoid);
 
-    HeapTuple plain = tde_decrypt_heap_tuple(enc_copy);
-    pfree(enc_copy);
+    ItemPointerCopy(&saved_tid, &plain->t_self);
+    plain->t_tableOid = saved_tableoid;
 
-    plain->t_self    = saved_tid;
-    plain->t_tableOid = slot->tts_tableOid;
-
-    ExecForceStoreHeapTuple(plain, slot, true);
-    slot->tts_tid = saved_tid;  /* ExecForceStoreHeapTuple does not set this */
+    ExecForceStoreHeapTuple(plain, slot, true);   /* internal ExecClearTuple releases pin */
+    ItemPointerCopy(&saved_tid, &slot->tts_tid);  /* ExecForceStoreHeapTuple does not set this */
 }
 ```
 
@@ -328,50 +369,42 @@ or modifying this callback.
 
 ### Wire Format per Encrypted Region
 
-**Version 3** (all new tuples from pg_vault_tde v1.5 — default):
+**Version 4** is the **only** on-disk tuple format. It is an **IV-first trailer**
+layout: the version byte and generation counter sit at the **end** of the blob, so
+the data differs from byte 0 on every encryption (this is what disables HOT — see
+[Known Limitations](#known-limitations)). The legacy v1/v2/v3 formats were **removed**.
+(The byte `0x02` still appears only in the `pg_dump_tde` *backup block* format — a
+separate code path, see [Backup](../README.md#encrypted-backups).)
 
 ```
-+-------+----------+----------------------------+----------+
-| VER   | GEN      | CIPHERTEXT                 | GCM TAG  |
-| 1 byte| 8 bytes  | N bytes (= plaintext len)  | 16 bytes |
-+-------+----------+----------------------------+----------+
++----------+----------------------------+----------+-------+----------+
+| IV       | CIPHERTEXT                 | GCM TAG  | VER   | GEN      |
+| 12 bytes | N bytes (= plaintext len)  | 16 bytes | 1 byte| 8 bytes  |
++----------+----------------------------+----------+-------+----------+
+  random                                            0x04   uint64 LE
 ```
 
-Total overhead: `TDE_V2_OVERHEAD = 37` bytes
-(`TDE_V3_VERSION_BYTE=0x03` + `TDE_V2_GEN_LEN=8` + `TDE_IV_LEN=12` + `TDE_TAG_LEN=16`).
+Total overhead: `TDE_V4_OVERHEAD = 37` bytes
+(`TDE_GCM_IV_LEN=12` + `TDE_GCM_TAG_LEN=16` + `1` version byte + `TDE_V4_GEN_LEN=8`).
 
-v3 passes `[database_oid(4) | relfilenode(4) | generation(8)]` as GCM Additional
-Authenticated Data (AAD) — zero wire overhead; prevents cross-table ciphertext smuggling.
-
-**Version 2** (pg_vault_tde v1.4): `VER = 0x02`; no AAD binding; fully readable by v1.5.
-
-**Version 1** (legacy, written by pg_vault_tde < 1.4):
-
-```
-+------------+----------------------------+----------+
-|  IV        |  CIPHERTEXT                |  GCM TAG |
-|  12 bytes  |  N bytes (= plaintext len) |  16 bytes|
-+------------+----------------------------+----------+
-```
-
-Total overhead: `TDE_GCM_OVERHEAD = 28` bytes per stored tuple.
-
-The decrypt path auto-detects v1/v2 from the first byte: if byte 0 is
-`0x02` AND the total length is ≥ `TDE_V2_OVERHEAD`, the v2 path is taken.
-Otherwise the v1 path is used. A false-positive retry handles the 1/256
-probability edge case where a v1 IV happens to start with `0x02`.
+v4 binds each tuple to its location by passing
+`[MyDatabaseId(4) | relid(4) | generation(8)]` (little-endian, `TDE_V4_AAD_LEN = 16`
+bytes) as GCM Additional Authenticated Data — zero wire overhead; prevents
+cross-table ciphertext smuggling. The AAD is reconstructed on decrypt from the
+**stored** generation in the wire trailer (not the current generation), so old-generation
+rows still authenticate during the rotation window.
 
 When `user_len == 0` (all-NULL tuple, or tuple with only system columns),
-`tde_gcm_encrypt()` produces a 28-byte ciphertext block (IV + empty payload
-+ GCM tag). This exercises the GCM tag path on zero data. The decrypt path
-handles this symmetrically. Test 16 covers this edge case.
+`tde_gcm_encrypt()` still produces a full `TDE_V4_OVERHEAD`-byte (37) block. This
+exercises the GCM tag path on zero data; the decrypt path handles it symmetrically.
+Test 16 covers this edge case.
 
 ### Memory Security
 
 - DEK copies in per-backend memory are `OPENSSL_cleanse`d before `pfree`.
 - Plaintext `HeapTuple` intermediates are `OPENSSL_cleanse`d after encryption.
 - Per-backend EVP contexts are freed via `on_proc_exit()` callbacks
-  (`tde_iam_siv_ctx_cleanup` for AES-SIV; analogous cleanup for GCM contexts).
+  (`tde_iam_ctx_cleanup` for AES-SIV; analogous cleanup for GCM contexts).
 - Shared-memory DEK is `OPENSSL_cleanse`d during rotation before the new key
   is written.
 
@@ -379,22 +412,45 @@ handles this symmetrically. Test 16 covers this edge case.
 
 ## Performance
 
-### Per-Backend EVP Context Pool
+### Per-Backend EVP Contexts Keyed by (relid, generation)
 
-Creating and destroying an `EVP_CIPHER_CTX` on every tuple (as a naive
-implementation would do) costs 2 heap allocations per operation. Instead,
-pg_vault_tde maintains a **per-backend pool** of pre-allocated contexts:
+Two costs hide on the per-tuple crypto path: allocating an `EVP_CIPHER_CTX`
+(a heap malloc) and installing the AES-256 **key schedule**
+(`EVP_EncryptInit_ex2` with the DEK). A naive implementation pays both on every
+tuple. pg_vault_tde caches each context together with the key it is keyed for:
 
 ```c
-static EVP_CIPHER_CTX *tde_gcm_enc_ctx = NULL;  /* lazily initialised */
-static EVP_CIPHER_CTX *tde_gcm_dec_ctx = NULL;
+typedef struct TdeCipherSlot {
+    EVP_CIPHER_CTX *ctx;
+    Oid             relid;
+    uint64          generation;
+} TdeCipherSlot;
+
+static TdeCipherSlot tde_enc = { NULL, InvalidOid, 0 };  /* encrypt direction */
+static TdeCipherSlot tde_dec = { NULL, InvalidOid, 0 };  /* decrypt direction */
 ```
 
-On each encrypt/decrypt call, the context is **reset** with
-`EVP_CIPHER_CTX_reset()` (cheap — reuses the already-allocated struct)
-instead of free + alloc. Contexts are freed in the `on_proc_exit()` callback
-`tde_backend_cleanup()`. The same pattern is applied to the IAM SIV contexts
-(`tde_iam_siv_enc_ctx`, `tde_iam_siv_dec_ctx`).
+Each context is allocated once per backend (`EVP_CIPHER_CTX_new()` on first
+use). The expensive key-schedule install runs **only when the slot's cached
+`(relid, generation)` differs** from the current operation — i.e. on the first
+tuple of a relation and again after a key rotation. For every other tuple the
+installed schedule is reused and only the per-tuple IV is rearmed with
+`EVP_EncryptInit_ex2(ctx, NULL, NULL, iv, NULL)`. Consecutive tuples of the same
+relation (the common bulk-INSERT / sequential-scan case) therefore skip the
+key schedule entirely.
+
+On decrypt the slot is keyed by the **stored** generation read from the wire
+trailer, so old-generation rows decrypted via `prev_dek` during the rotation
+window get their own cached schedule without thrashing the current-generation
+one.
+
+On any fatal OpenSSL error `tde_crypto_ctx_cleanup()` frees and NULL-outs both
+contexts (and resets their `relid` to `InvalidOid`) so the next call
+re-allocates and re-keys cleanly. Both contexts are freed in the
+`on_proc_exit()` callback `tde_crypto_ctx_cleanup()`, which also wipes the IV
+batch. The same allocate-once pattern is applied to the IAM: a single per-backend
+AES-256-SIV context, re-keyed only when the `(idx_oid, generation)` pair changes
+(`tde_iam_ctx_prepare`), freed by `tde_iam_ctx_cleanup()`.
 
 ### IV Batch Generation
 
@@ -403,21 +459,25 @@ non-batched implementation would pay one syscall per encrypted tuple. Instead,
 pg_vault_tde batches 256 IVs per `pg_strong_random()` call:
 
 ```c
-#define TDE_IV_BATCH_SIZE 256
-static unsigned char iv_batch[TDE_IV_BATCH_SIZE * TDE_IV_LEN];
-static int           iv_batch_pos = TDE_IV_BATCH_SIZE;  /* start empty */
+#define TDE_IV_BATCH_SIZE   256
+#define TDE_IV_BATCH_BYTES  (TDE_IV_BATCH_SIZE * TDE_GCM_IV_LEN)
+static char  iv_batch[TDE_IV_BATCH_BYTES];
+static int   iv_batch_pos = TDE_IV_BATCH_SIZE;  /* start empty */
 
 static void tde_next_iv(unsigned char *iv_out)
 {
     if (iv_batch_pos >= TDE_IV_BATCH_SIZE)
     {
-        pg_strong_random(iv_batch, sizeof(iv_batch));
+        if (!pg_strong_random(iv_batch, TDE_IV_BATCH_BYTES))
+            ereport(ERROR, (errmsg("[CRYPTO] pg_strong_random failed")));
         iv_batch_pos = 0;
     }
-    memcpy(iv_out, iv_batch + iv_batch_pos * TDE_IV_LEN, TDE_IV_LEN);
+    memcpy(iv_out, iv_batch + iv_batch_pos * TDE_GCM_IV_LEN, TDE_GCM_IV_LEN);
     iv_batch_pos++;
 }
 ```
+
+The buffer is wiped with `OPENSSL_cleanse()` in the backend-exit cleanup.
 
 This amortises the syscall cost across 256 tuples.
 
@@ -431,45 +491,61 @@ bash bench_tde.sh 100000
 
 The script runs INSERT, SELECT, UPDATE, index scan, and TABLESAMPLE workloads
 on `plain_heap` vs `encrypted_heap`, and prints a comparison table with
-overhead percentages. Use `pg_vault_tde.enabled = off` to isolate pure TAM
-overhead (no crypto) from actual encryption cost.
+overhead percentages. Use `pg_vault_tde.enabled = off` (requires a server
+restart — the GUC is `PGC_POSTMASTER`) to isolate pure TAM overhead (no
+crypto) from actual encryption cost. See the warning in README.md before
+toggling this on any database with existing `encrypted_heap` data.
 
 ```
-┌───────────────────────────────────────────────────┐
-│  Shared Memory  (pg_vault_tde_dek_cache)           │
-│  ─────────────────────────────────────────────────│
+┌────────────────────────────────────────────────────┐
+│  Shared memory                                     │
+│  ──────────────────────────────────────────────────│
 │  LWLock (embedded by value)                        │
-│  generation: uint64                                │
-│  dek_valid: bool                                   │
-│  dek[32]: char  (AES-256 raw key)                  │
-└───────────────────────────────────────────────────┘
-               ▲ LW_SHARED copy on miss
-┌───────────────────────────────────────────────────┐
-│  Per-backend  (TopMemoryContext)                   │
-│  ─────────────────────────────────────────────────│
-│  local_generation: uint64                          │
-│  local_dek[32]: char                               │
-└───────────────────────────────────────────────────┘
+│  HTAB (TdeRelDekMap)                               │
+│    ├─ relid: Oid         (key)                     │
+│    ├─ dek[32]: char      (current DEK)             │
+│    ├─ prev_dek[32]: char (rotation window)         │
+│    ├─ generation: uint64                           │
+│    └─ dek_valid / prev_dek_valid: bool             │
+└────────────────────────────────────────────────────┘
+               ▲ pg_vault_tde_kms_get_rel_dek(relid)
+               │  fast path:  LW_SHARED cache hit
+               │  slow path:  catalog read → KMS unwrap → cache insert
+┌────────────────────────────────────────────────────┐
+│  pg_vault_tde_catalog  (on-disk system table)      │
+│  ──────────────────────────────────────────────────│
+│  relid, generation,                                │
+│  wrapped_dek, kms_provider, created_at, updated_at │
+└────────────────────────────────────────────────────┘
 ```
 
-1. On first encrypt/decrypt, backend copies DEK from shmem under `LW_SHARED`.
-2. On subsequent calls, backend compares `local_generation` with shmem
-   `generation`. If equal, uses local copy (no lock needed after first load).
-3. On mismatch, acquires `LW_SHARED`, refreshes local copy, updates
-   `local_generation`.
+1. Every encrypt/decrypt call fetches the DEK with
+   `pg_vault_tde_kms_get_rel_dek()`: `hash_search(HASH_FIND)` under `LW_SHARED`,
+   `memcpy` into a stack buffer, release. The buffer is `OPENSSL_cleanse`d after
+   use (caller responsibility).
+2. On a cache miss (first access after startup, or after the entry was evicted
+   by rotation), the slow path reads `pg_vault_tde_catalog.wrapped_dek`, unwraps
+   it via the active KMS provider, and inserts the entry under `LW_EXCLUSIVE`.
+3. Cross-call key-schedule reuse lives in the **crypto layer**, not here: the
+   `TdeCipherSlot` EVP contexts cache the installed AES schedule keyed by
+   `(relid, generation)` (see [Per-Backend EVP Contexts](#per-backend-evp-contexts-keyed-by-relid-generation)),
+   so re-fetching the DEK bytes per call is cheap and the expensive schedule
+   install is amortised.
 
 ### Generation-Epoch Rotation
 
-`pg_vault_tde_rotate_key()`:
-1. Acquires `LW_EXCLUSIVE` on the shmem lock.
-2. `OPENSSL_cleanse`s `dek[32]`.
-3. Increments `generation`.
-4. Sets `dek_valid = false`.
+Key rotation is now **per-relation** via `pg_vault_tde_rotate_online(relname, batch_size)`.
+For each encrypted relation `pg_vault_tde_catalog_zero_rel_dek()`:
+1. Acquires `LW_EXCLUSIVE` on the single `rel_dek_lock` guarding the HTAB and
+   looks the entry up with `hash_search(HASH_FIND)`.
+2. Promotes the current DEK to `prev_dek` then `OPENSSL_cleanse`s `dek[32]` for the rotation window.
+3. Increments the per-relation `generation` counter.
+4. Sets `dek_valid = false` (triggers a catalog read + KMS unwrap on next access).
 5. Releases lock.
 
-Each backend detects the mismatch lazily on the next encrypt/decrypt call.
-Old-generation rows encrypted with DEK-A are permanently unreadable after the
-key is wiped. A re-encryption utility is on the roadmap.
+Each backend detects the mismatch lazily on the next encrypt/decrypt call for that
+relation. Old-generation rows can still be read via `prev_dek` during the rotation
+window; after `pg_vault_tde_reencrypt_table()` completes the window closes.
 
 - **Bounded staleness**: At most one LWLock pair per encrypt/decrypt call.
 - **No signals**: Generation mismatch is detected lazily; no SIGUSR1/SIGHUP needed.
@@ -493,7 +569,7 @@ The `tde_btree` access method provides a B-Tree index with deterministic
 | Equality | Preserved (same plaintext → same ciphertext under same DEK) |
 | Ordering | **Not preserved** — range scans return empty results |
 | Use case | Equality predicates only (`=`, `IN`, `ON CONFLICT`) |
-| Column support | `bytea` columns only in v1.4; other types require `CAST(col AS bytea)` |
+| Column support | Varlena `bytea`/`text`/`numeric` (`tde_*_ops`) and fixed-size `int4`/`int8`/`uuid`/`date`/`timestamptz` (`tde_*_enc_ops`, default since v1.7). All index keys are AES-256-SIV encrypted. |
 
 AES-SIV is chosen over AES-GCM for index entries because:
 - It produces a deterministic ciphertext (required for B-Tree comparisons).
@@ -527,9 +603,11 @@ runtime from the postgres binary on all ELF platforms, even though
 they are not declared in the installed extension dev headers.
 
 For each live heap tuple, `tde_build_callback()` encrypts each non-null
-bytea column datum via `tde_encrypt_bytea_datum()`, then spools it into
-the btree sort buffer. After the heap scan, `_bt_leafbuild()` writes all
-encrypted entries to the index pages in sorted order.
+indexed column datum via `tde_iam_encrypt_index_datum()` (which dispatches to
+`tde_iam_encrypt_fixed_type_datum()` for fixed-size types and the varlena path
+otherwise, both AES-256-SIV), then spools it into the btree sort buffer. After
+the heap scan, `_bt_leafbuild()` writes all encrypted entries to the index pages
+in sorted order.
 
 ### amrescan (query-time key encryption)
 
@@ -552,33 +630,324 @@ CREATE OPERATOR CLASS tde_bytea_ops DEFAULT FOR TYPE bytea USING tde_btree AS
     FUNCTION 1 byteacmp(bytea, bytea);
 ```
 
-### IAM Limitations (v1.6)
+`CREATE EXTENSION` registers two families of operator classes:
 
-`tde_btree` now supports native operator classes for `text`, `int4`, `int8`, `uuid`,
-`numeric`, `date`, `timestamptz` (added v1.5). **Caveat**: varlena types (`text`,
-`bytea`, `numeric`) have their index key encrypted with AES-256-SIV. Fixed-size
-pass-by-value types (`int4`, `uuid`, `date`, `timestamptz`) store the **index key in
-plaintext** — the heap tuple remains fully encrypted but the btree page entry is not.
-This requires a custom btree page format to fix; planned for v1.7.
+- **Varlena classes** — `tde_bytea_ops`, `tde_text_ops`, `tde_numeric_ops` (DEFAULT for
+  their types). The varlena datum is encrypted with AES-256-SIV and stored as `bytea`.
+- **Fixed-size `enc_ops` classes** (v1.7) — `tde_int4_enc_ops`, `tde_int8_enc_ops`,
+  `tde_uuid_enc_ops`, `tde_date_enc_ops`, `tde_timestamptz_enc_ops`, all in the
+  `tde_enc_ops_family` with `STORAGE bytea` and **DEFAULT** for their types. They expose
+  only `OPERATOR 3 (=)` — equality is the only meaningful predicate on SIV ciphertext.
+  The legacy non-encrypted classes (`tde_int4_ops`, `tde_int8_ops`, `tde_uuid_ops`,
+  `tde_date_ops`, `tde_timestamptz_ops`) are retained but **not** default; prefer the
+  `enc_ops` classes so index keys are encrypted.
 
-Range scans on `tde_btree` columns return empty results by design (ordering not
-preserved by AES-SIV, regardless of type).
+### Index-Only Scans
+
+Index-only scans are **not supported** on `tde_btree` indexes by design. PostgreSQL
+index-only scans return column values directly from the index pages without visiting
+the heap. Since `tde_btree` stores AES-256-SIV ciphertexts as index keys, returning
+those values directly would expose raw ciphertext to the client with no decryption.
+
+All decryption happens in the TAM layer (`decode_slot`) when the heap tuple is
+fetched. The planner is prevented from choosing an index-only scan path on
+`tde_btree` indexes; it always fetches the tuple from the `encrypted_heap` table.
+
+Range scans on `tde_btree` columns return empty results by design — AES-256-SIV
+does not preserve ordering regardless of column type.
+
+### Usage Example
+
+```sql
+-- Create an encrypted table
+CREATE TABLE employees (
+    id        int4,
+    username  text,
+    salary    numeric
+) USING encrypted_heap;
+
+-- Create tde_btree indexes on multiple column types. The opclass is optional:
+-- the encrypted-key classes are the DEFAULT for each type since v1.7, so
+-- `USING tde_btree (id)` picks tde_int4_enc_ops automatically.
+CREATE INDEX employees_id_idx       ON employees USING tde_btree (id tde_int4_enc_ops);
+CREATE INDEX employees_username_idx ON employees USING tde_btree (username tde_text_ops);
+
+-- Equality lookups use the encrypted index
+INSERT INTO employees VALUES (1, 'alice', 90000);
+INSERT INTO employees VALUES (2, 'bob',   85000);
+
+SELECT salary FROM employees WHERE id = 1;       -- uses index
+SELECT id     FROM employees WHERE username = 'alice';  -- uses index
+
+-- Range predicates fall back to sequential scan (index returns empty by design)
+SELECT * FROM employees WHERE id > 1;            -- seq scan, not index scan
+
+-- Index-only scans are not supported and never chosen by the planner;
+-- the heap tuple is always fetched to decrypt column values.
+```
+
+---
+
+## Logical Decoding and Replication
+
+`pg_vault_tde` ships a logical decoding output plugin (`pg_vault_tde_pgoutput`)
+so that `encrypted_heap` tables can be published to logical replication
+subscribers **in plaintext**, even though their on-disk tuples — and their WAL —
+are ciphertext.
+
+### Why a plugin is needed
+
+The TAM decrypt-on-read callbacks run in the query executor, not in the WAL
+sender. A logical decoder reads raw WAL records whose tuple bodies are
+ciphertext, so without intervention a subscriber receives encrypted garbage.
+
+### Non-TOAST tables — pgoutput wrapper
+
+`_PG_output_plugin_init` loads the built-in `pgoutput` via
+`load_external_function()`, lets it populate every callback, then overrides the
+change callbacks with thin wrappers that decrypt the tuple **in place** (via
+`tde_decrypt_heap_tuple`) before delegating back to `pgoutput` for the actual
+serialization. Because the emitted wire format is exactly the `pgoutput`
+protocol, this works with `pg_recvlogical` and with a native `CREATE
+SUBSCRIPTION` pointed at a slot created with this plugin. (Same wrapping
+technique as Citus's CDC decoder.)
+
+### TOAST columns — custom WAL resource manager
+
+Externally-TOASTed columns need more than in-place decryption: the core reorder
+buffer reassembles a TOAST value by `heap_deform_tuple()`-ing the chunks and the
+main tuple **before any output-plugin callback runs**, and on an encrypted tuple
+that crashes (`got sequence entry … for toast chunk`). There is no extension
+hook earlier than that point.
+
+The lever that does exist is a **custom WAL resource manager**, gated by the GUC
+`pg_vault_tde.toast_custom_rmgr` (PGC_POSTMASTER, default **off**; requires
+`pg_vault_tde` in `shared_preload_libraries`). When enabled:
+
+1. **Write path** — `tde_toast_wal_insert()` (a faithful clone of `heap_insert`)
+   logs encrypted TOAST chunks under `TDE_RMGR_ID` instead of `RM_HEAP_ID`. The
+   WAL record is byte-identical to heap's except for the resource manager id, so
+   crash recovery is unaffected (`rm_redo` delegates to `heap_redo`).
+2. **Decode** — routing the chunks to our `rm_decode` keeps them out of the
+   reorder buffer's `toast_hash`, so the core never deforms the still-encrypted
+   main tuple. `rm_decode` captures the raw encrypted chunks per transaction
+   (no catalog access during decode).
+3. **Stitch** — `tde_toast_stitch()`, called from the plugin's change callback
+   after the main tuple has been decrypted, decrypts the captured chunks,
+   reconstructs the plaintext value, and rewrites the external on-disk TOAST
+   pointers into in-memory indirect pointers — a faithful analogue of core's
+   `ReorderBufferToastReplace()`. `pgoutput` then serializes the full plaintext.
+
+### Requirements and supported operations
+
+| Operation | Requirement |
+|-----------|-------------|
+| INSERT (inline, TOAST, bursts) | `toast_custom_rmgr = on` for TOAST columns |
+| Initial table sync (COPY) | works via the TAM read path (decrypt-on-read) |
+| UPDATE / DELETE | **`REPLICA IDENTITY FULL` + a primary key** |
+
+`REPLICA IDENTITY FULL` is mandatory for UPDATE/DELETE: with `DEFAULT` the core
+derives the replica identity by reading the **encrypted** old tuple as if it
+were the key, producing a constant garbage key — the subscriber then silently
+targets the wrong row. Tables without a primary key are likewise unsupported for
+UPDATE/DELETE (no key to match on). These are documented limitations, not bugs:
+they follow from the tuple being an opaque ciphertext blob to the core.
+
+### Structural limitations
+
+- **`heap_insert` clone maintenance** — `tde_toast_wal_insert()` mirrors
+  `heap_insert()` and must be re-synced on each major PostgreSQL release; it is
+  version-audited against the upstream function (see the comment in
+  `src/logical/pg_vault_tde_rmgr.c`).
+- **Reorder-buffer coupling** — the stitch path mirrors internal contracts of
+  `ReorderBufferToastReplace` (buffer copy-back, memory context) that are not a
+  stable public API.
+- **Aborted-transaction capture** — a TOAST-writing transaction that reaches a
+  full snapshot and then aborts *without being streamed* leaves its captured
+  chunks in memory until the decoding process exits (there is no output-plugin
+  hook for non-streamed aborts; it is a slow, per-abort leak, not per-row).
+- **Resource manager id** — the experimental id `RM_EXPERIMENTAL_ID` (128) is
+  used for now; a stable custom rmid will be reserved and registered on the
+  PostgreSQL community wiki before GA.
+
+This ciphertext-as-opaque-blob conflict — every place the core reads a single
+column (e.g. replica identity) sees ciphertext — is the motivation for the
+column-level encryption alternative on the v1.8 roadmap.
+
+---
+
+## PKCS#11 / HSM Provider
+
+The `pkcs11` KMS provider (v1.7, `src/kms/pg_vault_tde_kms_pkcs11.c`) keeps
+the KEK inside a hardware security module. It talks the Cryptoki API
+directly: the vendor's PKCS#11 module (`pg_vault_tde.pkcs11_library`) is
+`dlopen()`ed at runtime and every DEK is wrapped/unwrapped with
+`C_WrapKey`/`C_UnwrapKey` using `CKM_AES_KEY_WRAP` (RFC 3394, the same
+algorithm the local wallet provider uses in software), with a runtime
+fallback to `CKM_AES_KEY_WRAP_PAD`. No OpenSSL involvement and no
+build/runtime dependency: the OASIS interface headers are vendored under
+`src/include/pkcs11/` (include them only through
+`src/include/pg_vault_tde_cryptoki.h`).
+
+### Key Hierarchy and Threat Model
+
+```
+HSM token (user PIN via env var)
+  └── KEK: AES-256, CKO_SECRET_KEY, CKA_SENSITIVE, CKA_EXTRACTABLE=FALSE
+        └── C_WrapKey (CKM_AES_KEY_WRAP) → per-table DEK  (40-byte blob
+              │                             in pg_vault_tde_catalog)
+              └── encrypts tuple data (AES-256-GCM, in-process)
+```
+
+Only the **KEK** is confined to the HSM: tuple crypto runs in-process, so
+the plaintext DEK necessarily transits backend memory (stack buffers,
+`OPENSSL_cleanse`d after use) — the same model as the Vault Transit
+provider. An attacker with the disk (or a catalog dump) holds only
+DEKs wrapped by a key that exists exclusively inside the device.
+
+### Setup
+
+1. `pg_vault_tde.kms_provider = 'pkcs11'`, `pkcs11_library`, and
+   `pkcs11_token_label` (preferred; `pkcs11_slot_id` is the fallback —
+   slot IDs are not stable across restarts on some modules).
+2. Export the token user PIN in the environment variable named by
+   `pkcs11_pin_env` (default `PG_TDE_PKCS11_PIN`) before starting
+   PostgreSQL. The GUC holds the env var *name* — never put the PIN in
+   `postgresql.conf`.
+3. `SELECT pg_vault_tde_pkcs11_keygen();` (superuser, once) generates the
+   AES-256 KEK on the token under `pkcs11_key_label`. It refuses to
+   overwrite an existing key. Alternatively provision the key with the HSM
+   tooling (`CKA_WRAP`, `CKA_UNWRAP`, `CKA_EXTRACTABLE=FALSE`).
+
+Per-database HSM isolation works like every other provider: all `pkcs11_*`
+GUCs are `PGC_SUSET`, so different databases can use different tokens or
+key labels via `ALTER DATABASE ... SET`.
+
+### Process Model and Fork Safety
+
+PKCS#11 (§6.6 of the spec) makes Cryptoki state unusable across `fork()`.
+Because every PostgreSQL backend is forked from the postmaster:
+
+- `C_Initialize` is **never** called in the postmaster — `init()` there
+  only validates the GUCs;
+- each backend attaches lazily on first use (dlopen → `C_Initialize` →
+  slot discovery → `C_OpenSession` → `C_Login` → KEK lookup), and a
+  `getpid()` guard discards any state inherited across fork without
+  calling into the module;
+- on session/device loss (`CKR_SESSION_HANDLE_INVALID`,
+  `CKR_DEVICE_ERROR`, ...) operations retry exactly once through a fresh
+  session;
+- the vendor module is never `dlclose()`d (many modules crash on unload).
+
+### KEK Rotation
+
+Each KEK generation lives forever under its own immutable token label
+`<label>.v<N>` (N monotonically increasing) — rotation never renames or
+destroys a key. "Current" is simply the highest `N` found on the token, and
+every wrapped DEK stored in the catalog carries a 4-byte version tag
+identifying exactly which `<label>.v<N>` produced it. Unwrap always looks
+up that exact version, regardless of which one is "current" at the time.
+
+`SELECT pg_vault_tde_rotate_kek();` drives:
+
+1. **prepare** — generates a fresh KEK as `<label>.v<current+1>`;
+2. **rewrap** — every catalog DEK is unwrapped with the KEK version tagged
+   in its own blob and re-wrapped with the new version, tagging the new
+   blob accordingly (transactional catalog UPDATEs);
+3. **commit** — purely an in-backend cache update (the new version is
+   already durably on the token and every rewrapped row already carries its
+   own version tag), so there is nothing left to make durable and no
+   crash window: whatever the catalog transaction ends up committing is
+   self-describing and always resolves to the right KEK.
+
+Because no KEK generation is ever renamed or destroyed, a crash or a rolled
+back rotation at any point simply leaves an unused `<label>.v<N+1>` key on
+the token (harmless — the next rotation attempt reuses or supersedes it)
+with the catalog untouched, still tagged with the old version and still
+fully readable.
+
+**Cross-backend propagation.** `commit_kek_rotation` only updates the
+cache of the ONE backend that ran `pg_vault_tde_rotate_kek()`. Without more,
+every OTHER already-connected backend would keep wrapping new DEKs under
+the pre-rotation KEK indefinitely. A small shared-memory beacon (one
+`LWLock` + a `uint32` KEK version, same dynamic-tranche pattern as the
+Vault token cache) fixes this: `commit_kek_rotation` (and the initial
+keygen) publish the new version there; every backend checks it
+opportunistically on its own next wrap/unwrap/rewrap call and, if stale,
+resolves its own `CK_OBJECT_HANDLE` locally via a label lookup. Only the
+version NUMBER crosses the process boundary — never the object handle
+itself, which PKCS#11 only guarantees meaningful within the session that
+resolved it. Staleness for an already-attached backend is therefore bounded
+by "its own next operation", not by wall-clock time or a reconnect.
+
+### Testing with SoftHSM2
+
+`tap/16_pkcs11.t` is fully self-contained: it provisions a throwaway
+SoftHSM2 token in a tempdir (`SOFTHSM2_CONF` + `softhsm2-util
+--init-token`, no root needed) and exercises keygen, round-trip, on-disk
+ciphertext, restart, health check, KEK rotation, cross-backend rotation
+propagation (a long-lived session picking up a rotation committed by a
+different connection, via `background_psql`), and clean failure paths
+(wrong token label, wrong PIN, unprovisioned key label, invalid
+`pkcs11_library` path) — 19 assertions in total.
+Run it via `make ci-pkcs11` (containerized) or `prove tap/16_pkcs11.t`
+where the `softhsm2` package is installed; it skips itself otherwise.
+`pkcs11-tool` (package `opensc`) is handy for inspecting the token:
+`pkcs11-tool --module /usr/lib/softhsm/libsofthsm2.so --login --list-objects`.
+
+### Limitations
+
+- The standalone backup tools (`pg_dump_tde`/`pg_restore_tde`) do not
+  support `kms_provider = 'pkcs11'` yet; they exit with a clear error.
+- `health_check()` may exceed its usual latency budget on first touch of
+  a *network* HSM (the lazy attach performs the full login sequence).
+- PKCS#11 labels are not unique: keep exactly one KEK under
+  `pkcs11_key_label` (the provider warns and picks the first match).
 
 ---
 
 ## Known Limitations
 
-### Current Limitations (v1.7)
+### Current Limitations (v1.7 — Current Release)
 
 | # | Limitation | Fix Version |
 |---|-----------|-------------|
 | 1 | **TOAST chunk-level storage encryption** — ✅ **Resolved in v1.6**: large values round-trip fully encrypted via `pg_vault_tde_toast_am` returning `encrypted_heap` AM. Disable with `pg_vault_tde.toast_encryption = off` for legacy behaviour. | v1.6 ✅ |
-| 2 | **tde_btree fixed-size types plaintext index keys** — `int4`, `int8`, `uuid`, `date`, `timestamptz` btree index entries are plaintext (heap fully encrypted); only varlena types have encrypted index keys | v1.7 |
-| 3 | **Logical replication TOAST gap** — tables with externally-TOAST'd columns not supported for logical decoding | v1.7 |
+| 2 | **tde_btree fixed-size types plaintext index keys** — ✅ **Resolved in v1.7**: `int4`, `int8`, `uuid`, `date`, `timestamptz` btree index keys are now encrypted with AES-256-SIV, matching varlena type behaviour. | v1.7 ✅ |
+| 3 | **Logical replication of TOAST columns** — ✅ **Resolved in v1.7** via the custom WAL resource manager (enable `pg_vault_tde.toast_custom_rmgr`). UPDATE/DELETE require `REPLICA IDENTITY FULL` + a primary key; `REPLICA IDENTITY DEFAULT` and PK-less tables remain unsupported. See [Logical Decoding and Replication](#logical-decoding-and-replication). | v1.7 ✅ |
 | 4 | **WAL unencrypted** — requires `XLogInsert()` hook unavailable in extension API | Permanently deferred |
 | 5 | **All-or-nothing table encryption** — no per-column granularity | v1.8 |
 | 6 | **Range scans on tde_btree** — `WHERE col > x` returns empty (AES-SIV not order-preserving) | By design, permanent |
 | 7 | **BRIN on encrypted columns** — min/max of AES-SIV ciphertexts is meaningless | By design, permanent |
+| 8 | **HOT updates disabled** — `heap_update` reject to use HOT updates because the wire format portion considerd by TupDesc for the comparison between old and new tuple is non-deterministic aka changes at every encryption | By design, permanent |
+| 9 | **`WITH HOLD` cursor plaintext temp file** — a held cursor's result set is materialized into a tuplestore at `COMMIT` and spills to a plain temp file on disk past `work_mem`, bypassing the TAM entirely; no extension hook exists anywhere in the `WITH HOLD` cursor lifecycle to intercept it. See README.md § Limitations item 6. | Permanently deferred |
+| 10 | **Plain `COPY <table> TO` / `pg_dump` produce a plaintext dump, with no warning** — encryption lives entirely in the TAM's read callbacks (`scan_getnextslot` and friends), which decrypt unconditionally and cannot distinguish a `COPY TO` from a `SELECT`; `pg_dump`'s default table-data path is exactly this form of `COPY`. No `ProcessUtility_hook` guard or GUC-gated `WARNING` exists yet (designed, never implemented). Use `pg_dump_tde`/`pg_restore_tde` instead. See README.md § Limitations item 10. | v1.8 |
+
+### HOT updates are disabled by design (v4 IV-first wire format)
+
+On an `encrypted_heap` table, `heap_update` never chooses a HOT (heap-only tuple)
+update: every UPDATE writes new index entries. This is **intentional** and is what
+keeps `tde_btree` indexes coherent across UPDATEs of indexed columns — the index always
+follows the row to its new key, with no `REINDEX` needed.
+
+**Mechanism.** `heap_update` decides whether an update can be HOT by comparing the
+indexed columns byte-for-byte between the old and new tuple image. On an `encrypted_heap`
+table both images are the encrypted wire format. The v4 layout (see
+[Wire Format per Encrypted Region](#wire-format-per-encrypted-region)) is **IV-first**:
+it begins with the random GCM IV, which is freshly generated on every encryption. The
+encrypted image therefore differs from **byte 0** for any re-encryption — including when
+the plaintext is unchanged — so `heap_update` always sees the indexed column as modified
+and skips the HOT path. The constant `[VERSION | GENERATION]` bytes were moved to the
+**end** of the blob precisely so they fall outside the comparison window.
+
+> **Historical note (v3 bug, fixed in v4).** The previous v3 format placed a constant
+> `[VERSION(1)=0x03 | GENERATION(8)]` prefix *first*. An indexed column whose datum landed
+> inside that 9-byte prefix — typically a leading fixed-width `int4`/`int8` key — looked
+> *unchanged* to `heap_update`, which then chose a HOT update and silently skipped the
+> index maintenance, leaving the index pointing at the old key. Moving the constant bytes
+> to the trailer removed the byte-stable region and resolved the bug structurally; the
+> workarounds that v3 required (`REINDEX`, or arranging the indexed column past the first
+> 9 bytes) are no longer needed.
 
 ### Historical Limitations (v1.0) — Many Resolved Since
 
@@ -588,18 +957,19 @@ preserved by AES-SIV, regardless of type).
    encrypted individually using the parent relation's DEK.  The v1.0 behaviour
    (forced `HEAP_TABLE_AM_OID`) is available via `toast_encryption = off`.
 
-2. **Row re-encryption after rotation** (ticket #2)  
-   Existing rows encrypted with DEK generation N become **permanently
-   unreadable** after rotating to generation N+1 (the old key is wiped).
-   The `pg_vault_tde_reencrypt_table()` cursor-based utility is planned
-   but not yet implemented.
+2. **Row re-encryption after rotation** (ticket #2) — ✅ **Resolved**  
+   `pg_vault_tde_rotate_online(relname, batch_size)` promotes the current DEK to
+   `prev_dek` and bumps the per-relation generation; old-generation rows stay readable
+   via `prev_dek` during the rotation window. `pg_vault_tde_reencrypt_table(regclass
+   [, batch_size])` (implemented in `src/tam/pg_vault_tde_tam.c`) then rewrites every
+   row to the new generation in batches, closing the window. A rotation background
+   worker (`src/kms/pg_vault_tde_rotation_bgw.c`) can drive this automatically.
 
-3. **Vault HTTP connector** (ticket #3)  
-   The libcurl-based async KMS integration is scaffolded in
-   `src/kms/pg_vault_tde_kms.c` (`pg_vault_tde_kms_request_async()`).
-   Production use currently requires injecting the DEK via
-   `pg_vault_tde_set_test_dek()` (development only) or directly via
-   `pg_vault_tde_kms_set_dek()` in C.
+3. **Vault HTTP connector** (ticket #3) — ✅ **Resolved**  
+   The libcurl-based Vault/OpenBao Transit integration is fully implemented in
+   `src/kms/pg_vault_tde_kms.c` (`vault_provider_wrap_dek()` /
+   `vault_provider_unwrap_dek()` / `vault_provider_rewrap_dek()`, synchronous via
+   `vault_transit_request()`). Supports token, AppRole, and Kubernetes JWT auth.
 
 4. **multi_insert / COPY throughput** (ticket #4)
    The `multi_insert` callback encrypts per-slot and calls `heap_insert`
@@ -607,11 +977,12 @@ preserved by AES-SIV, regardless of type).
    workloads by roughly the single-insert overhead multiplied by batch size.
    Batch-encrypted `heap_multi_insert` is targeted for v1.1.
 
-5. **Logical replication** (ticket #5)  
-   A `pgoutput`-compatible decoding plugin that decrypts tuples before
-   publishing to subscribers is required for logical replication
-   compatibility. The WAL sender runs in a separate code path from the
-   query executor.
+5. **Logical replication** (ticket #5) — ✅ **Resolved** (non-TOAST in v1.2,
+   TOAST columns in v1.7)  
+   The `pg_vault_tde_pgoutput` plugin decrypts tuples before publishing to
+   subscribers; the custom WAL resource manager
+   (`pg_vault_tde.toast_custom_rmgr`) extends this to externally-TOASTed
+   columns. See [Logical Decoding and Replication](#logical-decoding-and-replication).
 
 6. **IAM range scans** (ticket #6)  
    `WHERE col > 'x'` on a column with a `tde_btree` index always returns
@@ -662,7 +1033,7 @@ access control but do not replace it.
 |---|---|
 | Backend start | Local DEK copy in `TopMemoryContext` |
 | Query end | DEK remains in `TopMemoryContext` (not wiped per-query) |
-| `rotate_key()` | Shmem DEK `OPENSSL_cleanse`d; generation incremented |
+| `pg_vault_tde_rotate_online()` | Per-relation shmem DEK `OPENSSL_cleanse`d; generation incremented |
 | Backend exit | `on_proc_exit` hook calls `OPENSSL_cleanse` on local copy |
 | OS crash | Shmem lost; DEK must be re-injected from Vault on restart |
 
@@ -680,11 +1051,11 @@ access control but do not replace it.
 │  Free space                                                        │
 ├────────────────────────────────────────────────────────────────────┤
 │  ... tuples grow downward from end of page ...                     │
-│                                                                     │
-│  ┌─────────────────────────────┬──────────────────────────────┐   │
-│  │  HeapTupleHeaderData        │  IV(12) │ Ciphertext │ TAG(16)│   │
-│  │  (t_hoff bytes, PLAINTEXT)  │      (user data, ENCRYPTED)  │   │
-│  └─────────────────────────────┴──────────────────────────────┘   │
+│                                                                    │
+│  ┌─────────────────────────────┬─────────────────────────────────┐ │
+│  │  HeapTupleHeaderData        │IV(12)│CT│TAG(16)│VER(1)│GEN(8)│ │
+│  │  (t_hoff bytes, PLAINTEXT)  │                                 │ │
+│  └─────────────────────────────┴─────────────────────────────────┘ │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -692,12 +1063,12 @@ access control but do not replace it.
 
 | Constant | Value | Defined in |
 |---|---|---|
-| `TDE_IV_LEN` | 12 | `pg_vault_tde_crypto.h` |
-| `TDE_TAG_LEN` | 16 | `pg_vault_tde_crypto.h` |
-| `TDE_GCM_OVERHEAD` | 28 | `pg_vault_tde_crypto.h` (v1 wire format) |
-| `TDE_V2_VERSION_BYTE` | `0x02` | `pg_vault_tde_crypto.h` |
-| `TDE_V2_GEN_LEN` | 8 | `pg_vault_tde_crypto.h` |
-| `TDE_V2_OVERHEAD` | 37 | `pg_vault_tde_crypto.h` (v2 wire format) |
+| `TDE_GCM_IV_LEN` | 12 | `pg_vault_tde_crypto.h` |
+| `TDE_GCM_TAG_LEN` | 16 | `pg_vault_tde_crypto.h` |
+| `TDE_V4_VERSION_BYTE` | `0x04` | `pg_vault_tde_crypto.h` |
+| `TDE_V4_GEN_LEN` | 8 | `pg_vault_tde_crypto.h` |
+| `TDE_V4_AAD_LEN` | 16 | `pg_vault_tde_crypto.h` (`dboid` + `relid` + `generation`) |
+| `TDE_V4_OVERHEAD` | 37 | `pg_vault_tde_crypto.h` (= 12 + 16 + 1 + 8) |
 | `TDE_DEK_LEN` | 32 | `pg_vault_tde_kms.h` **only** |
 
 `TDE_DEK_LEN` MUST NOT be redefined in any `.c` file or other header
@@ -717,47 +1088,83 @@ CREATE TABLE t (...) USING encrypted_heap;
 CREATE INDEX ON t USING tde_btree (col);
 ```
 
-### Functions
-
-```sql
--- Key management
-SELECT pg_vault_tde_set_test_dek();     -- inject random ephemeral DEK (DEV/TEST ONLY)
-SELECT pg_vault_tde_rotate_key();       -- wipe DEK from shmem, bump generation
-SELECT pg_vault_tde_key_generation();   -- → bigint: current epoch counter
-
--- Operations / monitoring
-SELECT pg_vault_tde_backup_status();    -- → text: backup encryption status
-
--- Test / diagnostic (require DEK set; never use in production)
-SELECT pg_vault_tde_encrypt_test('text');   -- → bytea: [IV(12)|CT|TAG(16)]
-SELECT pg_vault_tde_decrypt_test(bytes);    -- → text: plaintext (verifies GCM tag)
-```
-
 ### GUC Parameters
 
 All parameters are in the `pg_vault_tde` namespace and are registered in
-`_PG_init` via `DefineCustomXxxVariable`. They take effect at postmaster
-start (`PGC_POSTMASTER`); `enabled` is changeable by superusers at runtime
-(`PGC_SUSET`).
+`_PG_init` via `DefineCustomXxxVariable`.
 
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `vault_url` | string | `''` | Vault / OpenBao base URL |
-| `vault_namespace` | string | `''` | Vault namespace (enterprise; empty for community) |
-| `vault_token` | string | `''` | Auth token — hidden from `pg_settings` (`GUC_SUPERUSER_ONLY`) |
-| `vault_role_id` | string | `''` | AppRole role_id UUID |
-| `vault_secret_id` | string | `''` | AppRole secret_id — hidden from `pg_settings` (`GUC_SUPERUSER_ONLY`) |
-| `vault_role_name` | string | `''` | AppRole role name for secret_id rotation **(v1.4)** — calls `secret-id/destroy` after login |
-| `vault_k8s_role` | string | `''` | Kubernetes JWT auth role name |
-| `vault_transit_mount` | string | `transit` | Transit secrets engine mount path |
-| `vault_key_name` | string | `pg-tde-dek` | Transit key name for DEK wrapping |
-| `vault_ca_cert` | string | `''` | Path to CA bundle for Vault TLS (`CURLOPT_CAINFO`) |
-| `vault_timeout_ms` | integer | `5000` | Vault HTTP timeout in ms (0 = no timeout; range 0–300000) |
-| `bgw_enabled` | boolean | `off` | Enable background worker for automatic token renewal |
-| `token_renewal_interval` | integer | `3600` | Token renewal interval in seconds (60–86400) |
-| `enabled` | boolean | `on` | Master switch: `off` disables crypto for benchmarking overhead |
+**Context**: all KMS-related parameters are `PGC_SUSET` — superusers can set
+  them at session level or scope them to individual databases with
+  `ALTER DATABASE SET` / `ALTER ROLE SET`.  No server restart is needed.
+  The exceptions are `max_encrypted_relations` (controls shared-memory
+  sizing, `PGC_POSTMASTER`), `crypto_provider` (OpenSSL provider selection,
+  `PGC_POSTMASTER`), and `enabled` (master crypto switch, `PGC_POSTMASTER` —
+  its value is baked into the on-disk wire format, so it cannot be toggled
+  without risking silent plaintext/ciphertext mismatches; see the `enabled`
+  row below).
 
-All variables are declared as `extern` in `src/include/pg_vault_tde_guc.h`
+
+#### Per-Database KMS Configuration
+
+Because all GUCs are `PGC_SUSET`, each database in the same PostgreSQL cluster
+can independently select its KMS backend and credentials.  This is the primary
+mechanism for multi-tenant key isolation:
+
+```sql
+-- cluster-wide default (postgresql.conf or ALTER SYSTEM)
+-- pg_vault_tde.kms_provider = 'vault'
+
+-- tenant_a: dedicated Transit key, no change to other settings
+ALTER DATABASE tenant_a SET pg_vault_tde.vault_key_name     = 'tde-dek-a';
+ALTER DATABASE tenant_a SET pg_vault_tde.vault_transit_mount = 'transit-tenants';
+
+-- tenant_b: offline local wallet, completely different backend
+ALTER DATABASE tenant_b SET pg_vault_tde.kms_provider          = 'local';
+ALTER DATABASE tenant_b SET pg_vault_tde.wallet_passphrase_env  = 'TDE_WALLET_B';
+
+-- verify effective configuration
+\connect tenant_b
+SHOW pg_vault_tde.kms_provider;   -- 'local'
+SELECT * FROM pg_vault_tde_health_check();
+```
+
+Settings applied with `ALTER DATABASE SET` take effect for new connections to
+that database.  The provider is selected per-connection from the effective GUC
+value; no shared state is changed.
+
+| Parameter | Type | Default | Context | Description |
+|---|---|---|---|---|
+| `kms_provider` | string | `''` (unset — must be configured) | suset | Active KMS backend: `vault`, `local` (v1.6). Settable per-database. |
+| `vault_url` | string | `''` | suset | Vault / OpenBao base URL |
+| `vault_namespace` | string | `''` | suset | Vault namespace (enterprise; empty for community) |
+| `vault_auth_method` | string | `token` | suset | Vault auth method: `token`, `approle`, or `kubernetes` |
+| `vault_token` | string | `''` | suset | Auth token — hidden from `pg_settings` (`GUC_NOT_IN_SAMPLE`) |
+| `vault_role_id` | string | `''` | suset | AppRole role_id UUID — hidden from `pg_settings` |
+| `vault_secret_id` | string | `''` | suset | AppRole secret_id — hidden from `pg_settings` |
+| `vault_role_name` | string | `''` | suset | AppRole role name for secret_id rotation **(v1.4)** — calls `secret-id/destroy` after login |
+| `vault_k8s_role` | string | `''` | suset | Kubernetes JWT auth role name |
+| `vault_k8s_mount` | string | `kubernetes` | suset | Kubernetes auth engine mount path |
+| `vault_transit_mount` | string | `transit` | suset | Transit secrets engine mount path |
+| `vault_key_name` | string | `pg-tde-dek` | suset | Transit key name for DEK wrapping. Override per-database to isolate tenant keys. |
+| `vault_ca_cert` | string | `''` | suset | Path to CA bundle for Vault TLS (`CURLOPT_CAINFO`) |
+| `vault_timeout_ms` | integer | `5000` | suset | Vault HTTP timeout in ms (0 = no timeout; range 0–300000) |
+| `wallet_path` | string | `/var/lib/pg_vault_tde/<OID>/wallet.p12` | suset | Local wallet PKCS#12 path (`kms_provider = 'local'`) |
+| `wallet_passphrase_env` | string | `''` | suset | Env var NAME holding the wallet passphrase |
+| `wallet_passphrase_file` | string | `''` | suset | File path containing the wallet passphrase (mode 0400 enforced) |
+| `wallet_passphrase_command` | string | `''` | suset | Shell command whose stdout is the passphrase (highest priority) |
+| `wallet_auto_open` | boolean | `on` | suset | Auto-open wallet at startup if passphrase env var is set |
+| `dev_mode` | boolean | `off` | suset | Enable development-only conveniences (insecure in production) |
+| `wallet_dev_mode_passphrase` | string | `''` | suset | Inline dev passphrase, used only when `dev_mode = on`; emits a `WARNING` on every use — hidden from `pg_settings` |
+| `dek_cache_ttl` | integer | `0` | suset | Per-backend DEK cache TTL in seconds (0 = no expiry; range 0–86400). When > 0, each backend re-reads the DEK from shmem after this interval even without rotation |
+| `toast_encryption` | boolean | `on` | suset | Encrypt TOAST chunks with the parent relation's DEK |
+| `allow_plaintext_index` | boolean | `off` | suset | When `off` (default), `CREATE INDEX`/`CREATE UNIQUE INDEX` with a non-`tde_btree` access method on an `encrypted_heap` table is rejected with `ERROR`. When `on`, the same statement is allowed after a `WARNING` — the indexed column's plaintext value is then stored unencrypted on disk. Does not affect `PRIMARY KEY`/`UNIQUE` table constraints, which PostgreSQL core always backs with a native btree index regardless of this setting (that case already warns unconditionally). |
+| `bgw_enabled` | boolean | `off` | suset | Enable background worker for automatic token renewal. **Requires cluster restart**: the BGW is registered via `RegisterBackgroundWorker()` at postmaster startup; changing via `pg_reload_conf()` updates the value but does not start/stop the worker dynamically. |
+| `token_renewal_interval` | integer | `3600` | suset | Token renewal interval in seconds (60–86400) |
+| `enabled` | boolean | `on` | postmaster | Master switch: `off` disables crypto for benchmarking overhead. Fixed at server startup |
+| `max_encrypted_relations` | integer | `1024` | postmaster | Max per-table DEK entries in shmem (64–65536). **Requires restart** — controls shared-memory allocation. |
+| `crypto_provider` | string | `''` | postmaster | OpenSSL 3.x provider name (`qatprovider`, `fips`; empty = built-in dispatch). **Requires restart**. |
+
+All variables are declared `extern` in `src/include/pg_vault_tde_guc.h`
 and included by any translation unit that needs them (`tam.c`, `kms.c`).
 
 ---
@@ -768,42 +1175,49 @@ and included by any translation unit that needs them (`tam.c`, `kms.c`).
 
 ```
 _PG_init()
-  ├── DefineCustomStringVariable("pg_vault_tde.vault_url", ...)
-  ├── DefineCustomStringVariable("pg_vault_tde.vault_token", ...)  [GUC_SUPERUSER_ONLY]
-  ├── ... 6 more GUC parameters ...
+  ├── DefineCustomStringVariable("pg_vault_tde.vault_url", ...)      [PGC_SUSET]
+  ├── DefineCustomStringVariable("pg_vault_tde.vault_token", ...)    [PGC_SUSET, GUC_NOT_IN_SAMPLE]
+  ├── ... ~20 more GUC parameters (all PGC_SUSET except max_encrypted_relations/crypto_provider/enabled) ...
   ├── install shmem_request_hook  → pg_vault_tde_shmem_request()
-  │       └── pg_vault_tde_kms_shmem_request()
-  │               └── RequestAddinShmemSpace(sizeof(pg_vault_tde_dek_cache))
-  │           NOTE: NO RequestNamedLWLockTranche here.
-  │           Tranche is allocated lazily in shmem_startup_hook (see below).
+  │       ├── pg_vault_tde_kms_shmem_request()
+  │       │       └── RequestAddinShmemSpace(sizeof(pg_vault_tde_kms_cache))
+  │       └── pg_vault_tde_catalog_shmem_request()
+  │               ├── RequestAddinShmemSpace(tde_rel_dek_cache_size(capacity))
+  │               └── RequestNamedLWLockTranche("TdeRelDekMap", 1)
   ├── install shmem_startup_hook  → pg_vault_tde_shmem_startup()
-  │       └── pg_vault_tde_kms_shmem_init()
-  │               ├── ShmemInitStruct("pg_vault_tde_dek_cache", ..., &found)
-  │               ├── if !found:
-  │               │       ├── LWLockNewTrancheId()       ← requires shmem to be up!
-  │               │       └── LWLockInitialize(&cache->lock, tranche_id)
-  │               └── LWLockRegisterTranche(id, "pg_vault_tde_kms")  (every process)
+  │       ├── pg_vault_tde_kms_shmem_init()       (Vault-token cache)
+  │       │       ├── ShmemInitStruct("pg_vault_tde_kms_cache", ..., &found)
+  │       │       └── if !found: LWLockNewTrancheId() + LWLockInitialize()
+  │       │                      ← dynamic tranche; requires shmem to be up!
+  │       ├── pg_vault_tde_catalog_shmem_init()   (per-relation DEK cache)
+  │       │       ├── ShmemInitHash("TdeRelDekMap", capacity, capacity, ...)
+  │       │       └── rel_dek_lock = &GetNamedLWLockTranche("TdeRelDekMap")[0].lock
+  │       └── tde_shmem_started = true; tde_active_kms_provider->init()
   ├── pg_vault_tde_tam_init()
   │       └── memcpy(&tde_methods, GetHeapamTableAmRoutine(), sizeof(TableAmRoutine))
-  │           + install 4 write + 7 read + 1 TOAST AM wrappers
+  │           + install 5 write + 8 read + 2 visibility/build + 2 rewrite AM wrappers
   └── register on_proc_exit(tde_backend_cleanup)
           ├── tde_crypto_ctx_cleanup()   ← EVP_CIPHER_CTX_free + OPENSSL_cleanse iv_batch
-          └── tde_iam_siv_ctx_cleanup()  ← EVP_CIPHER_CTX_free SIV enc/dec pool
+          └── tde_iam_ctx_cleanup()      ← EVP_CIPHER_CTX_free SIV enc/dec context
 ```
 
 #### Critical: Why LWLockNewTrancheId cannot be called from _PG_init
 
 In PostgreSQL 17+, `LWLockNewTrancheId()` acquires
 `WaitEventCustomCounterLock`, a spinlock stored **in shared memory**.
-Shared memory does not exist at `_PG_init` time. Calling
-`LWLockNewTrancheId()` (or `RequestNamedLWLockTranche()`) from `_PG_init`
-causes an immediate segfault. The correct pattern is:
+Shared memory does not exist at `_PG_init` time, so calling
+`LWLockNewTrancheId()` from `_PG_init` causes an immediate segfault. The two
+shmem structs use two different (both correct) tranche strategies:
 
-- `shmem_request_hook`: call `RequestAddinShmemSpace()` only.
-- `shmem_startup_hook` (first process, `!found` branch): call
-  `LWLockNewTrancheId()` + `LWLockInitialize()`.
-- `shmem_startup_hook` (every process): call `LWLockRegisterTranche()` to
-  register the display name in the local wait-event table.
+- **`pg_vault_tde_kms_cache`** (dynamic tranche): `RequestAddinShmemSpace()`
+  in `shmem_request_hook`; `LWLockNewTrancheId()` + `LWLockInitialize()` in the
+  `shmem_startup_hook` `!found` branch.
+- **`TdeRelDekMap`** (named tranche): `RequestAddinShmemSpace()` **and**
+  `RequestNamedLWLockTranche("TdeRelDekMap", 1)` in `shmem_request_hook`
+  (named-tranche *requests* are allowed there — only `LWLockNewTrancheId()` is
+  not), then `GetNamedLWLockTranche("TdeRelDekMap")` in `shmem_startup_hook`
+  (the HTAB and its lock are created by `ShmemInitHash` / picked up from the
+  tranche; no `LWLockInitialize()` needed for a named-tranche lock).
 
 This is the correct pattern for all PG17+ / PG18 extensions that need a
 dynamic LWLock tranche.
@@ -812,11 +1226,20 @@ dynamic LWLock tranche.
 
 ## Testing Strategy
 
-### Regression Tests (`sql/regression_test.sql`)
+### Regression Tests
 
-`sql/regression_test.sql` contains **70 tests**: the original 52 v1.4 baseline
-TAM/TOAST additions (tests 53–70). Combined with the v1.5 and v1.6 supplement files the
-full `make ci-regress` suite runs **105 tests**.
+`make ci-regress` (driven by `ci/scripts/run-regress.sh`) runs four SQL files in
+sequence, gated on the live extension version:
+
+| File | Tests | Scope |
+|---|---|---|
+| `sql/regression_test.sql` | 1–52 | v1.0–v1.4 baseline: crypto, TAM, TOAST, tde_btree |
+| `sql/regression_test_v15.sql` | 53–72 | v1.5: per-table DEK, online rotation, AAD |
+| `sql/regression_test_v16.sql` | 73–109 | v1.6: local wallet KMS |
+| `sql/regression_test_v17.sql` | 111–134 | v1.7: `enc_ops` indexes, partition trees, HOT/REINDEX, FK lifecycle, TidRangeScan|
+
+Test 110 (`WITH HOLD` cursor spill) is permanently deferred. The full suite is therefore
+**134 tests**. The table below details the v1.0–v1.4 baseline file:
 
 | Range | Area |
 |---|---|
@@ -851,7 +1274,7 @@ Starts PostgreSQL with `initdb -k` (`--data-checksums`). Verifies that:
 | File | Coverage |
 |---|---|
 | `tap/01_load.t` | Extension load, AM registration, basic SQL round-trip |
-| `tap/02_backup.t` | `pg_basebackup` + `pg_vault_tde_backup_status()` |
+| `tap/02_backup.t` | `pg_basebackup` |
 
 ### Isolation Tests (`isolation/dek_rotation.spec`)
 
@@ -877,13 +1300,34 @@ Verifies:
 
 ## Packaging
 
+### Pre-installation requirement: wallet base directory
+
+Before the extension can initialise a local wallet, the base directory
+`/var/lib/pg_vault_tde/` must exist and be owned by the OS user that runs
+PostgreSQL (typically `postgres`).  The directory must **not** be inside
+`PGDATA` — see [Security Considerations](#security-considerations).
+
+The package installers (postinst / %pre) create it automatically.  For
+bare source builds or container images, run once as root:
+
+```bash
+mkdir -p /var/lib/pg_vault_tde
+chown postgres:postgres /var/lib/pg_vault_tde
+chmod 0700 /var/lib/pg_vault_tde
+```
+
+`pg_vault_tde_wallet_init()` creates the per-database subdirectory
+(`/var/lib/pg_vault_tde/<db_oid>/`) at runtime; it does **not** create
+the base directory.  If the base directory is missing the function fails
+with an actionable error and hint.
+
 ### DEB (Debian / Ubuntu)
 
 ```bash
 # Build
 bash packaging/build_deb.sh --no-sign
 
-# Install
+# Install (creates /var/lib/pg_vault_tde via postinst)
 dpkg -i ../postgresql-18-pg-vault-tde_1.0-1_amd64.deb
 
 # Verify
@@ -896,33 +1340,32 @@ dpkg -l | grep pg-vault-tde
 # Build
 bash packaging/build_rpm.sh
 
-# Install
+# Install (creates /var/lib/pg_vault_tde via %pre scriptlet)
 dnf install ~/rpmbuild/RPMS/x86_64/postgresql18-pg_vault_tde-1.0-1.*.rpm
 
 # Verify
 rpm -qi postgresql18-pg_vault_tde
 ```
 
-### Hardware-Accelerated Variants
+### Hardware Acceleration
 
-| Variant | Flag | Package suffix |
-|---|---|---|
-| Generic (portable) | `TDE_TARGET_ARCH=generic` | *(default)* |
-| AES-NI (Intel/AMD) | `TDE_TARGET_ARCH=x86_64-aesni` | `-aesni` |
-| VAES + AVX2 | `TDE_TARGET_ARCH=x86_64-vaes` | `-vaes` |
-| ARM Crypto (ARMv8-A) | `TDE_TARGET_ARCH=aarch64-ce` | `-armce` |
-| ARM SVE2 (ARMv9-A) | `TDE_TARGET_ARCH=aarch64-sve2` | `-sve2` |
-
-The ARM CE variant is packaged as a separate `.so` (`pg_vault_tde_armce.so`)
-and RPM (`postgresql18-pg_vault_tde-armce`) that can coexist with the
-generic build. See `packaging/rpm/pg_vault_tde-arm.spec`.
+There is a single build/package — no `TDE_TARGET_ARCH` variant. Hardware-
+accelerated AES dispatch (AES-NI, VAES, ARM CE, SVE2) is provided by
+OpenSSL's EVP layer automatically at runtime on this one build; see
+"Hardware acceleration" above and `src/crypto/pg_vault_tde_hw_accel.c`.
+A previous version of this codebase shipped `TDE_TARGET_ARCH`-selected
+compiler flags and matching `-aesni`/`-vaes`/`-armce` package variants, but
+none of the corresponding preprocessor defines (`TDE_HW_AES_NI`,
+`TDE_HW_VAES`, `TDE_HW_ARM_CE`, `TDE_HW_ARM_SVE2`) were ever referenced by
+any `#ifdef`/`#if defined` in `src/`, so those variants never produced a
+measurably faster `.so` — they were removed.
 
 ### Version Matrix
 
 | pg_vault_tde | PostgreSQL | OpenSSL | Status |
 |---|---|---|---|
-| 1.6.x | 17.x, 18.x | 3.x | ✅ Current |
-| 1.7.x | 17.x, 18.x, 19.x | 3.x | 📋 Planned |
+| 1.6.x | 17.x, 18.x | 3.x | ✅ Completed |
+| 1.7.x | 17.x, 18.x | 3.x | 🔄 Current |
 | 1.8.x | 17.x, 18.x, 19.x | 3.x | 📋 Planned |
 
 ---
@@ -938,9 +1381,9 @@ See [ROADMAP.md](ROADMAP.md) for the full release roadmap.
 | **v1.3** | Vault KEK + multi_insert + BGW | ✅ Completed | 48 |
 | **v1.4** | CI/CD + tde_btree + Wire Format v2 | ✅ Completed | 52 |
 | **v1.5** | Per-Table DEK + Online Rotation + AAD | ✅ Completed | 72 |
-| **v1.6** | Local Wallet KMS (production-ready) | ✅ Completed | 72 |
-| **v1.7** | TOAST Chunks + HSM + Audit | 📋 Q4 2027 | ~100 |
-| **v1.8** | KMIP + Column-Level + HA | 📋 Q2 2028 | ~130 |
+| **v1.6** | Local Wallet KMS (production-ready) | ✅ Completed | 109 |
+| **v1.7** | Per-database KMS + pg_restore_tde + PGC_SUSET + enc_ops indexes | 🔄 Current | 109 |
+| **v1.8** | KMIP + Column-Level + GIN/Hash/GiST/BRIN + HA + Dual-Control | 📋 Q2 2027 | ~130 |
 
 ### Permanent Deferrals
 
@@ -959,7 +1402,7 @@ This extension follows PostgreSQL's BSD-derived coding style and
 `pgindent` formatting conventions. All contributions must:
 
 - Pass `make` with `-Wall -Wextra` and zero warnings
-- Pass the full 72-test regression suite (`make ci-regress`)
+- Pass the full 109-test regression suite (`make ci-regress`)
 - Pass the page checksum compatibility test (`make ci-checksums`)
 - Use `palloc` / `pfree` exclusively (never `malloc` / `free`)
 - Use `ereport` / `elog` exclusively (never `printf` / `exit`)

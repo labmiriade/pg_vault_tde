@@ -13,7 +13,7 @@ ENV CFLAGS="-O2 -fno-lto"
 
 # Install build dependencies
 RUN apt-get update && \
-    apt-get install -y build-essential postgresql-server-dev-${PG_MAJOR} libssl-dev libcurl4-openssl-dev && \
+    apt-get install -y build-essential postgresql-server-dev-${PG_MAJOR} libssl-dev libcurl4-openssl-dev libpq-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # Set workdir
@@ -30,6 +30,13 @@ RUN make && make install
 # and must only be run via CREATE EXTENSION, not directly
 RUN mkdir -p /docker-entrypoint-initdb.d && \
     cp sql/pg_vault_tde_init.sql /docker-entrypoint-initdb.d/
+
+# Create wallet base directory outside PGDATA.
+# In production this is done by the package installer (postinst / %pre scriptlet).
+# Here we replicate that step for the container image.
+RUN mkdir -p /var/lib/pg_vault_tde && \
+    chown postgres:postgres /var/lib/pg_vault_tde && \
+    chmod 0700 /var/lib/pg_vault_tde
 
 # Set environment for PostgreSQL to find the extension
 ENV LD_LIBRARY_PATH=/usr/lib/postgresql/${PG_MAJOR}/lib:$LD_LIBRARY_PATH

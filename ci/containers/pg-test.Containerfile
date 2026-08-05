@@ -32,6 +32,7 @@ RUN apt-get update -qq && \
         postgresql-server-dev-${PG_MAJOR} \
         libssl-dev \
         libcurl4-openssl-dev \
+        libpq-dev \
         pkg-config && \
     rm -rf /var/lib/apt/lists/*
 
@@ -62,11 +63,14 @@ RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends \
         libssl3 \
         libcurl4 \
+        postgresql-${PG_MAJOR}-pgaudit \ 
         # TAP test dependencies
         perl \
         libipc-run-perl \
         libhttp-daemon-perl \
         libhttp-message-perl \
+        # PKCS#11 provider test (tap/16): SoftHSM2 module + CLI
+        softhsm2 \
         # Debug tools (useful for failures)
         procps \
         less && \
@@ -80,6 +84,18 @@ COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/lib/pg_vault_tde.so \
      /usr/lib/postgresql/${PG_MAJOR}/lib/
 COPY --from=builder /usr/share/postgresql/${PG_MAJOR}/extension/pg_vault_tde* \
      /usr/share/postgresql/${PG_MAJOR}/extension/
+# Copy the compiled pg_dump_tde, pg_restore_tde and pg_basebackup_tde from builder stage
+COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/bin/pg_dump_tde \
+     /usr/lib/postgresql/${PG_MAJOR}/bin/
+COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/bin/pg_restore_tde \
+     /usr/lib/postgresql/${PG_MAJOR}/bin/
+COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/bin/pg_basebackup_tde \
+     /usr/lib/postgresql/${PG_MAJOR}/bin/
+# Copy PostgreSQL Perl test modules (PostgreSQL::Test::Cluster etc.) from builder
+COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/lib/pgxs/src/test/perl/ \
+     /usr/lib/postgresql/${PG_MAJOR}/lib/pgxs/src/test/perl/
+
+ENV PERL5LIB=/usr/lib/postgresql/${PG_MAJOR}/lib/pgxs/src/test/perl
 
 # Copy test assets into the image (for self-contained execution)
 COPY sql/regression_test.sql  /test/regression_test.sql
@@ -88,8 +104,18 @@ COPY tap/                     /test/tap/
 COPY test/isolation/               /test/isolation/
 COPY bench_tde.sh            /test/bench_tde.sh
 
-# Ensure test files are readable
-RUN chmod -R a+r /test
+# Ensure test files are readable and writable by the postgres user
+# (PostgreSQL::Test::Utils writes log/ relative to cwd, which is /test)
+RUN chmod -R a+r /test && \
+    mkdir -p /test/log && \
+    chown -R postgres:postgres /test
+
+# Create wallet base directory outside PGDATA.
+# In production this is done by the package installer (postinst / %pre scriptlet).
+# Here we replicate that step for the container image.
+RUN mkdir -p /var/lib/pg_vault_tde && \
+    chown postgres:postgres /var/lib/pg_vault_tde && \
+    chmod 0700 /var/lib/pg_vault_tde
 
 EXPOSE 5432
 

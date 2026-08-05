@@ -1,7 +1,6 @@
 # pg_vault_tde
 
-**Transparent Data Encryption (TDE) for PostgreSQL 17+** — plug-and-play,
-zero core modifications.
+**Transparent Data Encryption (TDE) for PostgreSQL 17+** — Open-source (PostgreSQL License), plug-and-play, zero core modifications.
 
 pg_vault_tde encrypts every tuple with **AES-256-GCM** at the Table Access
 Method layer. Data is encrypted before it reaches the storage manager and
@@ -9,7 +8,20 @@ decrypted after it leaves. Encryption keys are managed by **HashiCorp Vault** /
 **OpenBao** or a **local PKCS#12 wallet** and cached in shared memory with
 automatic rotation.
 
-**Current release: v1.6** - 109 regression tests (52 v1.4 + 20 v1.5 + 37 v1.6), zero compiler warnings on PG 17 + PG 18.
+**Current release: v1.7** — 109 regression tests (52 v1.4 + 20 v1.5 + 37 v1.6), zero compiler warnings on PG 17 + PG 18.
+
+### Commercial Support
+
+Looking for professional support for `pg_vault_tde` in production? At [Miriade](https://miriade.it), we offer dedicated enterprise services, including:
+
+* **24/7 Production Support & SLA Guarantees**
+* **Custom Feature Development & Vault Integration**
+* **Performance Tuning & Security Audits**
+* **Managed Setup & Migration Assistance**
+
+Learn more about our enterprise encryption solutions at [Mircrypt](https://www.miriade.it/en/products/mircrypt-it)
+
+Contact our engineering team at [marketing@miriade.it](mailto:marketing@miriade.it) to discuss your requirements.
 
 ### PostgreSQL Version Compatibility
 
@@ -47,6 +59,18 @@ dnf install -y postgresql17-devel openssl-devel libcurl-devel
 make PG_CONFIG=/usr/pgsql-17/bin/pg_config && make install
 ```
 
+**Or via [PGXN](https://pgxn.org/dist/pg_vault_tde/)** (same OS build
+dependencies as above are still required — `pgxn install` just runs the
+build for you):
+
+```bash
+pip install pgxnclient   # or: apt-get install pgxnclient / dnf install pgxnclient
+pgxn install pg_vault_tde
+```
+
+See [wiki: Installation](https://github.com/miriade/pg_vault_tde/wiki/Installation)
+for package-based (`.deb`/`.rpm`) installs and full per-OS prerequisites.
+
 ### 2. Configure PostgreSQL
 
 Add to `postgresql.conf`:
@@ -64,11 +88,14 @@ CREATE EXTENSION pg_vault_tde;
 ### 3. Configure Key Access
 
 
-#### a) HashiCorp Vault / OpenBao (default)
+#### a) HashiCorp Vault / OpenBao
 
-Set GUC parameters in `postgresql.conf` (or `ALTER SYSTEM`) to point at your Vault / OpenBao instance:
+`kms_provider` has no built-in default — it must be set explicitly. Set GUC
+parameters in `postgresql.conf` (or `ALTER SYSTEM`) to point at your Vault /
+OpenBao instance:
 
 ```ini
+pg_vault_tde.kms_provider          = 'vault'
 pg_vault_tde.vault_url            = 'https://vault.example.com:8200'
 pg_vault_tde.vault_namespace      = ''          # leave empty for community edition
 pg_vault_tde.vault_token          = 'hvs.TOKEN' # or use AppRole (1.1)
@@ -76,8 +103,19 @@ pg_vault_tde.vault_transit_mount  = 'transit'
 pg_vault_tde.vault_key_name       = 'pg-tde-dek'
 pg_vault_tde.vault_ca_cert        = '/etc/ssl/vault/ca.pem'
 pg_vault_tde.vault_timeout_ms     = 5000
-pg_vault_tde.enabled              = on          # set off to benchmark overhead
+pg_vault_tde.enabled              = on          # PGC_POSTMASTER: requires a full restart to change
 ```
+
+> **⚠️ Warning — do not toggle `pg_vault_tde.enabled` on a live database.**
+> Rows are written using the wire format active at the time of the write
+> (encrypted v4 trailer when `on`, verbatim heap tuple when `off`). Changing
+> the setting and restarting does **not** retroactively convert existing
+> rows: reads use whatever format is currently active for the *entire*
+> table, so any `encrypted_heap` table containing rows written under the
+> other setting will have those old rows misread (silent data corruption,
+> not an error). Only toggle this setting on databases where `encrypted_heap`
+> tables are empty or have been fully migrated (e.g. rewritten via
+> `CREATE TABLE ... AS SELECT` under the target setting) beforehand.
 
 #### b) Local Wallet (keypass locale, v1.6+)
 
@@ -87,7 +125,7 @@ To use a local PKCS#12 wallet (no external KMS, suitable for offline/air-gapped/
 
 ```ini
 pg_vault_tde.kms_provider          = 'local'
-# wallet_path defaults to $PGDATA/base/<DB_OID>/pg_vault_tde/wallet.p12 — omit unless overriding:
+# wallet_path defaults to /var/lib/pg_vault_tde/<DB_OID>/wallet.p12 — omit unless overriding:
 # pg_vault_tde.wallet_path         = '/custom/path/to/wallet.p12'
 pg_vault_tde.wallet_passphrase_env = 'TDE_WALLET_PASSPHRASE'   # env var name only
 pg_vault_tde.wallet_auto_open      = on
@@ -124,12 +162,55 @@ SELECT pg_vault_tde_wallet_lock();
 
 > **Tip:** You can also use `wallet_passphrase_file` or `wallet_passphrase_command` instead of an environment variable. See the [GUC Parameters](#guc-parameters) section for details.
 
-For development and testing (no Vault or wallet required):
+#### c) PKCS#11 / HSM (v1.7)
+
+To keep the KEK inside a hardware security module (or any device exposing a
+PKCS#11 module — Thales, Utimaco, YubiHSM, AWS CloudHSM, SoftHSM2 for
+testing). The extension loads the vendor's module directly and wraps every
+per-table DEK with `C_WrapKey` (`CKM_AES_KEY_WRAP`, RFC 3394) against an
+AES-256 KEK that never leaves the token.
+
+1. Set the following in `postgresql.conf`:
+
+```ini
+pg_vault_tde.kms_provider       = 'pkcs11'
+pg_vault_tde.pkcs11_library     = '/usr/lib/softhsm/libsofthsm2.so'  # vendor module
+pg_vault_tde.pkcs11_token_label = 'pgtde'      # preferred over pkcs11_slot_id
+# pg_vault_tde.pkcs11_pin_env   = 'PG_TDE_PKCS11_PIN'   # env var NAME (default)
+# pg_vault_tde.pkcs11_key_label = 'pg_vault_tde_kek'    # KEK CKA_LABEL (default)
+pg_vault_tde.enabled            = on
+```
+
+2. Export the token user PIN in the server environment before starting
+   PostgreSQL (the GUC holds the env var *name*, never the PIN itself):
+
+```bash
+export PG_TDE_PKCS11_PIN='1234'
+```
+
+3. Generate the KEK on the token (first time only, as superuser):
 
 ```sql
--- Inject a random ephemeral DEK (test/dev only — lost on restart)
-SELECT pg_vault_tde_set_test_dek();
+SELECT pg_vault_tde_pkcs11_keygen();
 ```
+
+The KEK is created with `CKA_SENSITIVE` and `CKA_EXTRACTABLE=FALSE`: it can
+never be read out of the device. KEK rotation goes through the standard
+`SELECT pg_vault_tde_rotate_kek();` — each generation is kept on the token
+forever as an immutable object labelled `<pkcs11_key_label>.v<N>` (never
+renamed or destroyed), so old data always decrypts regardless of which
+version is "current". A backend that is already connected when a rotation
+completes elsewhere picks it up automatically, on its next encrypt/decrypt
+call — no reconnect required.
+
+> **Testing without an HSM:** initialize a SoftHSM2 token with
+> `softhsm2-util --init-token --free --label pgtde --pin 1234 --so-pin 12345`
+> (package `softhsm2`; set `SOFTHSM2_CONF` for a custom token directory).
+> See `tap/16_pkcs11.t` for a complete self-contained example.
+
+> **Limitation:** the standalone backup tools (`pg_dump_tde` /
+> `pg_restore_tde`) do not support `kms_provider = 'pkcs11'` yet and exit
+> with a clear error.
 
 ### 4. Create an Encrypted Table
 
@@ -156,16 +237,27 @@ SELECT email, ssn FROM users WHERE id = 1;
 |---|---|---|
 | Tuple user data | ✅ **Yes** — AES-256-GCM | All column values in `encrypted_heap` tables |
 | HeapTupleHeader | ✗ No | xmin, xmax, ctid, infomask — required for MVCC |
-| Index keys (B-Tree) | ⚠️ Optional — `tde_btree` | AES-256-SIV — equality only; `bytea` only in v1.4; native types in v1.5 |
+| Index keys (B-Tree) | ⚠️ Optional — `tde_btree` | AES-256-SIV — equality only; all types encrypted (v1.7); index-only scans not supported |
 | Index keys (GIN, Hash) | 🔜 v1.8 | GIN for jsonb/arrays; Hash for equality hashing |
 | Index keys (GiST equality) | 🔜 v1.8 | Equality-only GiST (`inet_ops`); range/geometric GiST permanently deferred |
+| Index keys (BRIN bloom) | 🔜 v1.8 | Equality-only block-range pruning via a bloom filter over ciphertext hashes; `minmax` BRIN permanently deferred (needs a spike — see doc/ROADMAP.md) |
 | TOAST values | ✅ **Yes** | Heap-level round-trips functional; per-chunk storage encryption |
 | Column-level granularity | 🔜 v1.8 | Per-column `ENABLE COLUMN ENCRYPTION` DDL |
-| WAL / redo log | ✗ Permanently deferred | Requires core hook in `XLogInsert()` — not possible as extension |
+| WAL / redo log | ✅ **Yes** | Data encrypted before `heap_insert()` |
 | pg_statistic | 🔜 v1.8 | Statistics stored plaintext; MCVs/histograms expose value distribution |
 
 > **Column-level**: Only tables created with `USING encrypted_heap` are
 > encrypted. Regular `heap` tables are unaffected.
+
+> **Index access method whitelist**: `CREATE INDEX`/`CREATE UNIQUE INDEX`
+> with any access method other than `tde_btree` (so also `gin`, `gist`,
+> `hash`, `brin`) against an `encrypted_heap` table is rejected with `ERROR`
+> by default — the indexed column's plaintext value would otherwise sit
+> unencrypted on disk. Set `pg_vault_tde.allow_plaintext_index = on` to allow
+> it anyway (with a `WARNING`) until GIN/Hash/GiST encryption ships in v1.8.
+> `PRIMARY KEY`/`UNIQUE` **table constraints** are a separate, unavoidable
+> case — PostgreSQL core always backs them with a native btree index — and
+> are always allowed with a `WARNING`, regardless of this setting.
 
 ---
 
@@ -194,14 +286,15 @@ Index Access Method (IAM) — tde_btree                  src/iam/
    │
    ▼
 Crypto Layer — AES-256-GCM (OpenSSL 3.x EVP)           src/crypto/
-   │  [IV(12) | CIPHERTEXT | GCM-TAG(16)] per tuple
-   │  Per-backend EVP_CIPHER_CTX pool (reset, not reallocate)
+   │  [IV(12) | CIPHERTEXT | GCM-TAG(16) | VER(1) | GEN(8)] per tuple
+   │  Per-backend EVP_CIPHER_CTX cached & keyed by (relid, generation):
+   │  AES key schedule reused across tuples, only the IV rearmed per call
    │  IV batch generation: 256 IVs per pg_strong_random() call
    │
    ▼
-KMS Layer — shared-memory DEK cache                    src/kms/
-   │  ┌─ dek_cache (shmem, LWLock-protected, generation epoch)
-   │  └─ local_dek_cache (per-backend TopMemCtx, generation mismatch → reload)
+KMS Layer — per-relation DEK cache                     src/kms/
+   │  ┌─ TdeRelDekMap (shmem HTAB, one shared LWLock, per-relation generation)
+   │  └─ pg_vault_tde_catalog (on-disk wrapped DEKs, one row per relation)
    │
    ▼
 HashiCorp Vault / OpenBao (GUC-configurable endpoint)
@@ -209,23 +302,23 @@ HashiCorp Vault / OpenBao (GUC-configurable endpoint)
 
 ### Wire Format (on disk, per tuple)
 
-**v3 format** (all new tuples as of v1.5 — default for `encrypted_heap` tables):
+**v4 format** (default for `encrypted_heap` tables):
 
 ```
-┌─────────────────────────────────┬────────────────────────────────────────────────────────────────┐
-│  HeapTupleHeader (t_hoff bytes) │  VER(1) │ GEN(8) │ IV(12) │ Ciphertext │ GCM-Tag(16)      │
-│  PLAINTEXT — MVCC fields        │                       ENCRYPTED USER DATA                  │
-└─────────────────────────────────┴────────────────────────────────────────────────────────────────┘
-                                     ←────────── TDE_V2_OVERHEAD = 37 bytes ───────────→
+┌─────────────────────────────────┬───────────────────────────────────────────────────────┐
+│  HeapTupleHeader (t_hoff bytes) │   IV(12) │ Ciphertext │ GCM-Tag(16) | VER(1) │ GEN(8) | 
+│  PLAINTEXT — MVCC fields        │                                                       │
+└─────────────────────────────────┴───────────────────────────────────────────────────────┘
+                                   ←───────────── TDE_V4_OVERHEAD = 37 bytes ─────────────→
 ```
 
-v3 overhead: **37 bytes per tuple** (1-byte version `0x03` + 8-byte DEK generation
-counter + 12-byte IV + 16-byte GCM authentication tag).
-v3 also passes `[database_oid(4) | relfilenode(4) | generation(8)]` as AEAD Additional
+v4 overhead: **37 bytes per tuple** (12-byte IV + 16-byte GCM authentication tag +
+1-byte version `0x04` + 8-byte DEK generation counter).
+The IV-first layout keeps the version/generation bytes at the **end** so the blob has no
+byte-stable prefix — this is what structurally disables HOT updates (see
+[Limitations](#limitations-v17)).
+v4 also passes `[database_oid(4) | relid(4) | generation(8)]` as AEAD Additional
 Authenticated Data (AAD) — zero wire overhead; prevents cross-table ciphertext smuggling.
-
-**v2 format** (written by pg_vault_tde 1.4) is **fully backward-compatible**: the
-decrypt path detects v1/v2/v3 from the first byte and applies the correct AAD.
 
 ---
 
@@ -234,24 +327,56 @@ decrypt path detects v1/v2/v3 from the first byte and applies the correct AAD.
 ### KMS Provider Selection
 
 pg_vault_tde supports multiple KMS backends via a provider abstraction layer
-(introduced in v1.5). Select the provider with:
+(introduced in v1.5). `kms_provider` has **no built-in default** — it is an
+empty string until set, which the extension treats as "not yet configured."
+Select the provider explicitly with:
 
 ```ini
-pg_vault_tde.kms_provider = 'vault'   # HashiCorp Vault / OpenBao (default)
+pg_vault_tde.kms_provider = 'vault'   # HashiCorp Vault / OpenBao
 # pg_vault_tde.kms_provider = 'local'  # Local wallet (PKCS#12, no external service) (v1.6)
-# pg_vault_tde.kms_provider = 'pkcs11' # HSM via PKCS#11 (v1.7)
-# pg_vault_tde.kms_provider = 'kmip'   # KMIP 1.2 (v1.8)
+# pg_vault_tde.kms_provider = 'pkcs11' # HSM via a PKCS#11 module (v1.7)
+# pg_vault_tde.kms_provider = 'kmip'   # KMIP 1.2 (v1.8, not implemented yet)
 ```
+
+### Per-Database KMS Configuration
+
+Because all `pg_vault_tde` KMS-provider GUC parameters are declared `PGC_SUSET` (the master `enabled` switch and a couple of shared-memory-sizing parameters are `PGC_POSTMASTER` and cannot be scoped per database — see [doc/pg_vault_tde.md](doc/pg_vault_tde.md#guc-parameters)), a superuser can assign **different KMS settings to individual databases** in the same cluster without restarting PostgreSQL.
+Each connection picks up the effective GUC value for its own database, so `postgres` can use a central Vault instance while `tenant_a` uses a dedicated transit key and `tenant_b` uses a local wallet:
+
+```sql
+-- cluster-level default (postgresql.conf / ALTER SYSTEM)
+-- pg_vault_tde.kms_provider = 'vault'
+
+-- database "tenant_a" uses a dedicated Vault transit key
+ALTER DATABASE tenant_a SET pg_vault_tde.vault_key_name     = 'tde-dek-tenant-a';
+ALTER DATABASE tenant_a SET pg_vault_tde.vault_transit_mount = 'transit-tenants';
+
+-- database "tenant_b" uses a local wallet (no Vault dependency)
+ALTER DATABASE tenant_b SET pg_vault_tde.kms_provider = 'local';
+ALTER DATABASE tenant_b SET pg_vault_tde.wallet_passphrase_env = 'TDE_WALLET_B';
+
+-- verify effective settings for a database
+\connect tenant_b
+SHOW pg_vault_tde.kms_provider;        -- 'local'
+SELECT pg_vault_tde_health_check();
+```
+
+Settings applied with `ALTER DATABASE SET` take effect for **new connections**
+to that database and do not require a server restart.  The cluster-level defaults
+in `postgresql.conf` (or `ALTER SYSTEM`) act as the fallback for any database
+that does not override a parameter.
 
 ### Local Wallet Provider (v1.6 — Offline, No External Service)
 
 A PKCS#12-based encrypted file at
-`$PGDATA/base/<DB_OID>/pg_vault_tde/wallet.p12` protects the KEK. No network dependency.
+`/var/lib/pg_vault_tde/<DB_OID>/wallet.p12` protects the KEK — deliberately
+outside `PGDATA`, so a plain `pg_basebackup` does not copy it alongside the
+wrapped DEKs it protects. No network dependency.
 Suitable for single-server deployments, air-gapped environments, and development.
 
 ```ini
 pg_vault_tde.kms_provider          = 'local'
-# wallet_path defaults to $PGDATA/base/<DB_OID>/pg_vault_tde/wallet.p12 — omit unless overriding:
+# wallet_path defaults to /var/lib/pg_vault_tde/<DB_OID>/wallet.p12 — omit unless overriding:
 # pg_vault_tde.wallet_path         = '/custom/path/to/wallet.p12'
 pg_vault_tde.wallet_passphrase_env = 'TDE_WALLET_PASSPHRASE'   # env var, never postgresql.conf
 pg_vault_tde.wallet_auto_open      = on
@@ -261,16 +386,14 @@ pg_vault_tde.wallet_auto_open      = on
 -- First-time wallet setup (\set reads the shell var without exposing it in logs):
 \set PASSPHRASE `echo $TDE_WALLET_PASSPHRASE`
 SELECT pg_vault_tde_wallet_init(:'PASSPHRASE');
--- Check status (6-column SRF):
+-- Check status (5-column SRF):
 SELECT * FROM pg_vault_tde_wallet_status();
 -- Interactive unlock (without PG restart):
 SELECT pg_vault_tde_wallet_unlock('my_passphrase');
 -- Lock wallet (evict DEKs from shmem):
 SELECT pg_vault_tde_wallet_lock();
--- Rotate KEK (re-wrap all DEKs) — requires the new passphrase:
-SELECT pg_vault_tde_wallet_rotate_kek('my-strong-wallet-passphrase');
--- Export wallet backup bundle:
-SELECT pg_vault_tde_wallet_export_bundle('/backup/wallet_bundle.bin', 'daily-backup');
+-- Rotate KEK: generates a new KEK and re-wraps all per-table DEKs (works for the local, vault, and pkcs11 providers):
+SELECT pg_vault_tde_rotate_kek();
 ```
 
 ### Production (HashiCorp Vault / OpenBao)
@@ -293,79 +416,196 @@ and timeout are all configurable via GUC parameters registered at startup
 
 ### DEK Cache (Shared Memory)
 
+Since v1.7 the cache is a shared-memory hash table (`HTAB`) keyed by `relid`,
+not a fixed array. A single `LWLock` from the `"TdeRelDekMap"` named tranche
+guards the whole table (no per-entry lock).
+
 ```
-pg_vault_tde_dek_cache (shmem, 1 LWLock)
- ├─ dek[32]        : AES-256 key bytes (OPENSSL_cleanse'd on rotation)
- ├─ generation     : uint64 monotonic counter
- └─ valid          : bool
+TdeRelDekMap (shmem HTAB, ShmemInitHash, capacity = pg_vault_tde.max_encrypted_relations, default 1024)
+ └─ TdeRelDekMap entry, keyed by relid:
+     ├─ relid          : Oid  (hash key)
+     ├─ dek[32]        : AES-256 key bytes (OPENSSL_cleanse'd on rotation)
+     ├─ prev_dek[32]   : previous DEK (rotation window fallback)
+     ├─ generation     : uint64 per-relation counter
+     └─ dek_valid / prev_dek_valid : bool
 ```
 
-Each backend maintains a local copy. On every encrypt/decrypt:
-1. Acquire shared lock
-2. Compare `local.generation == shmem.generation`
-3. If mismatch: reload DEK under shared lock (bounded staleness)
+DEK access via `pg_vault_tde_kms_get_rel_dek(relid)`:
+1. **Fast path**: `hash_search(HASH_FIND)` under `LW_SHARED` — O(1) average; cache hit returns immediately.
+2. **Slow path** (cache miss): catalog read (`pg_vault_tde_catalog`) -> KMS unwrap -> `hash_search(HASH_ENTER)` under `LW_EXCLUSIVE`.
 
 ### Key Rotation
 
+**Per-table DEK rotation** (re-encrypts all tuples with a new DEK, no exclusive lock):
+
 ```sql
--- Step 1: wipe current DEK from shared memory (all new ops block until step 2)
-SELECT pg_vault_tde_rotate_online(tablename, batch_size);
+SELECT pg_vault_tde_rotate_online('mytable', 1000);
+-- Monitor progress:
+SELECT * FROM pg_vault_tde_rotation_status('mytable');
 ```
 
->**Production**: trigger Vault re-key and inject via pg_vault_tde_kms_set_dek()
+`rotate_online` accepts both table relations and `tde_btree` index relations:
+
+| Target | What happens |
+|--------|-------------|
+| `encrypted_heap` table | Generates a new table DEK, re-encrypts every tuple in-place (`RowExclusiveLock`), then rebuilds any `tde_btree` indexes on the table so their SIV ciphertexts match the new DEK. Standard `btree` indexes on encrypted columns need no rebuild. |
+| `tde_btree` index | Generates a new index DEK, then calls `reindex_index` (`AccessExclusiveLock` on the index only) to rebuild the index with keys encrypted under the new DEK. The parent table's DEK and heap data are untouched. Passing a non-`tde_btree` index raises an error before touching shmem or the catalog. |
+
+When a table with `tde_btree` indexes is rotated, the index rebuild uses the new table DEK
+implicitly because the heap rows the scan reads are re-encrypted first; the index keys
+are then produced from the decrypted values and re-encrypted under the (unchanged) index DEK.
+To also rotate the index DEK, call `rotate_online` on the index relation directly afterwards.
+
+**KEK rotation** (re-wraps all per-table DEKs under a new KEK — tuple data untouched):
+
+```sql
+-- Unified function — works for the local wallet, Vault Transit, and PKCS#11 providers:
+SELECT pg_vault_tde_rotate_kek();
+```
+
+> **Note on `pg_vault_tde_wallet_change_passphrase(old, new)`**: this function
+> automatically rotates the KEK as part of the passphrase change. A separate
+> `pg_vault_tde_rotate_kek()` call is unnecessary afterwards. The rationale: if an
+> attacker already holds the old passphrase, they already have the old KEK — changing
+> the passphrase without rotating the KEK provides no additional protection.
+
 ---
 
 ## GUC Parameters
 
 All parameters are in the `pg_vault_tde` namespace.
 
+Most parameters have context `suset` (superuser-settable), meaning a superuser
+can change them without restarting PostgreSQL and can scope them per-database
+with `ALTER DATABASE SET`.  The only exception is `max_encrypted_relations`,
+which has context `postmaster` because it controls shared memory allocation at
+startup.
+
+**Context summary:**
+- `suset` — superuser can `SET` at session level or via `ALTER DATABASE SET` /
+  `ALTER ROLE SET`; takes effect for new connections with no restart required.
+- `postmaster` — requires a server restart; set in `postgresql.conf` or via
+  `ALTER SYSTEM`.
+
 ### KMS Provider (v1.5+)
 
 | Parameter | Type | Default | Context | Description |
 |---|---|---|---|---|
-| `kms_provider` | string | `vault` | postmaster | Active KMS backend: `vault`, `local` (v1.6), `pkcs11` (v1.7), `kmip` (v1.8) |
-| `wallet_path` | string | `$PGDATA/base/<DB_OID>/pg_vault_tde/wallet.p12` | postmaster | Local wallet PKCS#12 file path (`kms_provider = 'local'`) |
-| `wallet_passphrase_env` | string | `''` | postmaster | Env var name holding wallet passphrase — env var NAME only, never the value |
-| `wallet_passphrase_file` | string | `''` | postmaster | File path containing wallet passphrase (trimmed; `0400` permission enforced) **(v1.6)** |
-| `wallet_passphrase_command` | string | `''` | postmaster | Shell command to retrieve passphrase (analogous to PG's `ssl_passphrase_command`) **(v1.6)** |
-| `wallet_dev_mode_passphrase` | string | `''` | userset | Convenience passphrase for dev/CI (only honoured when `dev_mode = on`) **(v1.6)** |
-| `dev_mode` | boolean | `off` | postmaster | Enable development mode features (wallet_dev_mode_passphrase) **(v1.6)** |
-| `wallet_auto_open` | boolean | `on` | postmaster | Auto-open wallet on startup if passphrase env var is set |
-| `max_encrypted_relations` | integer | `1024` | postmaster | Maximum number of per-table DEK entries in shmem (64–65536) |
-| `toast_encryption` | boolean | `on` | postmaster | Encrypt TOAST chunks with the parent relation's DEK (v1.5) |
+| `kms_provider` | string | `''` (unset — must be configured) | suset | Active KMS backend: `vault`, `local` (v1.6), `pkcs11` (v1.7), `kmip` (v1.8). No default is shipped; encrypted tables cannot be used until this is set. Settable per-database via `ALTER DATABASE SET`. |
+| `wallet_path` | string | `/var/lib/pg_vault_tde/<DB_OID>/wallet.p12` | suset | Local wallet PKCS#12 file path (`kms_provider = 'local'`). Default computed at runtime — `SHOW` returns the effective path even when not set in `postgresql.conf`. Deliberately outside `PGDATA` so a plain `pg_basebackup` does not copy it. |
+| `wallet_passphrase_env` | string | `''` | suset | Env var name holding wallet passphrase — env var NAME only, never the value |
+| `wallet_passphrase_file` | string | `''` | suset | File path containing wallet passphrase (trimmed; `0400` permission enforced) **(v1.6)** |
+| `wallet_passphrase_command` | string | `''` | suset | Shell command to retrieve passphrase (analogous to PG's `ssl_passphrase_command`) **(v1.6)** |
+| `wallet_dev_mode_passphrase` | string | `''` | suset | Convenience passphrase for dev/CI (only honoured when `dev_mode = on`) **(v1.6)** |
+| `dev_mode` | boolean | `off` | suset | Enable development mode features (wallet_dev_mode_passphrase) **(v1.6)** |
+| `wallet_auto_open` | boolean | `on` | suset | Auto-open wallet on startup if passphrase env var is set |
+| `max_encrypted_relations` | integer | `1024` | postmaster | Maximum number of per-table DEK entries in shmem (64–65536). Requires restart — affects shared memory sizing. |
+| `toast_encryption` | boolean | `on` | suset | Encrypt TOAST chunks with the parent relation's DEK (v1.5) |
 
 ### Vault / OpenBao (`kms_provider = 'vault'`)
 
+All parameters are `suset` — settable per-database with `ALTER DATABASE SET`.
+
 | Parameter | Type | Default | Context | Description |
 |---|---|---|---|---|
-| `vault_url` | string | `''` | postmaster | Vault / OpenBao base URL |
-| `vault_namespace` | string | `''` | postmaster | Vault namespace (enterprise; empty for community) |
-| `vault_token` | string | `''` | postmaster | Auth token — hidden from `pg_settings` (superuser only) |
-| `vault_role_id` | string | `''` | postmaster | AppRole role_id UUID |
-| `vault_secret_id` | string | `''` | postmaster | AppRole secret_id — hidden from `pg_settings` (superuser only) |
-| `vault_role_name` | string | `''` | postmaster | AppRole role name for secret_id rotation after login **(v1.4)** |
-| `vault_k8s_role` | string | `''` | postmaster | Kubernetes JWT auth role name |
-| `vault_transit_mount` | string | `transit` | postmaster | Transit secrets engine mount path |
-| `vault_key_name` | string | `pg-tde-dek` | postmaster | Transit key name for DEK wrapping |
-| `vault_ca_cert` | string | `''` | postmaster | Path to CA bundle for Vault TLS verification |
-| `vault_timeout_ms` | integer | `5000` | postmaster | Vault HTTP timeout in ms (0 = no timeout) |
-| `vault_response_wrapping` | boolean | `off` | postmaster | Use Vault response-wrapping for AppRole secret_id (v1.5) |
+| `vault_url` | string | `''` | suset | Vault / OpenBao base URL |
+| `vault_namespace` | string | `''` | suset | Vault namespace (enterprise; empty for community) |
+| `vault_token` | string | `''` | suset | Auth token — hidden from `pg_settings` (superuser only) |
+| `vault_role_id` | string | `''` | suset | AppRole role_id UUID |
+| `vault_secret_id` | string | `''` | suset | AppRole secret_id — hidden from `pg_settings` (superuser only) |
+| `vault_role_name` | string | `''` | suset | AppRole role name for secret_id rotation after login **(v1.4)** |
+| `vault_k8s_role` | string | `''` | suset | Kubernetes JWT auth role name |
+| `vault_transit_mount` | string | `transit` | suset | Transit secrets engine mount path |
+| `vault_key_name` | string | `pg-tde-dek` | suset | Transit key name for DEK wrapping. Override per-database to isolate tenant keys. |
+| `vault_ca_cert` | string | `''` | suset | Path to CA bundle for Vault TLS verification |
+| `vault_timeout_ms` | integer | `5000` | suset | Vault HTTP timeout in ms (0 = no timeout) |
+
+### PKCS#11 / HSM (`kms_provider = 'pkcs11'`) (v1.7)
+
+All parameters are `suset` — settable per-database with `ALTER DATABASE SET`.
+
+| Parameter | Type | Default | Context | Description |
+|---|---|---|---|---|
+| `pkcs11_library` | string | `''` | suset | Absolute path to the vendor's PKCS#11 module (`.so`). Loaded lazily per backend. |
+| `pkcs11_token_label` | string | `''` | suset | Token label for slot discovery. Preferred over `pkcs11_slot_id` (slot IDs are not stable across restarts on some modules, e.g. SoftHSM2). |
+| `pkcs11_slot_id` | integer | `-1` | suset | Explicit slot ID, used only when `pkcs11_token_label` is empty (`-1` = unset) |
+| `pkcs11_pin_env` | string | `PG_TDE_PKCS11_PIN` | suset | Env var name holding the token user PIN — env var NAME only, never the value |
+| `pkcs11_key_label` | string | `pg_vault_tde_kek` | suset | `CKA_LABEL` of the AES-256 KEK object on the token (create with `pg_vault_tde_pkcs11_keygen()`) |
 
 ### Background Worker
 
 | Parameter | Type | Default | Context | Description |
 |---|---|---|---|---|
-| `bgw_enabled` | boolean | `off` | postmaster | Enable background worker for automatic token renewal |
-| `token_renewal_interval` | integer | `3600` | postmaster | Token renewal interval in seconds (60–86400) |
+| `bgw_enabled` | boolean | `off` | suset | Enable background worker for automatic token renewal |
+| `token_renewal_interval` | integer | `3600` | suset | Token renewal interval in seconds (60–86400) |
 
 ### General
 
 | Parameter | Type | Default | Context | Description |
 |---|---|---|---|---|
-| `enabled` | boolean | `on` | superuser | Master switch — set `off` to measure TAM overhead without crypto |
-| `dump_plaintext_warning` | boolean | `on` | sighup | Emit WARNING when `pg_dump`/`COPY TO` reads from an encrypted table (v1.7) |
-| `encrypt_statistics` | boolean | `off` | sighup | Encrypt `pg_statistic` MCVs/histograms for encrypted columns (v1.8) |
-| `audit_enabled` | boolean | `on` | sighup | Enable audit event logging to `pg_vault_tde_audit_log` (v1.7) |
+| `enabled` | boolean | `on` | suset | Master switch — set `off` to measure TAM overhead without crypto. Settable per-database. |
+| `allow_plaintext_index` | boolean | `off` | suset | When `off` (default), `CREATE INDEX`/`CREATE UNIQUE INDEX` with a non-`tde_btree` access method on an `encrypted_heap` table is rejected with `ERROR`. When `on`, allowed after a `WARNING` — the indexed column's plaintext value is then stored unencrypted on disk. Does not affect `PRIMARY KEY`/`UNIQUE` table constraints (always allowed, always warned — see "What Gets Encrypted" above). |
+
+---
+
+## Auditing
+
+pg_vault_tde emits an audit record for every security-relevant KMS and DDL event.
+Auditing is **always active**: the audit handler is registered unconditionally at
+`_PG_init` time and there is no GUC to disable it.
+
+Each event is written to the PostgreSQL server log at `LOG` severity via
+`ereport(LOG)` with `errhidestmt` and `errhidecontext` set, so the originating
+SQL statement and context stack are suppressed — only the audit fields appear.
+
+### Log format
+
+```
+AUDIT: event=<name>, oid=<relation_oid_or_dash>, user=<role_name>, success=<t|f>, pid=<pid>
+```
+
+- `oid` — relation OID affected by the event, or `-` for cluster-level events.
+- `success` — `t` on success, `f` on failure (e.g. authentication error, GCM tag mismatch).
+
+### Logged events
+
+The `event=` field carries the value below (note the DEK/KEK events drop the `KMS_` prefix in the log line):
+
+| `event=` value | Trigger | PCI DSS ref |
+|---|---|---|
+| `AUDIT_LOG_START` | Audit subsystem initialised at server start | 10.2.1.6 |
+| `AUDIT_LOG_STOP` | Audit subsystem shut down | 10.2.1.6 |
+| `DEK_ACCESS` | DEK read from shared-memory cache or KMS | — |
+| `DEK_CREATE` | New per-relation DEK generated | — |
+| `DEK_ROTATE` | Per-relation DEK rotated (`pg_vault_tde_rotate_online`) | 10.2.1.7 |
+| `DEK_DELETE` | DEK revoked / removed from catalog (`DROP TABLE`) | 10.2.1.7 |
+| `KEK_ROTATE` | KEK rotated (`pg_vault_tde_rotate_kek`) | 10.2.1.7 |
+| `KMS_AUTH_SUCCESS` | KMS / Vault authentication succeeded | 10.2.1.5 |
+| `KMS_AUTH_FAILURE` | KMS / Vault authentication failed | 10.2.1.5 |
+| `WALLET_OPEN` | Local wallet opened (`pg_vault_tde_wallet_unlock`) | — |
+| `WALLET_CLOSE` | Local wallet closed (`pg_vault_tde_wallet_lock`) | — |
+| `RELATION_ENCRYPT` | Relation converted to `encrypted_heap` | 10.2.1.7 |
+| `RELATION_DECRYPT` | `encrypted_heap` converted back to plain heap | 10.2.1.7 |
+| `ACCESS_DENIED` | Decryption failed — wrong key or missing permission | 10.2.1.4 |
+
+`DEK_UPDATE` and `INTEGRITY_VIOLATION` are defined in the audit enum but not yet
+emitted by any code path (reserved for a future release).
+
+### Routing audit logs
+
+Because audit records are written as PostgreSQL `LOG` messages they flow through
+the standard `log_destination` / `logging_collector` pipeline.  To route them to
+a dedicated file or to an external SIEM, match on the `AUDIT:` prefix:
+
+```
+# postgresql.conf — route AUDIT lines to a separate file (requires logging_collector = on)
+log_destination = 'stderr'
+logging_collector = on
+log_filename = 'postgresql-%Y-%m-%d.log'
+```
+
+External sinks (syslog, Splunk, Datadog) can filter on `AUDIT:` from the standard
+log stream without any extension-level configuration.
 
 ---
 
@@ -373,27 +613,28 @@ All parameters are in the `pg_vault_tde` namespace.
 
 | Function | Returns | Description |
 |---|---|---|
-| `pg_vault_tde_set_test_dek()` | void | Inject a random ephemeral DEK (**dev/test only**) |
-|  `pg_vault_tde_rotate_key()` **deprecated** | void | Wipe DEK from shared cache, bump generation |
-| `pg_vault_tde_key_generation()` | bigint | Current generation counter |
-| `pg_vault_tde_backup_status()` | text | Backup encryption status string |
-| `pg_vault_tde_encrypt_test(text)` | bytea | Encrypt text via GCM (**test only**) |
-| `pg_vault_tde_decrypt_test(bytea)` | text | Decrypt bytea via GCM (**test only**) |
-| `pg_vault_tde_health_check()` | composite | KMS, DEK, crypto, and wallet status (15 columns) |
-| `pg_vault_tde_verify_integrity(regclass)` | void | GCM tag audit scan of all tuples |
-| `pg_vault_tde_reencrypt_table(regclass, int)` | bigint | Batch re-encrypt with current DEK (locks table) |
-| `pg_vault_tde_rotate_online(regclass, int)` | void | BGW-based online rotation, no exclusive lock **(v1.5)** |
-| `pg_vault_tde_rotation_status(regclass)` | composite | Online rotation progress **(v1.5)** |
+| `pg_vault_tde_health_check()` | composite | Status (5 columns: version, enabled, kms_provider, enc_ops_available, checked_at) |
+| `pg_vault_tde_verify_integrity(regclass)` | record | GCM tag audit scan of all tuples — returns `(total_tuples, failed_tuples)` |
+| `pg_vault_tde_encrypted_size(regclass)` | record | Encryption storage overhead — returns `(total_tuples, encryption_overhead_bytes)` |
+| `pg_vault_tde_reencrypt_table(regclass, int)` | void | Batch re-encrypt with current DEK (locks table); `int` = batch size, default 1000 |
+| `pg_vault_tde_rotate_online(regclass, int)` | void | BGW-based online rotation, no exclusive lock; accepts both `encrypted_heap` tables and `tde_btree` indexes **(v1.5)** |
+| `pg_vault_tde_get_rotation_status(regclass)` | table | Online rotation progress for one relation (status, tuples_done/total, pct_complete, timestamps) **(v1.5)** |
+| `pg_vault_tde_rotation_status` | view | All in-progress/completed rotations across the cluster; readable by `pg_monitor` **(v1.5)** |
+| `pg_vault_tde_check_plaintext_index_keys()` | table | Lists `tde_btree` indexes still using a pre-v1.6 plaintext operator class, with a ready-to-run `REINDEX` suggestion; `pg_monitor`/superuser only |
 | `pg_vault_tde_wallet_init(text)` | void | Create local wallet and generate KEK **(v1.5)** |
-| `pg_vault_tde_wallet_change_passphrase(text, text)` | void | Re-protect wallet with new passphrase **(v1.6)** |
-| `pg_vault_tde_wallet_status()` | composite | Wallet existence, open state, algorithm, DEK count, last opened, file perms (6 cols) **(v1.6)** |
+| `pg_vault_tde_wallet_change_passphrase(text, text)` | void | Re-protect wallet with new passphrase and automatically rotate the KEK (`local` provider only); no separate `rotate_kek()` needed **(v1.6)** |
+| `pg_vault_tde_wallet_status()` | composite | Wallet existence, open state, algorithm, last opened, file perms (5 cols) **(v1.6)** |
 | `pg_vault_tde_wallet_unlock(text)` | void | Interactive wallet unlock without PG restart **(v1.6)** |
 | `pg_vault_tde_wallet_lock()` | void | Evict all DEKs from shmem, mark wallet closed **(v1.6)** |
-| `pg_vault_tde_wallet_rotate_kek(new_passphrase text)` | void | Generate new KEK protected by `new_passphrase`, re-wrap all DEKs atomically **(v1.6)** |
-| `pg_vault_tde_wallet_export_bundle(text, text)` | void | Export HMAC-signed wallet backup bundle **(v1.6)** |
-| `pg_vault_tde_wallet_import_bundle(text, text)` | void | Import and verify wallet backup bundle **(v1.6)** |
+| `pg_vault_tde_rotate_kek()` | void | Rotate the KEK and re-wrap all per-table DEKs under a new key; works for the `local`, `vault`, and `pkcs11` providers; no tuple data re-encrypted **(v1.7)** |
+| `pg_vault_tde_pkcs11_keygen()` | void | One-time AES-256 KEK provisioning on the PKCS#11 token under `pkcs11_key_label`; refuses to overwrite an existing key **(v1.7)** |
+| `pg_vault_tde_seal_keys(text, text, text)` | void | Write an HMAC-SHA256-signed bundle of **all** wrapped DEKs (every provider) to a file, to accompany a physical backup (`pg_basebackup`); the KEK is never included **(v1.7)** |
+| `pg_vault_tde_seal_keys_bytea(text, text)` | bytea | Same signed bundle as `pg_vault_tde_seal_keys()`, returned as `bytea` instead of written server-side — used by `pg_basebackup_tde` to store the bundle on the client host **(v1.7)** |
+| `pg_vault_tde_unseal_keys(text, text)` | void | Verify (HMAC) and re-import a bundle written by `pg_vault_tde_seal_keys()`; rejects a tampered file or wrong passphrase before writing anything **(v1.7)** |
 | `pg_vault_tde_migrate_vault_to_wallet(text)` | void | Online Vault→local wallet migration **(v1.6)** |
-| `pg_vault_tde_kms_health_check()` | composite | Active provider connectivity and key access test **(v1.5)** |
+| `pg_vault_tde_vault_status()` | table | Vault provider diagnostics — `(configured, auth_method, reachable)` |
+| `pg_vault_tde_refresh_token()` | boolean | Manually renew the current Vault token lease |
+| `pg_vault_tde_hw_accel_info()` | record | OpenSSL provider/cipher diagnostics — `(openssl_version, configured_provider, provider_loaded, gcm_cipher, siv_cipher, aes_ni_available)` |
 
 ---
 
@@ -429,13 +670,16 @@ CREATE INDEX ON secrets USING tde_btree (id);
 | DELETE | ✅ Full | No-op (heapam header-only delete, no column data touched) |
 | HOT chains | ✅ Full | Header plaintext → HOT chain pointers preserved |
 | VACUUM | ✅ Full | Inherited from heapam (dead-tuple header only) |
-| pg_dump / pg_restore | ✅ Full | pg_dump reads via scan_getnextslot → decrypted |
+| CTAS   | ✅ Full | Per-table DEK registration before SELECT is executed |
+| `pg_dump` (plain) | ⚠️ Dump is plaintext | pg_dump reads via scan_getnextslot → decrypted. Use `pg_dump_tde` to re-encrypt the output. |
+| `pg_dump_tde` / `pg_restore_tde` | ⚠️ Full, except `pkcs11` | Encrypted logical backup: dump wrapped with AES-256-GCM + DEK sealed in backup header. Standalone tools have no PKCS#11 session/PIN handling yet — see "Configure Key Access → PKCS#11 / HSM" above. |
 | Streaming replication | ✅ Full | WAL ships encrypted bytes; standby decrypts at TAM layer |
 | Page checksums | ✅ Full | Checksums over encrypted content (complementary to GCM) |
 | Logical replication (non-TOAST) | ✅ Full (v1.2) | `pg_vault_tde_pgoutput` plugin decrypts tuples before streaming |
 | TOAST (large values > ≈2 kB) | ✅ Full | Heap-level round-trips functional; per-chunk storage encryption |
-| Logical replication (TOAST columns) | 🔜 v1.7 | TOAST decrypt in `change_cb` before `ReorderBufferToastReplace()` |
-| Range scans on TDE indexes | ⚠️ By design | `tde_btree`/`tde_gin`/`tde_hash` use AES-SIV — equality only; ranges return empty |
+| Logical replication (TOAST columns) | ✅ Full (v1.7) | Custom WAL rmgr (`toast_custom_rmgr`) routes encrypted chunks past the reorder buffer; stitched in `change_cb`. UPDATE/DELETE need `REPLICA IDENTITY FULL` + PK |
+| Range scans on TDE indexes | ⚠️ By design | `tde_btree` (GIN/Hash/GiST planned for v1.8, same AES-SIV pattern) — equality only; ranges return empty |
+| `CREATE INDEX USING gin/gist/hash/brin/btree` on `encrypted_heap` | ⚠️ `ERROR` by default | Not encrypted AMs; rejected unless `pg_vault_tde.allow_plaintext_index = on` (then allowed with `WARNING`) |
 | Column-level encryption | 🔜 v1.8 | Per-column `ENABLE COLUMN ENCRYPTION` DDL |
 
 ---
@@ -450,7 +694,7 @@ make ci-all
 PG_VERSION=17 make ci-all
 
 # Individual test stages:
-make ci-regress          # 109 SQL regression tests (vault provider)
+make ci-regress          # 109 SQL regression tests (vault provider) — tests 1-109 (test 110 deferred)
 make ci-wallet           # 109 SQL regression tests (local wallet provider)
 make ci-checksums        # 109 tests + page checksum compatibility
 make ci-tap              # TAP tests with mock Vault
@@ -488,9 +732,8 @@ Test coverage (109 tests = 52 v1.4 + 20 v1.5 + 37 v1.6):
 - Tests 65-67: tde_btree native type operator classes (text, int4, uuid) **(v1.5)**
 - Tests 68-69: Wire format v3 AEAD AAD — cross-table paste attack rejected **(v1.5)**
 - Tests 70-72: Online key rotation BGW — concurrent SELECTs, progress tracking, BGW completion **(v1.5)**
-- Tests 73-77: Wallet provider — init/unlock/lock, `wallet_status()` 6-col schema (`wallet_exists`, `wallet_open`, `kek_algorithm`, `dek_count`, `last_opened`, `file_perms`), DEK round-trip with wallet KEK **(v1.6)**
+- Tests 73-77: Wallet provider — init/unlock/lock, `wallet_status()` 5-col schema (`wallet_exists`, `wallet_open`, `kek_algorithm`, `last_opened`, `file_perms`), DEK round-trip with wallet KEK **(v1.6)**
 - Tests 78-79: Wallet `change_passphrase` re-wraps under new KEK; `rotate_kek` re-wraps all per-table DEKs (catalog ciphertext changes; both tables remain readable) **(v1.6 patch)**
-- Test 80: Wallet `export_bundle`/`import_bundle` round-trip — SKIPS gracefully if `pg_vault_tde.wallet_passphrase_env` source is not configured (export needs the passphrase string to derive the bundle HMAC key) **(v1.6)**
 - Test 81: DDL hook registers BOTH parent and `reltoastrelid` in `pg_vault_tde_catalog`; DROP deregisters both **(v1.6)**
 - Test 82: 64 KB compressible payload (pglz keeps it inline) — heap-level pre-TOAST + encrypt round-trip **(v1.6)**
 - Test 83: Transactional rollback after pre-TOAST + encrypt keeps the table consistent and restores `reltoastrelid` **(v1.6)**
@@ -522,54 +765,48 @@ Test coverage (109 tests = 52 v1.4 + 20 v1.5 + 37 v1.6):
 - Test 109: VACUUM FULL on table with STORAGE EXTERNAL columns **(v1.6)**
 
 > Test runner notes:
-> - `make ci-regress` (vault provider): 109/109 PASS, with conditional skips for `wal_level` (test 48), `pageinspect` (test 61) and wallet-only assertions (tests 74-80 when `kms_provider=local` is required).
-> - `make ci-wallet` (local provider): tests 73-79 PASS; test 80 SKIPS unless `wallet_passphrase_env` is wired up; tests 81-109 also PASS in wallet mode.
+> - `make ci-regress` (vault provider): 109/109 PASS, with conditional skips for `wal_level` (test 48), `pageinspect` (test 61) and wallet-only assertions (tests 74–80 when `kms_provider=local` is required).
+> - `make ci-wallet` (local provider): tests 73–79 PASS; test 80 SKIPS unless `wallet_passphrase_env` is wired up; tests 81–109 also PASS in wallet mode.
+> - Test 110 (WITH HOLD cursor plaintext spill) is permanently deferred — the executor's tuplestore layer bypasses the TAM write path, so pg_vault_tde cannot intercept it without core modifications. The test is commented out in `regression_test_v16.sql`.
 
 ---
 
 ## Building
 
-### Generic (portable)
-
 ```bash
 make && sudo make install
+
+# Optional: -O3 -funroll-loops -fomit-frame-pointer instead of -O2
+make TDE_OPTIMIZE=max && sudo make install
 ```
 
-### Hardware-Accelerated Variants
+There is a single build. Hardware-accelerated AES (AES-NI, VAES, ARM Crypto
+Extensions, SVE2) is provided automatically at runtime by OpenSSL's own
+default provider, based on the CPU the server is actually running on — this
+requires no special compiler flags and no separate build. pg_vault_tde never
+implements AES itself; it always calls into OpenSSL's EVP API
+(`src/crypto/pg_vault_tde_hw_accel.c`), which does its own CPUID/HWCAP
+detection independent of how pg_vault_tde.so was compiled. Confirm what's
+actually active at runtime with:
 
 ```bash
-# Intel / AMD AES-NI (SSE4.2)
-make TDE_TARGET_ARCH=x86_64-aesni
-
-# AMD VAES + AVX2 (Zen 4+, Intel IceLake+)
-make TDE_TARGET_ARCH=x86_64-vaes TDE_OPTIMIZE=max
-
-# ARM Crypto Extensions (ARMv8-A, Graviton, Apple M-series)
-make TDE_TARGET_ARCH=aarch64-ce
-
-# ARM SVE2 (ARMv9-A, Neoverse V2)
-make TDE_TARGET_ARCH=aarch64-sve2 TDE_OPTIMIZE=max
-
-# Detect CPU capabilities
-make check-cpu
-
-# OpenSSL AES throughput benchmark
-make bench-cpu
+make check-cpu     # detect this machine's available CPU crypto extensions
+make bench-cpu     # OpenSSL AES throughput microbenchmark
 ```
 
-All variants are ABI-compatible — the `.so` name is always `pg_vault_tde.so`.
-Hardware dispatch is via OpenSSL 3.x provider; the `TDE_TARGET_ARCH` flag
-enables the matching compiler intrinsics to ensure the provider is available.
+```sql
+SELECT * FROM pg_vault_tde_hw_accel_info();
+```
 
 ### Packages
 
 The easiest way — no local build toolchain required (only `podman` or `docker`):
 
 ```bash
-# Build all four generic packages (deb+rpm × pg17+pg18) into ./dist/
+# Build all four packages (deb+rpm × pg17+pg18) into ./dist/
 bash packaging/build_in_container.sh --all
 
-# Single package (defaults: DEB, PG18, Ubuntu 22.04, generic/portable)
+# Single package (defaults: DEB, PG18, Ubuntu 22.04)
 bash packaging/build_in_container.sh
 bash packaging/build_in_container.sh --format rpm             # RPM PG18
 bash packaging/build_in_container.sh --pg-version 17          # DEB PG17
@@ -594,60 +831,165 @@ bash packaging/build_in_container.sh --format rpm --os-version almalinux:9    # 
 bash packaging/build_in_container.sh --format rpm --os-version almalinux:8    # EL8 (AlmaLinux)
 ```
 
-#### Hardware acceleration variants
-
-pg_vault_tde ships a **generic** package (works everywhere) and optional
-**hardware-accelerated** packages for platforms that support AES CPU extensions.
-OpenSSL 3.x dispatches to the matching provider automatically at runtime when the
-compiler intrinsics have been enabled.
-
-| Variant | Target CPUs | Flag |
-|---------|-------------|------|
-| `generic` | All x86-64 / AArch64 (default) | *(none)* |
-| `aesni`   | Intel Westmere/Core 2010+ · AMD Bulldozer+ | `-maes -mpclmul -msse4.2 -O3` |
-| `vaes`    | AMD Zen 4+ · Intel Ice Lake+ (VAES + AVX2) | `-mvaes -mavx2 -maes -O3` |
-| `armce`   | ARMv8-A: AWS Graviton 2/3, Ampere Altra, Apple M-series | `-march=armv8-a+crypto+crc -O3` |
-| `sve2`    | ARMv9-A: NVIDIA Grace, Neoverse V2 | `-march=armv9-a+crypto+sve2 -O3` |
-
-```bash
-# AES-NI — Intel/AMD desktop & server (most common)
-bash packaging/build_in_container.sh --arch-variant aesni
-
-# VAES — AMD Zen 4+ / Intel Ice Lake+ (wider vectorised AES)
-bash packaging/build_in_container.sh --arch-variant vaes
-
-# ARM Crypto Extensions
-bash packaging/build_in_container.sh --arch-variant armce
-
-# ARM SVE2 (next-gen ARM servers)
-bash packaging/build_in_container.sh --arch-variant sve2
-```
-
 Options compose freely:
 
 ```bash
-# AES-NI RPM for PG17 on Rocky Linux 8
+# RPM for PG17 on Rocky Linux 8
 bash packaging/build_in_container.sh \
-    --format rpm --pg-version 17 --os-version rockylinux:8 --arch-variant aesni
+    --format rpm --pg-version 17 --os-version rockylinux:8
 
-# ARM CE DEB for PG18 on Debian 12
-bash packaging/build_in_container.sh --os-version debian:12 --arch-variant armce
+# DEB for PG18 on Debian 12
+bash packaging/build_in_container.sh --os-version debian:12
 ```
 
 If you have a local build environment, invoke the underlying scripts directly:
 
 ```bash
 # Debian / Ubuntu
-bash packaging/build_deb.sh --no-sign                   # generic
-bash packaging/build_deb.sh --arch-variant aesni        # AES-NI optimised
-bash packaging/build_deb.sh --arch-variant armce        # ARM CE optimised
+bash packaging/build_deb.sh --no-sign
 
 # RHEL / Rocky / Fedora
-bash packaging/build_rpm.sh                             # generic
-rpmbuild -ba packaging/rpm/pg_vault_tde-aesni.spec      # AES-NI optimised
-rpmbuild -ba packaging/rpm/pg_vault_tde-arm.spec        # ARM CE optimised
+bash packaging/build_rpm.sh
 ```
 
+---
+
+## Encrypted Backups
+
+### `pg_dump_tde` / `pg_restore_tde`
+Plain `pg_dump` decrypts rows at read time (via the TAM), so the dump file is
+**plaintext**.  `pg_dump_tde` closes this gap by piping the dump through
+AES-256-GCM before touching disk:
+
+```bash
+# Encrypted dump
+pg_dump_tde -h localhost -U postgres -d mydb -o /backup/mydb.tde
+
+# Restore encrypted dump
+pg_restore_tde -h localhost -U postgres -d mydb -i /backup/mydb.tde
+```
+
+>All other `pg_dump` options are fed directly to it.
+
+### `pg_basebackup`
+It's possible to use `pg_basebackup` to create a base backup of the cluster and use it for a standby creation.
+
+#### Primary configuration
+
+No special configuration is needed on the primary: encrypted relations are copied as-is by `pg_basebackup`, and the wrapped DEKs travel inside `pg_vault_tde_catalog` (part of the data directory). The **KEK never travels with the backup** — it stays in the KMS/wallet, exactly as with Oracle RMAN, SQL Server and Percona pg_tde.
+
+#### Standby / restore configuration
+
+The wrapped DEKs arrive with the base backup, but the KEK must be made available on the target separately:
+
+- **`local` provider** — copy the primary's `wallet.p12` to the standby (it lives outside `PGDATA`, so it is *not* in the base backup).
+- **`vault` provider** — point the standby at the **same** Vault; nothing to copy.
+
+#### Sealing the DEK catalog (key sealing)
+
+`pg_vault_tde_seal_keys()` writes a signed, point-in-time snapshot of every wrapped DEK to accompany the backup `pg_vault_tde_unseal_keys()` verifies and re-imports it on the target. This makes the key state **tamper-evident** and guards against key-rotation drift between primary and standby.
+
+```sql
+-- On the primary, before pg_basebackup:
+SELECT pg_vault_tde_seal_keys('/backup/keys.sealed', 'a-seal-passphrase');
+```
+```bash
+pg_basebackup -h primary -D /backup/data -X stream
+# local provider only: also transport the wallet, e.g.
+#   scp /path/to/wallet.p12 standby:/path/to/wallet.p12
+```
+```sql
+-- On the standby, after restoring the data dir and providing the KEK:
+SELECT pg_vault_tde_unseal_keys('/backup/keys.sealed', 'a-seal-passphrase');
+```
+The HMAC key is derived from the seal passphrase (PBKDF2-SHA256); it isindependent of the KMS provider, so the same bundle works for local and vault. unseal_keys verifies the HMAC before touching the catalog: a tampered bundle or wrong passphrase is rejected and nothing is written.
+
+> Key-rotation note: if the KEK/DEK is rotated after a backup, primary and standby can drift. Re-running seal_keys after a rotation (and unseal_keys on the standby) realigns the sealed key state with the data.
+
+> Concurrency note: don't run `unseal_keys()` while `pg_vault_tde_rotate_online()` is rotating the same table. Postgres's own MVCC checks make this fail safely — you'll see a `tuple concurrently updated` or duplicate-key error and nothing will have been imported — just re-run `unseal_keys()` once the rotation finishes.
+
+#### `pg_basebackup_tde` (automatic key sealing)
+
+`pg_basebackup_tde` wraps `pg_basebackup` and performs the sealing step
+automatically, for **every database** in the cluster that has the extension
+(the DEK catalog is per-database, while `pg_basebackup` is cluster-wide):
+
+```bash
+# passphrase from a 0600 file (the ~/.pgpass pattern) ...
+pg_basebackup_tde -h primary -D /backup/data -X stream \
+    --seal-passphrase-file /etc/pg_vault_tde/seal.pass
+# ... or from the environment
+export PG_VAULT_TDE_SEAL_PASSPHRASE='a-seal-passphrase'
+pg_basebackup_tde -h primary -D /backup/data -X stream
+```
+
+The passphrase is never accepted as a command-line value: it would leak in
+`ps` output and shell history. `--seal-passphrase-file` reads the first line
+of the file and takes precedence over the environment variable.
+
+All options are forwarded verbatim to `pg_basebackup`. For each database with
+`pg_vault_tde`, the wrapper calls `pg_vault_tde_seal_keys_bytea()` **before**
+the backup starts (point-in-time key snapshot) and, **only if the backup
+succeeds**, writes one bundle per database next to it:
+
+```
+/backup/data/pg_vault_tde_keys.<datname>.sealed   (mode 0600)
+```
+
+Use `--keys-dir DIR` to store the bundles elsewhere (e.g. outside `PGDATA`).
+Databases without the extension are skipped; a failed backup leaves no bundle
+files behind. The tar format (`-Ft`) is not supported — use the plain format
+or run `pg_vault_tde_seal_keys()` manually.
+
+Restore stays manual, exactly as above: restore the data dir, provision the
+KEK, then per database
+`SELECT pg_vault_tde_unseal_keys('/backup/data/pg_vault_tde_keys.<db>.sealed', '...');`
+
+### How it works
+
+1. `pg_dump_tde` forks `pg_dump -Fc` with stdout redirected to a pipe.
+2. It connects to PostgreSQL to read `pg_vault_tde.kms_provider` from GUCs.
+3. Generates a fresh DEK, wraps it via the active KMS provider, writes a
+   `tde_backup_header` (magic + format_version + wrapped_dek) to the output file.
+4. Reads the `pg_dump` stream in 64 KB blocks; encrypts each block as:
+
+   `[ Block length (4) | 0x02 (1) | IV (12) | Ciphertext | GCM-TAG (16) ]`
+
+   Block sequence number is bound as GCM AAD — reordering blocks is detectable.
+   
+   (Reading from a stream with `fread` not guarantee that the block is 64 KB every time,
+   that's why the block length is stored)
+5. If `pg_dump` fails mid-stream the partial output file is deleted automatically.
+
+### Block wire format
+
+```
+[ tde_backup_header ]
+[ Block 0: Block length (4) | 0x02 | IV(12) | CT(64 KB) | TAG(16) ]
+[ Block 1: Block length (4) | 0x02 | IV(12) | CT(64 KB) | TAG(16) ]
+...
+```
+
+Each block is independently authenticated — corruption is detected at the block
+level, not only at EOF.
+
+### Current limitations
+
+1. Only `-Fc` format is supported.
+
+2. `-j` option is **NOT** supported. Parallel jobs are only supported by `pg_dump`
+if the directory format (`-Fd`) is set.
+
+3. Fixed block size: 64 KB.
+
+4. Restore is locked to the original KEK used for DEK wrapping. This means that if we need to restore a dump into a new database that is using a different wallet (KMS local speaking) from the original, we can't. The old wallet or a new wallet containing the old KEK is needed.
+
+   Currently (v1.7) deleting a database (`DROP DATABASE`) deletes his .p12 wallet file. Dump files previous created from this database becomes undecryptable (if wallet file is lost).
+
+5. File-only output and input. The option `--output` or `-o` (for `pg_dump_tde`) and `--input`
+or `-i` (for `pg_restore_tde`) are mandatory. Neither piping nor reading from `stdin` are supported.
+
+6. Executing `pg_dump` still produces a plain-text backup
 ---
 
 ## Performance
@@ -675,21 +1017,25 @@ number of **pages**, not rows).
 
 ---
 
-## Limitations (v1.6)
+## Limitations (v1.7)
 
 See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
 
-1. **tde_btree fixed-size type index key encryption** (→ v1.7): `int4`, `int8`, `uuid`,
-   `date`, `timestamptz` columns using `tde_btree` store the **index key in plaintext**.
-   Only varlena types (`text`, `bytea`, `numeric`) have encrypted index keys. The heap
-   tuple is fully encrypted regardless.
+1. **tde_btree fixed-size type index key encryption** — ✅ **Resolved in v1.7**: `int4`,
+   `int8`, `uuid`, `date`, `timestamptz` columns now have their btree index keys encrypted
+   with AES-256-SIV, identical to varlena types. **Index-only scans are not supported**
+   (by design, for security — see `doc/pg_vault_tde.md` § Index-Only Scans).
 
 2. **Range scans on TDE indexes** (by design — permanent): The `tde_btree` AM uses
    AES-256-SIV (equality-preserving, NOT order-preserving). `WHERE col > 'x'` on a
    `tde_btree` index returns empty results. Use sequential scans for range predicates.
 
-3. **Logical replication TOAST gap** (→ v1.7): Tables with externally-TOASTed columns
-   are not supported for logical decoding.
+3. **Logical replication of TOAST columns** (✅ resolved in v1.7): Enable
+   `pg_vault_tde.toast_custom_rmgr` (PGC_POSTMASTER, default off) to publish
+   externally-TOASTed columns to subscribers. UPDATE/DELETE require
+   `REPLICA IDENTITY FULL` **and** a primary key; `REPLICA IDENTITY DEFAULT` and
+   PK-less tables remain unsupported (the replica identity would be read from
+   ciphertext). See doc/pg_vault_tde.md → "Logical Decoding and Replication".
 
 4. **All-or-nothing table encryption** (→ v1.8): All columns in an `encrypted_heap`
    table are encrypted. Per-column `ENABLE COLUMN ENCRYPTION` DDL is planned for v1.8.
@@ -697,14 +1043,75 @@ See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
 5. **WAL unencrypted** (permanently deferred): Full WAL encryption requires a hook in
    `XLogInsert()` / `XLogWrite()` — not achievable as a PostgreSQL extension.
 
-6. **`WITH HOLD` cursor temporary file is unencrypted** (→ v1.7): When a `CURSOR WITH HOLD`
-   spills its result set to a temporary file on disk (e.g. when `work_mem` is exhausted),
-   the file is written in **plaintext**. PostgreSQL writes the materialized tuples directly
-   through the executor's tuplestore layer, bypassing the TAM write path, so
-   `pg_vault_tde` has no opportunity to encrypt the data before it reaches disk.
+6. **`WITH HOLD` cursor temporary file is unencrypted** (permanently deferred): PostgreSQL
+   materializes a `CURSOR WITH HOLD`'s entire result set into a tuplestore when the declaring
+   transaction commits, so the cursor can still be fetched from afterward. Once that result set
+   exceeds `work_mem`, the tuplestore spills to a temporary file on disk, and that file is written
+   in **plaintext**. The tuplestore is populated directly by the executor, bypassing the table
+   access method write path entirely, so `pg_vault_tde` never gets a chance to encrypt the data
+   before it reaches disk — there is no extension hook anywhere in the `WITH HOLD` cursor
+   lifecycle (parse, plan, portal start, commit-time persist) that can intercept it. This is the
+   same class of gap documented for other TDE implementations (e.g. Percona's `pg_tde`): temporary
+   files produced by query execution that exceed `work_mem` are not covered by table-level
+   encryption. The spilled file can outlive the query that created it — it persists for as long as
+   the held cursor remains open, and, like any other PostgreSQL temp file, is not guaranteed to be
+   cleaned up if the server crashes before the owning session ends normally.
 
-   **Mitigation until v1.7:** set `work_mem` large enough to keep cursor data in memory,
-   or avoid `WITH HOLD` cursors on encrypted tables in memory-constrained environments.
+   **Mitigation:** set `work_mem` large enough that cursor result sets are expected to stay
+   in memory, and avoid declaring `WITH HOLD` cursors over queries that touch `encrypted_heap`
+   tables (directly or through a view) in memory-constrained environments or wherever the
+   result set size can't be bounded in advance.
+
+7. **HOT updates are disabled by design** (so that updating an indexed column always
+   maintains the index): On an `encrypted_heap` table `heap_update` never chooses a HOT
+   (heap-only) update — every UPDATE writes new index entries, keeping `tde_btree` indexes
+   coherent without a `REINDEX`.
+   **How:** `heap_update` decides whether an update is HOT by comparing the indexed columns
+   byte-for-byte between the old and new tuple. Both tuples are encrypted, and the v4 wire
+   format is **IV-first**: it begins with the random GCM IV, which changes on every
+   encryption. The encrypted image therefore always differs, so `heap_update` sees the
+   indexed column as modified and skips the HOT path. The constant `[VERSION | GENERATION]`
+   bytes were moved to the **end** of the blob precisely so they fall outside the comparison
+   window. See [doc/pg_vault_tde.md](doc/pg_vault_tde.md) § Known Limitations for the full
+   analysis (including the v3 bug this resolved).
+
+8. **Parallel index build/rebuild is disabled by design**: the parallel workers that
+   PostgreSQL uses to build or rebuild an index run in separate processes that are not
+   intercepted by the TAM/IAM wrappers, so a parallel worker would read raw ciphertext
+   as if it were plaintext. This is disabled via `amcanbuildparallel = false` on
+   `tde_btree`.
+
+9. **Only `tde_btree` is an encrypted index AM** (→ v1.8 for GIN/Hash/GiST): `CREATE
+   INDEX`/`CREATE UNIQUE INDEX USING gin/gist/hash/brin/btree` against an
+   `encrypted_heap` table is rejected with `ERROR` by default, because none of those
+   access methods encrypt the key they store — only `tde_btree` (AES-256-SIV) does.
+   Set `pg_vault_tde.allow_plaintext_index = on` to allow it anyway (with a
+   `WARNING`) when you need trigram/full-text/spatial search or a plain range-scan
+   index on an encrypted table and have accepted that the indexed values will sit in
+   plaintext on disk in that one index. This has caught out users trying to build a
+   `PRIMARY KEY`/`UNIQUE` index as two separate steps (`CREATE UNIQUE INDEX ... USING
+   btree` then `ALTER TABLE ... ADD CONSTRAINT ... USING INDEX`, the pattern used with
+   `CREATE INDEX CONCURRENTLY`): the first statement fails outright, so the table ends
+   up with **no index at all** — not a broken one — and duplicate inserts go through
+   unblocked simply because there is nothing left to enforce them. `PRIMARY
+   KEY`/`UNIQUE` declared as a normal table constraint (inline in `CREATE TABLE`, or
+   `ALTER TABLE ... ADD CONSTRAINT ... PRIMARY KEY (col)` without `USING INDEX`) is
+   unaffected by this setting and always works — PostgreSQL core forces those onto a
+   native btree index regardless, so pg_vault_tde can only warn about it, never block
+   it.
+
+10. **Plain `COPY ... TO` / `pg_dump` produce a plaintext dump, with no warning** (→ v1.8):
+    encryption in `pg_vault_tde` lives entirely in the table access method's read
+    callbacks (`scan_getnextslot` and friends), which decrypt unconditionally and have
+    no way to tell a `SELECT` apart from a `COPY <table> TO ...` — both dispatch through
+    the same `table_scan_getnextslot()` call. `pg_dump`'s default table-data path is
+    exactly this form of `COPY ... TO stdout`, so a plain `pg_dump` (or a manual
+    `COPY sensitive_table TO '/path'`) on an `encrypted_heap` table silently returns
+    fully decrypted rows — there is currently no `ProcessUtility_hook` guard or GUC-gated
+    `WARNING` for this (a "dump plaintext warning" was designed but never implemented).
+    **Mitigation:** always use `pg_dump_tde`/`pg_restore_tde` instead of plain
+    `pg_dump`/`pg_restore` for logical backups of encrypted tables — see
+    [Encrypted Backups](#encrypted-backups).
 
 ---
 

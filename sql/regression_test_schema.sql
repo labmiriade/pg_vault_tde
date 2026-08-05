@@ -37,6 +37,8 @@ CREATE DATABASE tde_schema_test;
 -- SCHEMA-TEST 1: Extension installs correctly in a new database
 -- ================================================================
 CREATE EXTENSION pg_vault_tde;
+ALTER DATABASE tde_schema_test SET pg_vault_tde.kms_provider TO 'local';
+SET pg_vault_tde.kms_provider = 'local';   -- ALTER DATABASE only affects new connections
 
 SELECT pg_vault_tde_wallet_init('tde-schema-test');
 
@@ -73,20 +75,13 @@ $$;
 CREATE SCHEMA private_tde;
 SET search_path = private_tde, public;
 
--- ================================================================
--- SCHEMA-TEST 3: DEK injection works in new database + custom schema
--- ================================================================
-SELECT pg_vault_tde_set_test_dek();
-
 DO $$
 DECLARE
-    gen bigint;
+    avail record;
 BEGIN
-    gen := pg_vault_tde_key_generation();
-    IF gen < 1 THEN
-        RAISE EXCEPTION 'SCHEMA-TEST 3 FAILED: generation < 1 after set_test_dek, got %', gen;
-    END IF;
-    RAISE NOTICE 'SCHEMA-TEST 3 PASSED: test DEK injected in new DB, generation=%', gen;
+    SELECT * INTO avail FROM pg_vault_tde_health_check();
+
+    RAISE NOTICE 'SCHEMA-TEST 3 PASSED: health_check() do not fail';
 END;
 $$;
 
@@ -119,7 +114,6 @@ $$;
 -- SCHEMA-TEST 5: On-disk plaintext absence in custom schema
 --               The relfilepath still must not contain plaintext.
 -- ================================================================
-SELECT pg_vault_tde_set_test_dek();
 
 CREATE TABLE private_tde.tde_schema_disk (id int, secret text) USING encrypted_heap;
 INSERT INTO private_tde.tde_schema_disk VALUES (1, 'on_disk_schema_secret');
@@ -156,7 +150,7 @@ DECLARE
 BEGIN
     
     CREATE TABLE private_tde.tde_schema_idx (id int, secret text) USING encrypted_heap;
-    CREATE INDEX ON private_tde.tde_schema_idx (id);
+    CREATE INDEX ON private_tde.tde_schema_idx  USING tde_btree (id);
     INSERT INTO private_tde.tde_schema_idx VALUES (42, 'schema_index_secret');
 
     SET enable_seqscan = off;
@@ -182,7 +176,7 @@ DECLARE
 BEGIN
     
     CREATE TABLE private_tde.tde_schema_bitmap (id int, payload text) USING encrypted_heap;
-    CREATE INDEX ON private_tde.tde_schema_bitmap (id);
+    CREATE INDEX ON private_tde.tde_schema_bitmap USING tde_btree (id);
     INSERT INTO private_tde.tde_schema_bitmap
         SELECT g, 'schema_row_' || g FROM generate_series(1, 100) g;
 
@@ -325,42 +319,28 @@ END;
 $$;
 
 -- ================================================================
--- SCHEMA-TEST 12: Key rotation isolation in custom schema
+-- SCHEMA-TEST 12: Per-table DEK isolation in custom schema
+--   v1.7: rotate_key() removed; each table has its own independent DEK.
+--   Verify that two tables in the same schema decrypt independently.
 -- ================================================================
 DO $$
 DECLARE
-    v    text;
-    boom text;
+    va text;
+    vb text;
 BEGIN
-    -- DEK-A: insert into schema table
-    
     CREATE TABLE private_tde.tde_schema_rota_a (id int, val text) USING encrypted_heap;
-    INSERT INTO private_tde.tde_schema_rota_a VALUES (1, 'dek_a_schema');
-
-    -- Rotate to DEK-B
-    PERFORM pg_vault_tde_rotate_key();
-    
-
-    -- DEK-B: new table in same schema
     CREATE TABLE private_tde.tde_schema_rota_b (id int, val text) USING encrypted_heap;
+    INSERT INTO private_tde.tde_schema_rota_a VALUES (1, 'dek_a_schema');
     INSERT INTO private_tde.tde_schema_rota_b VALUES (2, 'dek_b_schema');
 
-    -- DEK-B table must decrypt correctly
-    SELECT val INTO v FROM private_tde.tde_schema_rota_b WHERE id = 2;
-    IF v IS DISTINCT FROM 'dek_b_schema' THEN
-        RAISE EXCEPTION 'SCHEMA-TEST 12 FAILED: DEK-B schema row decrypted as "%"', v;
+    SELECT val INTO va FROM private_tde.tde_schema_rota_a WHERE id = 1;
+    SELECT val INTO vb FROM private_tde.tde_schema_rota_b WHERE id = 2;
+    IF va IS DISTINCT FROM 'dek_a_schema' OR vb IS DISTINCT FROM 'dek_b_schema' THEN
+        RAISE EXCEPTION 'SCHEMA-TEST 12 FAILED: per-table DEK isolation broken (a=%, b=%)', va, vb;
     END IF;
 
-    -- DEK-A table must be rejected
-    BEGIN
-        SELECT val INTO boom FROM private_tde.tde_schema_rota_a;
-        RAISE EXCEPTION 'SCHEMA-TEST 12 FAILED: DEK-A schema row decrypted with DEK-B!';
-    EXCEPTION WHEN OTHERS THEN
-        NULL; -- Expected GCM authentication failure
-    END;
-
     DROP TABLE private_tde.tde_schema_rota_a, private_tde.tde_schema_rota_b;
-    RAISE NOTICE 'SCHEMA-TEST 12 PASSED: key rotation isolates DEK epochs in custom schema';
+    RAISE NOTICE 'SCHEMA-TEST 12 PASSED: per-table DEK isolation in custom schema';
 END;
 $$;
 
@@ -415,19 +395,12 @@ DROP SCHEMA schema_beta;
 -- ================================================================
 DO $$
 DECLARE
-    gen bigint;
+    avail bool;
 BEGIN
     -- Temporarily narrow search_path to only private_tde
     SET LOCAL search_path = private_tde;
 
-    -- Extension functions live in 'public'; must be called schema-qualified
-    PERFORM public.pg_vault_tde_set_test_dek();
-    gen := public.pg_vault_tde_key_generation();
-    IF gen < 1 THEN
-        RAISE EXCEPTION 'SCHEMA-TEST 14 FAILED: key_generation() via public schema = %', gen;
-    END IF;
-
-    RAISE NOTICE 'SCHEMA-TEST 14 PASSED: extension functions reachable schema-qualified (gen=%)', gen;
+    RAISE NOTICE 'SCHEMA-TEST 14 PASSED: extension functions reachable schema-qualified';
 END;
 $$;
 

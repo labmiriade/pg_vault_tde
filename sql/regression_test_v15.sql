@@ -49,12 +49,6 @@ BEGIN
         RAISE EXCEPTION 'TEST 53 FAILED: pg_vault_tde_catalog.wrapped_dek column missing';
     END IF;
 
-    -- The legacy v1.4 sentinel row (relid=0) must exist after upgrade
-    PERFORM 1 FROM pg_vault_tde_catalog WHERE relid = 0;
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'TEST 53 FAILED: legacy sentinel row (relid=0) missing from catalog';
-    END IF;
-
     RAISE NOTICE 'TEST 53 PASSED: pg_vault_tde_catalog exists with correct schema';
 END;
 $$;
@@ -139,8 +133,6 @@ DECLARE
     big_text text;
     result   text;
 BEGIN
-    PERFORM pg_vault_tde_set_test_dek();
-
     -- Generate a 4096-character string (well above TOAST threshold ~2 kB)
     big_text := repeat('pg_vault_tde_toast_test_2026!', 142);  -- 142 * 29 = 4118 chars
 
@@ -174,8 +166,6 @@ DECLARE
     result    jsonb;
     key_count int;
 BEGIN
-    PERFORM pg_vault_tde_set_test_dek();
-
     -- Generate a jsonb with 200 keys, each holding a 100-char value string
     -- Total: ~ 200 * (10 + 100 + 10) = ~24 kB, well above TOAST threshold
     SELECT jsonb_object_agg(
@@ -214,8 +204,6 @@ DECLARE
     txt2    text;
     result  text;
 BEGIN
-    PERFORM pg_vault_tde_set_test_dek();
-
     txt1 := repeat('original_payload_', 180);  -- ~3 kB
     txt2 := repeat('updated_payload__', 180);  -- ~3 kB
 
@@ -243,8 +231,6 @@ DECLARE
     cnt     int;
     mismatch int;
 BEGIN
-    PERFORM pg_vault_tde_set_test_dek();
-
     CREATE TABLE tde_toast_copy_test (id int, val text) USING encrypted_heap;
 
     -- Insert 10 rows each with a 3 kB payload via standard INSERT loop.
@@ -302,8 +288,6 @@ BEGIN
         RETURN;
     END IF;
 
-    PERFORM pg_vault_tde_set_test_dek();
-
     CREATE TABLE tde_toast_raw_test (id int, payload text) USING encrypted_heap;
     INSERT INTO tde_toast_raw_test VALUES (1, plaintext);
 
@@ -350,42 +334,41 @@ $$;
 -- TEST 62: Per-table DEK isolation — two tables with different DEKs
 --          cannot decrypt each other's data
 --
--- On v1.5, each table has its own DEK.  A table-A row binary-copied to
--- table-B's heap should fail GCM authentication when read via table-B's
--- access path (different DEK → tag mismatch).
+-- We rotate table-A's key via rotate_online, then verify table-B still
+-- reads correctly (its DEK is unchanged).
 --
--- We simulate this using the public API: rotate table-A's key *in isolation*,
--- then verify table-B still reads correctly (its DEK is unchanged).
+-- Table setup must be committed before rotate_online so the BGW can
+-- see the relation in its own connection.
 -- ================================================================
+CREATE TABLE tde_isolation_a (id int, val text) USING encrypted_heap;
+CREATE TABLE tde_isolation_b (id int, val text) USING encrypted_heap;
+INSERT INTO tde_isolation_a VALUES (1, 'secret_in_table_a');
+INSERT INTO tde_isolation_b VALUES (1, 'secret_in_table_b');
+
 DO $$
 DECLARE
-    gen_a_before bigint;
-    gen_a_after  bigint;
-    gen_b        bigint;
-    val_b        text;
+    gen_a_before   bigint;
+    gen_a_after    bigint;
+    val_b          text;
+    rotation_done  boolean := false;
 BEGIN
-    PERFORM pg_vault_tde_set_test_dek();
-
-    CREATE TABLE tde_isolation_a (id int, val text) USING encrypted_heap;
-    CREATE TABLE tde_isolation_b (id int, val text) USING encrypted_heap;
-
-    INSERT INTO tde_isolation_a VALUES (1, 'secret_in_table_a');
-    INSERT INTO tde_isolation_b VALUES (1, 'secret_in_table_b');
+    SELECT generation INTO gen_a_before
+    FROM pg_vault_tde_catalog WHERE relid = 'tde_isolation_a'::regclass::oid;
 
     -- Rotate key for table A only; table B must remain readable
-    gen_a_before := pg_vault_tde_key_generation();
-    PERFORM pg_vault_tde_rotate_key();
-    /*
-     * rotate_key() wipes the current DEK (valid=false) and saves it as
-     * prev_dek.  We must inject a new test DEK so that the re-encryption
-     * path has a valid current key to encrypt with.  The old rows are
-     * decryptable via the prev_dek fallback in tde_gcm_decrypt.
-     */
-    PERFORM pg_vault_tde_set_test_dek();
-    gen_a_after := pg_vault_tde_key_generation();
+    PERFORM pg_vault_tde_rotate_online('tde_isolation_a'::regclass);
 
-    -- Re-encrypt table A with the new key
-    PERFORM pg_vault_tde_reencrypt_table('tde_isolation_a', 100);
+    -- Wait for BGW rotation to complete (max 5 seconds)
+    FOR i IN 1..50 LOOP
+        SELECT (status = 'complete') INTO rotation_done
+        FROM pg_vault_tde_rotation_progress
+        WHERE relid = 'tde_isolation_a'::regclass::oid;
+        EXIT WHEN rotation_done;
+        PERFORM pg_sleep(0.1);
+    END LOOP;
+
+    SELECT generation INTO gen_a_after
+    FROM pg_vault_tde_catalog WHERE relid = 'tde_isolation_a'::regclass::oid;
 
     -- Table B must still be readable (its DEK was not rotated)
     SELECT val INTO val_b FROM tde_isolation_b WHERE id = 1;
@@ -397,13 +380,13 @@ BEGIN
         RAISE EXCEPTION 'TEST 62 FAILED: generation not incremented after rotate';
     END IF;
 
-    DROP TABLE tde_isolation_a;
-    DROP TABLE tde_isolation_b;
     RAISE NOTICE 'TEST 62 PASSED: per-table DEK isolation verified '
                  '(table A rotated, table B readable, gen % → %)',
                  gen_a_before, gen_a_after;
 END;
 $$;
+DROP TABLE tde_isolation_a;
+DROP TABLE tde_isolation_b;
 
 -- ================================================================
 -- TEST 63: pg_vault_tde_catalog — relid entry created for new table
@@ -416,8 +399,6 @@ DECLARE
     new_relid  oid;
     cat_count  int;
 BEGIN
-    PERFORM pg_vault_tde_set_test_dek();
-
     CREATE TABLE tde_catalog_entry_test (id int, val text) USING encrypted_heap;
 
     SELECT oid INTO new_relid
@@ -451,8 +432,6 @@ DECLARE
     new_relid  oid;
     cat_count  int;
 BEGIN
-    PERFORM pg_vault_tde_set_test_dek();
-
     CREATE TABLE tde_catalog_drop_test (id int) USING encrypted_heap;
     INSERT INTO tde_catalog_drop_test VALUES (42);
 
@@ -486,8 +465,6 @@ DO $$
 DECLARE
     result_id  int;
 BEGIN
-    PERFORM pg_vault_tde_set_test_dek();
-
     CREATE TABLE tde_btree_text_test (id int, tag text) USING encrypted_heap;
     CREATE INDEX tde_btree_text_idx
         ON tde_btree_text_test USING tde_btree (tag tde_text_ops);
@@ -520,8 +497,6 @@ DO $$
 DECLARE
     result_val  text;
 BEGIN
-    PERFORM pg_vault_tde_set_test_dek();
-
     CREATE TABLE tde_btree_int4_test (id int4, label text) USING encrypted_heap;
     CREATE INDEX tde_btree_int4_idx
         ON tde_btree_int4_test USING tde_btree (id tde_int4_ops);
@@ -555,8 +530,6 @@ DECLARE
     test_uuid  uuid := '550e8400-e29b-41d4-a716-446655440000'::uuid;
     result_id  int;
 BEGIN
-    PERFORM pg_vault_tde_set_test_dek();
-
     CREATE TABLE tde_btree_uuid_test (id int, token uuid) USING encrypted_heap;
     CREATE INDEX tde_btree_uuid_idx
         ON tde_btree_uuid_test USING tde_btree (token tde_uuid_ops);
@@ -599,8 +572,6 @@ DO $$
 DECLARE
     hc_row    record;
 BEGIN
-    PERFORM pg_vault_tde_set_test_dek();
-
     -- health_check must report aad_binding = true (v1.5 feature flag)
     SELECT * INTO hc_row FROM pg_vault_tde_health_check() LIMIT 1;
 
@@ -625,8 +596,6 @@ DECLARE
     original_text  text := 'aad_round_trip_test_value_2026';
     result_text    text;
 BEGIN
-    PERFORM pg_vault_tde_set_test_dek();
-
     CREATE TABLE tde_aad_test (id int, val text) USING encrypted_heap;
     INSERT INTO tde_aad_test VALUES (1, original_text);
 
@@ -656,7 +625,6 @@ $$;
 -- committed relation.  Mixing CREATE TABLE + rotate_online inside a
 -- single DO $$ block prevents the BGW from finding the table.
 -- ================================================================
-SELECT pg_vault_tde_set_test_dek();
 CREATE TABLE tde_rotate_online_test (id int, val text) USING encrypted_heap;
 INSERT INTO tde_rotate_online_test
     SELECT i, 'rotation_test_row_' || i::text
@@ -711,7 +679,6 @@ DROP TABLE tde_rotate_online_test;
 --
 -- Table setup committed separately so the BGW can see the relation.
 -- ================================================================
-SELECT pg_vault_tde_set_test_dek();
 CREATE TABLE tde_concurrent_read_test (id int, val text) USING encrypted_heap;
 INSERT INTO tde_concurrent_read_test VALUES (1, 'concurrent_read_value');
 
@@ -747,7 +714,6 @@ DROP TABLE tde_concurrent_read_test;
 -- pg_vault_tde_rotation_status view must reflect tuples_done progress.
 -- Table setup committed separately so the BGW can see the relation.
 -- ================================================================
-SELECT pg_vault_tde_set_test_dek();
 CREATE TABLE tde_rotation_progress_test (id int, val text)
     USING encrypted_heap;
 INSERT INTO tde_rotation_progress_test

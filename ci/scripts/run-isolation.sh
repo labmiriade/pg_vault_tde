@@ -21,7 +21,29 @@ log_stage "ISOLATION TESTS"
 
 build_pg_test_image
 
-start_pg_container "$CONTAINER" "${PG_TEST_PORT:-15432}"
+# ── Start container with kms_provider=local configured ───────────────────
+#
+# We inline the container start instead of using start_pg_container() because
+# we need to add extra postgres -c flags AFTER the image name (postgres args),
+# whereas start_pg_container extra_args are passed as container runtime args
+# (before the image name).
+#
+log_info "Starting pg-tde-isolation container with kms_provider=local ..."
+$RT rm -f "$CONTAINER" 2>/dev/null || true
+$RT run --rm -d \
+    --name "$CONTAINER" \
+    -e POSTGRES_PASSWORD=postgres \
+    -p "${PG_TEST_PORT:-15432}:5432" \
+    "${PG_TEST_IMAGE:-pg-tde-test}:latest" \
+    postgres \
+        -c "shared_preload_libraries=pg_vault_tde" \
+        -c "pg_vault_tde.dev_mode=on" \
+        -c "pg_vault_tde.kms_provider=local" \
+        -c "pg_vault_tde.wallet_auto_open=off" \
+        -c "pg_vault_tde.wallet_dev_mode_passphrase=tde_isolation" \
+        -c "log_min_messages=warning"
+
+wait_pg_ready "$CONTAINER"
 
 # Copy latest isolation specs + expected output
 $RT cp "$REPO_ROOT/test/isolation/." "$CONTAINER:/test/isolation/"
@@ -37,7 +59,8 @@ START=$(timer_start)
 # After a successful first run (no expected file), copy actual → expected so
 # subsequent runs act as regression guards.
 if $RT exec -u postgres "$CONTAINER" bash -c '
-    export PATH="/usr/lib/postgresql/18/bin:/usr/lib/postgresql/18/lib/pgxs/src/test/isolation:$PATH"
+    PGV=$(pg_config --version | awk "{print \$2}" | cut -d. -f1)
+    export PATH="/usr/lib/postgresql/${PGV}/lib/pgxs/src/test/isolation:$PATH"
     export PGDATA="/var/lib/postgresql/data"
     OUTDIR=$(mktemp -d /tmp/isolation_out.XXXXXX)
     ALL_PASS=true

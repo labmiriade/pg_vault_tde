@@ -110,7 +110,9 @@ Configurable via `ci/.env` or shell override. Key variables:
 | `PG_TEST_IMAGE` | `pg-tde-test` | Name of the test container image |
 | `VAULT_MOCK_TOKEN` | `test-token` | Vault mock authentication token |
 | `PG_TEST_PORT` | `15432` | Host port for regression container |
-| `BENCH_ROWS` | `100000` | Number of rows for benchmark |
+| `BENCH_ROWS` | `200000` | Rows per INSERT, per profile |
+| `BENCH_PROFILES` | `"tiny oltp wide"` | Row-width profiles (~32 B / ~256 B / ~512 B) |
+| `BENCH_THRESHOLD_PCT` | `100` | Avg overhead % above which the bench WARNs (exit 7) |
 | `PG_STARTUP_TIMEOUT` | `30` | Seconds to wait for PG startup |
 
 ## Multi-Version PostgreSQL Testing

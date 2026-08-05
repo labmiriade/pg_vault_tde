@@ -2,312 +2,156 @@
 # bitbucket-pipelines.yml
 #
 # CI/CD Pipeline for pg_vault_tde — Bitbucket Cloud
-# Mirror of .github/workflows/ci.yml
 #
-# Tests against PostgreSQL 17 AND 18 (update when adding PG 19+).
+# Delegates all build and test logic to the containerised local pipeline
+# (ci/scripts/run-all.sh) via `make ci-all`.
 #
-# Jobs (per PG version):
-#   1. build        – Compile extension (zero warnings gate)
-#   2. regress      – Run pg_regress 24-test regression suite
-#   3. tap          – Run TAP tests with mock Vault (HTTP::Daemon)
-#   4. isolation    – Run isolation tests (MVCC, key rotation concurrency)
-#   5. memcheck     – Valgrind + AddressSanitizer memory safety check
-#
-# CRITICAL: pg_vault_tde MUST be loaded via shared_preload_libraries.
-# Every test step must initialize its own cluster with this setting.
-#
-# ── Multi-PG Version ─────────────────────────────────────────────────────
-# Bitbucket pipelines do not support matrix strategies. Each PG version
-# is tested via explicit duplicate steps. When adding PG 19:
-#   1. Add install-pg19 / init-cluster-19 anchors
-#   2. Duplicate each step block with PG 19 references
-#   3. Update TDE_PG_MAX in the Makefile
 ##############################################################################
 image: ubuntu:24.04
 
 definitions:
   caches:
     apt-pgdg: /var/cache/apt
+  services:
+    docker:
+      memory: 7128
 
-  # ── PG 17 install ──────────────────────────────────────────────────────
-  install-pg17: &install-pg17
-    - apt-get update -qq
-    - apt-get install -y --no-install-recommends
-        build-essential libssl-dev libcurl4-openssl-dev
-        pkg-config curl ca-certificates gnupg lsb-release
-    - curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc
-        | gpg --dearmor -o /usr/share/keyrings/postgresql.gpg
-    - echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg]
-        https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main"
-        | tee /etc/apt/sources.list.d/pgdg.list
-    - apt-get update -qq
-    - apt-get install -y postgresql-17 postgresql-server-dev-17
-    - export PATH="/usr/lib/postgresql/17/bin:$PATH"
+  steps:
+    - step: &test-pg-17
+        name: Testing — PostgreSQL 17
+        size: 2x
+        services:
+          - docker
+        script:
+          - apt-get update -qq
+          - apt-get install -y --no-install-recommends ca-certificates curl wget
+          # Docker Compose
+          - curl -fsSL https://github.com/docker/compose/releases/download/v5.1.2/docker-compose-linux-x86_64 -o /usr/local/bin/docker-compose
+          - chmod +x /usr/local/bin/docker-compose
+          # Run test
+          - export PG_VERSION=17
+          - bash ci/scripts/run-all.sh $TEST_RUNALL_OPTIONS
 
-  # ── PG 18 install ──────────────────────────────────────────────────────
-  install-pg18: &install-pg18
-    - apt-get update -qq
-    - apt-get install -y --no-install-recommends
-        build-essential libssl-dev libcurl4-openssl-dev
-        pkg-config curl ca-certificates gnupg lsb-release
-    - curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc
-        | gpg --dearmor -o /usr/share/keyrings/postgresql.gpg
-    - echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg]
-        https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main"
-        | tee /etc/apt/sources.list.d/pgdg.list
-    - apt-get update -qq
-    - apt-get install -y postgresql-18 postgresql-server-dev-18
-    - export PATH="/usr/lib/postgresql/18/bin:$PATH"
+    - step: &test-pg-18
+        name: Testing — PostgreSQL 18
+        size: 2x
+        services:
+          - docker
+        script:
+          - apt-get update -qq
+          - apt-get install -y --no-install-recommends ca-certificates curl wget
+          # Docker Compose
+          - curl -fsSL https://github.com/docker/compose/releases/download/v5.1.2/docker-compose-linux-x86_64 -o /usr/local/bin/docker-compose
+          - chmod +x /usr/local/bin/docker-compose
+          # Run test
+          - export PG_VERSION=18
+          - bash ci/scripts/run-all.sh $TEST_RUNALL_OPTIONS
 
-  # ── Cluster init (version-agnostic, uses $PG_MAJOR) ────────────────────
-  init-cluster: &init-cluster
-    - export PGPORT=15432
-    - export PGDATA=/tmp/tde_test_data
-    - pg_ctlcluster $PG_MAJOR main stop 2>/dev/null || true
-    - su - postgres -c "initdb -D $PGDATA --no-locale -E UTF8" || initdb -D "$PGDATA" --no-locale -E UTF8
-    - |
-      cat >> "$PGDATA/postgresql.conf" <<EOF
-      shared_preload_libraries = 'pg_vault_tde'
-      port = $PGPORT
-      log_min_messages = warning
-      EOF
-    - pg_ctl -D "$PGDATA" -l "$PGDATA/logfile" start
-    - pg_isready -p $PGPORT -t 30
+    - step: &package
+        name: Build and Package Artifacts
+        size: 2x
+        services:
+          - docker
+        script:
+          - bash packaging/build_in_container.sh --all
+        artifacts:
+          - dist/**
+
+    - step: &inspect-artifacts
+        name: Inspect Artifacts
+        script:
+          - ls -la dist/
+
+    - step: &github-synchronization
+        # Sincronizza su GitHub: master->main, develop->develop, tag di versione (v*)->tag omonimo
+        # Mirror reale (storia, autori, messaggi preservati) a partire da GITHUB_HISTORY_SINCE,
+        # filtrando via git-filter-repo i path non destinati al repo pubblico (ci/, bitbucket-pipelines.yml).
+        name: GitHub Synchronization
+        clone:
+          depth: full
+        script:
+          - apt-get update -qq
+          - apt-get install -y --no-install-recommends git openssh-client ca-certificates python3-pip
+          - pip install --break-system-packages --quiet git-filter-repo
+          # Determina il ref di destinazione su GitHub in base al trigger Bitbucket
+          - |
+            if [ -n "$BITBUCKET_TAG" ]; then
+              export TARGET_TYPE="tag"
+              export TARGET_REF="$BITBUCKET_TAG"
+            elif [ "$BITBUCKET_BRANCH" = "master" ]; then
+              export TARGET_TYPE="branch"
+              export TARGET_REF="main"
+            else
+              export TARGET_TYPE="branch"
+              export TARGET_REF="$BITBUCKET_BRANCH"
+            fi
+            echo "Sync -> $TARGET_TYPE $TARGET_REF"
+          # Individua il commit più vecchio non anteriore a GITHUB_HISTORY_SINCE: diventerà la
+          # nuova radice della storia pubblicata. Fissa e nel passato, GITHUB_HISTORY_SINCE
+          # risolve sempre allo stesso commit tra un'esecuzione e l'altra.
+          - |
+            export GITHUB_HISTORY_SINCE="${GITHUB_HISTORY_SINCE:-2026-07-01}"
+            CUTOFF_COMMIT=$(git log --since="$GITHUB_HISTORY_SINCE" --reverse --format=%H | head -1)
+            if [ -z "$CUTOFF_COMMIT" ]; then
+              echo "Nessun commit da $GITHUB_HISTORY_SINCE in poi su questo ref, sincronizzo l'intera storia disponibile."
+              export FILTER_REFS=""
+            else
+              echo "Storia pubblicata a partire da: $(git show -s --format='%h %ad %s' --date=short "$CUTOFF_COMMIT")"
+              PARENT_COMMIT=$(git rev-parse "${CUTOFF_COMMIT}^" 2>/dev/null || true)
+              if [ -n "$PARENT_COMMIT" ]; then
+                export FILTER_REFS="${PARENT_COMMIT}..HEAD"
+              else
+                export FILTER_REFS=""
+              fi
+            fi
+          # Riscrive la storia rimuovendo i path interni e troncandola a GITHUB_HISTORY_SINCE,
+          # mantenendo autori/messaggi/date reali per i commit inclusi.
+          # Deterministico: a parità di storia sorgente e di cutoff produce sempre gli stessi SHA
+          # filtrati, quindi il push verso GitHub resta un fast-forward, senza bisogno di un
+          # commit-map persistito.
+          - |
+            if [ -n "$FILTER_REFS" ]; then
+              git filter-repo --force --invert-paths \
+                --path ci \
+                --path bitbucket-pipelines.yml \
+                --refs "$FILTER_REFS"
+            else
+              git filter-repo --force --invert-paths \
+                --path ci \
+                --path bitbucket-pipelines.yml
+            fi
+          - git remote add github "$GITHUB_REPO_URL"
+          # Push del ref reale (storia intatta) verso GitHub
+          - |
+            if [ "$TARGET_TYPE" = "branch" ]; then
+              git push github --force "HEAD:refs/heads/$TARGET_REF"
+            else
+              git push github --force "refs/tags/$BITBUCKET_TAG:refs/tags/$TARGET_REF"
+            fi
+
 
 pipelines:
-  default:
-    # ══════════════════════════════════════════════════════════════════════
-    # PostgreSQL 17
-    # ══════════════════════════════════════════════════════════════════════
-    - step:
-        name: Build (PG 17)
-        caches: [apt-pgdg]
-        script:
-          - export PG_MAJOR=17
-          - *install-pg17
-          - make PG_CONFIG=$(which pg_config) 2>&1 | tee /tmp/build.log
-          - |
-            if grep -qE ': warning:' /tmp/build.log; then
-              echo "FATAL: Compilation produced warnings — zero-warning policy violated"
-              grep ': warning:' /tmp/build.log
-              exit 1
-            fi
-          - make install PG_CONFIG=$(which pg_config)
+  branches:
+    feature/pipeline-ci:
+      # - parallel:
+      #     - step: *test-pg-17
+      #     - step: *test-pg-18
+      # - step: *package
+      # - step: *inspect-artifacts
+      - step: *github-synchronization
 
-    - step:
-        name: Regression Tests (PG 17)
-        caches: [apt-pgdg]
-        script:
-          - export PG_MAJOR=17
-          - *install-pg17
-          - make PG_CONFIG=$(which pg_config)
-          - make install PG_CONFIG=$(which pg_config)
-          - *init-cluster
-          - createdb -p $PGPORT regression_tde
-          - make installcheck
-              PGPORT=$PGPORT
-              PGDATABASE=regression_tde
-              PG_CONFIG=$(which pg_config)
-              REGRESS_OPTS="--dbname=regression_tde --port=$PGPORT"
-        after-script:
-          - cat "$PGDATA/logfile" 2>/dev/null || true
-          - pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true
+    develop:
+      - parallel:
+          - step: *test-pg-17
+          - step: *test-pg-18
+      - step: *github-synchronization
 
-    - step:
-        name: TAP Tests (PG 17)
-        caches: [apt-pgdg]
-        script:
-          - export PG_MAJOR=17
-          - *install-pg17
-          - apt-get install -y --no-install-recommends
-              perl cpanminus libipc-run-perl
-              libhttp-daemon-perl libhttp-message-perl
-          - make PG_CONFIG=$(which pg_config)
-          - make install PG_CONFIG=$(which pg_config)
-          - prove -v tap/*.t
-        after-script:
-          - cat /tmp/tde_test_data/logfile 2>/dev/null || true
+    master:
+      - parallel:
+          - step: *test-pg-17
+          - step: *test-pg-18
+      - step: *github-synchronization
 
-    - step:
-        name: Isolation Tests (PG 17)
-        caches: [apt-pgdg]
-        script:
-          - export PG_MAJOR=17
-          - *install-pg17
-          - make PG_CONFIG=$(which pg_config)
-          - make install PG_CONFIG=$(which pg_config)
-          - export PGPORT=15433
-          - export PGDATA=/tmp/tde_isolation_data
-          - pg_ctlcluster $PG_MAJOR main stop 2>/dev/null || true
-          - su - postgres -c "initdb -D $PGDATA --no-locale -E UTF8" || initdb -D "$PGDATA" --no-locale -E UTF8
-          - |
-            cat >> "$PGDATA/postgresql.conf" <<EOF
-            shared_preload_libraries = 'pg_vault_tde'
-            port = $PGPORT
-            max_prepared_transactions = 10
-            log_min_messages = warning
-            EOF
-          - pg_ctl -D "$PGDATA" -l "$PGDATA/logfile" start
-          - pg_isready -p $PGPORT -t 30
-          - createdb -p $PGPORT isolation_tde
-          - make installcheck-isolation
-              PGPORT=$PGPORT
-              PG_CONFIG=$(which pg_config)
-              ISOLATION_OPTS="--dbname=isolation_tde --port=$PGPORT"
-        after-script:
-          - cat "$PGDATA/logfile" 2>/dev/null || true
-          - pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true
-
-    - step:
-        name: Memory Safety (PG 17)
-        caches: [apt-pgdg]
-        script:
-          - export PG_MAJOR=17
-          - *install-pg17
-          - apt-get install -y --no-install-recommends valgrind
-          - export PGPORT=15434
-          - export PGDATA=/tmp/tde_memcheck_data
-          - make clean
-          - make PG_CONFIG=$(which pg_config)
-              CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g -O1"
-              SHLIB_LINK="-lasan"
-          - make install PG_CONFIG=$(which pg_config)
-          - pg_ctlcluster $PG_MAJOR main stop 2>/dev/null || true
-          - su - postgres -c "initdb -D $PGDATA --no-locale -E UTF8" || initdb -D "$PGDATA" --no-locale -E UTF8
-          - |
-            cat >> "$PGDATA/postgresql.conf" <<EOF
-            shared_preload_libraries = 'pg_vault_tde'
-            port = $PGPORT
-            log_min_messages = warning
-            EOF
-          - pg_ctl -D "$PGDATA" -l "$PGDATA/logfile" start
-          - pg_isready -p $PGPORT -t 30
-          - createdb -p $PGPORT memcheck_tde
-          - >
-            ASAN_OPTIONS="detect_leaks=1:abort_on_error=1"
-            make installcheck
-              PGPORT=$PGPORT
-              PGDATABASE=memcheck_tde
-              PG_CONFIG=$(which pg_config)
-              REGRESS_OPTS="--dbname=memcheck_tde --port=$PGPORT"
-        after-script:
-          - cat "$PGDATA/logfile" 2>/dev/null || true
-          - pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true
-
-    # ══════════════════════════════════════════════════════════════════════
-    # PostgreSQL 18
-    # ══════════════════════════════════════════════════════════════════════
-    - step:
-        name: Build (PG 18)
-        caches: [apt-pgdg]
-        script:
-          - export PG_MAJOR=18
-          - *install-pg18
-          - make PG_CONFIG=$(which pg_config) 2>&1 | tee /tmp/build.log
-          - |
-            if grep -qE ': warning:' /tmp/build.log; then
-              echo "FATAL: Compilation produced warnings — zero-warning policy violated"
-              grep ': warning:' /tmp/build.log
-              exit 1
-            fi
-          - make install PG_CONFIG=$(which pg_config)
-
-    - step:
-        name: Regression Tests (PG 18)
-        caches: [apt-pgdg]
-        script:
-          - export PG_MAJOR=18
-          - *install-pg18
-          - make PG_CONFIG=$(which pg_config)
-          - make install PG_CONFIG=$(which pg_config)
-          - *init-cluster
-          - createdb -p $PGPORT regression_tde
-          - make installcheck
-              PGPORT=$PGPORT
-              PGDATABASE=regression_tde
-              PG_CONFIG=$(which pg_config)
-              REGRESS_OPTS="--dbname=regression_tde --port=$PGPORT"
-        after-script:
-          - cat "$PGDATA/logfile" 2>/dev/null || true
-          - pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true
-
-    - step:
-        name: TAP Tests (PG 18)
-        caches: [apt-pgdg]
-        script:
-          - export PG_MAJOR=18
-          - *install-pg18
-          - apt-get install -y --no-install-recommends
-              perl cpanminus libipc-run-perl
-              libhttp-daemon-perl libhttp-message-perl
-          - make PG_CONFIG=$(which pg_config)
-          - make install PG_CONFIG=$(which pg_config)
-          - prove -v tap/*.t
-        after-script:
-          - cat /tmp/tde_test_data/logfile 2>/dev/null || true
-
-    - step:
-        name: Isolation Tests (PG 18)
-        caches: [apt-pgdg]
-        script:
-          - export PG_MAJOR=18
-          - *install-pg18
-          - make PG_CONFIG=$(which pg_config)
-          - make install PG_CONFIG=$(which pg_config)
-          - export PGPORT=15433
-          - export PGDATA=/tmp/tde_isolation_data
-          - pg_ctlcluster $PG_MAJOR main stop 2>/dev/null || true
-          - su - postgres -c "initdb -D $PGDATA --no-locale -E UTF8" || initdb -D "$PGDATA" --no-locale -E UTF8
-          - |
-            cat >> "$PGDATA/postgresql.conf" <<EOF
-            shared_preload_libraries = 'pg_vault_tde'
-            port = $PGPORT
-            max_prepared_transactions = 10
-            log_min_messages = warning
-            EOF
-          - pg_ctl -D "$PGDATA" -l "$PGDATA/logfile" start
-          - pg_isready -p $PGPORT -t 30
-          - createdb -p $PGPORT isolation_tde
-          - make installcheck-isolation
-              PGPORT=$PGPORT
-              PG_CONFIG=$(which pg_config)
-              ISOLATION_OPTS="--dbname=isolation_tde --port=$PGPORT"
-        after-script:
-          - cat "$PGDATA/logfile" 2>/dev/null || true
-          - pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true
-
-    - step:
-        name: Memory Safety (PG 18)
-        caches: [apt-pgdg]
-        script:
-          - export PG_MAJOR=18
-          - *install-pg18
-          - apt-get install -y --no-install-recommends valgrind
-          - export PGPORT=15434
-          - export PGDATA=/tmp/tde_memcheck_data
-          - make clean
-          - make PG_CONFIG=$(which pg_config)
-              CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g -O1"
-              SHLIB_LINK="-lasan"
-          - make install PG_CONFIG=$(which pg_config)
-          - pg_ctlcluster $PG_MAJOR main stop 2>/dev/null || true
-          - su - postgres -c "initdb -D $PGDATA --no-locale -E UTF8" || initdb -D "$PGDATA" --no-locale -E UTF8
-          - |
-            cat >> "$PGDATA/postgresql.conf" <<EOF
-            shared_preload_libraries = 'pg_vault_tde'
-            port = $PGPORT
-            log_min_messages = warning
-            EOF
-          - pg_ctl -D "$PGDATA" -l "$PGDATA/logfile" start
-          - pg_isready -p $PGPORT -t 30
-          - createdb -p $PGPORT memcheck_tde
-          - >
-            ASAN_OPTIONS="detect_leaks=1:abort_on_error=1"
-            make installcheck
-              PGPORT=$PGPORT
-              PGDATABASE=memcheck_tde
-              PG_CONFIG=$(which pg_config)
-              REGRESS_OPTS="--dbname=memcheck_tde --port=$PGPORT"
-        after-script:
-          - cat "$PGDATA/logfile" 2>/dev/null || true
-          - pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true
+  tags:
+    'v*':
+      - step: *github-synchronization

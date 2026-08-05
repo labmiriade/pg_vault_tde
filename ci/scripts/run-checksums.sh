@@ -3,6 +3,7 @@
 #
 # Verifies pg_vault_tde is fully compatible with PostgreSQL data checksums.
 # Uses POSTGRES_INITDB_ARGS="-k" to enable checksums at initdb time.
+# Runs with kms_provider=local
 #
 # Exit code: 0 on success, 2 on failure.
 #
@@ -30,9 +31,12 @@ $RT run --rm -d \
     -p "${PG_CHECKSUMS_PORT:-15433}:5432" \
     "${PG_TEST_IMAGE:-pg-tde-test}:latest" \
     postgres \
-    -c "shared_preload_libraries=pg_vault_tde" \
-    -c "pg_vault_tde.dev_mode=on" \
-    -c "log_min_messages=warning"
+        -c "shared_preload_libraries=pg_vault_tde" \
+        -c "pg_vault_tde.dev_mode=on" \
+        -c "pg_vault_tde.kms_provider=local" \
+        -c "pg_vault_tde.wallet_auto_open=off" \
+        -c "pg_vault_tde.wallet_dev_mode_passphrase=tde_regression_pass_2026" \
+        -c "log_min_messages=warning"
 
 wait_pg_ready "$CONTAINER"
 
@@ -43,6 +47,16 @@ if [[ "$CHECKSUMS" != "on" ]]; then
     exit 2
 fi
 log_ok "data_checksums = on"
+
+# Initialise wallet so wrap/unwrap and encrypt_test work for the regression suite
+log_info "Initialising local wallet ..."
+if ! container_psql "$CONTAINER" -v ON_ERROR_STOP=1 -c \
+        "SELECT pg_vault_tde_wallet_init('tde_regression_pass_2026');"; then
+    log_error "CHECKSUMS: wallet_init failed"
+    $RT logs "$CONTAINER" --tail 30 2>/dev/null || true
+    exit 2
+fi
+log_ok "Local wallet initialised"
 
 # Run full regression suite
 $RT cp "$REPO_ROOT/sql/regression_test.sql" "$CONTAINER:/tmp/regression_test.sql"
@@ -60,7 +74,6 @@ fi
 # Extra: encrypted page read without checksum error
 log_info "Running checksum-specific verification ..."
 container_psql "$CONTAINER" \
-    -c "SELECT pg_vault_tde_set_test_dek();" \
     -c "CREATE TABLE chk_test (id int, val text) USING encrypted_heap;" \
     -c "INSERT INTO chk_test SELECT g, 'row_'||g FROM generate_series(1,10) g;" \
     -c "CHECKPOINT;" \

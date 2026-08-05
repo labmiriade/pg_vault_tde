@@ -1,14 +1,6 @@
 Parsed test spec with 5 sessions
 
-starting permutation: init_pass su_setup rx_begin rx_read1 rot_rotate wx_begin wx_write wx_commit rx_read2 rx_commit
-step init_pass: 
-    SELECT pg_vault_tde_wallet_init('tde_isolation');
-
-pg_vault_tde_wallet_init
-------------------------
-                        
-(1 row)
-
+starting permutation: su_setup rx_begin rx_read1 rot_rotate wx_begin wx_write wx_commit rx_read2 rx_commit
 step su_setup: 
     CREATE TABLE tde_iso_test (
         id serial PRIMARY KEY,
@@ -25,7 +17,6 @@ data
 initial_value_1
 (1 row)
 
-rotator: NOTICE:  pg_vault_tde_rotate_online: rotation started for relation 16963 (batch_size=1000)
 step rot_rotate: SELECT pg_vault_tde_rotate_online('tde_iso_test');
 pg_vault_tde_rotate_online
 --------------------------
@@ -54,7 +45,6 @@ step su_setup:
 
 step wx_begin: BEGIN; --Read committed
 step wx_write: INSERT INTO tde_iso_test (data) VALUES ('Isolation_test');
-rotator: NOTICE:  pg_vault_tde_rotate_online: rotation started for relation 17112 (batch_size=1000)
 step rot_rotate: SELECT pg_vault_tde_rotate_online('tde_iso_test');
 pg_vault_tde_rotate_online
 --------------------------
@@ -81,7 +71,6 @@ step su_setup:
 
 step wx_begin: BEGIN; --Read committed
 step wx_write: INSERT INTO tde_iso_test (data) VALUES ('Isolation_test');
-rotator: NOTICE:  pg_vault_tde_rotate_online: rotation started for relation 17261 (batch_size=1000)
 step rot_rotate: SELECT pg_vault_tde_rotate_online('tde_iso_test');
 pg_vault_tde_rotate_online
 --------------------------
@@ -114,7 +103,6 @@ step su_setup:
 
 step wx_begin: BEGIN; --Read committed
 step wx_update: UPDATE tde_iso_test SET data = 'Updated' WHERE id = 50;
-rotator: NOTICE:  pg_vault_tde_rotate_online: rotation started for relation 17410 (batch_size=1000)
 step rot_rotate: SELECT pg_vault_tde_rotate_online('tde_iso_test');
 pg_vault_tde_rotate_online
 --------------------------
@@ -134,7 +122,6 @@ step su_setup:
     SELECT 'initial_value_' || g FROM generate_series(1, 100) g;
 
 step vacuum: VACUUM tde_iso_test;
-rotator: NOTICE:  pg_vault_tde_rotate_online: rotation started for relation 17559 (batch_size=1000)
 step rot_rotate: SELECT pg_vault_tde_rotate_online('tde_iso_test');
 pg_vault_tde_rotate_online
 --------------------------
@@ -152,7 +139,6 @@ step su_setup:
     INSERT INTO tde_iso_test (data)
     SELECT 'initial_value_' || g FROM generate_series(1, 100) g;
 
-rotator: NOTICE:  pg_vault_tde_rotate_online: rotation started for relation 17708 (batch_size=1000)
 step rot_rotate: SELECT pg_vault_tde_rotate_online('tde_iso_test');
 pg_vault_tde_rotate_online
 --------------------------
