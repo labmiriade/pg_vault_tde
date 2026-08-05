@@ -97,7 +97,7 @@ definitions:
           # Push del ref reale (storia intatta) verso GitHub
           - |
             if [ "$TARGET_TYPE" = "branch" ]; then
-              git push github "HEAD:refs/heads/$TARGET_REF"
+              git push github --force "HEAD:refs/heads/$TARGET_REF"
             else
               git push github --force "refs/tags/$BITBUCKET_TAG:refs/tags/$TARGET_REF"
             fi
