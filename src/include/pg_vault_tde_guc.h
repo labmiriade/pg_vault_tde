@@ -1,7 +1,7 @@
 /*
  * pg_vault_tde_guc.h - GUC parameter extern declarations
  *
- * Copyright (c) 2026 Miriade Srl  
+ * Copyright (c) 2026 Miriade S.r.l.  
  * Licensed under the PostgreSQL License.
  *
  * All GUC variables are defined as static in pg_vault_tde.c and exposed

@@ -1,7 +1,7 @@
 /*
  * pg_vault_tde_crypto.c - Core AES-256-GCM encrypt/decrypt primitives
  *
- * Copyright (c) 2026 Miriade Srl  
+ * Copyright (c) 2026 Miriade S.r.l.  
  * Licensed under the PostgreSQL License.
  *
  * DESIGN RATIONALE:

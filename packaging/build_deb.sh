@@ -20,7 +20,7 @@
 #
 # Output: ../postgresql-PG-pg-vault-tde_1.7-1_<arch>.deb
 #
-# Copyright (c) 2026 Miriade Srl — PostgreSQL License
+# Copyright (c) 2026 Miriade S.r.l. — PostgreSQL License
 
 set -e
 cd "$(dirname "$0")/.."   # move to project root

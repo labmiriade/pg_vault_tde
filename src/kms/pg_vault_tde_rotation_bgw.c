@@ -24,7 +24,7 @@
  * @SecurityKMS: online rotation logic + KMS re-wrap calls.
  * @Architect:   TAM / catalog integration points.
  *
- * Copyright (c) 2024-2025 Miriade SARL.  BSD (PostgreSQL) License.
+ * Copyright (c) 2024-2025 Miriade S.r.l.  BSD (PostgreSQL) License.
  *-------------------------------------------------------------------------*/
 
 #include "postgres.h"

@@ -11,7 +11,7 @@
 #
 # Output: ~/rpmbuild/RPMS/x86_64/postgresql{17,18}-pg_vault_tde-1.7-1.*.rpm
 #
-# Copyright (c) 2026 Miriade Srl — PostgreSQL License
+# Copyright (c) 2026 Miriade S.r.l. — PostgreSQL License
 
 set -e
 cd "$(dirname "$0")/.."  # move to project root

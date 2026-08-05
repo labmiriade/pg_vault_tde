@@ -1,7 +1,7 @@
 /*
  * pg_vault_tde_toast.h - TOAST data encryption header
  *
- * Copyright (c) 2026 Miriade Srl  
+ * Copyright (c) 2026 Miriade S.r.l.  
  * Licensed under the PostgreSQL License.
  */
 #ifndef PG_VAULT_TDE_TOAST_H

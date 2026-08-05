@@ -79,7 +79,7 @@ chrpath -d %{buildroot}%{pginstdir}/lib/%{sname}.so
 %{pginstdir}/lib/bitcode/%{sname}*
 
 %changelog
-* Mon Jun 08 2026 Miriade Srl <info@miriade.it> - 1.7-1
+* Mon Jun 08 2026 Miriade S.r.l. <info@miriade.it> - 1.7-1
 - v1.7: tde_btree access method — encrypted (AES-256-SIV) index keys for
   bytea/text/int4/int8/numeric/uuid/date/timestamptz operator classes;
   index-only scans disabled by design
@@ -99,7 +99,7 @@ chrpath -d %{buildroot}%{pginstdir}/lib/%{sname}.so
 - Per-database KMS configuration (PGC_SUSET for all KMS GUCs)
 - 137 regression tests passing (52 v1.4 + 20 v1.5 + 38 v1.6 + 27 v1.7)
 
-* Wed Mar 04 2026 Miriade Srl <info@miriade.it> - 1.6-1
+* Wed Mar 04 2026 Miriade S.r.l. <info@miriade.it> - 1.6-1
 - v1.6: Local PKCS#12 wallet KMS provider (offline, no external service)
 - Flexible passphrase sources: env, file, command, dev_mode
 - wallet_unlock/lock/rotate_kek/export_bundle/import_bundle SQL functions
@@ -107,7 +107,7 @@ chrpath -d %{buildroot}%{pginstdir}/lib/%{sname}.so
 - Support for PostgreSQL 17 and 18
 - 72 regression tests passing
 
-* Fri Feb 27 2026 Miriade Srl <info@miriade.it> - 1.0-1
+* Fri Feb 27 2026 Miriade S.r.l. <info@miriade.it> - 1.0-1
 - Initial RPM release for PostgreSQL 17-18
 - AES-256-GCM transparent encryption via TAM
 - 24 regression tests passing including page checksum compatibility

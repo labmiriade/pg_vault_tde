@@ -1,0 +1,163 @@
+name: Build & Publish Packages
+
+# Manually-triggered release pipeline: builds .deb/.rpm packages for every
+# currently-supported OS (see packaging/build_in_container.sh) from an
+# existing git tag, then attaches them to a GitHub Release.
+#
+# Prerequisite: the version bump + `packaging/` Release Checklist
+# (packaging/packaging.instructions.md) must already be committed and
+# tagged. This workflow only builds and publishes — it does not bump
+# versions.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing git tag to build from (e.g. v1.7.0)"
+        required: true
+        type: string
+      version:
+        description: "Version expected at that tag (e.g. 1.7.0) — sanity-checked against VERSION before any build runs"
+        required: true
+        type: string
+      draft:
+        description: "Create the release as a draft (review assets before publishing)"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+# Guards against two runs racing to publish/update the same release.
+# (github.event.inputs, not the newer `inputs` context, for broad Actions compatibility here.)
+concurrency:
+  group: build-packages-${{ github.event.inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Verify version consistency at tag
+        run: |
+          set -euo pipefail
+          INPUT_VERSION="${{ inputs.version }}"
+          SHORT="${INPUT_VERSION%.*}"   # 1.7.0 -> 1.7
+
+          fail=0
+          check() {
+            local what="$1" actual="$2" expected="$3"
+            if [ "$actual" != "$expected" ]; then
+              echo "ERROR: $what is '$actual', expected '$expected' for tag '${{ inputs.tag }}'"
+              fail=1
+            fi
+          }
+
+          check "VERSION file" "$(cat VERSION)" "$INPUT_VERSION"
+          check "rpm spec Version:" "$(grep -m1 '^Version:' packaging/rpm/pg_vault_tde.spec | awk '{print $2}')" "$SHORT"
+          check "build_rpm.sh VERSION=" "$(grep -m1 '^VERSION=' packaging/build_rpm.sh | cut -d'"' -f2)" "$SHORT"
+          check "debian/changelog top version" "$(sed -n '1p' packaging/debian/changelog | grep -oP '(?<=\()[^)]+(?=\))' | cut -d- -f1)" "$SHORT"
+
+          if [ "$fail" -ne 0 ]; then
+            echo ""
+            echo "Refusing to build: the tag's source does not match the version you entered."
+            echo "Either the wrong tag/version was selected, or the release-checklist version"
+            echo "bump was incomplete for this tag. See packaging/packaging.instructions.md."
+            exit 1
+          fi
+          echo "OK: version $INPUT_VERSION consistent across VERSION, spec, build_rpm.sh, changelog."
+
+  build:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # DEB — packaging/build_in_container.sh VALID_DEB_OS
+          - { format: deb, os: "ubuntu:22.04", pg: "17", slug: ubuntu22.04 }
+          - { format: deb, os: "ubuntu:22.04", pg: "18", slug: ubuntu22.04 }
+          - { format: deb, os: "ubuntu:24.04", pg: "17", slug: ubuntu24.04 }
+          - { format: deb, os: "ubuntu:24.04", pg: "18", slug: ubuntu24.04 }
+          - { format: deb, os: "ubuntu:26.04", pg: "17", slug: ubuntu26.04 }
+          - { format: deb, os: "ubuntu:26.04", pg: "18", slug: ubuntu26.04 }
+          - { format: deb, os: "debian:11",    pg: "17", slug: debian11 }
+          - { format: deb, os: "debian:11",    pg: "18", slug: debian11 }
+          - { format: deb, os: "debian:12",    pg: "17", slug: debian12 }
+          - { format: deb, os: "debian:12",    pg: "18", slug: debian12 }
+          - { format: deb, os: "debian:13",    pg: "17", slug: debian13 }
+          - { format: deb, os: "debian:13",    pg: "18", slug: debian13 }
+          # RPM — packaging/build_in_container.sh VALID_RPM_OS
+          - { format: rpm, os: "rockylinux:8",  pg: "17", slug: rockylinux8 }
+          - { format: rpm, os: "rockylinux:8",  pg: "18", slug: rockylinux8 }
+          - { format: rpm, os: "rockylinux:9",  pg: "17", slug: rockylinux9 }
+          - { format: rpm, os: "rockylinux:9",  pg: "18", slug: rockylinux9 }
+          - { format: rpm, os: "rockylinux:10", pg: "17", slug: rockylinux10 }
+          - { format: rpm, os: "rockylinux:10", pg: "18", slug: rockylinux10 }
+          - { format: rpm, os: "almalinux:8",   pg: "17", slug: almalinux8 }
+          - { format: rpm, os: "almalinux:8",   pg: "18", slug: almalinux8 }
+          - { format: rpm, os: "almalinux:9",   pg: "17", slug: almalinux9 }
+          - { format: rpm, os: "almalinux:9",   pg: "18", slug: almalinux9 }
+          - { format: rpm, os: "almalinux:10",  pg: "17", slug: almalinux10 }
+          - { format: rpm, os: "almalinux:10",  pg: "18", slug: almalinux10 }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Build ${{ matrix.format }} — ${{ matrix.os }} — PG${{ matrix.pg }}
+        run: |
+          bash packaging/build_in_container.sh \
+            --format "${{ matrix.format }}" \
+            --pg-version "${{ matrix.pg }}" \
+            --os-version "${{ matrix.os }}" \
+            --output-dir dist
+
+      - name: Qualify filename with OS
+        # build_in_container.sh names packages after (format, pg), never the OS —
+        # rockylinux:9 and almalinux:9 PG17 RPMs would otherwise both land on the
+        # same *.el9.x86_64.rpm name and silently clobber each other as release
+        # assets. Tag every artifact with its OS slug before it leaves this job.
+        run: |
+          set -euo pipefail
+          cd dist
+          for f in *.deb *.rpm; do
+            [ -e "$f" ] || continue
+            mv "$f" "${f%.*}.${{ matrix.slug }}.${f##*.}"
+          done
+          ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.format }}-pg${{ matrix.pg }}-${{ matrix.slug }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts into one directory
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f \( -name '*.deb' -o -name '*.rpm' \) -exec cp {} dist/ \;
+          ls -la dist
+
+      - name: Create/update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: pg_vault_tde ${{ inputs.version }}
+          draft: ${{ inputs.draft }}
+          files: dist/*

@@ -1,7 +1,7 @@
 /*
  * pg_vault_tde_kms.c - KMS/Vault integration (async, shared memory cache)
  *
- * Copyright (c) 2026 Miriade Srl  
+ * Copyright (c) 2026 Miriade S.r.l.  
  * Licensed under the PostgreSQL License.
  */
 #include "postgres.h"
