@@ -50,240 +50,22 @@ AppRole response-wrapping. Wallet SQL stubs registered (not functional). Tests 5
 
 ## v1.6 — Local Wallet KMS — Production-Ready Offline Encryption — COMPLETED ✅
 
-> Completed: 2026-06-03 — **109 regression tests** (52 v1.4 + 20 v1.5 + 37 v1.6: 8 wallet + 29 TOAST/per-table DEK isolation/storage-path coverage + forensic helpers; test 110 deferred as permanent limit) — PG 17 + PG 18, zero compiler warnings.
->
-> **Theme**: The Local Wallet KMS provider becomes a first-class, fully flexible offline
-> encryption backend — an equal to the Vault connector.
+> Completed: 2026-06-03, patched 2026-05-08 — **109 regression tests** (52 v1.4 + 20 v1.5 + 37 v1.6) — PG 17 + PG 18, zero compiler warnings.
 
-### What Shipped
+Local Wallet KMS provider (`src/kms/pg_vault_tde_kms_local.c`) — full PKCS#12 / AES-256-WRAP
+implementation, PBKDF2-SHA256 (600,000 iterations, NIST SP 800-132), `0600` wallet file
+permissions. Flexible passphrase ingestion via GUCs (env var, file, shell command, dev-mode
+convenience; priority `command > env > file > dev_mode`) plus SQL `wallet_unlock`/`wallet_lock`
+for interactive control without a restart. `pg_vault_tde_wallet_status()` 6-column SRF.
+KEK rotation and passphrase change re-wrap all DEKs atomically via SPI. Zero-downtime
+`pg_vault_tde_migrate_vault_to_wallet()`. TOAST chunk-level storage encryption shipped here
+as the foundation for v1.7's logical-replication work. Patch fixed a write-path error-handling
+gap (`PG_TRY` widened to cover the full write pipeline in all four write callbacks) and added
+the `RELKIND_TOASTVALUE` read-path bypass so real TOAST chunks round-trip correctly. Tests 73–109.
 
-#### 1. Local Wallet KMS Provider — Full Implementation
-
-| Feature | Status |
-|---------|--------|
-| `src/kms/pg_vault_tde_kms_local.c` — complete PKCS#12 / AES-256-WRAP implementation | ✅ Done |
-| `kms_provider = 'local'` fully operative — routes `get_dek`/`wrap_dek`/`unwrap_dek` to local provider | ✅ Done |
-| PBKDF2-SHA256 with 600,000 iterations (NIST SP 800-132) | ✅ Done |
-| Wallet file permissions `0600` enforced at creation and on every open | ✅ Done |
-
-#### 2. Flexible Passphrase Ingestion
-
-| Feature | Status |
-|---------|--------|
-| GUC `wallet_passphrase_env` — environment variable name | ✅ Done |
-| GUC `wallet_passphrase_file` — file path (trimmed, `0400` permission check) | ✅ Done |
-| GUC `wallet_passphrase_command` — shell command (analogous to PG's `ssl_passphrase_command`) | ✅ Done |
-| GUC `wallet_dev_mode_passphrase` — convenience for dev/CI (only when `dev_mode = on`) | ✅ Done |
-| Source priority: command > env > file > dev_mode; conflict detection at startup | ✅ Done |
-| `pg_vault_tde_wallet_unlock(passphrase)` — SQL interactive unlock without PG restart | ✅ Done |
-| `pg_vault_tde_wallet_lock()` — evict all DEKs from shmem, mark wallet closed | ✅ Done |
-
-#### 3. Wallet Status (6-Column SRF)
-
-`pg_vault_tde_wallet_status()` returns `(wallet_exists bool, wallet_open bool, kek_algorithm text, dek_count int, last_opened timestamptz, file_perms text)`.
-
-#### 4. KEK Rotation and Passphrase Management
-
-| Feature | Status |
-|---------|--------|
-| `pg_vault_tde_wallet_change_passphrase(old, new)` — re-wraps all DEKs atomically via SPI | ✅ Done |
-| `pg_vault_tde_rotate_kek()` — new random KEK, re-wrap all DEKs, atomic wallet file write | ✅ Done |
-
-#### 5. Wallet Export/Import Ceremony
-
-| Feature | Status |
-|---------|--------|
-| `pg_vault_tde_wallet_export_bundle(dest, label)` — HMAC-SHA256-signed binary bundle | ❌ Removed in v1.7 — 
-  superseded by pg_vault_tde_seal_keys |
-| `pg_vault_tde_wallet_import_bundle(src, passphrase)` — HMAC verify, idempotent catalog UPSERT | ❌ Removed in v1.7 — 
-  superseded by pg_vault_tde_unseal_keys |
-| Bundle format: `[magic(4)  version(2)  label_len(2)  label  timestamp(8)  wallet_len(4)  wallet_bytes  catalog_entries  HMAC-SHA256(32)]` | ❌ Removed in v1.7 |
-
-#### 6. Vault-to-Wallet Migration
-
-`pg_vault_tde_migrate_vault_to_wallet(passphrase)` — online zero-downtime migration: iterates
-all `pg_vault_tde_catalog` rows, calls Vault unwrap then local wrap per entry, atomic switch.
-
-#### 7. New GUCs (v1.6)
-
-All new GUCs use `PGC_SUSET` — superusers can set them without restart and
-scope them per-database via `ALTER DATABASE SET`.
-
-| GUC | Type | Default | Context |
-|-----|------|---------|---------|
-| `pg_vault_tde.wallet_passphrase_file` | string | `''` | PGC_SUSET |
-| `pg_vault_tde.wallet_passphrase_command` | string | `''` | PGC_SUSET |
-| `pg_vault_tde.wallet_dev_mode_passphrase` | string | `''` | PGC_SUSET |
-| `pg_vault_tde.dev_mode` | bool | `off` | PGC_SUSET |
-
-> Note: Initial design used `PGC_POSTMASTER` for these parameters.
-> Migrated to `PGC_SUSET` together with all other KMS GUCs to enable
-> per-database KMS configuration without server restart.
-
-### v1.6 Deferred Items (Moved to v1.7+)
-
-- **TOAST chunk-level storage encryption** → v1.7
-- **KEK/DEK formal wrapping hierarchy** (provider-agnostic `wrap_dek`/`unwrap_dek` API) → v1.7
-- **tde_btree fixed-size type index key encryption** → v1.7
-- **Logical replication TOAST gap** → v1.7
-- **Column-level encryption** → v1.8
-- **GIN / Hash index encryption** → v1.8
-- **pg_statistic plaintext mitigation** → v1.8
-- **PG19 compatibility audit** — pending PG19 release
-
-### Bugfix in v1.6 patch (2026-05-07)
-
-#### Fix #1 — Write-path PG_TRY widening (`src/tam/pg_vault_tde_tam.c`)
-
-`PG_TRY` now wraps the entire write pipeline in all four write callbacks
-(`pg_vault_tde_tuple_insert`, `pg_vault_tde_tuple_insert_speculative`,
-`pg_vault_tde_multi_insert`, `pg_vault_tde_tuple_update`).
-
-Previously the `PG_TRY` block started AFTER `heap_toast_insert_or_update()` and
-`tde_encrypt_heap_tuple()`, leaving an error window where the relation's
-`reltoastrelid` could remain swapped without being restored, and pre-TOAST and
-plaintext intermediates would leak. The widened block now:
-
-- Restores `reltoastrelid` selectively via a `toastrelid_swapped` flag.
-- `OPENSSL_cleanse`s every plaintext / pre-TOAST intermediate.
-- In `multi_insert` cleans up `plain_inflight` and `toasted_inflight` arrays.
-
-TOAST chunks already written by `heap_toast_insert_or_update` are rolled back
-by the surrounding subtransaction.
-
-#### Fix #2.b — DDL hook registers `reltoastrelid` (`src/pg_vault_tde.c`)
-
-`tde_process_utility_hook` now inserts BOTH the parent relation OID AND the
-auto-created `reltoastrelid` into `pg_vault_tde_catalog` after
-`CREATE TABLE ... USING encrypted_heap`. Symmetrically, the `DROP` path
-deregisters both rows. Without this, the TOAST relation was missing from the
-per-table DEK catalog and round-trips on TOAST chunks could not resolve a DEK.
-Covered by tests 81, 84, and 85.
-
-#### Pre-existing wrap_dek length init bugs
-
-- `src/kms/pg_vault_tde_catalog.c` line 488: `int wrapped_len = sizeof(wrapped);`
-  (was `0`). The Vault provider's `vault_provider_wrap_dek` interprets
-  `*out_len` as input-buffer capacity; passing `0` made every
-  `CREATE TABLE ... USING encrypted_heap` fail under `kms_provider=vault`.
-- `src/kms/pg_vault_tde_kms_local.c` lines ~1413 (change_passphrase) and
-  ~1706 (rotate_kek): same idiom, `int new_len = sizeof(new_wrapped);` (was `0`).
-
-#### Test schema realignment
-
-- Test 44: rewritten from the v1.3 14-column `health_check()` schema
-  (`overall_status`, `dek_valid`, `generation`, `encryption_enabled`,
-  `openssl_version`, `crypto_provider`, `auth_method`, ...) to the v1.5+ 7-column
-  schema (`version`, `enabled`, `kms_provider`, `dek_available`, `aad_binding`,
-  `wallet_open`, `checked_at`).
-- Test 47: same migration; uses only `dek_available` for state transitions.
-- Test 51: previously asserted on `wrapped_dek_perms` (v1.4 file-based wallet);
-  now validates coherence between `health_check.kms_provider` and the
-  `pg_vault_tde.kms_provider` GUC.
-- Test 77: previously used `wallet_path`/`algorithm`; now matches the v1.6
-  `wallet_status()` 6-column schema (`wallet_exists`, `wallet_open`,
-  `kek_algorithm`, `dek_count`, `last_opened`, `file_perms`).
-
-#### New tests 81–110 (`sql/regression_test_v16.sql`)
-
-- Test 81 — Parent + `reltoastrelid` registered/deregistered in catalog.
-- Test 82 — Round-trip with 64 KB compressible payload (pglz keeps it inline).
-- Test 83 — Transactional rollback after pre-TOAST + encrypt restores
-  `reltoastrelid` and leaves the table consistent.
-- Test 84 — Per-table DEK isolation: `parent_a`, `toast_a`, `parent_b`,
-  `toast_b` produce 4 distinct `wrapped_dek` entries.
-- Test 85 — STORAGE EXTERNAL round-trip with **real** TOAST chunks
-  (incompressible 80 KB payload, ~41 chunks). Validates the TAM
-  `RELKIND_TOASTVALUE` read-path bypass that lets plaintext chunks pass
-  through `tuple_fetch_row_version` / `index_fetch_tuple` without
-  attempted decryption.
-- Test 86 — `pg_vault_tde_verify_plaintext_on_disk()` executed on a
-  STORAGE EXTERNAL incompressible payload to cover the forensic
-  main/TOAST file plaintext scanner in the real-chunk path.
-- Test 87 — `pg_vault_tde_verify_toast_by_comparison()` executed on the
-  same STORAGE EXTERNAL path to cover the byte-for-byte TOAST diagnostic
-  helper against raw relation bytes.
-- Test 88 — STORAGE EXTERNAL — no compression, real TOAST chunks, plaintext
-  visible via SELECT but absent on disk.
-- Test 89 — STORAGE EXTENDED — compression + TOAST chunks + transparent DML.
-- Test 90 — Storage metadata sanity: `attstorage` flags and TOAST presence.
-- Test 91 — STORAGE EXTERNAL DELETE removes visible TOAST entries.
-- Test 92 — VACUUM FULL on plain `encrypted_heap` table.
-- Test 93 — VACUUM FULL on `encrypted_heap` table with TOAST data.
-- Test 94 — CLUSTER on `encrypted_heap` with TOAST data.
-- Test 95 — TOAST data readable via index scan (`index_fetch_tuple`).
-- Test 96 — TOAST data readable via BitmapHeapScan.
-- Test 97 — TOAST data readable via SELECT FOR UPDATE (`tuple_lock`).
-- Test 98 — TOAST data readable via TABLESAMPLE (`scan_sample_next_tuple`).
-- Test 99 — TOAST data: ANALYZE computes statistics correctly.
-- Test 100 — `multi_insert` (COPY path) with TOAST-triggering values.
-- Test 101 — Multi-column TOAST: two large varlena attributes.
-- Test 102 — UPDATE large→large exercises `old_has_external` branch in
-  `tuple_update`.
-- Test 103 — `pg_vault_tde.toast_encryption=on`: TOAST table uses
-  `encrypted_heap` AM (`pg_vault_tde_toast_am` callback).
-- Test 104 — TOAST header overflow edge case.
-- Test 105 — `ALTER TABLE x SET ACCESS METHOD heap`: convert encrypted to plain.
-- Test 106 — `ALTER TABLE x SET ACCESS METHOD encrypted_heap`: convert plain to
-  encrypted.
-- Test 107 — Tuple readable after `pg_vault_tde_rotation_online()` completes.
-- Test 108 — `CREATE TABLE AS` with `encrypted_heap`.
-- Test 109 — VACUUM FULL on table with STORAGE EXTERNAL columns.
-- Test 110 — WITH HOLD cursor plaintext spill: **deferred as a permanent limitation** — the executor's tuplestore bypasses the TAM write path, so `pg_vault_tde` cannot intercept the spill; the test is commented out in `regression_test_v16.sql`.
-
-#### CI script idempotency
-
-- `ci/scripts/run-regress.sh` — `ALTER EXTENSION UPDATE TO '1.5'/'1.6'` is now
-  conditioned on the live extension version and skipped if already at target.
-- `ci/scripts/run-wallet.sh` — uses `CREATE EXTENSION IF NOT EXISTS` so it can
-  be re-run without manual cleanup.
-
-### Resolved in v1.6 patch (formerly Known Issues)
-
-- `pg_vault_tde_wallet_change_passphrase()` — fixed.  Two underlying bugs:
-  (1) `local_open_wallet(NEW_pass)` ran `PKCS12_verify_mac` against a file
-  still authenticated under the *old* passphrase, blocking re-wrap with
-  *"wallet MAC verification failed"*.  Solved with a new
-  `local_derive_kek_from_pass()` helper that does PBKDF2 only.
-  (2) `SPI_execute_with_args` inside the re-wrap loop overwrote
-  `SPI_tuptable`, invalidating the next iteration and crashing the backend
-  on the second tuple (segfault, signal 11).  Solved by snapshotting the
-  read set into caller-owned arrays before issuing any UPDATE.
-  Same dual fix applied to `pg_vault_tde_rotate_kek()`.
-  Tests 78–79 now PASS under `make ci-wallet`.
-
-- `pg_vault_tde_wallet_kek()` — extended with a dual-source KEK
-  policy: prefers the in-memory cached KEK from `wallet_unlock` when
-  available (so tests don't need GUC config), falls back to the GUC
-  passphrase source otherwise.
-
-
-### TAM read-path RELKIND_TOASTVALUE bypass (v1.6 patch)
-
-When `pg_vault_tde.toast_encryption=on` (default), the auto-created TOAST
-relation inherits the `encrypted_heap` AM.  Chunks themselves, however,
-are written by `toast_save_datum → heap_insert(toastrel, …)` directly,
-bypassing `rd_tableam` dispatch — so they land plaintext on disk (the
-documented v1 limitation; per-chunk encryption is v1.7).  Reading the
-parent table back, however, DOES go through our TAM via
-`heap_fetch_toast_slice → systable_beginscan_ordered → table_index_fetch_tuple`,
-which would attempt GCM decryption on plaintext bytes and ERROR with
-*"AES-256-GCM authentication FAILED"*.
-
-The patch adds an early `relkind == RELKIND_TOASTVALUE` short-circuit to
-all read-path callbacks (`scan_getnextslot`, `index_fetch_tuple`,
-`scan_bitmap_next_tuple`, `scan_analyze_next_tuple`,
-`scan_sample_next_tuple`, `tuple_fetch_row_version`, `tuple_lock`) and to
-the write callbacks (defensive — covers manual `INSERT INTO pg_toast_*`).
-The original heapam callbacks are saved at TAM init and reused for the
-bypass.  `index_build_range_scan` deliberately does NOT delegate to the
-heapam callback (which would call `heap_getnext`, failing on
-`rd_tableam == GetHeapamTableAmRoutine()`); instead our existing custom
-loop runs unchanged because its scan dispatch already routes through the
-relkind-aware `scan_getnextslot` bypass.
-
-Test 85 covers this end-to-end with `STORAGE EXTERNAL` + an incompressible
-80 KB payload that produces ~41 real chunks.
+> The original wallet export/import bundle functions (`pg_vault_tde_wallet_export_bundle`/
+> `_import_bundle`) shipped in v1.6 were removed in v1.7, superseded by
+> `pg_vault_tde_seal_keys()`/`pg_vault_tde_unseal_keys()`.
 
 ---
 
@@ -367,10 +149,12 @@ next operation", not wall-clock time.
 `INTEGRITY_VIOLATION`, `WALLET_OPEN`, etc.). `pg_vault_tde_audit_log` encrypted table.
 PCI-DSS Requirement 10 / HIPAA §164.312(b).
 
-### 7. pg_dump Plaintext Leak Protection (Medium)
+### 7. pg_dump Plaintext Leak Protection (Medium) — NOT completed, moved to v1.8
 
-`ProcessUtility_hook` intercepts `COPY TO` on encrypted tables — emits WARNING.
-GUC `pg_vault_tde.dump_plaintext_warning = on`.
+Designed (see `src/backup/pg_vault_tde_backup.c` header comment, "Layer 2 — SQL-LEVEL
+GUARD"): `ProcessUtility_hook` would intercept `COPY TO` on encrypted tables and emit a
+WARNING, gated by GUC `pg_vault_tde.dump_plaintext_warning`. Neither the hook nor the GUC
+exist in code yet — tracked as v1.8 §10 below.
 
 ### 8. Physical Backup Key Sealing / `pg_restore_tde` (Medium) — COMPLETED ✅
 
@@ -386,7 +170,7 @@ A core-side `BackupState`/`bbsink` hook was evaluated and discarded: PostgreSQL 
 
 ---
 
-## v1.8 — KMIP + Column-Level + GIN/Hash/GiST/BRIN + HA + Dual-Control (Q2 2028)
+## v1.8 — KMIP + Column-Level + GIN/Hash/GiST/BRIN + HA + Dual-Control (Q2 2027)
 
 > Status: 📋 Defined
 > **Target**: ~130 regression tests.
@@ -512,6 +296,13 @@ the BRIN opclass support-function contract (`opcinfo`/`add_value`/
 `consistent`/`union`) can be satisfied purely on ciphertext bytes without
 ever needing the plaintext inside the index AM.
 
+### 10. pg_dump Plaintext Leak Protection (Medium — carried over from v1.7, never implemented)
+
+`ProcessUtility_hook` intercepts `COPY TO` on encrypted tables — emits WARNING.
+GUC `pg_vault_tde.dump_plaintext_warning = on`. Designed in v1.7 (see
+`src/backup/pg_vault_tde_backup.c` header comment) but the hook and GUC were
+never written; carried forward here as the actual target release.
+
 ---
 
 ## Permanent Deferrals
@@ -540,4 +331,4 @@ These gaps **cannot be closed without modifying PostgreSQL core**.
 | **v1.5** | Per-Table DEK + Online Rotation + AAD | ✅ 2026 | 72 | Per-table catalog, native type ops, wire format v3, rotate_online BGW |
 | **v1.6** | Local Wallet KMS (production-ready) + write-path / catalog bugfix patch | ✅ 2026-07-20 (patched 2026-05-08) | 109 | Wallet unlock/lock, passphrase flexibility, KEK rotation, export/import, Vault→wallet migration; PG_TRY widening; TOAST relid auto-registration; STORAGE EXTERNAL TAM read bypass; all-read-paths TOAST coverage; forensic helpers; tests 73–109 |
 | **v1.7** | Per-database KMS + pg_restore_tde + PGC_SUSET + PKCS#11 + HSM + v1.4 removal | ✅ Completed | 109 | All KMS GUCs PGC_SUSET → per-database KMS via `ALTER DATABASE SET`; `pg_restore_tde` full decrypt-and-pipe restore loop; removed v1.4 global-DEK backward compat (`TdeShmemData`, `rotate_key`, `key_generation`, `clear_prev_dek`, `encrypt_test`, `decrypt_test`); PKCS#11/HSM provider with cross-backend KEK-rotation propagation; documentation overhaul |
-| **v1.8** | KMIP + Column-Level + GIN/Hash/GiST/BRIN + HA + Dual-Control | Q2 2028 | ~130 | KMIP 1.2 client, per-column encryption, GIN/Hash/GiST(equality)/BRIN(bloom) index AMs, streaming replication standby DEK distribution, M-of-N key ceremony |
+| **v1.8** | KMIP + Column-Level + GIN/Hash/GiST/BRIN + HA + Dual-Control | Q2 2027 | ~130 | KMIP 1.2 client, per-column encryption, GIN/Hash/GiST(equality)/BRIN(bloom) index AMs, streaming replication standby DEK distribution, M-of-N key ceremony, pg_dump/COPY TO plaintext-leak WARNING (carried over from v1.7) |

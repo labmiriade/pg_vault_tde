@@ -1100,6 +1100,19 @@ See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
    native btree index regardless, so pg_vault_tde can only warn about it, never block
    it.
 
+10. **Plain `COPY ... TO` / `pg_dump` produce a plaintext dump, with no warning** (→ v1.8):
+    encryption in `pg_vault_tde` lives entirely in the table access method's read
+    callbacks (`scan_getnextslot` and friends), which decrypt unconditionally and have
+    no way to tell a `SELECT` apart from a `COPY <table> TO ...` — both dispatch through
+    the same `table_scan_getnextslot()` call. `pg_dump`'s default table-data path is
+    exactly this form of `COPY ... TO stdout`, so a plain `pg_dump` (or a manual
+    `COPY sensitive_table TO '/path'`) on an `encrypted_heap` table silently returns
+    fully decrypted rows — there is currently no `ProcessUtility_hook` guard or GUC-gated
+    `WARNING` for this (a "dump plaintext warning" was designed but never implemented).
+    **Mitigation:** always use `pg_dump_tde`/`pg_restore_tde` instead of plain
+    `pg_dump`/`pg_restore` for logical backups of encrypted tables — see
+    [Encrypted Backups](#encrypted-backups).
+
 ---
 
 ## License
