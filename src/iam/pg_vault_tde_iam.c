@@ -1,7 +1,7 @@
 /*
  * pg_vault_tde_iam.c - Index Access Method (IAM) handler for pg_vault_tde
  *
- * Copyright (c) 2026 Miriade Srl  
+ * Copyright (c) 2026 Miriade S.r.l.  
  * Licensed under the PostgreSQL License.
  *
  * DESIGN RATIONALE:
@@ -37,6 +37,10 @@
 #include "nodes/execnodes.h"   /* IndexInfo full struct definition */
 #include "utils/fmgroids.h"     /* F_BTHANDLER */
 #include "utils/memutils.h"
+#include "utils/syscache.h"     /* SearchSysCache1, ReleaseSysCache, CLAOID */
+#include "utils/uuid.h"         /* DatumGetUUIDP, pg_uuid_t */
+#include "catalog/pg_opclass.h" /* Form_pg_opclass */
+#include "catalog/pg_am_d.h"    /* BTREE_AM_OID */
 #include "storage/lwlock.h"
 #include <openssl/evp.h>
 #include <openssl/crypto.h>
@@ -62,8 +66,7 @@
  *
  * PKCS5_PBKDF2_HMAC is declared in openssl/evp.h (included above).
  */
-
-#include "src/include/pg_vault_tde_kms.h"
+#include "src/include/pg_vault_tde_catalog.h"
 #include "src/include/pg_vault_tde_iam.h"
 #include "src/include/pg_vault_tde_hw_accel.h"
 
@@ -71,34 +74,128 @@
 #define TDE_SIV_OVERHEAD 16
 
 /*
- * Per-backend reusable EVP contexts for AES-256-SIV.
+ * Per-backend AES-256-SIV context, re-keyed only when (idx_oid, generation)
+ * changes — same caching strategy as the GCM slots in crypto.c.
  *
- * AES-SIV requires full EVP_EncryptInit_ex() on every call (because the
- * derived siv_key changes if the DEK rotates), but we save the
- * EVP_CIPHER_CTX_new() heap allocation (~20-30 ns) by reusing the struct.
- * EVP_CIPHER_CTX_reset() is called on reuse to zero internal state before
- * the new Init.
+ * One difference forced by the algorithm: GCM rearms only the IV per message
+ * (keyless), but AES-SIV has no IV and OpenSSL requires the key to be re-fed
+ * for every message (verified empirically: a keyless rearm corrupts the tag
+ * on the 2nd message).  So we keep the derived key cached in the slot and the
+ * per-message rearm re-supplies it via EVP_CipherInit_ex(ctx, NULL, ..., key);
+ * the cipher fetch and PBKDF2 derivation still happen only on (oid, gen) change.
  */
-static EVP_CIPHER_CTX *tde_iam_siv_enc_ctx = NULL;
-static EVP_CIPHER_CTX *tde_iam_siv_dec_ctx = NULL;
+typedef struct TdeCipherSlot
+{
+    EVP_CIPHER_CTX *ctx;
+    Oid             idx_oid;        /* InvalidOid = ctx not yet keyed */
+    uint64          generation;
+    unsigned char   siv_key[64];    /* cached derived key; re-armed per message */
+} TdeCipherSlot;
+
+static TdeCipherSlot idx_enc = {NULL, InvalidOid, 0, {0}};
+static TdeCipherSlot idx_dec = {NULL, InvalidOid, 0, {0}};
+
+/* Free a slot and wipe its cached key (shared by cleanup and error paths). */
+static void
+tde_iam_ctx_drop(TdeCipherSlot *slot)
+{
+    if (slot->ctx != NULL)
+    {
+        EVP_CIPHER_CTX_free(slot->ctx);
+        slot->ctx = NULL;
+    }
+    OPENSSL_cleanse(slot->siv_key, sizeof(slot->siv_key));
+    slot->idx_oid    = InvalidOid;
+    slot->generation = 0;
+}
 
 /*
- * tde_iam_siv_ctx_cleanup -- free cached SIV contexts.
+ * tde_iam_ctx_cleanup -- free cached SIV contexts.
  * Called from tde_crypto_ctx_cleanup() registered via on_proc_exit().
  */
 void
-tde_iam_siv_ctx_cleanup(void)
+tde_iam_ctx_cleanup(void)
 {
-    if (tde_iam_siv_enc_ctx != NULL)
+    tde_iam_ctx_drop(&idx_enc);
+    tde_iam_ctx_drop(&idx_dec);
+}
+
+/*
+ * tde_iam_ctx_prepare -- return a per-backend AES-256-SIV context ready for one
+ * message.  enc: 1 = encrypt, 0 = decrypt.  Raises ERROR on failure.
+ *
+ * On (idx_oid, generation) change the SIV key is re-derived from `dek` and the
+ * cipher + key installed; otherwise only the cached key is re-armed.
+ */
+static EVP_CIPHER_CTX *
+tde_iam_ctx_prepare(TdeCipherSlot *slot, Oid idx_oid,
+                    const unsigned char *dek, int dek_len, int enc)
+{
+    uint64 gen = pg_vault_tde_catalog_get_rel_generation(idx_oid);
+
+    /* Allocate once per backend in TopMemoryContext (survives per-tuple resets). */
+    if (slot->ctx == NULL)
     {
-        EVP_CIPHER_CTX_free(tde_iam_siv_enc_ctx);
-        tde_iam_siv_enc_ctx = NULL;
+        MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+        slot->ctx = EVP_CIPHER_CTX_new();
+        MemoryContextSwitchTo(old);
+        if (slot->ctx == NULL)
+            ereport(ERROR,
+                    (errmsg("[IAM] Failed to create EVP_CIPHER_CTX for AES-SIV")));
+        slot->idx_oid = InvalidOid;     /* force the re-key path below */
     }
-    if (tde_iam_siv_dec_ctx != NULL)
+
+    if (slot->idx_oid != idx_oid || slot->generation != gen)
     {
-        EVP_CIPHER_CTX_free(tde_iam_siv_dec_ctx);
-        tde_iam_siv_dec_ctx = NULL;
+        /* Cache miss: derive the SIV key and install cipher + key. */
+        const EVP_CIPHER *siv_cipher;
+        EVP_CIPHER       *fetched = NULL;
+        int               ok;
+
+        /* 64-byte SIV key (two 256-bit keys) from the DEK; 1 PBKDF2 round. */
+        if (PKCS5_PBKDF2_HMAC((const char *) dek, dek_len,
+                              (const unsigned char *) "tde-siv", 7,
+                              1, EVP_sha256(), 64, slot->siv_key) != 1)
+        {
+            tde_iam_ctx_drop(slot);
+            ereport(ERROR, (errmsg("[IAM] PBKDF2 SIV key derivation failed")));
+        }
+
+        siv_cipher = tde_hw_accel_siv_cipher();
+        if (siv_cipher == NULL)
+            siv_cipher = fetched = EVP_CIPHER_fetch(NULL, "AES-256-SIV", NULL);
+        if (siv_cipher == NULL)
+        {
+            tde_iam_ctx_drop(slot);
+            ereport(ERROR,
+                    (errmsg("[IAM] AES-256-SIV cipher unavailable; requires "
+                            "OpenSSL 3.x with the default provider")));
+        }
+
+        /* enc flows straight into the OpenSSL primitive: no ternary dispatch. */
+        ok = EVP_CipherInit_ex(slot->ctx, siv_cipher, NULL, slot->siv_key, NULL, enc);
+        if (fetched)
+            EVP_CIPHER_free(fetched);
+        if (ok != 1)
+        {
+            tde_iam_ctx_drop(slot);
+            ereport(ERROR, (errmsg("[IAM] AES-256-SIV CipherInit failed")));
+        }
+
+        slot->idx_oid    = idx_oid;
+        slot->generation = gen;
     }
+    else
+    {
+        /* Cache hit: re-arm the per-message SIV state with the cached key. */
+        if (EVP_CipherInit_ex(slot->ctx, NULL, NULL, slot->siv_key, NULL, enc) != 1)
+        {
+            tde_iam_ctx_drop(slot);
+            ereport(ERROR, (errmsg("[IAM] AES-256-SIV re-arm failed")));
+        }
+    }
+
+    return slot->ctx;
 }
 
 /*
@@ -116,169 +213,42 @@ tde_iam_siv_ctx_cleanup(void)
  * Side effects: reads DEK from shared-memory KMS cache under shared LWLock.
  */
 char *
-tde_iam_encrypt_key(const char *plaintext, Size plaintext_len, Size *out_len)
+tde_iam_encrypt_key(Oid idx_oid, const char* dek, int dek_len,
+                    const char *plaintext, Size plaintext_len, Size *out_len)
 {
     EVP_CIPHER_CTX *ctx;
-    char            dek[TDE_DEK_LEN];
-    char           *out_buf = NULL;
+    char           *out_buf;
     int             olen1 = 0,
                     olen2 = 0;
 
     Assert(plaintext != NULL);
     Assert(out_len != NULL);
 
-    /* Cache miss: we cannot encrypt without a DEK; caller must retry. */
-    if (!pg_vault_tde_kms_get_dek(dek, TDE_DEK_LEN))
-    {
-        ereport(WARNING,
-                (errmsg("[IAM] DEK unavailable for index key encryption")));
-        return NULL;
-    }
+    out_buf = (char *) palloc0(plaintext_len + TDE_SIV_OVERHEAD);
+    ctx = tde_iam_ctx_prepare(&idx_enc, idx_oid, (const unsigned char *) dek, dek_len, 1);
 
     /*
-     * PG_TRY/PG_CATCH guarantees the DEK is wiped from the stack on ALL
-     * exit paths — including palloc OOM between DEK acquisition and the
-     * PBKDF2 derivation step.  Inner ereport(ERROR) calls longjmp into
-     * PG_CATCH, so OPENSSL_cleanse runs before re-throw.
+     * AES-256-SIV: no IV (synthetic IV derived internally).  The 16-byte SIV
+     * tag is fetched after Final into out_buf[0..15]: [SIV-tag(16) | CT(N)].
      */
-    PG_TRY();
+    if (EVP_EncryptUpdate(ctx,
+                          (unsigned char *) out_buf + TDE_SIV_OVERHEAD, &olen1,
+                          (const unsigned char *) plaintext,
+                          (int) plaintext_len) != 1 ||
+        EVP_EncryptFinal_ex(ctx,
+                            (unsigned char *) out_buf + TDE_SIV_OVERHEAD + olen1,
+                            &olen2) != 1 ||
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG,
+                            TDE_SIV_OVERHEAD, out_buf) != 1)
     {
-        out_buf = (char *) palloc0(plaintext_len + TDE_SIV_OVERHEAD);
-
-        /*
-         * Reuse the per-backend SIV encrypt context; allocate on first use.
-         *
-         * Allocate in TopMemoryContext so the EVP_CIPHER_CTX survives
-         * for the lifetime of the backend.  During index builds this
-         * function is called from pg_vault_tde_index_build_range_scan
-         * where the per-tuple memory context may be reset between rows;
-         * allocating in TopMemoryContext ensures the context pointer
-         * (tde_iam_siv_enc_ctx) remains valid across iterations.
-         */
-        if (tde_iam_siv_enc_ctx == NULL)
-        {
-            MemoryContext old_ctx = MemoryContextSwitchTo(TopMemoryContext);
-            tde_iam_siv_enc_ctx = EVP_CIPHER_CTX_new();
-            MemoryContextSwitchTo(old_ctx);
-            if (tde_iam_siv_enc_ctx == NULL)
-            {
-                pfree(out_buf);
-                ereport(ERROR,
-                        (errmsg("[IAM] Failed to create EVP_CIPHER_CTX for AES-SIV")));
-            }
-        }
-        else
-            EVP_CIPHER_CTX_reset(tde_iam_siv_enc_ctx);
-        ctx = tde_iam_siv_enc_ctx;
-
-        /*
-         * Derive a 64-byte AES-256-SIV key from the 32-byte DEK.
-         * AES-256-SIV requires two independent 256-bit keys; we obtain them
-         * via PBKDF2-SHA256 with a static salt and 1 iteration (this is key
-         * derivation, not password hashing — 1 iteration is intentional).
-         */
-        {
-            unsigned char siv_key[64];
-
-            if (PKCS5_PBKDF2_HMAC(dek, TDE_DEK_LEN,
-                                   (const unsigned char *) "tde-siv", 7,
-                                   1, EVP_sha256(), 64, siv_key) != 1)
-            {
-                EVP_CIPHER_CTX_free(tde_iam_siv_enc_ctx);
-                tde_iam_siv_enc_ctx = NULL;
-                ctx = NULL;
-                pfree(out_buf);
-                ereport(ERROR,
-                        (errmsg("[IAM] PBKDF2 SIV key derivation failed")));
-            }
-
-            /*
-             * AES-256-SIV via OpenSSL 3.x EVP AEAD (provider API):
-             *  - Use pre-fetched cipher from hw_accel layer when available;
-             *    fall back to EVP_CIPHER_fetch() otherwise (e.g. when QAT
-             *    doesn't support SIV).
-             *  - No IV argument for SIV (synthetic IV derived internally).
-             *  - EVP_EncryptUpdate writes ciphertext into out_buf + overhead.
-             *  - EVP_EncryptFinal_ex flushes remaining ciphertext bytes.
-             *  - EVP_CTRL_AEAD_GET_TAG retrieves the 16-byte SIV and places
-             *    it at out_buf[0..15]: [SIV-tag(16) | ciphertext(N)].
-             */
-            {
-                const EVP_CIPHER *siv_cipher = tde_hw_accel_siv_cipher();
-                EVP_CIPHER *siv_cipher_fetched = NULL;
-                if (siv_cipher == NULL)
-                {
-                    siv_cipher_fetched = EVP_CIPHER_fetch(NULL, "AES-256-SIV", NULL);
-                    siv_cipher = siv_cipher_fetched;
-                }
-                if (siv_cipher == NULL)
-                {
-                    EVP_CIPHER_CTX_free(tde_iam_siv_enc_ctx);
-                    tde_iam_siv_enc_ctx = NULL;
-                    ctx = NULL;
-                    OPENSSL_cleanse(siv_key, sizeof(siv_key));
-                    OPENSSL_cleanse(out_buf, plaintext_len + TDE_SIV_OVERHEAD);
-                    pfree(out_buf);
-                    ereport(ERROR,
-                            (errmsg("[IAM] AES-256-SIV cipher unavailable in this "
-                                    "OpenSSL build; requires OpenSSL 3.x with "
-                                    "default provider")));
-                }
-
-                if (EVP_EncryptInit_ex(ctx, siv_cipher, NULL,
-                                       siv_key, NULL) != 1)
-                {
-                    if (siv_cipher_fetched)
-                        EVP_CIPHER_free(siv_cipher_fetched);
-                    EVP_CIPHER_CTX_free(tde_iam_siv_enc_ctx);
-                    tde_iam_siv_enc_ctx = NULL;
-                    ctx = NULL;
-                    OPENSSL_cleanse(siv_key, sizeof(siv_key));
-                    OPENSSL_cleanse(out_buf, plaintext_len + TDE_SIV_OVERHEAD);
-                    pfree(out_buf);
-                    ereport(ERROR,
-                            (errmsg("[IAM] AES-256-SIV EncryptInit failed")));
-                }
-                if (siv_cipher_fetched)
-                    EVP_CIPHER_free(siv_cipher_fetched);
-            }
-
-            if (EVP_EncryptUpdate(ctx,
-                                  (unsigned char *) out_buf + TDE_SIV_OVERHEAD,
-                                  &olen1,
-                                  (const unsigned char *) plaintext,
-                                  (int) plaintext_len) != 1 ||
-                EVP_EncryptFinal_ex(ctx,
-                                    (unsigned char *) out_buf + TDE_SIV_OVERHEAD + olen1,
-                                    &olen2) != 1 ||
-                EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG,
-                                     TDE_SIV_OVERHEAD, out_buf) != 1)
-            {
-                EVP_CIPHER_CTX_free(tde_iam_siv_enc_ctx);
-                tde_iam_siv_enc_ctx = NULL;
-                ctx = NULL;
-                OPENSSL_cleanse(siv_key, sizeof(siv_key));
-                OPENSSL_cleanse(out_buf, plaintext_len + TDE_SIV_OVERHEAD);
-                pfree(out_buf);
-                ereport(ERROR,
-                        (errmsg("[IAM] AES-256-SIV EncryptUpdate/Final/GetTag failed")));
-            }
-
-            OPENSSL_cleanse(siv_key, sizeof(siv_key));
-        }
-
-        /* ctx is kept alive in tde_iam_siv_enc_ctx for reuse — do NOT free here */
-
-        *out_len = (Size)(TDE_SIV_OVERHEAD + olen1 + olen2);
+        OPENSSL_cleanse(out_buf, plaintext_len + TDE_SIV_OVERHEAD);
+        pfree(out_buf);
+        tde_iam_ctx_drop(&idx_enc);
+        ereport(ERROR,
+                (errmsg("[IAM] AES-256-SIV EncryptUpdate/Final/GetTag failed")));
     }
-    PG_CATCH();
-    {
-        OPENSSL_cleanse(dek, TDE_DEK_LEN);
-        PG_RE_THROW();
-    }
-    PG_END_TRY();
 
-    OPENSSL_cleanse(dek, TDE_DEK_LEN);
+    *out_len = (Size)(TDE_SIV_OVERHEAD + olen1 + olen2);
     return out_buf;
 }
 
@@ -294,11 +264,11 @@ tde_iam_encrypt_key(const char *plaintext, Size plaintext_len, Size *out_len)
  * @returns               palloc'd plaintext buffer, or NULL on DEK miss
  */
 char *
-tde_iam_decrypt_key(const char *ciphertext, Size ciphertext_len, Size *out_len)
+tde_iam_decrypt_key(Oid idx_oid, const char* dek, int dek_len,
+                    const char *ciphertext, Size ciphertext_len, Size *out_len)
 {
     EVP_CIPHER_CTX *ctx;
-    char            dek[TDE_DEK_LEN];
-    char           *out_buf = NULL;
+    char           *out_buf;
     int             olen1 = 0,
                     olen2 = 0;
 
@@ -309,144 +279,32 @@ tde_iam_decrypt_key(const char *ciphertext, Size ciphertext_len, Size *out_len)
         ereport(ERROR,
                 (errmsg("[IAM] Ciphertext too short for AES-SIV decryption")));
 
-    if (!pg_vault_tde_kms_get_dek(dek, TDE_DEK_LEN))
-    {
-        ereport(WARNING,
-                (errmsg("[IAM] DEK unavailable for index key decryption")));
-        return NULL;
-    }
+    out_buf = (char *) palloc0(ciphertext_len);
+    ctx = tde_iam_ctx_prepare(&idx_dec, idx_oid, (const unsigned char *) dek, dek_len, 0);
 
     /*
-     * PG_TRY/PG_CATCH guarantees the DEK is wiped from the stack on ALL
-     * exit paths — including palloc OOM between DEK acquisition and the
-     * PBKDF2 derivation step.  Inner ereport(ERROR) calls longjmp into
-     * PG_CATCH, so OPENSSL_cleanse runs before re-throw.
+     * The first TDE_SIV_OVERHEAD bytes are the SIV tag; provide it via SET_TAG
+     * before Update.  DecryptFinal returns <= 0 on auth failure (tampered key
+     * or wrong DEK) — treated as a hard error.
      */
-    PG_TRY();
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG,
+                            TDE_SIV_OVERHEAD, (void *) ciphertext) != 1 ||
+        EVP_DecryptUpdate(ctx, (unsigned char *) out_buf, &olen1,
+                          (const unsigned char *) ciphertext + TDE_SIV_OVERHEAD,
+                          (int)(ciphertext_len - TDE_SIV_OVERHEAD)) != 1 ||
+        EVP_DecryptFinal_ex(ctx,
+                            (unsigned char *) out_buf + olen1, &olen2) != 1)
     {
-        out_buf = (char *) palloc0(ciphertext_len);
-
-        /*
-         * Reuse the per-backend SIV decrypt context; allocate in
-         * TopMemoryContext (same rationale as the encrypt context above).
-         */
-        if (tde_iam_siv_dec_ctx == NULL)
-        {
-            MemoryContext old_ctx = MemoryContextSwitchTo(TopMemoryContext);
-            tde_iam_siv_dec_ctx = EVP_CIPHER_CTX_new();
-            MemoryContextSwitchTo(old_ctx);
-            if (tde_iam_siv_dec_ctx == NULL)
-            {
-                pfree(out_buf);
-                ereport(ERROR,
-                        (errmsg("[IAM] Failed to create EVP_CIPHER_CTX for AES-SIV")));
-            }
-        }
-        else
-            EVP_CIPHER_CTX_reset(tde_iam_siv_dec_ctx);
-        ctx = tde_iam_siv_dec_ctx;
-
-        {
-            unsigned char siv_key[64];
-
-            if (PKCS5_PBKDF2_HMAC(dek, TDE_DEK_LEN,
-                                   (const unsigned char *) "tde-siv", 7,
-                                   1, EVP_sha256(), 64, siv_key) != 1)
-            {
-                EVP_CIPHER_CTX_free(tde_iam_siv_dec_ctx);
-                tde_iam_siv_dec_ctx = NULL;
-                ctx = NULL;
-                pfree(out_buf);
-                ereport(ERROR,
-                        (errmsg("[IAM] PBKDF2 SIV key derivation failed")));
-            }
-
-            /*
-             * AES-256-SIV decryption via OpenSSL 3.x EVP AEAD (provider API):
-             *  - Use pre-fetched cipher from hw_accel layer when available;
-             *    fall back to per-call EVP_CIPHER_fetch() otherwise.
-             *  - The first TDE_SIV_OVERHEAD bytes of ciphertext are the SIV tag.
-             *  - Provide the tag BEFORE EVP_DecryptUpdate via SET_TAG.
-             *  - EVP_DecryptFinal_ex returns <= 0 on auth failure;
-             *    we treat that as a hard error (tampered index key).
-             */
-            {
-                const EVP_CIPHER *siv_cipher = tde_hw_accel_siv_cipher();
-                EVP_CIPHER *siv_cipher_fetched = NULL;
-                if (siv_cipher == NULL)
-                {
-                    siv_cipher_fetched = EVP_CIPHER_fetch(NULL, "AES-256-SIV", NULL);
-                    siv_cipher = siv_cipher_fetched;
-                }
-                if (siv_cipher == NULL)
-                {
-                    EVP_CIPHER_CTX_free(tde_iam_siv_dec_ctx);
-                    tde_iam_siv_dec_ctx = NULL;
-                    ctx = NULL;
-                    OPENSSL_cleanse(siv_key, sizeof(siv_key));
-                    OPENSSL_cleanse(out_buf, ciphertext_len);
-                    pfree(out_buf);
-                    ereport(ERROR,
-                            (errmsg("[IAM] AES-256-SIV cipher unavailable in this "
-                                    "OpenSSL build; requires OpenSSL 3.x with "
-                                    "default provider")));
-                }
-
-                if (EVP_DecryptInit_ex(ctx, siv_cipher, NULL,
-                                       siv_key, NULL) != 1)
-                {
-                    if (siv_cipher_fetched)
-                        EVP_CIPHER_free(siv_cipher_fetched);
-                    EVP_CIPHER_CTX_free(tde_iam_siv_dec_ctx);
-                    tde_iam_siv_dec_ctx = NULL;
-                    ctx = NULL;
-                    OPENSSL_cleanse(siv_key, sizeof(siv_key));
-                    OPENSSL_cleanse(out_buf, ciphertext_len);
-                    pfree(out_buf);
-                    ereport(ERROR,
-                            (errmsg("[IAM] AES-256-SIV DecryptInit failed")));
-                }
-                if (siv_cipher_fetched)
-                    EVP_CIPHER_free(siv_cipher_fetched);
-            }
-
-            if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG,
-                                     TDE_SIV_OVERHEAD,
-                                     (void *) ciphertext) != 1 ||
-                EVP_DecryptUpdate(ctx, (unsigned char *) out_buf, &olen1,
-                                  (const unsigned char *) ciphertext + TDE_SIV_OVERHEAD,
-                                  (int)(ciphertext_len - TDE_SIV_OVERHEAD)) != 1 ||
-                EVP_DecryptFinal_ex(ctx,
-                                    (unsigned char *) out_buf + olen1,
-                                    &olen2) != 1)
-            {
-                EVP_CIPHER_CTX_free(tde_iam_siv_dec_ctx);
-                tde_iam_siv_dec_ctx = NULL;
-                ctx = NULL;
-                OPENSSL_cleanse(siv_key, sizeof(siv_key));
-                OPENSSL_cleanse(out_buf, ciphertext_len);
-                pfree(out_buf);
-                ereport(ERROR,
-                        (errcode(ERRCODE_DATA_CORRUPTED),
-                         errmsg("[IAM] AES-256-SIV authentication/decryption failed: "
-                                "index key integrity violation or wrong DEK")));
-            }
-
-            OPENSSL_cleanse(siv_key, sizeof(siv_key));
-        }
-
-        /* ctx is kept alive in tde_iam_siv_dec_ctx for reuse — do NOT free here */
-
-        *out_len = (Size)(olen1 + olen2);
+        OPENSSL_cleanse(out_buf, ciphertext_len);
+        pfree(out_buf);
+        tde_iam_ctx_drop(&idx_dec);
+        ereport(ERROR,
+                (errcode(ERRCODE_DATA_CORRUPTED),
+                 errmsg("[IAM] AES-256-SIV authentication/decryption failed: "
+                        "index key integrity violation or wrong DEK")));
     }
-    PG_CATCH();
-    {
-        OPENSSL_cleanse(dek, TDE_DEK_LEN);
-        PG_RE_THROW();
-    }
-    PG_END_TRY();
 
-    OPENSSL_cleanse(dek, TDE_DEK_LEN);
+    *out_len = (Size)(olen1 + olen2);
     return out_buf;
 }
 
@@ -478,6 +336,11 @@ tde_iam_decrypt_key(const char *ciphertext, Size ciphertext_len, Size *out_len)
  * ================================================================
  */
 
+/* Forward declaration: identity-checked against index_rel->rd_indam->ambuild
+ * by tde_iam_is_tde_btree_index, defined further down in this file. */
+static IndexBuildResult *pg_vault_tde_ambuild(Relation heap, Relation index,
+                                               IndexInfo *index_info);
+
 /* Mutable copy of the btree AM routine, patched with our overrides */
 static IndexAmRoutine  tde_btree_methods;
 
@@ -498,11 +361,141 @@ static IndexAmRoutine  saved_btree_methods;
 static bool            saved_btree_methods_valid = false;
 
 /*
- * tde_iam_build_in_progress — process-local flag (see pg_vault_tde_iam.h).
- * Set while pg_vault_tde_ambuild is executing saved_btree_methods.ambuild
- * so pg_vault_tde_index_build_range_scan (tam.c) knows to encrypt index keys.
+ * tde_iam_is_tde_btree_index (see pg_vault_tde_iam.h for the full rationale).
+ *
+ * index_rel->rd_indam is populated per-backend from the catalog's amhandler
+ * for this index (pg_vault_tde_get_iam_routine, below), which always sets
+ * ->ambuild = pg_vault_tde_ambuild for a tde_btree index — so the identity
+ * check below holds in the leader AND in every parallel build worker.
  */
-bool tde_iam_build_in_progress = false;
+bool
+tde_iam_is_tde_btree_index(Relation index_rel)
+{
+    return index_rel->rd_indam != NULL &&
+           index_rel->rd_indam->ambuild == pg_vault_tde_ambuild;
+}
+
+/*
+ * tde_iam_serialize_fixed_type
+ *
+ * Writes the canonical big-endian byte representation of `datum` for
+ * the given `typoid` into `buf` (caller-supplied, must be ≥ 16 bytes).
+ * Returns the number of bytes written, or 0 if typoid is unknown.
+ *
+ * Big-endian is used for int4/int8/date/timestamptz to guarantee
+ * identical serialisation across x86 (little-endian) and aarch64 (BE/LE).
+ * UUID is treated as a 16-byte opaque byte array (RFC 4122 representation).
+ *
+ * MUST NOT palloc — called from tight index-build loops.
+ */
+static Size
+tde_iam_serialize_fixed_type(Datum datum, Oid typoid, uint8 *buf)
+{
+    switch (typoid)
+    {
+        case INT4OID:
+        case DATEOID:
+        {
+            /* DateADT is typedef int32 — same serialisation as int4 */
+            uint32 v = pg_hton32((uint32) DatumGetInt32(datum));
+            memcpy(buf, &v, 4);
+            return 4;
+        }
+        case INT8OID:
+        case TIMESTAMPTZOID:
+        {
+            /* TimestampTz is typedef int64 — same serialisation as int8 */
+            uint64 v = pg_hton64((uint64) DatumGetInt64(datum));
+            memcpy(buf, &v, 8);
+            return 8;
+        }
+        case UUIDOID:
+        {
+            /*
+             * DatumGetUUIDP returns a pointer to pg_uuid_t whose 'data'
+             * field is the 16 raw UUID bytes in RFC 4122 network byte order
+             * (already big-endian for every field).
+             */
+            pg_uuid_t *uid = DatumGetUUIDP(datum);
+            memcpy(buf, uid->data, 16);
+            return 16;
+        }
+        default:
+            return 0;   /* caller falls back to the varlena path */
+    }
+}
+
+/*
+ * tde_iam_encrypt_fixed_type_datum
+ *
+ * Encrypts a fixed-size typed Datum using AES-256-SIV.
+ * Called from aminsert, amrescan, and index_build_range_scan when an
+ * index attribute uses a tde_*_enc_ops operator class (detected by
+ * rd_att[i].atttypid == BYTEAOID && rd_opcintype[i] != BYTEAOID).
+ *
+ * Returns a palloc'd bytea Datum ready for btree storage.
+ * On DEK unavailability, emits a WARNING and returns the original datum
+ * unchanged (index key stored unencrypted; heap still TAM-encrypted).
+ *
+ * The 16-byte stack buffer `plain_buf` is cleansed before return.
+ */
+Datum
+tde_iam_encrypt_fixed_type_datum(Relation index_rel, Datum datum, Oid typoid)
+{
+    uint8   plain_buf[16];   /* max 16 bytes for uuid */
+    Size    plain_len;
+    Size    enc_len    = 0;
+    char   *encrypted;
+    bytea  *enc_bytea  = NULL;
+
+    unsigned char dek[TDE_DEK_LEN];
+
+    plain_len = tde_iam_serialize_fixed_type(datum, typoid, plain_buf);
+
+    if (plain_len == 0)
+    {
+        ereport(WARNING,
+                (errmsg("[IAM] tde_iam_encrypt_fixed_type_datum: "
+                        "unknown typoid %u, skipping encryption", typoid)));
+        return datum;
+    }
+
+    if(!pg_vault_tde_kms_get_rel_dek(RelationGetRelid(index_rel), dek, sizeof(dek)))
+    {
+        ereport(ERROR, 
+                (errmsg("[IAM] tde_iam_encrypt_fixed_type_datum: "
+                        "DEK unavailable for index rel: %u", RelationGetRelid(index_rel))));
+    }
+
+    /*
+     * PG_TRY wipes the DEK even if tde_iam_encrypt_key raises ERROR — the
+     * longjmp would otherwise skip the cleanse on the success path below.
+     */
+    PG_TRY();
+    {
+        encrypted = tde_iam_encrypt_key(RelationGetRelid(index_rel),
+                                        (const char *) dek, sizeof(dek),
+                                        (const char *) plain_buf, plain_len, &enc_len);
+        OPENSSL_cleanse(plain_buf, sizeof(plain_buf));
+
+        enc_bytea = (bytea *) palloc(VARHDRSZ + enc_len);
+        SET_VARSIZE(enc_bytea, VARHDRSZ + enc_len);
+        memcpy(VARDATA(enc_bytea), encrypted, enc_len);
+        OPENSSL_cleanse(encrypted, enc_len);
+    }
+    PG_CATCH();
+    {
+        OPENSSL_cleanse(plain_buf, sizeof(plain_buf));
+        OPENSSL_cleanse(dek, sizeof(dek));
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+
+    OPENSSL_cleanse(dek, sizeof(dek));
+
+    /* Do NOT pfree(encrypted) — let ecxt_per_tuple_memory reset reclaim it. */
+    return PointerGetDatum(enc_bytea);
+}
 
 /*
  * tde_iam_encrypt_index_datum
@@ -516,14 +509,14 @@ bool tde_iam_build_in_progress = false;
  * from the Datum scalar — NOT detoasted as varlena, which would SIGSEGV on
  * small fixed-size types because the datum value is not a pointer.
  *
- * Called from pg_vault_tde_index_build_range_scan (tam.c) when
- * tde_iam_build_in_progress is set, and from pg_vault_tde_aminsert /
- * pg_vault_tde_amrescan for individual INSERTs and index scans.
+ * Called from pg_vault_tde_index_build_range_scan (tam.c) for tde_btree
+ * index builds, and from pg_vault_tde_aminsert / pg_vault_tde_amrescan for
+ * individual INSERTs and index scans.
  *
  * Caller is responsible for pfree'ing the result when done.
  */
 Datum
-tde_iam_encrypt_index_datum(Datum datum, bool typbyval, int16 typlen)
+tde_iam_encrypt_index_datum(Relation index_rel, Datum datum, bool typbyval, int16 typlen)
 {
 
     /*
@@ -575,7 +568,8 @@ tde_iam_encrypt_index_datum(Datum datum, bool typbyval, int16 typlen)
         Size        plen;
         Size        enc_len    = 0;
         char       *encrypted;
-        bytea      *enc_bytea;
+        bytea      *enc_bytea  = NULL;
+        unsigned char dek[TDE_DEK_LEN];
 
         if (typlen == -1)
         {
@@ -594,34 +588,39 @@ tde_iam_encrypt_index_datum(Datum datum, bool typbyval, int16 typlen)
             /* typlen == -2: C string */
             plain = DatumGetCString(datum);
             plen  = strlen(plain) + 1;   /* include null terminator */
-        }
+        }   
 
-        encrypted = tde_iam_encrypt_key(plain, plen, &enc_len);
-
-        if (encrypted == NULL)
+        if(!pg_vault_tde_kms_get_rel_dek(RelationGetRelid(index_rel), dek, sizeof(dek)))
         {
-            /*
-             * DEK not available.  Log a warning and pass the plaintext through
-             * unchanged.  This means the index entry will be unencrypted; the
-             * TAM-layer encryption of the heap tuple is still intact.
-             */
-            ereport(WARNING,
-                    (errmsg("[IAM] DEK unavailable during index insert — "
-                            "index key stored unencrypted")));
-            return datum;
+            ereport(ERROR, 
+                    errmsg("[IAM] tde_iam_encrypt_index_datum: "
+                           "DEK unavailable for index relid %u", RelationGetRelid(index_rel)));
         }
-
-        enc_bytea = (bytea *) palloc(VARHDRSZ + enc_len);
-        SET_VARSIZE(enc_bytea, VARHDRSZ + enc_len);
-        memcpy(VARDATA(enc_bytea), encrypted, enc_len);
-
-        OPENSSL_cleanse(encrypted, enc_len);
         /*
-         * Do NOT pfree(encrypted) here — let ecxt_per_tuple_memory reset
-         * reclaim it.  Avoiding manual pfree prevents double-free risks
-         * when the context is reset right after this function returns.
+         * PG_TRY wipes the DEK even if tde_iam_encrypt_key raises ERROR — the
+         * longjmp would otherwise skip the cleanse on the success path below.
          */
+        PG_TRY();
+        {
+            encrypted = tde_iam_encrypt_key(RelationGetRelid(index_rel),
+                                            (const char *) dek, sizeof(dek),
+                                            plain, plen, &enc_len);
 
+            enc_bytea = (bytea *) palloc(VARHDRSZ + enc_len);
+            SET_VARSIZE(enc_bytea, VARHDRSZ + enc_len);
+            memcpy(VARDATA(enc_bytea), encrypted, enc_len);
+            OPENSSL_cleanse(encrypted, enc_len);
+        }
+        PG_CATCH();
+        {
+            OPENSSL_cleanse(dek, sizeof(dek));
+            PG_RE_THROW();
+        }
+        PG_END_TRY();
+
+        OPENSSL_cleanse(dek, sizeof(dek));
+
+        /* Do NOT pfree(encrypted) — let ecxt_per_tuple_memory reset reclaim it. */
         return PointerGetDatum(enc_bytea);
     }
 }
@@ -633,9 +632,9 @@ tde_iam_encrypt_index_datum(Datum datum, bool typbyval, int16 typlen)
 /*
  * pg_vault_tde_ambuild
  *
- * Delegates entirely to btree's ambuild but sets tde_iam_build_in_progress
- * first so that pg_vault_tde_index_build_range_scan (tam.c) will encrypt
- * index key values before passing them to btbuildCallback.
+ * Delegates entirely to btree's ambuild. pg_vault_tde_index_build_range_scan
+ * (tam.c) recognises this index via tde_iam_is_tde_btree_index() and
+ * encrypts index key values before passing them to btbuildCallback.
  *
  * This approach avoids the private btree spool API (_bt_spoolinit, etc.) and
  * the single-row aminsert approach (which does not work correctly because
@@ -649,33 +648,47 @@ tde_iam_encrypt_index_datum(Datum datum, bool typbyval, int16 typlen)
  *         → pg_vault_tde_index_build_range_scan (via heap's TableAmRoutine)
  *           → [for each tuple] encrypt values[], then btbuildCallback(...)
  *
- * tde_iam_build_in_progress is a process-local (not thread-local) variable;
- * PostgreSQL is multi-process, so concurrent backends are unaffected.
+ * Parallel build is disabled (amcanbuildparallel = false, set in
+ * tde_iam_init, see https://www.postgresql.org/docs/current/index-functions.html ):
+ * the relam impersonation below only mutates this backend's
+ * in-memory Relation, but a real parallel worker opens its own fresh copy
+ * of the index relation and hits core code (sortsupport.c's
+ * PrepareSortSupportFromIndexRel) that unconditionally errors out on a
+ * non-btree relam. Forcing a single-process build keeps every scan/sort
+ * call inside this (correctly impersonated) backend.
  */
 static IndexBuildResult *
 pg_vault_tde_ambuild(Relation heap, Relation index, IndexInfo *index_info)
 {
     IndexBuildResult *result;
-
+    Oid               saved_relam = index->rd_rel->relam;
+      
     Assert(saved_btree_methods_valid);
-
+    
     /*
-     * Signal pg_vault_tde_index_build_range_scan to encrypt index keys.
-     * PG_TRY ensures the flag is cleared even if btbuild raises an error.
+     * On PG17, tuplesort_begin_index_btree() hard-asserts
+     * indexRel->rd_rel->relam == BTREE_AM_OID before it will build a sort
+     * for the index (removed/relaxed in PG18). Since tde_btree registers
+     * its own AM oid, btbuild() would fail with "unexpected non-btree AM"
+     * for every build. Impersonate BTREE_AM_OID for the duration of the
+     * delegated build call, same pattern used for rd_tableam in
+     * pg_vault_tde_relation_copy_for_cluster (tam.c) — RelationData is
+     * per-backend, so the swap is safe from concurrency.
      */
-    tde_iam_build_in_progress = true;
+    index->rd_rel->relam = BTREE_AM_OID;
 
+    /* PG_TRY ensures relam is restored even if btbuild raises an error. */
     PG_TRY();
     {
         result = saved_btree_methods.ambuild(heap, index, index_info);
     }
     PG_CATCH();
     {
-        tde_iam_build_in_progress = false;
+        index->rd_rel->relam = saved_relam;
         PG_RE_THROW();
     }
     PG_END_TRY();
-    tde_iam_build_in_progress = false;
+    index->rd_rel->relam = saved_relam;
 
     return result;
 }
@@ -705,11 +718,19 @@ pg_vault_tde_aminsert(Relation index, Datum *values, bool *isnull,
         {
             enc_values[i] = (Datum) 0;
         }
+        else if (TDE_IS_ENC_OPS_COL(index, i))
+        {
+            enc_values[i] = tde_iam_encrypt_fixed_type_datum(
+                                index,
+                                values[i],
+                                index->rd_opcintype[i]);
+        }
         else
         {
             Form_pg_attribute att = TupleDescAttr(index->rd_att, i);
 
-            enc_values[i] = tde_iam_encrypt_index_datum(values[i],
+            enc_values[i] = tde_iam_encrypt_index_datum(index,
+                                                        values[i],
                                                          att->attbyval,
                                                          att->attlen);
         }
@@ -760,23 +781,84 @@ pg_vault_tde_amrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
             if ((keys[i].sk_flags & SK_ISNULL) == 0 &&
                 keys[i].sk_strategy == BTEqualStrategyNumber)
             {
-                Form_pg_attribute att;
+                int col = keys[i].sk_attno - 1;
 
-                /*
-                 * sk_attno is the 1-based index column number; convert to
-                 * 0-based to index rd_att for this index's attribute descriptor.
-                 */
-                att = TupleDescAttr(scan->indexRelation->rd_att,
-                                    keys[i].sk_attno - 1);
-                keys[i].sk_argument =
-                    tde_iam_encrypt_index_datum(keys[i].sk_argument,
-                                                att->attbyval,
-                                                att->attlen);
+                if (TDE_IS_ENC_OPS_COL(scan->indexRelation, col))
+                {
+                    keys[i].sk_argument =
+                        tde_iam_encrypt_fixed_type_datum(scan->indexRelation, keys[i].sk_argument, scan->indexRelation->rd_opcintype[col]);
+
+                    /* Set the sk_func (boolean cmp function for rd_opcintype) to the bytea one*/
+                    fmgr_info(F_BYTEAEQ, &keys[i].sk_func); 
+                }
+                else
+                {
+                    Form_pg_attribute att = TupleDescAttr(scan->indexRelation->rd_att, col);
+                    keys[i].sk_argument =
+                        tde_iam_encrypt_index_datum(scan->indexRelation,
+                                                    keys[i].sk_argument,
+                                                    att->attbyval,
+                                                    att->attlen);
+                }
             }
         }
     }
 
     saved_btree_methods.amrescan(scan, keys, nkeys, orderbys, norderbys);
+}
+
+/* ── AMVALIDATE ─────────────────────────────────────────────────────────── */
+
+/*
+ * pg_vault_tde_amvalidate
+ *
+ * Validates an operator class.  For standard tde_*_ops classes (no STORAGE
+ * override) this delegates to btvalidate.  For tde_*_enc_ops classes
+ * (opckeytype = BYTEAOID, opcintype ≠ BYTEAOID) we return true directly:
+ * those classes register strategy operators with the original column type
+ * (e.g. int4 = int4) instead of (bytea = bytea), so btvalidate would reject
+ * them, but they are correct by construction.
+ */
+static bool
+pg_vault_tde_amvalidate(Oid opclassoid)
+{
+    HeapTuple       classtup;
+    Form_pg_opclass classform;
+    bool            is_enc_ops;
+
+    Assert(saved_btree_methods_valid);
+
+    /*
+     * enc_ops operator classes (tde_int4_enc_ops, tde_int8_enc_ops, etc.)
+     * register their strategy operators with the original column type
+     * (int4, int8, …) so the planner can match equality clauses against
+     * the index.  btvalidate, however, expects operator types to equal
+     * opckeytype (BYTEAOID) when STORAGE bytea is set and would emit
+     * warnings and return false.  Skip btvalidate for these classes; they
+     * are valid by construction.
+     *
+     * Detection: enc_ops classes have opckeytype = BYTEAOID and
+     * opcintype ≠ BYTEAOID.  Plain tde_*_ops and tde_text_ops have
+     * opckeytype = InvalidOid (same as opcintype), so they delegate
+     * normally.
+     */
+    classtup = SearchSysCache1(CLAOID, ObjectIdGetDatum(opclassoid));
+    if (!HeapTupleIsValid(classtup))
+        ereport(ERROR,
+                (errcode(ERRCODE_UNDEFINED_OBJECT),
+                 errmsg("cache lookup failed for operator class %u",
+                        opclassoid)));
+
+    classform = (Form_pg_opclass) GETSTRUCT(classtup);
+    is_enc_ops = (OidIsValid(classform->opckeytype) &&
+                  classform->opckeytype == BYTEAOID &&
+                  classform->opcintype  != BYTEAOID);
+    ReleaseSysCache(classtup);
+
+    if (is_enc_ops)
+        return true;
+
+    return saved_btree_methods.amvalidate(opclassoid);
 }
 
 /* ── INIT + HANDLER ─────────────────────────────────────────────────────── */
@@ -829,6 +911,33 @@ tde_iam_init(void)
     tde_btree_methods.aminsert    = pg_vault_tde_aminsert;
     tde_btree_methods.ambeginscan = pg_vault_tde_ambeginscan;
     tde_btree_methods.amrescan    = pg_vault_tde_amrescan;
+    tde_btree_methods.amvalidate  = pg_vault_tde_amvalidate;
+
+
+    /* Encrypted tuples are unencryptable only if they comes from the table */
+    tde_btree_methods.amcanreturn = NULL;
+
+    /*
+     * Disable parallel index build.  pg_vault_tde_ambuild delegates to
+     * btree's ambuild by impersonating index->rd_rel->relam = BTREE_AM_OID
+     * for the duration of the call — but that impersonation only mutates
+     * the LEADER's in-memory Relation. Real parallel workers open their own
+     * fresh copy of the index relation (nbtsort.c's _bt_parallel_build_main
+     * calling index_open()), which reports the true tde_btree AM oid. That
+     * reaches core code we cannot hook (sortsupport.c's
+     * PrepareSortSupportFromIndexRel), which unconditionally
+     * ereport(ERROR)s on a non-btree relam. Forcing a single-process build
+     * keeps every scan/sort call inside the (correctly impersonated) leader.
+     */
+    tde_btree_methods.amcanbuildparallel = false;
+
+    /*
+     * Allow STORAGE type ≠ opcintype for tde_*_enc_ops operator classes.
+     * Standard btree sets amstorage=false; we need true so that
+     * CREATE OPERATOR CLASS ... STORAGE bytea does not fail with
+     * "storage type cannot be different from data type".
+     */
+    tde_btree_methods.amstorage   = true;
 
     ereport(DEBUG1,
             (errmsg("[IAM] tde_btree initialized: btree AM wrapped with "
@@ -863,4 +972,30 @@ pg_vault_tde_get_iam_routine(void)
     result = (IndexAmRoutine *) palloc(sizeof(IndexAmRoutine));
     memcpy(result, &tde_btree_methods, sizeof(IndexAmRoutine));
     return result;
+}
+
+/*
+ * tde_enc_bytea_cmp
+ *
+ * B-Tree support function 1 (three-way comparator) for tde_*_enc_ops
+ * operator classes.  Both arguments are AES-256-SIV ciphertexts of the
+ * same length (20, 24, or 32 bytes depending on the original type).
+ *
+ * AES-SIV is deterministic: equal plaintexts → equal ciphertexts under
+ * the same DEK.  The memcmp order has no semantic meaning; range scans
+ * on enc_ops indexes return arbitrary results (documented limitation).
+ */
+PG_FUNCTION_INFO_V1(tde_enc_bytea_cmp);
+Datum
+tde_enc_bytea_cmp(PG_FUNCTION_ARGS)
+{
+    bytea  *a   = PG_GETARG_BYTEA_PP(0);
+    bytea  *b   = PG_GETARG_BYTEA_PP(1);
+    int     la  = VARSIZE_ANY_EXHDR(a);
+    int     lb  = VARSIZE_ANY_EXHDR(b);
+    int     cmp = memcmp(VARDATA_ANY(a), VARDATA_ANY(b), Min(la, lb));
+
+    if (cmp != 0)
+        PG_RETURN_INT32(cmp > 0 ? 1 : -1);
+    PG_RETURN_INT32(la > lb ? 1 : (la < lb ? -1 : 0));
 }

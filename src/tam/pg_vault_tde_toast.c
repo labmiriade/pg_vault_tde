@@ -1,7 +1,7 @@
 /*
  * pg_vault_tde_toast.c - TOAST data encryption for pg_vault_tde
  *
- * Copyright (c) 2026 Miriade Srl  
+ * Copyright (c) 2026 Miriade S.r.l.  
  * Licensed under the PostgreSQL License.
  *
  * DESIGN RATIONALE:
@@ -51,6 +51,8 @@
 #include "src/include/pg_vault_tde_crypto.h"
 #include "src/include/pg_vault_tde_tam.h"
 #include "src/include/pg_vault_tde_toast.h"
+#include "src/include/pg_vault_tde_guc.h"      /* pg_vault_tde_toast_custom_rmgr */
+#include "src/include/pg_vault_tde_rmgr.h"     /* tde_toast_wal_insert */
 /*
  * tde_toast_encrypt_chunk
  *
@@ -76,7 +78,7 @@ tde_toast_encrypt_chunk(Oid parent_relid, const char *chunk_data, Size chunk_len
 
     /*
      * Delegate to the shared AES-256-GCM primitive with the parent
-     * relation's DEK.  The [VERSION|GEN|IV|CT|TAG] wire format is
+     * relation's DEK.  The [IV|CT|TAG|VERSION|GEN] wire format is
      * self-contained: each chunk carries its own IV.
      */
     return tde_gcm_encrypt(parent_relid, chunk_data, chunk_len, out_len);
@@ -89,7 +91,7 @@ tde_toast_encrypt_chunk(Oid parent_relid, const char *chunk_data, Size chunk_len
  * Verifies the GCM authentication tag before returning plaintext; any
  * tampering aborts via ereport(ERROR).
  *
- * @param enc_data     [VERSION|GEN|IV|CT|TAG] encrypted chunk
+ * @param enc_data     [IV|CT|TAG|VERSION|GEN] encrypted chunk
  * @param enc_len      total encrypted length
  * @param out_len      set to decrypted chunk length
  * @returns            palloc'd plaintext chunk; caller cleans up
@@ -97,10 +99,19 @@ tde_toast_encrypt_chunk(Oid parent_relid, const char *chunk_data, Size chunk_len
 char *
 tde_toast_decrypt_chunk(Oid parent_relid, const char *enc_data, Size enc_len, Size *out_len)
 {
-    Assert(enc_data != NULL);
-    Assert(enc_len > TDE_GCM_OVERHEAD);
+    char *out;
 
-    return tde_gcm_decrypt(parent_relid, enc_data, enc_len, out_len);
+    Assert(enc_data != NULL);
+    Assert(enc_len > TDE_V4_OVERHEAD);
+
+    /* Chunk path (not the hot seq-scan): palloc the plaintext destination. */
+    out = (char *) palloc(enc_len - TDE_V4_OVERHEAD);
+    if (!tde_gcm_decrypt(parent_relid, enc_data, enc_len, out, out_len))
+    {
+        pfree(out);
+        return NULL;
+    }
+    return out;
 }
 
 /*
@@ -312,7 +323,17 @@ Datum pg_vault_tde_toast_save_datum(Relation rel, Datum value,
             {
                 chunk_enc = tde_encrypt_heap_tuple(toast_tup, toast_tup->t_tableOid);
 
-                heap_insert(toast_rel, chunk_enc, mycid, options, NULL);
+                /*
+                 * Normally heap_insert (logs under RM_HEAP_ID).  With the
+                 * custom-rmgr GUC on, log the chunk under TDE_RMGR_ID instead
+                 * so the logical decoder routes it away from the reorder
+                 * buffer's toast_hash.  Both emit a byte-identical WAL record
+                 * except for the resource manager id.
+                 */
+                if (pg_vault_tde_toast_custom_rmgr)
+                    tde_toast_wal_insert(toast_rel, chunk_enc, mycid, options, NULL);
+                else
+                    heap_insert(toast_rel, chunk_enc, mycid, options, NULL);
 
                 /*
                 * heap_insert writes the physical TID into toast_enc->t_self.

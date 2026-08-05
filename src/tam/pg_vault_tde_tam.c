@@ -6,18 +6,17 @@
  * callbacks are overridden; every structural callback (VACUUM, ANALYZE, HOT,
  * CLUSTER, index build, truncate ...) delegates unchanged to heapam.
  *
- * Wire format on disk (per tuple):
- *   [HeapTupleHeader  (t_hoff bytes, PLAINTEXT - MVCC fields)]
- *   [VERSION(1) | GENERATION(8) | IV (12 B) | CIPHERTEXT (N B) | GCM TAG (16 B)]
+ * Wire format on disk (per tuple), v4 IV-first trailer:
+ *   [HeapTupleHeader (t_hoff bytes, PLAINTEXT - MVCC fields)]
+ *   [IV(12) | CIPHERTEXT(N) | GCM TAG(16) | VERSION(1) | GENERATION(8)]
  *
- * Total overhead vs. plain heap: TDE_V2_OVERHEAD (37) bytes per stored tuple.
- * (v3 uses the same wire bytes as v2 and adds AEAD AAD binding.)
+ * Overhead vs. plain heap: TDE_V4_OVERHEAD (37) bytes/tuple. IV-first disables
+ * HOT on encrypted tables but keeps tde_btree coherent.
  *
- * Copyright (c) 2026 Miriade Srl  
+ * Copyright (c) 2026 Miriade S.r.l.  
  * Licensed under the PostgreSQL License.
  */
 #include "postgres.h"
-#include "executor/spi.h"
 #include "access/heapam.h"          /* heap_insert, heap_update, heap_multi_insert,
                                        heap_getnextslot */
 #include "access/heaptoast.h"       /* TOAST_TUPLE_THRESHOLD, TOAST_MAX_CHUNK_SIZE */
@@ -42,6 +41,7 @@
 #include "commands/defrem.h"        /* get_table_am_oid — used by toast_am */
 #include "utils/rel.h"              /* RelationGetRelid */
 #include "utils/memutils.h"
+#include "utils/tuplesort.h"        /* tuplesort_getdatum (index_validate_scan)*/
 #include "utils/snapmgr.h"          /* GetLatestSnapshot, RegisterSnapshot,
                                        UnregisterSnapshot */
 #include "miscadmin.h"              /* CHECK_FOR_INTERRUPTS */
@@ -53,10 +53,10 @@
 
 #include "access/toast_compression.h" /* TOAST_PGLZ_COMPRESSION_ID */
 #include "src/include/pg_vault_tde_crypto.h"  /* tde_gcm_encrypt, tde_gcm_decrypt,
-                                                  TDE_GCM_OVERHEAD */
+                                                  TDE_V4_OVERHEAD */
 #include "src/include/pg_vault_tde_tam.h"
 #include "src/include/pg_vault_tde_guc.h"      /* pg_vault_tde_enabled */
-#include "src/include/pg_vault_tde_iam.h"      /* tde_iam_build_in_progress,
+#include "src/include/pg_vault_tde_iam.h"      /* tde_iam_is_tde_btree_index,
                                                   tde_iam_encrypt_index_datum */
 #include "src/include/pg_vault_tde_toast.h"
 #include "src/include/pg_vault_tde_catalog.h"
@@ -71,17 +71,20 @@ static TableAmRoutine tde_methods;
  * Saved original heapam callbacks (non-NULL after tam_init).
  *
  * We intercept ALL read paths that deliver a HeapTuple into a slot:
- *  - scan_getnextslot      : sequential scan
- *  - index_fetch_tuple     : index scan (CRITICAL — was missing)
- *  - scan_bitmap_next_tuple: bitmap heap scan (BitmapHeapScan nodes)
- *  - scan_analyze_next_tuple: ANALYZE statistics collection
- *  - scan_sample_next_tuple: TABLESAMPLE clauses
- *  - tuple_fetch_row_version: direct TID fetch (TidScan, lock recheck)
- *  - tuple_lock            : SELECT FOR UPDATE / FOR SHARE
+ *  - scan_getnextslot              : sequential scan
+ *  - scan_getnextslot_tidrange     : Tid range scan
+ *  - index_fetch_tuple             : index scan (CRITICAL — was missing)
+ *  - scan_bitmap_next_tuple        : bitmap heap scan (BitmapHeapScan nodes)
+ *  - scan_analyze_next_tuple       : ANALYZE statistics collection
+ *  - scan_sample_next_tuple        : TABLESAMPLE clauses
+ *  - tuple_fetch_row_version       : direct TID fetch (TidScan, lock recheck)
+ *  - tuple_lock                    : SELECT FOR UPDATE / FOR SHARE
  *
  * Write paths call heap_insert / heap_update / heap_multi_insert directly.
  */
 static bool       (*heapam_scan_getnextslot_cb)(TableScanDesc, ScanDirection,
+                                                 TupleTableSlot *);
+static bool       (*heapam_scan_getnextslot_tidrange_cb)(TableScanDesc, ScanDirection,
                                                  TupleTableSlot *);
 static bool       (*heapam_index_fetch_tuple_cb)(struct IndexFetchTableData *,
                                                   ItemPointer, Snapshot,
@@ -116,6 +119,9 @@ static TM_Result  (*heapam_tuple_lock_cb)(Relation, ItemPointer, Snapshot,
                                            TupleTableSlot *, CommandId,
                                            LockTupleMode, LockWaitPolicy,
                                            uint8, TM_FailureData *);
+static bool       (*heapam_tuple_satisfies_snapshot_cb)(Relation,
+                                                         TupleTableSlot *,
+                                                         Snapshot);
 /* save original heapam delete callback */
 static TM_Result (*heapam_tuple_delete_cb)(Relation rel,
                                            ItemPointer tid,
@@ -138,6 +144,28 @@ static TM_Result pg_vault_tde_tuple_delete(Relation rel,
                                            TM_FailureData *tmfd,
                                            bool changingPart);
 
+static bool tde_tuple_has_external(HeapTuple tup, Relation rel);
+
+static HeapTuple tde_prepare_encrypt_tuple(Relation rel, HeapTuple plain, HeapTuple old, HeapTuple *toasted_out, int options);
+
+static inline void tde_release_plain(HeapTuple plain)
+{
+    Size hdr = plain->t_data->t_hoff;
+    OPENSSL_cleanse((char *) plain->t_data + hdr, plain->t_len - hdr);
+    pfree(plain);
+}
+
+static HeapTuple tde_prepare_encrypt_tuple(Relation rel, HeapTuple plain, HeapTuple old, HeapTuple *toasted_out, int options)
+{
+    HeapTuple toasted = pg_vault_tde_toast_insert_or_update(rel, plain, old, options);
+    HeapTuple enc = tde_encrypt_heap_tuple(toasted, RelationGetRelid(rel));
+
+    enc->t_data->t_infomask &= ~HEAP_HASEXTERNAL;
+    enc->t_tableOid = plain->t_tableOid;
+    *toasted_out = toasted;
+
+    return enc;
+}
 
 /*
  * index_build_range_scan: called by CREATE INDEX to scan the table and build
@@ -158,9 +186,9 @@ static TM_Result pg_vault_tde_tuple_delete(Relation rel,
  * tde_encrypt_heap_tuple
  *
  * Returns a palloc'd HeapTuple whose user-data region is replaced with the
- * v2/v3 wire format produced by tde_gcm_encrypt():
- *   [VERSION(1) | GENERATION(8) | IV(12) | CIPHERTEXT(N) | TAG(16)]
- * Total overhead: TDE_V2_OVERHEAD (37 bytes) per encrypted user-data region.
+ * v4 wire format produced by tde_gcm_encrypt():
+ *   [IV(12) | CIPHERTEXT(N) | TAG(16) | VERSION(1) | GENERATION(8)]
+ * Total overhead: TDE_V4_OVERHEAD (37 bytes) per encrypted user-data region.
  *
  * Header bytes [0 .. t_hoff) are copied verbatim (plaintext) because MVCC
  * fields (xmin, xmax, ctid, infomask, null bitmap) must remain readable by
@@ -181,7 +209,7 @@ tde_encrypt_heap_tuple(HeapTuple plain, Oid relid)
     /*
      * user_len may be 0 for tuples with all-NULL columns (only the null
      * bitmap lives in the header, no column data follows).  AES-256-GCM
-     * handles zero-length plaintext correctly: output is [IV(12)|TAG(16)],
+     * handles zero-length plaintext correctly: output is [IV(12)|TAG(16)|VERSION(1)|GEN(8)],
      * giving us authenticated integrity protection even on null-only rows.
      * We must NOT Assert(user_len > 0) here.
      */
@@ -196,7 +224,7 @@ tde_encrypt_heap_tuple(HeapTuple plain, Oid relid)
         return copy;
     }
     enc_buf = tde_gcm_encrypt(relid, user_data, user_len, &enc_len);
-    Assert(enc_len == user_len + TDE_V2_OVERHEAD);
+    Assert(enc_len == user_len + TDE_V4_OVERHEAD);
     enc = (HeapTuple) palloc0(HEAPTUPLESIZE + hdr_len + enc_len);
     enc->t_len      = (uint32) (hdr_len + enc_len);
     enc->t_self     = plain->t_self;
@@ -205,6 +233,21 @@ tde_encrypt_heap_tuple(HeapTuple plain, Oid relid)
     memcpy(enc->t_data, plain->t_data, hdr_len);                 /* header verbatim */
     memcpy((char *) enc->t_data + hdr_len, enc_buf, enc_len);    /* encrypted payload */
     pfree(enc_buf);  /* ciphertext - no need to cleanse */
+
+    /*
+     * Clear HEAP_HASEXTERNAL on the encrypted tuple.  From the core's point of
+     * view the encrypted tuple is an opaque blob with no external columns — the
+     * TOAST pointer lives INSIDE the ciphertext, invisible to heap_deform.
+     * Leaving the bit set makes core touch the ciphertext as if it had external
+     * data; in particular ExtractReplicaIdentity() (heap_delete/heap_update) runs
+     * toast_flatten_tuple()/heap_deform_tuple() on the ciphertext and logs a
+     * garbage replica identity, breaking logical UPDATE/DELETE.  TOAST lifecycle
+     * is driven by the TAM itself (per-attribute VARATT scan on the decrypted
+     * tuple, tde_tuple_has_external_slow), not this bit — and VACUUM FULL already
+     * writes encrypted tuples with this bit cleared, so the codebase copes.
+     */
+    enc->t_data->t_infomask &= ~HEAP_HASEXTERNAL;
+
     return enc;
 }
 /*
@@ -227,46 +270,32 @@ tde_decrypt_heap_tuple(HeapTuple enc, Oid relid)
     Size        hdr_len   = enc->t_data->t_hoff;
     char       *enc_data  = (char *) enc->t_data + hdr_len;
     Size        enc_len   = enc->t_len - hdr_len;
-    Size        pt_len    = 0;
-    char       *pt_buf;
+    Size        pt_len    = enc_len - TDE_V4_OVERHEAD;
     HeapTuple   plain;
-    /*
-     * Pass-through mode: when encryption is disabled the stored tuple is
-     * already plaintext — return a copy unchanged.
-     */
+    /* Pass-through mode: stored tuple is plaintext — return a copy. */
     if (!pg_vault_tde_enabled)
-    {
-        HeapTuple copy = heap_copytuple(enc);
-        return copy;
-    }
-    /*
-     * Minimum size check: TDE_GCM_OVERHEAD (28) is the smallest possible
-     * encrypted payload — a legacy v1 tuple with zero user bytes.  v2/v3
-     * tuples carry TDE_V2_OVERHEAD (37) bytes.  tde_gcm_decrypt detects
-     * the wire-format version from the first byte and validates accordingly.
-     */
-    if (enc_len < (Size) TDE_GCM_OVERHEAD)
+        return heap_copytuple(enc);
+    /* Every v4 tuple carries TDE_V4_OVERHEAD bytes; shorter means corrupt. */
+    if (hdr_len > enc->t_len || enc_len < (Size) TDE_V4_OVERHEAD)
         ereport(ERROR,
                 (errcode(ERRCODE_DATA_CORRUPTED),
                  errmsg("pg_vault_tde: encrypted tuple too short (%zu bytes)",
                         enc_len)));
-    pt_buf = tde_gcm_decrypt(relid, enc_data, enc_len, &pt_len);
-    /*
-     * We cannot assert an exact overhead value here because the on-disk tuple
-     * may be v1 (28-byte overhead) or v2/v3 (37-byte overhead).
-     * tde_gcm_decrypt performs its own version-specific validation; if it
-     * returned a non-NULL result the plaintext length is correct.
-     */
-    Assert(pt_buf != NULL);
+    /* Allocate once, copy header, then decrypt straight into user-data. */
     plain = (HeapTuple) palloc0(HEAPTUPLESIZE + hdr_len + pt_len);
+    plain->t_data = (HeapTupleHeader) ((char *) plain + HEAPTUPLESIZE);
+    memcpy(plain->t_data, enc->t_data, hdr_len);
+    /* GCM auth failure ereports inside; returns false only on non-v4 version byte. */
+    if (!tde_gcm_decrypt(relid, enc_data, enc_len,
+                         (char *) plain->t_data + hdr_len, &pt_len))
+    {
+        pfree(plain);
+        ereport(ERROR,
+                    (errmsg("pg_vault_tde: decryption failed")));
+    }
     plain->t_len      = (uint32) (hdr_len + pt_len);
     plain->t_self     = enc->t_self;
     plain->t_tableOid = enc->t_tableOid;
-    plain->t_data     = (HeapTupleHeader) ((char *) plain + HEAPTUPLESIZE);
-    memcpy(plain->t_data, enc->t_data, hdr_len);
-    memcpy((char *) plain->t_data + hdr_len, pt_buf, pt_len);
-    OPENSSL_cleanse(pt_buf, pt_len);
-    pfree(pt_buf);
     return plain;
 }
 /*
@@ -287,7 +316,7 @@ tde_decrypt_heap_tuple(HeapTuple enc, Oid relid)
  *
  * Instead we let ExecForceStoreHeapTuple() release the pin internally
  * (it calls ExecClearTuple as its first step).  The pin stays held during
- * heap_copytuple → decrypt → pfree, and is released only once per tuple
+ * the in-place decrypt, and is released only once per tuple
  * by the force-store call — preserving the natural page-at-a-time access
  * pattern of heapam.
  */
@@ -295,7 +324,6 @@ static void
 pg_vault_tde_decode_slot(TupleTableSlot *slot)
 {
     BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) slot;
-    HeapTuple   enc_copy;
     HeapTuple   plain;
     ItemPointerData saved_tid;
     Oid         saved_tableoid;
@@ -322,16 +350,15 @@ pg_vault_tde_decode_slot(TupleTableSlot *slot)
     ItemPointerCopy(&bslot->base.tuple->t_self, &saved_tid);
     saved_tableoid = bslot->base.tuple->t_tableOid;
     /*
-     * Palloc a copy of the encrypted tuple while the buffer pin is still
-     * held by the slot.  This is just a memcpy — cheap compared to a page
-     * re-fetch if the pin were released prematurely.
+     * Decrypt the buffer-backed tuple directly while the slot still holds the
+     * pin.  tde_decrypt_heap_tuple pallocs the plaintext copy; the encrypted
+     * source is read straight from the shared buffer.
      *
      * NOTE: Do NOT call ExecClearTuple() here.  The buffer pin must stay
      * held until ExecForceStoreHeapTuple() below, which releases it as
      * part of its internal ExecClearTuple.  Releasing early causes O(rows)
      * buffer hits during sequential scans (see function header comment).
      */
-    enc_copy = heap_copytuple(bslot->base.tuple);
     /* Decrypt (verifies GCM tag; ereport(ERROR) on tamper) */
     /*
      * Extract the relation OID from the encrypted tuple copy.
@@ -339,10 +366,10 @@ pg_vault_tde_decode_slot(TupleTableSlot *slot)
      * slots during a heap scan, so this is valid here (buffer still pinned
      * when heap_copytuple runs above).
      * For tuples from index scans, t_tableOid is also set by heap_hot_search_buffer.
-     * Fall back to InvalidOid for legacy v1.4 global-DEK tables.
      */
-    plain = tde_decrypt_heap_tuple(enc_copy, enc_copy->t_tableOid);
-    pfree(enc_copy);
+    plain = tde_decrypt_heap_tuple(bslot->base.tuple, saved_tableoid);
+
+
     /* Stamp physical address onto decrypted tuple */
     ItemPointerCopy(&saved_tid, &plain->t_self);
     plain->t_tableOid = saved_tableoid;
@@ -351,8 +378,8 @@ pg_vault_tde_decode_slot(TupleTableSlot *slot)
      *
      * ExecForceStoreHeapTuple calls ExecClearTuple internally as its first
      * step, which releases the buffer pin.  This is the ONLY place the pin
-     * is released — exactly once per tuple, and only after we have already
-     * copied the ciphertext out via heap_copytuple above.
+     * is released — exactly once per tuple, and only after the plaintext copy
+     * has already been produced by tde_decrypt_heap_tuple above.
      *
      * IMPORTANT: ExecForceStoreHeapTuple into a BufferHeapTupleTableSlot
      * does NOT set slot->tts_tid (it calls ExecClearTuple then copies the
@@ -385,11 +412,11 @@ pg_vault_tde_slot_callbacks(Relation rel)
     (void) rel;
     return &TTSOpsBufferHeapTuple;
 }
-/* ---- Sequential scan (SeqScan, TidRangeScan) ---- */
+/* ---- Sequential scan (SeqScan) ---- */
 /*
  * pg_vault_tde_scan_getnextslot
  *
- * SeqScan / TidRangeScan read path.  Delegates to heapam which fills the
+ * SeqScan read path.  Delegates to heapam which fills the
  * slot with a buffer-backed encrypted tuple, then decrypts in-place via
  * decode_slot.  This is the most commonly exercised read path in OLTP.
  *
@@ -407,6 +434,28 @@ pg_vault_tde_scan_getnextslot(TableScanDesc scan, ScanDirection direction,
     if (!TupIsNull(slot))
         pg_vault_tde_decode_slot(slot);  /* decode handles TOAST chunks automatically */
     return true;
+}
+/*
+ * pg_vault_tde_scan_getnextslot_tidrange
+ *
+ * TidRangeScan read path.  scan_getnextslot_tidrange is a
+ * SEPARATE TableAmRoutine callback from scan_getnextslot — it is not
+ * covered by overriding scan_getnextslot alone.  Without this wrapper,
+ * queries planned as "Tid Range Scan" (e.g. WHERE ctid BETWEEN ...)
+ * read raw ciphertext from the page into the slot, undecrypted.
+ *
+ * Same delegate-then-decode pattern as pg_vault_tde_scan_getnextslot.
+ */
+
+static bool 
+pg_vault_tde_scan_getnextslot_tidrange(TableScanDesc scan, ScanDirection direction,
+                                            TupleTableSlot *slot)
+{
+    if(!heapam_scan_getnextslot_tidrange_cb(scan, direction, slot))
+        return false;
+    if(!TupIsNull(slot))
+        pg_vault_tde_decode_slot(slot);
+    return true;  
 }
 /*
  * pg_vault_tde_index_fetch_tuple
@@ -598,6 +647,8 @@ pg_vault_tde_index_build_range_scan(Relation heap_rel,
     double                  reltuples = 0;
     Datum                   values[INDEX_MAX_KEYS];
     bool                    isnull[INDEX_MAX_KEYS];
+    OffsetNumber            root_offsets[MaxHeapTuplesPerPage];
+    BlockNumber             root_blkno = InvalidBlockNumber;
     /*
      * TOAST relations: do NOT delegate to heapam's index_build_range_scan.
      * heapam's implementation calls heap_getnext, whose PG18 identity check
@@ -666,6 +717,8 @@ pg_vault_tde_index_build_range_scan(Relation heap_rel,
             HeapTuple       heapTuple;
             bool            tupleIsAlive = true;
             MemoryContext   oldcxt;
+            ItemPointerData itid;
+
             CHECK_FOR_INTERRUPTS();
             /*
              * Reset per-tuple memory from the previous iteration.  This
@@ -719,17 +772,51 @@ pg_vault_tde_index_build_range_scan(Relation heap_rel,
             oldcxt = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
             FormIndexDatum(index_info, slot, estate, values, isnull);
             heapTuple = ExecFetchSlotHeapTuple(slot, false, NULL);
+
+
+            /* 
+             * If HeapTuple is HeapOnly it can't have index to directly 
+             * point to it. The index should point to the root tuple (line pointer).
+             * This happen if a tuple has been update in HOT method.
+             */
+            itid = heapTuple->t_self;
+
+            if(HeapTupleIsHeapOnly(heapTuple))
+            {
+                BlockNumber     blkno =  ItemPointerGetBlockNumber(&itid); 
+                OffsetNumber off;
+
+                if(blkno != root_blkno)
+                {
+                    Buffer buf = ReadBuffer(heap_rel, blkno);
+                    LockBuffer(buf, BUFFER_LOCK_SHARE);
+
+                    /* 
+                     * Populate a 1-based OffsetNumber array with values for the 
+                     * whole page. Select the correspondent to heapTuple below 
+                     * in the code with ItemPointerGetOffsetNumber
+                     */
+                    heap_get_root_tuples(BufferGetPage(buf), root_offsets);
+
+                    LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+                    ReleaseBuffer(buf);
+                    root_blkno = blkno;
+                }
+
+                off = ItemPointerGetOffsetNumber(&itid);
+                ItemPointerSet(&itid, blkno, root_offsets[off-1]);
+            }
             /*
-             * If a tde_btree index is being built (signalled by IAM's
-             * ambuild), encrypt each non-null index key value with
-             * AES-256-SIV before passing it to the btree build callback.
+             * If a tde_btree index is being built, encrypt each non-null
+             * index key value with AES-256-SIV before passing it to the
+             * btree build callback.
              *
              * We build a SEPARATE enc_values[] array rather than modifying
              * values[] in-place.  _bt_spool copies the datum bytes into
              * its own IndexTuple buffer immediately, so the palloc'd
              * enc_bytea does not need to outlive the callback call.
              */
-            if (tde_iam_build_in_progress)
+            if (tde_iam_is_tde_btree_index(index_rel))
             {
                 Datum  enc_values[INDEX_MAX_KEYS];
                 bool   enc_isnull[INDEX_MAX_KEYS];
@@ -741,21 +828,32 @@ pg_vault_tde_index_build_range_scan(Relation heap_rel,
                 {
                     if (!enc_isnull[kcol])
                     {
-                        Form_pg_attribute att = TupleDescAttr(index_rel->rd_att, kcol);
-                        enc_values[kcol] = tde_iam_encrypt_index_datum(
-                                               enc_values[kcol],
-                                               att->attbyval,
-                                               att->attlen);
+                        if (TDE_IS_ENC_OPS_COL(index_rel, kcol))
+                        {
+                            enc_values[kcol] = tde_iam_encrypt_fixed_type_datum(
+                                                   index_rel,
+                                                   enc_values[kcol],
+                                                   index_rel->rd_opcintype[kcol]);
+                        }
+                        else
+                        {
+                            Form_pg_attribute att = TupleDescAttr(index_rel->rd_att, kcol);
+                            enc_values[kcol] = tde_iam_encrypt_index_datum(
+                                                    index_rel,
+                                                   enc_values[kcol],
+                                                   att->attbyval,
+                                                   att->attlen);
+                        }
                     }
                 }
                 MemoryContextSwitchTo(oldcxt);
-                callback(index_rel, &heapTuple->t_self, enc_values, enc_isnull,
+                callback(index_rel, &itid, enc_values, enc_isnull,
                          tupleIsAlive, callback_state);
             }
             else
             {
                 MemoryContextSwitchTo(oldcxt);
-                callback(index_rel, &heapTuple->t_self, values, isnull,
+                callback(index_rel, &itid, values, isnull,
                          tupleIsAlive, callback_state);
             }
             reltuples += 1;
@@ -769,6 +867,175 @@ pg_vault_tde_index_build_range_scan(Relation heap_rel,
     FreeExecutorState(estate);
     return reltuples;
 }
+
+/* ---- Index validation (CREATE INDEX CONCURRENTLY / REINDEX CONCURRENTLY) ---- */
+/*
+* pg_vault_tde_index_validate_scan
+*
+* Why a custom scan instead of delegating to heapam_index_validate_scan (as
+* index_fetch_tuple does by impersonating heapam): heapam scans with
+* heap_getnext(), which trips the rd_tableam == GetHeapamTableAmRoutine()
+* guard and, even with impersonation, would feed FormIndexDatum raw ciphertext
+* -- silently indexing garbage keys for concurrently-inserted rows.
+*
+* Why no key pre-encryption here (unlike pg_vault_tde_index_build_range_scan):
+* validation inserts via index_insert -> pg_vault_tde_aminsert, which owns
+* the AES-256-SIV encryption -- exactly like a runtime INSERT.
+*/
+static void
+pg_vault_tde_index_validate_scan(Relation heap_rel,
+                                Relation index_rel,
+                                struct IndexInfo *index_info,
+                                Snapshot snapshot,
+                                struct ValidateIndexState *state)
+{   
+    TableScanDesc   scan;
+    HeapScanDesc    hscan;
+    EState         *estate;
+    ExprContext    *econtext;
+    TupleTableSlot *slot;
+    ExprState      *predicate;
+    Datum           values[INDEX_MAX_KEYS];
+    bool            isnull[INDEX_MAX_KEYS];
+    OffsetNumber    root_offsets[MaxHeapTuplesPerPage];
+    bool            in_index[MaxHeapTuplesPerPage];
+    BlockNumber     root_blkno = InvalidBlockNumber;
+    ItemPointer     indexcursor = NULL;
+    ItemPointerData decoded;
+    bool            tuplesort_empty = false;
+    MemoryContext   scan_mcxt;
+
+    estate   = CreateExecutorState();
+    econtext = GetPerTupleExprContext(estate);
+    slot     = table_slot_create(heap_rel, NULL);
+    econtext->ecxt_scantuple = slot;
+    predicate = ExecPrepareQual(index_info->ii_Predicate, estate);
+
+    scan  = table_beginscan_strat(heap_rel, snapshot, 0, NULL, true, false);
+    hscan = (HeapScanDesc) scan;
+
+    /*
+    * decode_slot's decrypted tuple must outlive the per-tuple context we reset
+    * each iteration, or it would be freed under the slot (see
+    * pg_vault_tde_index_build_range_scan).
+    */ 
+    scan_mcxt = CurrentMemoryContext;
+    for (;;)
+    {   
+        HeapTuple       heapTuple;
+        ItemPointerData rootTuple;
+        OffsetNumber    root_offnum;
+        MemoryContext   oldcxt;
+
+        CHECK_FOR_INTERRUPTS();
+
+        ResetExprContext(econtext);
+        ExecClearTuple(slot);
+        
+        oldcxt = MemoryContextSwitchTo(scan_mcxt);
+        if (!table_scan_getnextslot(scan, ForwardScanDirection, slot))
+        {
+            MemoryContextSwitchTo(oldcxt);
+            break;
+        }
+        MemoryContextSwitchTo(oldcxt);
+
+        state->htups += 1;
+        heapTuple = ExecFetchSlotHeapTuple(slot, false, NULL);
+
+        /*
+        * On each new heap page rebuild the root-offset map and clear in_index[]:
+        * we visit tuples by offset but compare against HOT root offsets, so a
+        * page's index TIDs may be consumed out of order and must be remembered.
+        */
+        if (hscan->rs_cblock != root_blkno)
+        {
+            Page page = BufferGetPage(hscan->rs_cbuf);
+            
+            LockBuffer(hscan->rs_cbuf, BUFFER_LOCK_SHARE);
+            heap_get_root_tuples(page, root_offsets);
+            LockBuffer(hscan->rs_cbuf, BUFFER_LOCK_UNLOCK);
+        
+            memset(in_index, 0, sizeof(in_index));
+            root_blkno = hscan->rs_cblock;
+        }
+        
+        /* Index HOT-chain members under their root line pointer. */
+        rootTuple   = heapTuple->t_self;
+        root_offnum = ItemPointerGetOffsetNumber(&heapTuple->t_self);
+        if (HeapTupleIsHeapOnly(heapTuple))
+        {
+            root_offnum = root_offsets[root_offnum - 1];
+            if (!OffsetNumberIsValid(root_offnum))
+                ereport(ERROR,
+                        (errcode(ERRCODE_DATA_CORRUPTED),
+                        errmsg_internal("failed to find parent tuple for heap-only tuple at (%u,%u) in table \"%s\"",
+                                        ItemPointerGetBlockNumber(&heapTuple->t_self),
+                                        ItemPointerGetOffsetNumber(&heapTuple->t_self),
+                                        RelationGetRelationName(heap_rel))));
+            ItemPointerSetOffsetNumber(&rootTuple, root_offnum);
+        }                                
+            
+        while (!tuplesort_empty &&       
+                (indexcursor == NULL ||
+                ItemPointerCompare(indexcursor, &rootTuple) < 0))
+        {
+            Datum ts_val;
+            bool  ts_isnull;
+            
+            /* Remember index TIDs already passed over on the current page. */
+            if (indexcursor != NULL &&
+                ItemPointerGetBlockNumber(indexcursor) == root_blkno)
+                in_index[ItemPointerGetOffsetNumber(indexcursor) - 1] = true;
+                
+            tuplesort_empty = !tuplesort_getdatum(state->tuplesort, true, false,
+                                                &ts_val, &ts_isnull, NULL);
+            Assert(tuplesort_empty || !ts_isnull);
+            if (!tuplesort_empty)
+            {
+                itemptr_decode(&decoded, DatumGetInt64(ts_val));
+                indexcursor = &decoded;
+            }   
+            else
+                indexcursor = NULL;
+        }   
+            
+        if ((tuplesort_empty ||
+            ItemPointerCompare(indexcursor, &rootTuple) > 0) &&
+            !in_index[root_offnum - 1])
+        {    
+            oldcxt = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+        
+            /* Partial index: skip tuples failing the predicate. */
+            if (predicate != NULL && !ExecQual(predicate, econtext))
+            {
+                MemoryContextSwitchTo(oldcxt);
+                continue;
+            }   
+            
+            FormIndexDatum(index_info, slot, estate, values, isnull);
+            
+            index_insert(index_rel, values, isnull, &rootTuple,
+                        heap_rel,
+                        index_info->ii_Unique ? UNIQUE_CHECK_YES
+                                                : UNIQUE_CHECK_NO,
+                        false,          /* indexUnchanged */
+                        index_info);
+                        
+            state->tups_inserted += 1;
+            MemoryContextSwitchTo(oldcxt);
+        }   
+    }       
+        
+    table_endscan(scan);
+    ExecDropSingleTupleTableSlot(slot);
+    FreeExecutorState(estate);
+
+    /* estate is gone; drop the expression states that pointed into it. */
+    index_info->ii_ExpressionsState = NIL;
+    index_info->ii_PredicateState = NULL;
+}
+
 /* ---- Direct TID fetch (TidScan, lock rechecks) ---- */
 /*
  * pg_vault_tde_tuple_fetch_row_version
@@ -817,6 +1084,47 @@ pg_vault_tde_tuple_lock(Relation relation, ItemPointer tid,
     if (result == TM_Ok && !TupIsNull(slot))
         pg_vault_tde_decode_slot(slot);  /* automatic TOAST routing */
     return result;
+}
+
+/*
+ * pg_vault_tde_tuple_satisfies_snapshot
+ *
+ * Visibility recheck used by RI foreign-key triggers via
+ * table_tuple_satisfies_snapshot (RI_FKey_check, ri_triggers.c).  heapam's
+ * version takes the slot's pinned buffer content lock and runs
+ * HeapTupleSatisfiesVisibility on the on-buffer tuple — it asserts the slot
+ * still holds a valid buffer pin.
+ *
+ * Our read paths decrypt into a palloc'd HeapTuple and release the pin
+ * (decode_slot leaves bslot->buffer == InvalidBuffer), so delegating would
+ * call LockBuffer(InvalidBuffer) → GetBufferDescriptor(-1) → SIGSEGV.
+ *
+ * The MVCC header is plaintext and copied verbatim into the decrypted tuple,
+ * so visibility only needs the page the tuple lives on (for hint bits).
+ * Re-pin it from the tuple's physical TID, lock shared, run the standard check.
+ */
+static bool
+pg_vault_tde_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
+                                       Snapshot snapshot)
+{
+    BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) slot;
+    Buffer  buffer;
+    bool    res;
+
+    Assert(TTS_IS_BUFFERTUPLE(slot));
+
+    /* Still buffer-backed (non-decrypted slot): heapam handles it directly. */
+    if (bslot->buffer != InvalidBuffer)
+        return heapam_tuple_satisfies_snapshot_cb(rel, slot, snapshot);
+
+    /* Decrypted slot: re-pin the page the tuple lives on for the check. */
+    buffer = ReadBuffer(rel,
+                        ItemPointerGetBlockNumber(&bslot->base.tuple->t_self));
+    LockBuffer(buffer, BUFFER_LOCK_SHARE);
+    res = HeapTupleSatisfiesVisibility(bslot->base.tuple, snapshot, buffer);
+    LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+    ReleaseBuffer(buffer);
+    return res;
 }
 
 /*
@@ -875,8 +1183,6 @@ pg_vault_tde_tuple_insert(Relation rel, TupleTableSlot *slot,
     HeapTuple  plain = NULL;
     HeapTuple  toasted = NULL;
     HeapTuple  enc = NULL;
-    Oid        saved_toastrelid = InvalidOid;
-    bool       toastrelid_swapped = false;
 
     plain = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
     plain->t_tableOid = RelationGetRelid(rel);
@@ -886,32 +1192,17 @@ pg_vault_tde_tuple_insert(Relation rel, TupleTableSlot *slot,
      */
     PG_TRY();
     {
-        toasted = pg_vault_tde_toast_insert_or_update(rel, plain, NULL, options);
-        enc = tde_encrypt_heap_tuple(toasted, RelationGetRelid(rel));
-        enc->t_tableOid = plain->t_tableOid;
-        /*
-         * Suppress TOAST inside heap_insert — we already handled it above.
-         * reltoastrelid is per-backend (relcache local copy), same pattern as
-         * the rd_tableam impersonation in index_fetch_tuple.
-         */
-        saved_toastrelid = rel->rd_rel->reltoastrelid;
-        rel->rd_rel->reltoastrelid = InvalidOid;
-        toastrelid_swapped = true;
+        enc = tde_prepare_encrypt_tuple(rel, plain, NULL, &toasted, options);
         heap_insert(rel, enc, cid, options, bistate);
-        rel->rd_rel->reltoastrelid = saved_toastrelid;
-        toastrelid_swapped = false;
+
         ItemPointerCopy(&enc->t_self, &slot->tts_tid);
         slot->tts_tableOid = enc->t_tableOid;
     }
     PG_CATCH();
     {
-        if (toastrelid_swapped)
-            rel->rd_rel->reltoastrelid = saved_toastrelid;
         if (shouldFree && plain != NULL)
         {
-            Size hdr = plain->t_data->t_hoff;
-            OPENSSL_cleanse((char *) plain->t_data + hdr, plain->t_len - hdr);
-            pfree(plain);
+            tde_release_plain(plain);
         }
         if (toasted != NULL && toasted != plain)
             pfree(toasted);
@@ -922,9 +1213,7 @@ pg_vault_tde_tuple_insert(Relation rel, TupleTableSlot *slot,
     PG_END_TRY();
     if (shouldFree)
     {
-        Size hdr = plain->t_data->t_hoff;
-        OPENSSL_cleanse((char *) plain->t_data + hdr, plain->t_len - hdr);
-        pfree(plain);
+        tde_release_plain(plain);
     }
     if (toasted != plain)
         pfree(toasted);
@@ -952,8 +1241,7 @@ pg_vault_tde_tuple_insert_speculative(Relation rel, TupleTableSlot *slot,
     HeapTuple  plain = NULL;
     HeapTuple  toasted = NULL;
     HeapTuple  enc = NULL;
-    Oid        saved_toastrelid = InvalidOid;
-    bool       toastrelid_swapped = false;
+
     plain = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
     plain->t_tableOid = RelationGetRelid(rel);
     /* Stamp the speculative token on the header BEFORE encrypting so it is
@@ -965,28 +1253,16 @@ pg_vault_tde_tuple_insert_speculative(Relation rel, TupleTableSlot *slot,
     options |= HEAP_INSERT_SPECULATIVE;
     PG_TRY();
     {
-        toasted = pg_vault_tde_toast_insert_or_update(rel, plain, NULL, options);
-        enc = tde_encrypt_heap_tuple(toasted, RelationGetRelid(rel));
-        enc->t_tableOid = plain->t_tableOid;
-        saved_toastrelid = rel->rd_rel->reltoastrelid;
-        rel->rd_rel->reltoastrelid = InvalidOid;
-        toastrelid_swapped = true;
+        enc = tde_prepare_encrypt_tuple(rel, plain, NULL, &toasted, options);
         heap_insert(rel, enc, cid, options, bistate);
-        rel->rd_rel->reltoastrelid = saved_toastrelid;
-        toastrelid_swapped = false;
+
         ItemPointerCopy(&enc->t_self, &slot->tts_tid);
         slot->tts_tableOid = enc->t_tableOid;
     }
     PG_CATCH();
     {
-        if (toastrelid_swapped)
-            rel->rd_rel->reltoastrelid = saved_toastrelid;
         if (shouldFree && plain != NULL)
-        {
-            Size hdr = plain->t_data->t_hoff;
-            OPENSSL_cleanse((char *) plain->t_data + hdr, plain->t_len - hdr);
-            pfree(plain);
-        }
+            tde_release_plain(plain);
         if (toasted != NULL && toasted != plain)
             pfree(toasted);
         if (enc != NULL)
@@ -995,11 +1271,7 @@ pg_vault_tde_tuple_insert_speculative(Relation rel, TupleTableSlot *slot,
     }
     PG_END_TRY();
     if (shouldFree)
-    {
-        Size hdr = plain->t_data->t_hoff;
-        OPENSSL_cleanse((char *) plain->t_data + hdr, plain->t_len - hdr);
-        pfree(plain);
-    }
+        tde_release_plain(plain);
     if (toasted != plain)
         pfree(toasted);
     pfree(enc);
@@ -1035,8 +1307,6 @@ pg_vault_tde_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
 
     int         i;
     Oid         table_oid = RelationGetRelid(rel);
-    Oid         saved_toastrelid = rel->rd_rel->reltoastrelid;
-    volatile bool toastrelid_swapped = false;
     TupleDesc   tupdesc = RelationGetDescr(rel);
 
     /* In-flight intermediates for the iteration that may throw */
@@ -1072,10 +1342,10 @@ pg_vault_tde_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
             plain_inflight = plain;
             plain_inflight_owned = sf;
             toasted_inflight = NULL;
-            toasted = pg_vault_tde_toast_insert_or_update(rel, plain, NULL, options);
+            
+            enc_tuples[i] = tde_prepare_encrypt_tuple(rel, plain, NULL, &toasted, options);
+
             toasted_inflight = (toasted != plain) ? toasted : NULL;
-            enc_tuples[i] = tde_encrypt_heap_tuple(toasted, RelationGetRelid(rel));
-            enc_tuples[i]->t_tableOid = table_oid;
             /* Create a temporary slot and store the encrypted tuple in it */
             enc_slots[i] = MakeSingleTupleTableSlot(tupdesc,
                                                      &TTSOpsHeapTuple);
@@ -1085,11 +1355,7 @@ pg_vault_tde_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
             if (toasted != plain)
                 pfree(toasted);
             if (sf)
-            {
-                Size hdr = plain->t_data->t_hoff;
-                OPENSSL_cleanse((char *) plain->t_data + hdr, plain->t_len - hdr);
-                pfree(plain);
-            }
+                tde_release_plain(plain);
             /* Iteration completed cleanly — clear in-flight tracking */
             plain_inflight = NULL;
             plain_inflight_owned = false;
@@ -1102,11 +1368,8 @@ pg_vault_tde_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
          * TOAST the (already encrypted) tuples — their byte pattern is
          * random-looking ciphertext and would confuse the TOAST deformer.
          */
-        rel->rd_rel->reltoastrelid = InvalidOid;
-        toastrelid_swapped = true;
+      
         heap_multi_insert(rel, enc_slots, nslots, cid, options, bistate);
-        rel->rd_rel->reltoastrelid = saved_toastrelid;
-        toastrelid_swapped = false;
         /*
          * Phase 3: propagate physical TIDs back to the original slots.
          *
@@ -1122,16 +1385,11 @@ pg_vault_tde_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
     }
     PG_CATCH();
     {
-        /* Restore TOAST relid only if we actually swapped it */
-        if (toastrelid_swapped)
-            rel->rd_rel->reltoastrelid = saved_toastrelid;
         /* Clean up in-flight iteration plaintexts (cleanse + free) */
         if (plain_inflight != NULL && plain_inflight_owned)
         {
             HeapTuple p = plain_inflight;
-            Size hdr = p->t_data->t_hoff;
-            OPENSSL_cleanse((char *) p->t_data + hdr, p->t_len - hdr);
-            pfree(p);
+            tde_release_plain(p);
         }
         if (toasted_inflight != NULL)
             pfree(toasted_inflight);
@@ -1177,66 +1435,43 @@ pg_vault_tde_tuple_update(Relation rel, ItemPointer otid,
     HeapTuple  toasted = NULL;
     HeapTuple  enc = NULL;
     TM_Result  result;
-    Oid        saved_toastrelid = InvalidOid;
-    bool       toastrelid_swapped = false;
-    bool       old_has_external = false;
+   
     TupleTableSlot *slot_old = NULL;
 
     plain = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
     plain->t_tableOid = RelationGetRelid(rel);
 
     slot_old = table_slot_create(rel, NULL);
-    if (pg_vault_tde_tuple_fetch_row_version(rel, otid, snapshot, slot_old))
-    {
-        /* Read old tuple metadata from slot storage (no materialized copy). */
-        old_tuple = ExecFetchSlotHeapTuple(slot_old, false, NULL);
-        old_has_external = HeapTupleHasExternal(old_tuple);
-    }
 
-    /*
-     * The PG_TRY wraps the entire pre-TOAST → encrypt → heap_update pipeline.
-     * Errors from pre-TOAST handling or tde_encrypt_heap_tuple now
-     * also restore reltoastrelid and OPENSSL_cleanse the plaintext.  TOAST
-     * chunks already inserted are rolled back by the transaction abort.
-     */
     PG_TRY();
     {
-        toasted = pg_vault_tde_toast_insert_or_update(rel, plain, old_tuple, 0);
-        enc = tde_encrypt_heap_tuple(toasted, RelationGetRelid(rel));
-        enc->t_tableOid = plain->t_tableOid;
-        saved_toastrelid = rel->rd_rel->reltoastrelid;
-        rel->rd_rel->reltoastrelid = InvalidOid;
-        toastrelid_swapped = true;
+        bool old_has_external = false;
+        if (pg_vault_tde_tuple_fetch_row_version(rel, otid, snapshot, slot_old))
+        {
+            old_tuple = ExecFetchSlotHeapTuple(slot_old, false, NULL);
+            old_has_external = tde_tuple_has_external(old_tuple, rel);
+        }
+
+        enc = tde_prepare_encrypt_tuple(rel, plain, old_tuple, &toasted, 0);
+
         result = heap_update(rel, otid, enc, cid, crosscheck, wait,
                              tmfd, lockmode, update_indexes);
-        rel->rd_rel->reltoastrelid = saved_toastrelid;
-        toastrelid_swapped = false;
+
         if (result == TM_Ok)
         {
             ItemPointerCopy(&enc->t_self, &slot->tts_tid);
             slot->tts_tableOid = enc->t_tableOid;
 
-            /*
-             * If old row had external TOAST chunks but the updated row no longer
-             * does, proactively delete the old TOAST payload after TM_Ok.
-             */
-            if (old_tuple != NULL && old_has_external &&
-                !HeapTupleHasExternal(toasted))
-            {
+            /* Check toasted (plaintext): enc is ciphertext with HASEXTERNAL cleared. */
+            if (old_tuple != NULL && old_has_external && !HeapTupleHasExternal(toasted))
                 heap_toast_delete(rel, old_tuple, false);
-            }
         }
     }
     PG_CATCH();
     {
-        if (toastrelid_swapped)
-            rel->rd_rel->reltoastrelid = saved_toastrelid;
-
         if (shouldFree && plain != NULL)
         {
-            Size hdr = plain->t_data->t_hoff;
-            OPENSSL_cleanse((char *) plain->t_data + hdr, plain->t_len - hdr);
-            pfree(plain);
+            tde_release_plain(plain);
         }
         if (toasted != NULL && toasted != plain)
             pfree(toasted);
@@ -1252,9 +1487,7 @@ pg_vault_tde_tuple_update(Relation rel, ItemPointer otid,
     PG_END_TRY();
     if (shouldFree)
     {
-        Size hdr = plain->t_data->t_hoff;
-        OPENSSL_cleanse((char *) plain->t_data + hdr, plain->t_len - hdr);
-        pfree(plain);
+        tde_release_plain(plain);
     }
     if (toasted != plain)
         pfree(toasted);
@@ -1267,37 +1500,66 @@ pg_vault_tde_tuple_update(Relation rel, ItemPointer otid,
 }
 
 /*
- * tde_tuple_has_external_slow
+ * tde_tuple_has_external
  *
  * Per-attribute scan for VARATT_IS_EXTERNAL varlenas on a decrypted heap
- * tuple.  Required as a fallback when HEAP_HASEXTERNAL may be cleared in
- * t_infomask — specifically for tuples written by VACUUM FULL, which clears
- * the flag on encrypted tuples to satisfy rewrite_heap_tuple's assertion
- * (see pg_vault_tde_relation_copy_for_cluster).
- *
- * Without this fallback, pg_vault_tde_tuple_delete would silently skip
- * heap_toast_delete for rows written during VACUUM FULL, orphaning TOAST
- * chunks until the next regular VACUUM.
- */
+ * tuple. This is necessary because flag HEAP_HASEXTERNAL is cleansed 
+ * in insert before calling heap_insert(), otherwise it will call
+ * heap_toast_insert_or_update.
+*/
 static bool
-tde_tuple_has_external_slow(HeapTuple tup, TupleDesc tupdesc)
+tde_tuple_has_external(HeapTuple tup, Relation rel)
 {
-    int natts = Min(tupdesc->natts, HeapTupleHeaderGetNatts(tup->t_data));
+    int natts;
+    TupleDesc tupdesc;
+    Datum stack_values[MAX_STACK_ATTRS];
+    bool  stack_isnull[MAX_STACK_ATTRS];
+    
+    Datum *values = stack_values;
+    bool  *isnull = stack_isnull;
+    bool  has_ext = false;
+
+    if(!OidIsValid(rel->rd_rel->reltoastrelid)) 
+        return false;
+    
+    tupdesc = RelationGetDescr(rel);
+    natts = tupdesc->natts;
+
+    if (unlikely(natts > MAX_STACK_ATTRS))
+    {
+        values = (Datum *) palloc(natts * sizeof(Datum));
+        isnull = (bool *) palloc(natts * sizeof(bool));
+    }
+
+    /* 
+     * Previous version was using heap_getattr (O(n)) in a for loop
+     * for every attr in heaptuple resulting in a O(n²). 
+     * In the current vesion: Deforming is O(n) so the total complexity 
+     * is O(n + n) = O(n).
+     */
+    heap_deform_tuple(tup, tupdesc, values, isnull); 
 
     for (int i = 0; i < natts; i++)
     {
         Form_pg_attribute att = TupleDescAttr(tupdesc, i);
-        bool    isnull;
-        Datum   d;
 
-        if (att->attlen != -1 || att->attisdropped)
-            continue;
-
-        d = heap_getattr(tup, i + 1, tupdesc, &isnull);
-        if (!isnull && VARATT_IS_EXTERNAL(DatumGetPointer(d)))
-            return true;
+        if (!isnull[i] && !att->attisdropped && att->attlen == -1)
+        {
+            if (VARATT_IS_EXTERNAL(DatumGetPointer(values[i])))
+            {
+                has_ext = true;
+                break; 
+            }
+        }
     }
-    return false;
+
+    if (unlikely(natts > MAX_STACK_ATTRS))
+    {
+       pfree(values);
+       pfree(isnull);
+    }
+
+    return has_ext;
 }
 
 /*
@@ -1311,7 +1573,7 @@ tde_tuple_has_external_slow(HeapTuple tup, TupleDesc tupdesc)
  *     infomask bit.  Normally reliable, but VACUUM FULL clears this bit on
  *     encrypted tuples to satisfy rewrite_heap_tuple's assertion
  *     (see pg_vault_tde_relation_copy_for_cluster).
- *  2. tde_tuple_has_external_slow() — per-attribute VARATT_IS_EXTERNAL scan
+ *  2. tde_tuple_has_external() — per-attribute VARATT_IS_EXTERNAL scan
  *     on the decrypted tuple.  Falls back to this when the bit is clear so
  *     TOAST chunks from VACUUM FULL-rewritten rows are never orphaned.
  *
@@ -1332,8 +1594,7 @@ pg_vault_tde_tuple_delete(Relation rel,
     TM_Result result;
     TupleTableSlot * slot = NULL;
     HeapTuple volatile plain = NULL;
-    Oid saved_toastrelid = InvalidOid;
-    bool swapped = false;
+   
     bool volatile has_externals = false;
     bool shouldFree = false;
 
@@ -1347,27 +1608,19 @@ pg_vault_tde_tuple_delete(Relation rel,
          * from encrypted tuples to satisfy rewrite_heap_tuple's assertion;
          * without the fallback those TOAST chunks would be orphaned.
          */
-        has_externals = HeapTupleHasExternal(plain) ||
-                        tde_tuple_has_external_slow(plain, RelationGetDescr(rel));
+        has_externals = tde_tuple_has_external(plain, rel);
     }
 
     PG_TRY();
     {
         result = heapam_tuple_delete_cb(rel, tid, cid, snapshot, crosscheck, wait, tmfd, changingPart);
-        
-        if(result == TM_Ok && has_externals && plain != NULL) heap_toast_delete(rel, plain, false);
+
+        if(result == TM_Ok && has_externals) heap_toast_delete(rel, plain, false);
     }
     PG_CATCH();
     {
-        if (swapped)
-            rel->rd_rel->reltoastrelid = saved_toastrelid;
-
         if (shouldFree)
-        {
-            Size hdr = plain->t_data->t_hoff;
-            OPENSSL_cleanse((char *) plain->t_data + hdr, plain->t_len - hdr);
-            pfree(plain);
-        }
+            tde_release_plain(plain);
 
         if (slot != NULL)
             ExecDropSingleTupleTableSlot(slot);
@@ -1377,11 +1630,7 @@ pg_vault_tde_tuple_delete(Relation rel,
     PG_END_TRY();
 
     if (shouldFree)
-    {
-        Size hdr = plain->t_data->t_hoff;
-        OPENSSL_cleanse((char *) plain->t_data + hdr, plain->t_len - hdr);
-        pfree(plain);
-    }
+        tde_release_plain(plain);
     
     if (slot != NULL)
         ExecDropSingleTupleTableSlot(slot);
@@ -1421,7 +1670,7 @@ pg_vault_tde_tuple_delete(Relation rel,
  * rewrite_heap_tuple asserts !HeapTupleHasExternal(newTuple).  For re-toasted
  * tuples we clear HEAP_HASEXTERNAL from enc_new's t_infomask before the call.
  * TOAST chunk cleanup on later DELETE is still correct because
- * pg_vault_tde_tuple_delete uses tde_tuple_has_external_slow as a fallback
+ * pg_vault_tde_tuple_delete uses tde_tuple_has_external as a fallback
  * that does a per-attribute varlena tag scan instead of relying on the flag.
  */
 static void
@@ -1476,22 +1725,17 @@ pg_vault_tde_relation_copy_for_cluster(Relation OldTable,
     PG_TRY();
     {
         /*
-         * Use heap_beginscan directly (not table_beginscan) to bypass our
-         * TAM override.  This gives us:
-         *   - raw ciphertext tuples pointing into pinned buffer pages
-         *   - hscan->rs_cbuf valid for HeapTupleSatisfiesVacuum
-         *
-         * PG18 introduced a mandatory async read stream in heapgettup.
+         * PG17 introduced a mandatory async read stream in heapgettup.
          * heap_fetch_next_buffer asserts scan->rs_read_stream != NULL, and
          * the stream is created in heap_beginscan only when SO_TYPE_SEQSCAN
          * is present.  Without it, every heapgettup call crashes (Assert in
-         * cassert builds, NULL-deref segfault in release builds).
+         * cassert builds, NULL-deref segfault in release builds).  This is
+         * unconditional because it already applies on PG17, the minimum
+         * supported version.
          */
         hscan = (HeapScanDesc) heap_beginscan(OldTable, SnapshotAny, 0, NULL,
                                               NULL,
-#if PG_VERSION_NUM >= 180000
                                               SO_TYPE_SEQSCAN |
-#endif
                                               SO_ALLOW_STRAT | SO_ALLOW_SYNC);
 
         while ((enc_raw = heap_getnext((TableScanDesc) hscan,
@@ -1566,7 +1810,10 @@ pg_vault_tde_relation_copy_for_cluster(Relation OldTable,
                 plain = tde_decrypt_heap_tuple(enc_copy, RelationGetRelid(OldTable));
                 plain_for_write = plain;
 
-                if (HeapTupleHasExternal(plain))
+                /* Header bit is cleared on disk (see tde_encrypt_heap_tuple);
+                 * scan the plaintext, else the re-TOAST migration below is
+                 * skipped and the rewrite keeps OldTable's TOAST pointers. */
+                if (tde_tuple_has_external(plain, OldTable))
                 {
                     /*
                      * External TOAST pointers in the decrypted tuple reference
@@ -1615,7 +1862,7 @@ pg_vault_tde_relation_copy_for_cluster(Relation OldTable,
                  *
                  * Clear the flag so the assertion passes.
                  * pg_vault_tde_tuple_delete compensates via
-                 * tde_tuple_has_external_slow, which does a per-attribute
+                 * tde_tuple_has_external, which does a per-attribute
                  * VARATT_IS_EXTERNAL scan on the decrypted tuple regardless
                  * of this flag.
                  */
@@ -1626,7 +1873,7 @@ pg_vault_tde_relation_copy_for_cluster(Relation OldTable,
             }
             PG_CATCH(2);
             {
-                /* Cleanse any plaintext key material before re-throwing. */
+                /* Cleanse any plaintext key mterial before re-throwing. */
                 if (plain != NULL)
                 {
                     Size hdr = plain->t_data->t_hoff;
@@ -1743,12 +1990,14 @@ pg_vault_tde_tam_init(void)
     memcpy(&tde_methods, heapam, sizeof(TableAmRoutine));
     /* --- Save originals for every read path we wrap --- */
     heapam_scan_getnextslot_cb              = heapam->scan_getnextslot;
+    heapam_scan_getnextslot_tidrange_cb     = heapam->scan_getnextslot_tidrange;
     heapam_index_fetch_tuple_cb             = heapam->index_fetch_tuple;
     heapam_scan_bitmap_next_tuple_cb        = heapam->scan_bitmap_next_tuple;
     heapam_scan_analyze_next_tuple_cb       = heapam->scan_analyze_next_tuple;
     heapam_scan_sample_next_tuple_cb        = heapam->scan_sample_next_tuple;
     heapam_tuple_fetch_row_version_cb       = heapam->tuple_fetch_row_version;
     heapam_tuple_lock_cb                    = heapam->tuple_lock;
+    heapam_tuple_satisfies_snapshot_cb      = heapam->tuple_satisfies_snapshot;
     heapam_tuple_delete_cb                  = heapam->tuple_delete;
     /* --- Install encrypt/decrypt wrappers --- */
     /* Slot type: always buffer-backed (needed for decode_slot cast) */
@@ -1761,13 +2010,17 @@ pg_vault_tde_tam_init(void)
     tde_methods.tuple_delete                = pg_vault_tde_tuple_delete;
     /* Read paths: delegate to heapam then decrypt the returned slot */
     tde_methods.scan_getnextslot            = pg_vault_tde_scan_getnextslot;
+    tde_methods.scan_getnextslot_tidrange   = pg_vault_tde_scan_getnextslot_tidrange;
     tde_methods.index_fetch_tuple           = pg_vault_tde_index_fetch_tuple;
     tde_methods.scan_bitmap_next_tuple      = pg_vault_tde_scan_bitmap_next_tuple;
     tde_methods.scan_analyze_next_tuple     = pg_vault_tde_scan_analyze_next_tuple;
     tde_methods.scan_sample_next_tuple      = pg_vault_tde_scan_sample_next_tuple;
     tde_methods.tuple_fetch_row_version     = pg_vault_tde_tuple_fetch_row_version;
     tde_methods.tuple_lock                  = pg_vault_tde_tuple_lock;
+    /* Visibility recheck (RI FK triggers): tolerate decrypted, unpinned slots */
+    tde_methods.tuple_satisfies_snapshot    = pg_vault_tde_tuple_satisfies_snapshot;
     /* Index build: bypass rd_tableam identity check inside heap_getnext */
+    tde_methods.index_validate_scan         = pg_vault_tde_index_validate_scan;
     tde_methods.index_build_range_scan      = pg_vault_tde_index_build_range_scan;
     tde_methods.relation_copy_for_cluster   = pg_vault_tde_relation_copy_for_cluster;
     /*
@@ -1817,12 +2070,11 @@ pg_vault_tde_get_tableam_routine(void)
  * path (re-encrypt with current DEK), without changing any column values.
  *
  * When used after key rotation with prev_dek fallback:
- *   1. rotate_key() saves old DEK → prev_dek
- *   2. set_test_dek() / vault_fetch_dek() sets new DEK
- *   3. reencrypt_table() reads old rows (fallback to prev_dek),
+ *   1. KMS provider replaces current DEK → prev_dek retained
+ *   2. reencrypt_table() reads old rows (fallback to prev_dek),
  *      writes new tuples (encrypted with current DEK), and
  *      rebuilds any tde_btree indexes (SIV keys are DEK-bound)
- *   4. clear_prev_dek() wipes old key material
+ *   3. KMS provider wipes prev_dek after re-encryption completes
  *
  * Why tde_btree indexes must be rebuilt:
  *   AES-256-SIV is deterministic under a fixed DEK: same plaintext + same DEK
@@ -2050,11 +2302,11 @@ pg_vault_tde_verify_integrity(PG_FUNCTION_ARGS)
  *   → (total_tuples bigint, encryption_overhead_bytes bigint)
  *
  * Reports the storage overhead imposed by TDE on the given table.
- * Each encrypted tuple carries TDE_GCM_OVERHEAD (28) bytes of overhead:
- * 12-byte IV + 16-byte GCM tag.  The total overhead is simply
- * total_tuples × 28.
+ * Each encrypted tuple carries TDE_V4_OVERHEAD (37) bytes of overhead:
+ * 1-byte version + 8-byte generation + 12-byte IV + 16-byte GCM tag.
+ * The total overhead is simply total_tuples × 37.
  *
- * Uses SPI to count live rows (which also validates readability).
+ * Uses direct api to count live rows (which also validates readability).
  */
 PG_FUNCTION_INFO_V1(pg_vault_tde_encrypted_size);
 PGDLLEXPORT Datum
@@ -2062,41 +2314,43 @@ pg_vault_tde_encrypted_size(PG_FUNCTION_ARGS)
 {
     Oid             relid = PG_GETARG_OID(0);
     char           *relname;
-    StringInfoData  cmd;
-    int             ret;
-    int64           total;
+    Relation        rel;
+    TupleTableSlot *slot;
+    TableScanDesc   scan;
+    int64           total = 0;
     TupleDesc       tupdesc;
     Datum           values[2];
     bool            nulls[2] = {false, false};
     HeapTuple       result_tup;
+
     if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
         ereport(ERROR,
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                  errmsg("function returning record called in context "
                         "that cannot accept type record")));
+
     tupdesc = BlessTupleDesc(tupdesc);
+
     relname = get_rel_name(relid);
     if (relname == NULL)
         ereport(ERROR,
                 (errcode(ERRCODE_UNDEFINED_TABLE),
                  errmsg("relation with OID %u does not exist", relid)));
-    SPI_connect();
-    initStringInfo(&cmd);
-    appendStringInfo(&cmd, "SELECT count(*) FROM %s", quote_identifier(relname));
-    ret = SPI_execute(cmd.data, true, 0);
-    if (ret != SPI_OK_SELECT)
-        ereport(ERROR,
-                (errcode(ERRCODE_INTERNAL_ERROR),
-                 errmsg("pg_vault_tde_encrypted_size: count query failed")));
-    {
-        bool isnull;
-        total = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
-                                            SPI_tuptable->tupdesc, 1, &isnull));
-    }
-    pfree(cmd.data);
-    SPI_finish();
+
+    rel = table_open(relid, AccessShareLock);
+    slot = table_slot_create(rel, NULL);
+    scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL);
+
+    while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+        total++;
+
+    table_endscan(scan);
+    ExecDropSingleTupleTableSlot(slot);
+    table_close(rel, AccessShareLock);
+
+    /* Each encrypted tuple carries TDE_V4_OVERHEAD bytes of overhead. */
     values[0] = Int64GetDatum(total);
-    values[1] = Int64GetDatum(total * (int64) TDE_GCM_OVERHEAD);
+    values[1] = Int64GetDatum(total * (int64) TDE_V4_OVERHEAD);
     result_tup = heap_form_tuple(tupdesc, values, nulls);
     PG_RETURN_DATUM(HeapTupleGetDatum(result_tup));
 }

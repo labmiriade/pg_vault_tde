@@ -1,0 +1,13 @@
+CLAUDE.md
+REFACTOR.md
+*.env*
+.vscode/
+.claude/
+AGENTS.md
+test/tap
+ONBOARDING.md
+tmp_pgext/
+PRODUCT_INFORMATION.md
+PRODUCT_INFORMATION.html
+dist/
+demo/

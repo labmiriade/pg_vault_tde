@@ -1,3 +1,27 @@
+postgresql-pg-vault-tde (1.7-1) unstable; urgency=medium
+
+  * v1.7: tde_btree access method — encrypted (AES-256-SIV) index keys for
+    bytea/text/int4/int8/numeric/uuid/date/timestamptz operator classes;
+    index-only scans disabled by design.
+  * KEK/DEK wrapping hierarchy: provider-agnostic wrap_dek/unwrap_dek/
+    rewrap_dek API; wrapped_dek is now the authoritative catalog column
+    for every KMS provider (Vault, wallet, PKCS#11).
+  * PKCS#11/HSM KMS provider: direct Cryptoki wrap/unwrap of DEKs
+    (CKM_AES_KEY_WRAP), versioned KEK objects, cross-backend rotation
+    propagation via shared memory. CI covered with SoftHSM2.
+  * Logical replication of encrypted_heap TOAST columns via a custom WAL
+    resource manager (pg_vault_tde.toast_custom_rmgr, off by default).
+  * Structured audit event logging (16 event types: DEK/KEK lifecycle,
+    wallet open/close, relation encrypt/decrypt, access denied, etc.)
+    to the server log for PCI-DSS/HIPAA trails.
+  * Physical backup key handling: pg_vault_tde_seal_keys()/unseal_keys(),
+    pg_basebackup_tde wrapper, and pg_restore_tde decrypt-and-pipe restore.
+  * All KMS GUCs promoted to PGC_SUSET for per-database KMS configuration
+    via ALTER DATABASE SET.
+  * 137 regression tests passing (52 v1.4 + 20 v1.5 + 38 v1.6 + 27 v1.7).
+
+ -- Miriade S.r.l. <info@miriade.it>  Mon, 08 Jun 2026 00:00:00 +0100
+
 postgresql-pg-vault-tde (1.6-1) unstable; urgency=medium
 
   * v1.6: Local PKCS#12 wallet KMS provider (offline/air-gapped support).
@@ -7,7 +31,7 @@ postgresql-pg-vault-tde (1.6-1) unstable; urgency=medium
   * Support for PostgreSQL 17 and 18 from a single source package.
   * 72 regression tests passing.
 
- -- Miriade Srl <info@miriade.it>  Tue, 04 Mar 2026 00:00:00 +0100
+ -- Miriade S.r.l. <info@miriade.it>  Tue, 04 Mar 2026 00:00:00 +0100
 
 postgresql-pg-vault-tde (1.0-1) unstable; urgency=medium
 
@@ -16,4 +40,4 @@ postgresql-pg-vault-tde (1.0-1) unstable; urgency=medium
   * Support for PostgreSQL 18.
   * All 24 regression tests pass, including page-checksum compatibility.
 
- -- Miriade Srl <info@miriade.it>  Fri, 27 Feb 2026 00:00:00 +0100
+ -- Miriade S.r.l. <info@miriade.it>  Fri, 27 Feb 2026 00:00:00 +0100

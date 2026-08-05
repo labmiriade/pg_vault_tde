@@ -129,26 +129,18 @@ SELECT val FROM test_nn_feature WHERE id = 1;
 DROP TABLE test_nn_feature;
 ```
 
-For key rotation tests, use SEPARATE tables per DEK generation:
+For per-table DEK isolation tests, create separate tables and verify each decrypts independently:
 
 ```sql
--- Create and populate with DEK-A
+-- Each table gets its own DEK at CREATE TABLE time
 CREATE TABLE test_dek_a (...) USING encrypted_heap;
-INSERT INTO test_dek_a ...;
-
--- Rotate
-SELECT pg_vault_tde_rotate_key();
-SELECT pg_vault_tde_set_test_dek();
-
--- Create new table with DEK-B
 CREATE TABLE test_dek_b (...) USING encrypted_heap;
+INSERT INTO test_dek_a ...;
 INSERT INTO test_dek_b ...;
 
--- DEK-B table should work
+-- Both tables should decrypt correctly and independently
+SELECT * FROM test_dek_a;  -- OK
 SELECT * FROM test_dek_b;  -- OK
-
--- DEK-A table should fail (GCM auth error)
-SELECT * FROM test_dek_a;  -- ERROR: GCM authentication failed
 ```
 
 ---
@@ -190,7 +182,6 @@ $node->append_conf('postgresql.conf', "shared_preload_libraries = 'pg_vault_tde'
 $node->start;
 
 $node->safe_psql('postgres', "CREATE EXTENSION pg_vault_tde;");
-$node->safe_psql('postgres', "SELECT pg_vault_tde_set_test_dek();");
 
 # ... test logic ...
 
@@ -207,7 +198,6 @@ Isolation specs live in `isolation/` and use the PostgreSQL isolation tester:
 # isolation/feature_name.spec
 setup {
     CREATE EXTENSION IF NOT EXISTS pg_vault_tde;
-    SELECT pg_vault_tde_set_test_dek();
 }
 
 teardown {
@@ -233,7 +223,8 @@ Arguments: `bash bench_tde.sh <row_count>`
 
 Workloads compared: INSERT, SELECT, UPDATE, index scan, TABLESAMPLE.
 Both `plain_heap` and `encrypted_heap` are tested. Use
-`pg_vault_tde.enabled = off` to isolate TAM overhead from crypto cost.
+`pg_vault_tde.enabled = off` (requires a server restart) to isolate TAM
+overhead from crypto cost.
 
 ---
 

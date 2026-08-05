@@ -1,7 +1,7 @@
 /*
  * pg_vault_tde_guc.h - GUC parameter extern declarations
  *
- * Copyright (c) 2026 Miriade Srl  
+ * Copyright (c) 2026 Miriade S.r.l.  
  * Licensed under the PostgreSQL License.
  *
  * All GUC variables are defined as static in pg_vault_tde.c and exposed
@@ -97,21 +97,28 @@ extern int         pg_vault_tde_token_renewal_interval;
  * -----------------------------------------------------------------------*/
 
 /*
- * KMS provider selector (PGC_POSTMASTER).
- * Valid values: "vault" (default), "local".
- * Future: "pkcs11" (v1.7), "kmip" (v1.8).
+ * KMS provider selector (PGC_SUSET, per-database via ALTER DATABASE SET).
+ * Valid values: "vault", "local", "pkcs11" (v1.7).
+ * Future: "kmip" (v1.8).
  * Controls which TdeKmsProvider vtable is loaded into
- * tde_active_kms_provider at startup.
+ * tde_active_kms_provider by the GUC assign hook.
  */
 extern char       *pg_vault_tde_kms_provider;
 
 /*
- * Local wallet path (PGC_POSTMASTER).
+ * Local wallet path (PGC_SUSET).
  * Absolute path to the PKCS#12 wallet file.
- * Default: $PGDATA/base/<DB_OID>/pg_vault_tde/wallet.p12 (resolved at runtime).
+ * Default: /var/lib/pg_vault_tde/<DB_OID>/wallet.p12 (resolved at runtime).
  * Used only when kms_provider = 'local'.
  */
 extern char       *pg_vault_tde_wallet_path;
+
+/*
+ * show_hook for pg_vault_tde.wallet_path.
+ * Returns the effective wallet path (computed default when GUC is empty).
+ * Registered in DefineCustomStringVariable so SHOW works immediately on connect.
+ */
+extern const char *wallet_path_show_hook(void);
 
 /*
  * Environment variable name that holds the wallet passphrase
@@ -131,7 +138,7 @@ extern bool        pg_vault_tde_wallet_auto_open;
 /*
  * Maximum number of independently-keyed encrypted_heap relations that may
  * be cached in shmem simultaneously (PGC_POSTMASTER, range 64–65536,
- * default 1024).  Determines the size of TdeRelDekCache at startup.
+ * default 1024).  Determines the size of the TdeRelDekMap HTAB at startup.
  */
 extern int         pg_vault_tde_max_encrypted_relations;
 
@@ -142,6 +149,15 @@ extern int         pg_vault_tde_max_encrypted_relations;
  * Set to false only for debugging or backward compatibility testing.
  */
 extern bool        pg_vault_tde_toast_encryption;
+
+/*
+ * Custom WAL resource manager for TOAST chunks (PGC_POSTMASTER, default: false).
+ * When true, encrypted TOAST chunks are WAL-logged under TDE_RMGR_ID so the
+ * logical decoder routes them away from the reorder buffer's toast_hash (see
+ * src/logical/pg_vault_tde_rmgr.c).  Requires the rmgr to be registered at
+ * preload time, hence PGC_POSTMASTER.
+ */
+extern bool        pg_vault_tde_toast_custom_rmgr;
 
 /* -----------------------------------------------------------------------
  * v1.6 GUCs — Flexible wallet passphrase ingestion
@@ -181,6 +197,58 @@ extern char       *pg_vault_tde_wallet_dev_mode_passphrase;
  * When true, ereport(WARNING) is emitted on every dev-mode passphrase use.
  */
 extern bool        pg_vault_tde_dev_mode;
+
+/* -----------------------------------------------------------------------
+ * v1.7 GUCs — PKCS#11 / HSM provider
+ * -----------------------------------------------------------------------*/
+
+/*
+ * Absolute path to the vendor PKCS#11 module (PGC_SUSET).
+ * dlopen()ed lazily per backend; never loaded in the postmaster because
+ * PKCS#11 state does not survive fork().
+ * Used only when kms_provider = 'pkcs11'.
+ */
+extern char       *pg_vault_tde_pkcs11_library;
+
+/*
+ * Token label for slot discovery (PGC_SUSET).
+ * Preferred over pkcs11_slot_id: slot IDs are not stable across restarts
+ * on some modules (SoftHSM2 randomizes them per token).
+ */
+extern char       *pg_vault_tde_pkcs11_token_label;
+
+/*
+ * Explicit slot ID, used only when pkcs11_token_label is empty
+ * (PGC_SUSET, default -1 = unset).
+ */
+extern int         pg_vault_tde_pkcs11_slot_id;
+
+/*
+ * Environment variable NAME that holds the token user PIN (PGC_SUSET).
+ * NEVER the PIN itself — same rule as wallet_passphrase_env.
+ * Default: "PG_TDE_PKCS11_PIN".
+ */
+extern char       *pg_vault_tde_pkcs11_pin_env;
+
+/*
+ * CKA_LABEL of the AES-256 KEK object on the token (PGC_SUSET).
+ * Default: "pg_vault_tde_kek".
+ */
+extern char       *pg_vault_tde_pkcs11_key_label;
+
+/*
+ * Opt-in relaxation of the encrypted_heap index AM whitelist (PGC_SUSET,
+ * default false).  When false (default), CREATE INDEX / CREATE UNIQUE INDEX
+ * with a non-whitelisted access method (i.e. anything other than tde_btree)
+ * on an encrypted_heap table is rejected with ERROR, because the indexed
+ * column's plaintext value would be stored unencrypted on disk.  When true,
+ * the same statement is allowed to proceed after emitting a WARNING.  Does
+ * NOT affect PRIMARY KEY / UNIQUE table constraints, which PostgreSQL core
+ * always backs with a native (unencrypted) btree index regardless of this
+ * setting — that case already always warns-and-allows (see
+ * tde_process_utility_hook).
+ */
+extern bool        pg_vault_tde_allow_plaintext_index;
 
 extern char*       pg_vault_tde_extension_name;
 

@@ -1,5 +1,5 @@
 # pg_vault_tde.control
 comment = 'Transparent Data Encryption (TDE) for PostgreSQL 17+'
-default_version = '1.6'
+default_version = '1.7'
 relocatable = false
 module_pathname = '$libdir/pg_vault_tde'
