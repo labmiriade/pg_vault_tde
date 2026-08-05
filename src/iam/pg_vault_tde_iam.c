@@ -1,7 +1,7 @@
 /*
  * pg_vault_tde_iam.c - Index Access Method (IAM) handler for pg_vault_tde
  *
- * Copyright (c) 2026 Miriade Srl  
+ * Copyright (c) 2026 Miriade S.r.l.  
  * Licensed under the PostgreSQL License.
  *
  * DESIGN RATIONALE:

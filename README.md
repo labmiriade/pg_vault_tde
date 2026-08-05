@@ -1,7 +1,6 @@
 # pg_vault_tde
 
-**Transparent Data Encryption (TDE) for PostgreSQL 17+** — plug-and-play,
-zero core modifications.
+**Transparent Data Encryption (TDE) for PostgreSQL 17+** — Open-source (PostgreSQL License), plug-and-play, zero core modifications.
 
 pg_vault_tde encrypts every tuple with **AES-256-GCM** at the Table Access
 Method layer. Data is encrypted before it reaches the storage manager and
@@ -11,9 +10,16 @@ automatic rotation.
 
 **Current release: v1.7** — 109 regression tests (52 v1.4 + 20 v1.5 + 37 v1.6), zero compiler warnings on PG 17 + PG 18.
 
-### Professional Support
+### Commercial Support
 
+Looking for professional support for `pg_vault_tde` in production? As Miriade we offer dedicated enterprise services, including:
 
+* **24/7 Production Support & SLA Guarantees**
+* **Custom Feature Development & Vault Integration**
+* **Performance Tuning & Security Audits**
+* **Managed Setup & Migration Assistance**
+
+Contact our engineering team at [marketing@miriade.it](mailto:marketing@miriade.it ) to discuss your requirements.
 
 ### PostgreSQL Version Compatibility
 

@@ -46,7 +46,7 @@
 #   bash packaging/build_in_container.sh --all
 #       → dist/ with all four packages (deb+rpm × pg17+pg18)
 #
-# Copyright (c) 2026 Miriade Srl — PostgreSQL License
+# Copyright (c) 2026 Miriade S.r.l. — PostgreSQL License
 
 set -euo pipefail
 cd "$(dirname "$0")/.."   # project root

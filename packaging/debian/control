@@ -1,7 +1,7 @@
 Source: postgresql-pg-vault-tde
 Section: database
 Priority: optional
-Maintainer: Miriade Srl <info@miriade.it>
+Maintainer: Miriade S.r.l. <info@miriade.it>
 Build-Depends:
  debhelper-compat (= 13),
  postgresql-server-dev-18,

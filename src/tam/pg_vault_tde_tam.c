@@ -13,7 +13,7 @@
  * Overhead vs. plain heap: TDE_V4_OVERHEAD (37) bytes/tuple. IV-first disables
  * HOT on encrypted tables but keeps tde_btree coherent.
  *
- * Copyright (c) 2026 Miriade Srl  
+ * Copyright (c) 2026 Miriade S.r.l.  
  * Licensed under the PostgreSQL License.
  */
 #include "postgres.h"

@@ -1,7 +1,7 @@
 /*
  * pg_restore_tde.c - TDE-encrypted logical backup restore utility
  *
- * Copyright (c) 2026 Miriade Srl
+ * Copyright (c) 2026 Miriade S.r.l.
  * Licensed under the PostgreSQL License.
  *
  * Mirrors pg_dump_tde: reads a file produced by pg_dump_tde, validates the
