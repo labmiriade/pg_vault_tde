@@ -55,6 +55,11 @@ All other `pg_dump`/`pg_restore` options are forwarded through. Internally:
    PKCS#11-backed databases instead.
 7. Running plain `pg_dump` against a pg_vault_tde database still produces a
    plaintext backup — this is expected (see above), not a bug in `pg_dump`.
+   The same is true of a manual `COPY <table> TO ...`: encryption lives in the
+   table access method's read callbacks, which can't distinguish a `COPY TO`
+   from a `SELECT`. No `WARNING` is emitted in either case today — a
+   GUC-gated warning was designed but never implemented (see
+   [Known Limitations and Troubleshooting](Known-Limitations-and-Troubleshooting), item 12).
 
 ## Physical Backups: `pg_basebackup`
 

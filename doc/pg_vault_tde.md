@@ -919,8 +919,9 @@ where the `softhsm2` package is installed; it skips itself otherwise.
 | 5 | **All-or-nothing table encryption** — no per-column granularity | v1.8 |
 | 6 | **Range scans on tde_btree** — `WHERE col > x` returns empty (AES-SIV not order-preserving) | By design, permanent |
 | 7 | **BRIN on encrypted columns** — min/max of AES-SIV ciphertexts is meaningless | By design, permanent |
-| 8 | **HOT updates disabled** — `heap_update` reject to use HOT updates because the wire format portion considerd by TupDesc for the comparison between old and new tuple is non-deterministic aka changes at every encryption | v1.8 ⚠️ |
+| 8 | **HOT updates disabled** — `heap_update` reject to use HOT updates because the wire format portion considerd by TupDesc for the comparison between old and new tuple is non-deterministic aka changes at every encryption | By design, permanent |
 | 9 | **`WITH HOLD` cursor plaintext temp file** — a held cursor's result set is materialized into a tuplestore at `COMMIT` and spills to a plain temp file on disk past `work_mem`, bypassing the TAM entirely; no extension hook exists anywhere in the `WITH HOLD` cursor lifecycle to intercept it. See README.md § Limitations item 6. | Permanently deferred |
+| 10 | **Plain `COPY <table> TO` / `pg_dump` produce a plaintext dump, with no warning** — encryption lives entirely in the TAM's read callbacks (`scan_getnextslot` and friends), which decrypt unconditionally and cannot distinguish a `COPY TO` from a `SELECT`; `pg_dump`'s default table-data path is exactly this form of `COPY`. No `ProcessUtility_hook` guard or GUC-gated `WARNING` exists yet (designed, never implemented). Use `pg_dump_tde`/`pg_restore_tde` instead. See README.md § Limitations item 10. | v1.8 |
 
 ### HOT updates are disabled by design (v4 IV-first wire format)
 
@@ -1381,9 +1382,8 @@ See [ROADMAP.md](ROADMAP.md) for the full release roadmap.
 | **v1.4** | CI/CD + tde_btree + Wire Format v2 | ✅ Completed | 52 |
 | **v1.5** | Per-Table DEK + Online Rotation + AAD | ✅ Completed | 72 |
 | **v1.6** | Local Wallet KMS (production-ready) | ✅ Completed | 109 |
-| **v1.7** | Per-database KMS + pg_restore_tde + PGC_SUSET + enc_ops indexes | 🔄 Current | 127 |
-| **v1.8** | TOAST Chunks + HSM + Audit | 📋 Q4 2027 | ~100 |
-| **v1.9** | KMIP + Column-Level + HA | 📋 Q2 2028 | ~130 |
+| **v1.7** | Per-database KMS + pg_restore_tde + PGC_SUSET + enc_ops indexes | 🔄 Current | 109 |
+| **v1.8** | KMIP + Column-Level + GIN/Hash/GiST/BRIN + HA + Dual-Control | 📋 Q2 2027 | ~130 |
 
 ### Permanent Deferrals
 
@@ -1402,7 +1402,7 @@ This extension follows PostgreSQL's BSD-derived coding style and
 `pgindent` formatting conventions. All contributions must:
 
 - Pass `make` with `-Wall -Wextra` and zero warnings
-- Pass the full 127-test regression suite (`make ci-regress`)
+- Pass the full 109-test regression suite (`make ci-regress`)
 - Pass the page checksum compatibility test (`make ci-checksums`)
 - Use `palloc` / `pfree` exclusively (never `malloc` / `free`)
 - Use `ereport` / `elog` exclusively (never `printf` / `exit`)

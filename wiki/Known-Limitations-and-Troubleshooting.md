@@ -15,6 +15,7 @@
 | 9 | **`WITH HOLD` cursor temp-file spill is unencrypted** | Permanently deferred — see below |
 | 10 | **PKCS#11 provider unsupported by `pg_dump_tde`/`pg_restore_tde`** | Planned; use `pg_basebackup_tde` meanwhile |
 | 11 | **`CREATE INDEX USING <non-tde_btree>` on `encrypted_heap` is rejected by default** — `btree`, `gin`, `gist`, `hash`, `brin` all store the key unencrypted | Escape hatch: `pg_vault_tde.allow_plaintext_index = on` (see below); real encryption planned (v1.8, item 5) |
+| 12 | **Plain `COPY <table> TO` / `pg_dump` produce a plaintext dump, with no warning** — encryption lives entirely in the table access method's read callbacks, which decrypt unconditionally and can't distinguish a `COPY TO` from a `SELECT`; `pg_dump`'s default table-data path is exactly this form of `COPY` | Use `pg_dump_tde`/`pg_restore_tde` instead — see [Backup and Restore](Backup-and-Restore); a GUC-gated `WARNING` was designed but never implemented (planned v1.8) |
 
 ### `WITH HOLD` Cursor Plaintext Spill — Read Before Relying on Held Cursors
 
