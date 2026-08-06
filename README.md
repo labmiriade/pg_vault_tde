@@ -822,21 +822,25 @@ Choose the base OS image for the build container:
 bash packaging/build_in_container.sh --os-version ubuntu:22.04   # default (Jammy LTS)
 bash packaging/build_in_container.sh --os-version ubuntu:24.04   # Noble LTS
 bash packaging/build_in_container.sh --os-version debian:12      # Bookworm
-bash packaging/build_in_container.sh --os-version debian:11      # Bullseye
+bash packaging/build_in_container.sh --os-version debian:13      # Trixie
 
 # RPM — Rocky Linux or AlmaLinux (EL-compatible)
 bash packaging/build_in_container.sh --format rpm --os-version rockylinux:9   # default (EL9)
-bash packaging/build_in_container.sh --format rpm --os-version rockylinux:8   # EL8
+bash packaging/build_in_container.sh --format rpm --os-version rockylinux:10  # EL10
 bash packaging/build_in_container.sh --format rpm --os-version almalinux:9    # EL9 (AlmaLinux)
-bash packaging/build_in_container.sh --format rpm --os-version almalinux:8    # EL8 (AlmaLinux)
+bash packaging/build_in_container.sh --format rpm --os-version almalinux:10   # EL10 (AlmaLinux)
 ```
+
+OpenSSL 3.x is required (the KMS layer uses `EVP_EncryptInit_ex2`/AES-256-WRAP
+key wrapping, added in OpenSSL 3.0), so OSes that only ship OpenSSL 1.1.1 —
+Debian 11 (Bullseye) and EL8 (Rocky/AlmaLinux 8) — are not supported.
 
 Options compose freely:
 
 ```bash
-# RPM for PG17 on Rocky Linux 8
+# RPM for PG17 on Rocky Linux 9
 bash packaging/build_in_container.sh \
-    --format rpm --pg-version 17 --os-version rockylinux:8
+    --format rpm --pg-version 17 --os-version rockylinux:9
 
 # DEB for PG18 on Debian 12
 bash packaging/build_in_container.sh --os-version debian:12

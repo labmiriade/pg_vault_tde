@@ -15,10 +15,13 @@
 #   --os-version VERSION      OS base image for the build container:
 #                               DEB:  ubuntu:26.04 (default),
 #                                     ubuntu:22.04, ubuntu:24.04,
-#                                     debian:12, debian:11
+#                                     debian:13, debian:12
 #                               RPM:  rockylinux:10 (default),
-#                                     rockylinux:9, rockylinux:8,
-#                                     almalinux:9, almalinux:8
+#                                     rockylinux:9, almalinux:10, almalinux:9
+#                             OpenSSL 3.x is required (EVP_EncryptInit_ex2 /
+#                             EVP_aes_256_wrap AEAD-KW path) — OSes shipping
+#                             only OpenSSL 1.1.1 (Debian 11, EL8) are not
+#                             supported.
 #   --all                     Build all combinations: deb+rpm × pg17+pg18
 #                             (uses default OS versions)
 #   --output-dir DIR          Where to copy finished packages  (default: ./dist)
@@ -40,8 +43,8 @@
 #   bash packaging/build_in_container.sh --os-version ubuntu:24.04
 #       → DEB PG18 built on Ubuntu 24.04 Noble
 #
-#   bash packaging/build_in_container.sh --format rpm --os-version rockylinux:8 --pg-version 17
-#       → RPM PG17 built on Rocky Linux 8 (EL8)
+#   bash packaging/build_in_container.sh --format rpm --os-version rockylinux:9 --pg-version 17
+#       → RPM PG17 built on Rocky Linux 9 (EL9)
 #
 #   bash packaging/build_in_container.sh --all
 #       → dist/ with all four packages (deb+rpm × pg17+pg18)
@@ -127,8 +130,10 @@ fi
 # ---------------------------------------------------------------------------
 # OS version validation and defaults
 # ---------------------------------------------------------------------------
-VALID_DEB_OS=("ubuntu:22.04" "ubuntu:24.04" "ubuntu:26.04" "debian:13" "debian:12" "debian:11")
-VALID_RPM_OS=("rockylinux:10" "rockylinux:9" "rockylinux:8" "almalinux:10" "almalinux:9" "almalinux:8")
+# OpenSSL 3.x only — Debian 11 and EL8 (Rocky/Alma 8) ship OpenSSL 1.1.1,
+# which lacks EVP_EncryptInit_ex2/EVP_DecryptInit_ex2, and are not supported.
+VALID_DEB_OS=("ubuntu:22.04" "ubuntu:24.04" "ubuntu:26.04" "debian:13" "debian:12")
+VALID_RPM_OS=("rockylinux:10" "rockylinux:9" "almalinux:10" "almalinux:9")
 
 # Set format defaults
 DEB_OS_IMAGE="ubuntu:26.04"
@@ -188,14 +193,13 @@ OUTPUT_DIR="$(realpath "$OUTPUT_DIR")"
 
 # ---------------------------------------------------------------------------
 # Helper: derive the EL version number from an RPM OS image name.
-# Used to construct the correct PGDG repo URL (EL-8 vs EL-9).
+# Used to construct the correct PGDG repo URL (EL-9 vs EL-10).
 # ---------------------------------------------------------------------------
 _el_version_from_image() {
     local img="$1"
     case "$img" in
         rockylinux:10|almalinux:10) echo "10" ;;
         rockylinux:9|almalinux:9) echo "9" ;;
-        rockylinux:8|almalinux:8) echo "8" ;;
         *) echo "9" ;;
     esac
 }
