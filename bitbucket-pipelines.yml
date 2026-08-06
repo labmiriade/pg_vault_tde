@@ -140,6 +140,39 @@ definitions:
               git push github --force "refs/tags/$BITBUCKET_TAG:refs/tags/$TARGET_REF"
             fi
 
+    - step: &wiki-synchronization
+        # Sincronizza wiki/ con la GitHub Wiki, che GitHub espone come repo separato
+        # (<repo>.wiki.git), non raggiunto dal mirror del codice sopra.
+        # A differenza del mirror del codice qui non si preserva la storia: wiki/ nel
+        # branch è la fonte di verità, quindi ad ogni run si sovrascrive il contenuto
+        # del repo wiki e si committa/pusha solo se qualcosa è effettivamente cambiato.
+        # Prerequisito una tantum: abilitare la Wiki dai Settings del repo GitHub
+        # (altrimenti <repo>.wiki.git non esiste e il clone fallisce).
+        name: GitHub Wiki Synchronization
+        condition:
+          changesets:
+            includePaths:
+              - "wiki/**"
+        script:
+          - apt-get update -qq
+          - apt-get install -y --no-install-recommends git openssh-client ca-certificates
+          - export GITHUB_WIKI_REPO_URL="${GITHUB_REPO_URL%.git}.wiki.git"
+          - git clone --depth 1 "$GITHUB_WIKI_REPO_URL" /tmp/wiki-sync
+          # Ripulisce il clone (tranne .git) e ci copia sopra il contenuto corrente di wiki/,
+          # così il repo wiki riflette esattamente wiki/ nel branch appena sincronizzato.
+          - find /tmp/wiki-sync -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+          - cp wiki/*.md /tmp/wiki-sync/
+          - cd /tmp/wiki-sync
+          - git add -A
+          - |
+            if git diff --cached --quiet; then
+              echo "Wiki invariata, nessun push necessario."
+            else
+              git -c user.name="Bitbucket Pipelines" -c user.email="pipelines@miriade.it" \
+                commit -m "Sync wiki from ${BITBUCKET_COMMIT:0:12}"
+              git push origin HEAD:master
+            fi
+
 
 pipelines:
   branches:
@@ -150,18 +183,21 @@ pipelines:
       # - step: *package
       # - step: *inspect-artifacts
       - step: *github-synchronization
+      - step: *wiki-synchronization
 
     develop:
       - parallel:
           - step: *test-pg-17
           - step: *test-pg-18
       - step: *github-synchronization
+      - step: *wiki-synchronization
 
     master:
       - parallel:
           - step: *test-pg-17
           - step: *test-pg-18
       - step: *github-synchronization
+      - step: *wiki-synchronization
 
   tags:
     'v*':
