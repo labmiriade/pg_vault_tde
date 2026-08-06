@@ -102,7 +102,12 @@ definitions:
               export FILTER_REFS=""
             else
               echo "Esclusi $(echo "$OLD_COMMITS" | wc -l) commit precedenti a $GITHUB_HISTORY_SINCE (per data di commit propria)."
-              export FILTER_REFS="HEAD --not $OLD_COMMITS"
+              # "--not" non è utilizzabile qui: l'nargs='+' di argparse in git-filter-repo
+              # interrompe la raccolta dei valori di --refs al primo token che inizia per "-",
+              # quindi "--not" verrebbe scartato come opzione non riconosciuta ("unrecognized
+              # arguments"). Il prefisso "^<rev>" ha la stessa semantica di "--not <rev>" per una
+              # singola revisione ma non inizia per "-", quindi resta un valore valido per --refs.
+              export FILTER_REFS="HEAD $(echo "$OLD_COMMITS" | sed 's/^/^/')"
             fi
           # Riscrive la storia rimuovendo i path interni e troncandola a GITHUB_HISTORY_SINCE,
           # mantenendo autori/messaggi/date reali per i commit inclusi.
@@ -111,11 +116,11 @@ definitions:
           # commit-map persistito.
           - |
             if [ -n "$FILTER_REFS" ]; then
-              # $FILTER_REFS is intentionally unquoted: git-filter-repo forwards --refs to
-              # `git rev-list` as separate arguments (one per excluded hash). Quoting it keeps
-              # the embedded newlines from OLD_COMMITS, so it collapses into a single argument
-              # that git can't resolve as a revision and then fails to stat as a path
-              # ("File name too long") once there are enough excluded commits.
+              # $FILTER_REFS is intentionally unquoted: --refs (argparse nargs='+') needs "HEAD"
+              # and each "^hash" as separate argv tokens. Quoting it would keep the embedded
+              # newlines from OLD_COMMITS, collapsing everything into a single argument that git
+              # can't resolve as a revision and then fails to stat as a path ("File name too
+              # long") once there are enough excluded commits.
               # shellcheck disable=SC2086
               git filter-repo --force --invert-paths \
                 --path ci \
