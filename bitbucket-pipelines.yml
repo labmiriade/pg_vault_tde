@@ -86,23 +86,23 @@ definitions:
               export TARGET_REF="$BITBUCKET_BRANCH"
             fi
             echo "Sync -> $TARGET_TYPE $TARGET_REF"
-          # Individua il commit più vecchio non anteriore a GITHUB_HISTORY_SINCE: diventerà la
-          # nuova radice della storia pubblicata. Fissa e nel passato, GITHUB_HISTORY_SINCE
-          # risolve sempre allo stesso commit tra un'esecuzione e l'altra.
+          # Esclude ogni commit precedente a GITHUB_HISTORY_SINCE in base alla propria data di
+          # commit, non in base alla posizione nel grafo: su rami non lineari (merge, PR,
+          # merge da/verso altri branch) un taglio basato sul solo primo genitore del commit più
+          # vecchio lascerebbe entrare storia più vecchia arrivata da un altro genitore del merge.
+          # Deterministico: a parità di storia sorgente e di cutoff produce sempre lo stesso
+          # insieme di commit esclusi, quindi il push verso GitHub resta un fast-forward.
           - |
             export GITHUB_HISTORY_SINCE="${GITHUB_HISTORY_SINCE:-2026-07-01}"
-            CUTOFF_COMMIT=$(git log --since="$GITHUB_HISTORY_SINCE" --reverse --format=%H | head -1)
-            if [ -z "$CUTOFF_COMMIT" ]; then
-              echo "Nessun commit da $GITHUB_HISTORY_SINCE in poi su questo ref, sincronizzo l'intera storia disponibile."
+            CUTOFF_TS=$(date -d "$GITHUB_HISTORY_SINCE" +%s)
+            OLD_COMMITS=$(git rev-list HEAD --pretty='format:%H %ct' | grep -v '^commit' \
+              | awk -v c="$CUTOFF_TS" '$2 < c {print $1}')
+            if [ -z "$OLD_COMMITS" ]; then
+              echo "Nessun commit precedente a $GITHUB_HISTORY_SINCE su questo ref, sincronizzo l'intera storia disponibile."
               export FILTER_REFS=""
             else
-              echo "Storia pubblicata a partire da: $(git show -s --format='%h %ad %s' --date=short "$CUTOFF_COMMIT")"
-              PARENT_COMMIT=$(git rev-parse "${CUTOFF_COMMIT}^" 2>/dev/null || true)
-              if [ -n "$PARENT_COMMIT" ]; then
-                export FILTER_REFS="${PARENT_COMMIT}..HEAD"
-              else
-                export FILTER_REFS=""
-              fi
+              echo "Esclusi $(echo "$OLD_COMMITS" | wc -l) commit precedenti a $GITHUB_HISTORY_SINCE (per data di commit propria)."
+              export FILTER_REFS="HEAD --not $OLD_COMMITS"
             fi
           # Riscrive la storia rimuovendo i path interni e troncandola a GITHUB_HISTORY_SINCE,
           # mantenendo autori/messaggi/date reali per i commit inclusi.
