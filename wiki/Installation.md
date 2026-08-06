@@ -15,6 +15,11 @@ server start, and it links against OpenSSL 3.x and libcurl.
 | libcurl | Required for the HashiCorp Vault / OpenBao provider |
 | CPU | Any x86-64 or AArch64 — AES hardware acceleration (AES-NI/VAES/ARM CE/SVE2) is automatic via OpenSSL on every build; see [Performance and Tuning](Performance-and-Tuning) |
 
+OpenSSL 3.x is required (the KMS layer uses `EVP_EncryptInit_ex2`/AES-256-WRAP
+key wrapping, added in OpenSSL 3.0), so OSes that only ship OpenSSL 1.1.1 —
+Debian 11 (Bullseye) and EL8 (Rocky/AlmaLinux 8) — are not supported.
+
+
 ## Option A — Install From Package (Recommended)
 
 Pre-built DEB and RPM packages are produced for both PostgreSQL 17 and 18.
