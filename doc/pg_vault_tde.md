@@ -738,6 +738,29 @@ The lever that does exist is a **custom WAL resource manager**, gated by the GUC
    pointers into in-memory indirect pointers — a faithful analogue of core's
    `ReorderBufferToastReplace()`. `pgoutput` then serializes the full plaintext.
 
+### Server configuration
+
+PostgreSQL 17.11 / 18.x — and the matching minors of the older back branches —
+only load a library as a logical decoding output plugin if it is listed in the
+`output_plugin_libraries` GUC (default `pgoutput, test_decoding`). On those
+versions the publisher must be told to accept this plugin, otherwise slot
+creation fails with:
+
+```
+ERROR:  library "pg_vault_tde" may not be used as an output plugin
+HINT:   ... add it to "output_plugin_libraries" and reload the server configuration.
+```
+
+```conf
+# postgresql.conf on the publisher (PGC_SUSET — a reload is enough)
+output_plugin_libraries = 'pgoutput, pg_vault_tde'
+```
+
+It must be set in the server configuration, not in a session: the process that
+loads the plugin is the walsender, not the client backend. Earlier minors have
+no such GUC — and an unrecognised parameter in `postgresql.conf` is fatal at
+startup — so add the line only where `pg_settings` reports it.
+
 ### Requirements and supported operations
 
 | Operation | Requirement |

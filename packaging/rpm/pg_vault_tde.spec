@@ -105,6 +105,14 @@ chrpath -d %{buildroot}%{pginstdir}/lib/%{sname}.so
   byte-identical. Nothing is lost and reinstalling 1.7.0 restores access, but
   the export must be taken BEFORE this package is installed. See
   "Upgrading to 1.7.1" in README.md for the preflight query and procedure
+- COMPATIBILITY NOTE (not a change in this release): PostgreSQL 17.11, 18.x and
+  the matching minors of the older back branches only load a library named as a
+  logical decoding output plugin if it is listed in the output_plugin_libraries
+  GUC (default "pgoutput, test_decoding"); slot creation otherwise fails with
+  'library "pg_vault_tde" may not be used as an output plugin'. Publishers
+  replicating encrypted_heap tables need
+  output_plugin_libraries = 'pgoutput, pg_vault_tde' in postgresql.conf plus a
+  reload. Earlier minors have no such GUC and must not carry the line
 
 * Mon Jun 08 2026 Miriade S.r.l. <info@miriade.it> - 1.7-1
 - v1.7: tde_btree access method — encrypted (AES-256-SIV) index keys for
