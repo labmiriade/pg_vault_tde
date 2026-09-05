@@ -31,6 +31,8 @@ definitions:
           # Run test
           - export PG_VERSION=17
           - bash ci/scripts/run-all.sh $TEST_RUNALL_OPTIONS
+        artifacts:
+          - test/tap/**
 
     - step: &test-pg-18
         name: Testing — PostgreSQL 18
@@ -46,6 +48,8 @@ definitions:
           # Run test
           - export PG_VERSION=18
           - bash ci/scripts/run-all.sh $TEST_RUNALL_OPTIONS
+        artifacts:
+          - test/tap/**
 
     - step: &package
         name: Build and Package Artifacts

@@ -285,9 +285,8 @@ bindir := $(shell $(PG_CONFIG) --bindir)
 
 .PHONY: install-pg-dump-tde
 install-pg-dump-tde: pg_dump_tde pg_restore_tde pg_basebackup_tde
-	install -m 755 pg_dump_tde $(bindir)/pg_dump_tde
-	install -m 755 pg_restore_tde $(bindir)/pg_restore_tde
-	install -m 755 pg_basebackup_tde $(bindir)/pg_basebackup_tde
+	install -d $(DESTDIR)$(bindir)
+	install -m 755 pg_dump_tde pg_restore_tde pg_basebackup_tde $(DESTDIR)$(bindir)/
 
 install: install-pg-dump-tde
 

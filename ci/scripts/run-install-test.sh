@@ -250,7 +250,9 @@ apt-get install -y -q \
 
 # ── Build package from source ──────────────────────────────────────────
 echo '--- Building DEB ---'
-cp -r /src /build && cd /build
+mkdir -p /build
+tar -C /src --exclude=./.git --exclude=./test/tap --exclude=./ci/docker-data -cf - . | tar -C /build -xf -
+cd /build
 bash packaging/build_deb.sh --no-sign --pg-version ${pg}
 DEB=\$(ls /build/../postgresql-${pg}-pg-vault-tde_*.deb | head -1)
 echo \"Built: \$(basename \$DEB)\"
@@ -259,6 +261,12 @@ echo \"Built: \$(basename \$DEB)\"
 echo '--- Installing DEB ---'
 dpkg -i \"\$DEB\"
 apt-get install -f -y -q 2>/dev/null || true   # resolve any deps
+
+echo '--- Checking frontend binaries ---'
+for b in pg_dump_tde pg_restore_tde pg_basebackup_tde; do
+    test -x /usr/lib/postgresql/${pg}/bin/\$b \
+        || { echo \"MISSING BINARY: \$b\"; exit 1; }
+done
 
 # ── Create wallet base directory ──────────────────────────────────────
 mkdir -p /var/lib/pg_vault_tde
@@ -314,7 +322,9 @@ dnf install -y -q \
 # ── Build RPM from source ──────────────────────────────────────────────
 echo '--- Building RPM ---'
 export PATH=\"/usr/pgsql-${pg}/bin:\$PATH\"
-cp -r /src /build && cd /build
+mkdir -p /build
+tar -C /src --exclude=./.git --exclude=./test/tap --exclude=./ci/docker-data -cf - . | tar -C /build -xf -
+cd /build
 bash packaging/build_rpm.sh --pg-version ${pg}
 RPM=\$(find ~/rpmbuild/RPMS -name \"postgresql${pg}-pg_vault_tde-*.rpm\" \
            ! -name '*debuginfo*' ! -name '*debugsource*' | head -1)
@@ -323,6 +333,12 @@ echo \"Built: \$(basename \$RPM)\"
 # ── Install RPM ────────────────────────────────────────────────────────
 echo '--- Installing RPM ---'
 dnf install -y -q \"\$RPM\"
+
+echo '--- Checking frontend binaries ---'
+for b in pg_dump_tde pg_restore_tde pg_basebackup_tde; do
+    test -x ${PGBIN}/\$b \
+        || { echo \"MISSING BINARY: \$b\"; exit 1; }
+done
 
 # ── Create wallet base directory ──────────────────────────────────────
 mkdir -p /var/lib/pg_vault_tde
