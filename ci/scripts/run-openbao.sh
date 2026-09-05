@@ -41,6 +41,16 @@ source "$SCRIPT_DIR/lib.sh"
 
 if [ -n "${BITBUCKET_CLONE_DIR:-}" ]; then
     COMPOSE_FILE="$CI_DIR/compose-openbao-bitbucket.yml"
+    # This compose file uses bind mounts where the local one uses named
+    # volumes.  A fresh named volume inherits owner/mode from the image path;
+    # a missing bind source is created by the daemon as root:root 0755.  The
+    # openbao image runs as uid 100 and must write its Raft storage there, so
+    # pre-create the directories with that owner or every node dies at boot.
+    mkdir -p "$CI_DIR"/docker-data/bao-1-file \
+             "$CI_DIR"/docker-data/bao-2-file \
+             "$CI_DIR"/docker-data/bao-3-file \
+             "$CI_DIR"/docker-data/bao-init-data
+    chown -R 100:1000 "$CI_DIR"/docker-data
 else
     COMPOSE_FILE="$CI_DIR/compose-openbao.yml"
 fi
@@ -132,6 +142,11 @@ for i in $(seq 1 "$STARTUP_TIMEOUT"); do
     fi
     if [[ "$i" -eq "$STARTUP_TIMEOUT" ]]; then
         log_error "Timed out waiting for bao-1 (${STARTUP_TIMEOUT}s)"
+        $COMPOSE_CMD -f "$COMPOSE_FILE" ps 2>&1 || true
+        for n in bao-1 bao-2 bao-3; do
+            echo "--- $n (last 50 log lines) ---"
+            $RT logs --tail 50 "$n" 2>&1 || true
+        done
         exit 5
     fi
     sleep 1

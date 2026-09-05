@@ -74,6 +74,9 @@ chrpath -d %{buildroot}%{pginstdir}/lib/%{sname}.so
 %license LICENSE
 %doc doc/pg_vault_tde.md README.md
 %{pginstdir}/lib/%{sname}.so
+%{pginstdir}/bin/pg_dump_tde
+%{pginstdir}/bin/pg_restore_tde
+%{pginstdir}/bin/pg_basebackup_tde
 %{pginstdir}/share/extension/%{sname}.control
 %{pginstdir}/share/extension/%{sname}--*.sql
 %{pginstdir}/lib/bitcode/%{sname}*
