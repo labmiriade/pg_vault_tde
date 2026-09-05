@@ -77,6 +77,11 @@ $RT cp "$REPO_ROOT/tap/." "$CONTAINER:/test/tap/"
 log_info "Running TAP tests with prove ..."
 START=$(timer_start)
 
+# Tee prove's output: the failure branch needs the "Test Summary Report" to know
+# which test files failed.
+PROVE_OUT=$(mktemp)
+trap 'rm -f "$PROVE_OUT"; cleanup' EXIT
+
 if $RT exec -u postgres "$CONTAINER" bash -c '
     PGV=$(pg_config --version | awk "{print \$2}" | cut -d. -f1)
     export PATH="/usr/lib/postgresql/${PGV}/bin:$PATH"
@@ -85,13 +90,29 @@ if $RT exec -u postgres "$CONTAINER" bash -c '
     export PG_REGRESS="/usr/lib/postgresql/${PGV}/lib/pgxs/src/test/regress/pg_regress"
     cd /test
     prove -v --failures tap/*.t 
-'; then
+' 2>&1 | tee "$PROVE_OUT"; then
     ELAPSED=$(timer_elapsed "$START")
     log_ok "TAP: ALL TESTS PASSED ($(timer_fmt "$ELAPSED"))"
     exit 0
 else
     ELAPSED=$(timer_elapsed "$START")
     $RT cp "$CONTAINER":/test/log "$REPO_ROOT"/test/tap
+
+    # PostgreSQL::Test redirects every diagnostic — psql stderr, the server's
+    # own ERROR/PANIC lines, the croak that killed the script — into
+    # test/log/regress_log_<test>, and only the bare TAP stream reaches the
+    # console.  A failing build therefore prints "Dubious, test returned N" and
+    # nothing else, and the cause is only reachable by downloading the
+    # artifact.  Echo the tail of each failing test's log so the build output
+    # names the failing statement on its own.
+    for t in $(awk '/\(Wstat:/ {print $1}' "$PROVE_OUT"); do
+        f="$REPO_ROOT/test/tap/log/regress_log_$(basename "$t" .t)"
+        [[ -f "$f" ]] || continue
+        echo ""
+        echo "──── ${f##*/} (last 80 lines) ────"
+        tail -n 80 "$f"
+    done
+
     log_error "TAP: FAILED after $(timer_fmt "$ELAPSED")"
     exit 3
 fi

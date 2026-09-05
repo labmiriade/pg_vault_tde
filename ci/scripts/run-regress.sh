@@ -18,7 +18,7 @@ CONTAINER="pg-tde-regress-$$"
 cleanup() { stop_container "$CONTAINER"; }
 trap cleanup EXIT
 
-log_stage "REGRESSION TESTS (52 v1.4 + 20 v1.5 + 38 v1.6 + 29 v1.7  = 140 total)"
+log_stage "REGRESSION TESTS (52 v1.4 + 20 v1.5 + 38 v1.6 + 30 v1.7 = 140 total)"
 
 build_pg_test_image
 
