@@ -25,6 +25,14 @@ postgresql-pg-vault-tde (1.7.1-1) unstable; urgency=medium
     access, but the export must be taken BEFORE this package is installed.
     See "Upgrading to 1.7.1" in README.md for the preflight query and the
     dump/restore procedure.
+  * COMPATIBILITY NOTE (not a change in this release): PostgreSQL 17.11, 18.x
+    and the matching minors of the older back branches only load a library
+    named as a logical decoding output plugin if it is listed in the
+    output_plugin_libraries GUC (default "pgoutput, test_decoding"). Slot
+    creation otherwise fails with 'library "pg_vault_tde" may not be used as
+    an output plugin'. Publishers replicating encrypted_heap tables need
+    output_plugin_libraries = 'pgoutput, pg_vault_tde' in postgresql.conf and
+    a reload. Earlier minors have no such GUC and must not carry the line.
 
  -- Miriade S.r.l. <info@miriade.it>  Sat, 05 Sep 2026 00:00:00 +0200
 

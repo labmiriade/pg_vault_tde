@@ -1,6 +1,6 @@
 # pg_vault_tde Roadmap
 
-> Last updated: 2026-06-29 — **v1.7 current**. 109 regression tests (52 v1.4 + 20 v1.5 + 37 v1.6) carried forward, plus the `tap/12_logical_repl_toast.t` end-to-end logical replication test. Key v1.7 changes: all KMS GUCs promoted to PGC_SUSET (per-database KMS via `ALTER DATABASE SET`); `pg_restore_tde` decrypt-and-pipe loop completed; logical replication of `encrypted_heap` TOAST columns via a custom WAL resource manager (`pg_vault_tde.toast_custom_rmgr`); documentation updated throughout.
+> Last updated: 2026-09-05 — **v1.7.1 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.1 from 1.7.0 at runtime). 140 regression tests (52 v1.4 + 20 v1.5 + 38 v1.6 + 30 v1.7), 17 TAP files / 212 assertions (including the `tap/12_logical_repl_toast.t` end-to-end logical replication test), 20 schema-isolation tests, the `per_table_dek_rotation` isolation spec and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18. Key v1.7 changes: all KMS GUCs promoted to PGC_SUSET (per-database KMS via `ALTER DATABASE SET`); `pg_restore_tde` decrypt-and-pipe loop completed; logical replication of `encrypted_heap` TOAST columns via a custom WAL resource manager (`pg_vault_tde.toast_custom_rmgr`); documentation updated throughout. v1.7.1 patches two data-visible defects — see below.
 
 ---
 
@@ -71,8 +71,9 @@ the `RELKIND_TOASTVALUE` read-path bypass so real TOAST chunks round-trip correc
 
 ## v1.7 — TOAST Chunks + KEK Hierarchy + HSM + Audit
 
-> Status: ✅ Completed
-> **Target**: ~100 regression tests — PG 17 + PG 18 + PG 19.
+> Status: ✅ Completed — patched by v1.7.1 (below)
+> **Delivered**: 137 regression tests at release, 140 with v1.7.1 (target was ~100) —
+> PG 17 + PG 18; the PG 19 audit moves to that release.
 
 **Theme**: Close the TOAST data-leak gap, formalize the KEK/DEK wrap hierarchy across
 all providers, add PKCS#11/HSM support, audit trail for compliance (PCI-DSS, HIPAA).
@@ -167,6 +168,49 @@ exist in code yet — tracked as v1.8 §10 below.
 `pg_vault_tde_seal_keys()`/`pg_vault_tde_seal_keys_bytea()`/`pg_vault_tde_unseal_keys()` (`src/kms/pg_vault_tde_seal.c`) — signed bundle of all `wrapped_dek` entries (KEK excluded), for `pg_basebackup`; TAP `tap/14_seal_keys.t`.
 `pg_basebackup_tde` (`src/backup/pg_basebackup_tde.c`) — pg_basebackup wrapper: seals every database's keys via `seal_keys_bytea` before the backup and writes one `pg_vault_tde_keys.<datname>.sealed` bundle per database after it succeeds; TAP `tap/15_basebackup_tde.t`.
 A core-side `BackupState`/`bbsink` hook was evaluated and discarded: PostgreSQL exposes no extension hook to inject files into the `pg_basebackup` stream, and a custom `bbsink` runs in the walsender without SPI.
+
+---
+
+## v1.7.1 — Patch: AAD relid resolution + HEAP_HASEXTERNAL on decrypt — COMPLETED ✅
+
+> Released 2026-09-05 — **140 regression tests** (52 v1.4 + 20 v1.5 + 38 v1.6 + 30 v1.7;
+> tests 138–140 added here) — PG 17 + PG 18, zero compiler warnings.
+
+Two data-visible defects. No SQL changes: `pg_extension.extversion` stays at `1.7` and
+`pg_vault_tde_build_version()` is what distinguishes the builds.
+
+1. **AAD was computed from the raw relid.** `ALTER TABLE ... SET ACCESS METHOD
+   encrypted_heap` on a populated table failed with `AES-256-GCM authentication FAILED`:
+   the tag was derived from the relation's own OID while the DEK and the generation
+   counter had already been looked up under `resolve_effective_relid()`. During the
+   rewrite, `make_new_heap()` gives the transient relation a different OID, so rows were
+   tagged against an OID that no longer existed after `finish_heap_swap()`. Both call
+   sites now resolve the relid first.
+   **This is breaking for data already on disk**: for a TOAST relation the effective OID
+   is the parent's, where ≤ 1.7.0 used the TOAST relation's own — so out-of-line TOAST
+   values written by 1.7.0 or earlier no longer authenticate, and `pg_dump` of an affected
+   table fails. Nothing is lost (reinstalling 1.7.0 makes it readable again), but the
+   export has to be taken *before* upgrading. Preflight query and dump/restore procedure:
+   README → "Upgrading to 1.7.1".
+2. **`HEAP_HASEXTERNAL` was inherited instead of recomputed.** `tde_encrypt_heap_tuple()`
+   clears that bit on the on-disk representation so the core never dereferences a TOAST
+   pointer inside ciphertext; decrypt copied the header back verbatim, leaving the bit
+   wrong on the plaintext tuple. Any consumer trusting the header — `CREATE TABLE AS`,
+   `INSERT ... SELECT` — then skipped re-externalizing and kept pointing at the *source*
+   relation's TOAST table, breaking as soon as that source was dropped or rewritten. The
+   bit is now recomputed in `tde_decrypt_heap_tuple()`, the single choke point every
+   decrypted tuple passes through.
+
+Decrypt failures on a relation whose tag is bound to a different OID now carry a
+DETAIL/HINT naming the 1.7.0 → 1.7.1 change, so the bare "data integrity violation" no
+longer sends an operator into disaster recovery for a reversible version mismatch.
+
+**Operational note — PostgreSQL-side, not a change of ours**: PostgreSQL 17.11, 18.x and
+the matching back-branch minors only load a library named as a logical decoding output
+plugin if it is listed in the `output_plugin_libraries` GUC (default
+`pgoutput, test_decoding`). Publishers replicating `encrypted_heap` tables need
+`output_plugin_libraries = 'pgoutput, pg_vault_tde'` in `postgresql.conf` plus a reload;
+earlier minors have no such GUC and must not carry the line. See README → Compatibility.
 
 ---
 
@@ -330,5 +374,6 @@ These gaps **cannot be closed without modifying PostgreSQL core**.
 | **v1.4** | CI/CD + tde_btree + Wire Format v2 | ✅ 2026-07-05 | 52 | OpenBao 3-node Raft, ambuild/aminsert/amrescan, generation tag |
 | **v1.5** | Per-Table DEK + Online Rotation + AAD | ✅ 2026 | 72 | Per-table catalog, native type ops, wire format v3, rotate_online BGW |
 | **v1.6** | Local Wallet KMS (production-ready) + write-path / catalog bugfix patch | ✅ 2026-07-20 (patched 2026-05-08) | 109 | Wallet unlock/lock, passphrase flexibility, KEK rotation, export/import, Vault→wallet migration; PG_TRY widening; TOAST relid auto-registration; STORAGE EXTERNAL TAM read bypass; all-read-paths TOAST coverage; forensic helpers; tests 73–109 |
-| **v1.7** | Per-database KMS + pg_restore_tde + PGC_SUSET + PKCS#11 + HSM + v1.4 removal | ✅ Completed | 109 | All KMS GUCs PGC_SUSET → per-database KMS via `ALTER DATABASE SET`; `pg_restore_tde` full decrypt-and-pipe restore loop; removed v1.4 global-DEK backward compat (`TdeShmemData`, `rotate_key`, `key_generation`, `clear_prev_dek`, `encrypt_test`, `decrypt_test`); PKCS#11/HSM provider with cross-backend KEK-rotation propagation; documentation overhaul |
+| **v1.7** | Per-database KMS + pg_restore_tde + PGC_SUSET + PKCS#11 + HSM + v1.4 removal | ✅ 2026-06-29 | 137 | All KMS GUCs PGC_SUSET → per-database KMS via `ALTER DATABASE SET`; `pg_restore_tde` full decrypt-and-pipe restore loop; removed v1.4 global-DEK backward compat (`TdeShmemData`, `rotate_key`, `key_generation`, `clear_prev_dek`, `encrypt_test`, `decrypt_test`); PKCS#11/HSM provider with cross-backend KEK-rotation propagation; documentation overhaul |
+| **v1.7.1** | Patch: AAD relid resolution + HEAP_HASEXTERNAL on decrypt | ✅ 2026-09-05 | 140 | AEAD tag bound to the effective relid (fixes `ALTER TABLE ... SET ACCESS METHOD` on populated tables); `HEAP_HASEXTERNAL` recomputed on decrypt (fixes CTAS / `INSERT ... SELECT` copying a dangling TOAST pointer); DETAIL/HINT on OID-mismatch decrypt failures; tests 138–140. Breaking for out-of-line TOAST written by ≤ 1.7.0 — dump before upgrading |
 | **v1.8** | KMIP + Column-Level + GIN/Hash/GiST/BRIN + HA + Dual-Control | Q2 2027 | ~130 | KMIP 1.2 client, per-column encryption, GIN/Hash/GiST(equality)/BRIN(bloom) index AMs, streaming replication standby DEK distribution, M-of-N key ceremony, pg_dump/COPY TO plaintext-leak WARNING (carried over from v1.7) |

@@ -46,6 +46,22 @@ pg_vault_tde.kms_provider = 'local'
 pg_vault_tde.wallet_passphrase_command = 'echo test-password'
 CONF
 $pub->start;
+
+# PostgreSQL 17.11 / 18.x (and the matching back-branch minors) refuse to load
+# any library not listed in output_plugin_libraries as an output plugin:
+#   ERROR: library "pg_vault_tde" may not be used as an output plugin
+# The GUC does not exist on older minors — and an unknown parameter in
+# postgresql.conf is fatal at startup — so feature-detect it instead of
+# pinning a version.  It must live in the server configuration, not in a
+# session: the process that loads the plugin is the walsender, not us.
+if ($pub->safe_psql('postgres',
+        q{SELECT count(*) FROM pg_settings WHERE name = 'output_plugin_libraries'}) == 1)
+{
+    $pub->append_conf('postgresql.conf',
+        "output_plugin_libraries = 'pgoutput, pg_vault_tde'\n");
+    $pub->reload;
+}
+
 $pub->safe_psql('postgres', 'CREATE EXTENSION pg_vault_tde;');
 system('/bin/sh', '-c', 'rm -rf /var/lib/pg_vault_tde/*');
 $pub->safe_psql('postgres', "SELECT pg_vault_tde_wallet_init('test-password');");

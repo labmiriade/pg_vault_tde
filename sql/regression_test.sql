@@ -1403,6 +1403,21 @@ DROP TABLE IF EXISTS tde_lr_demo;
 CREATE TABLE tde_lr_demo (id int PRIMARY KEY, val int) USING encrypted_heap;
 CREATE PUBLICATION tde_lr_pub FOR TABLE tde_lr_demo;
 
+-- PostgreSQL 17.11 / 18.x (and the matching back-branch minors) only accept an
+-- output plugin whose library is listed in output_plugin_libraries.  The GUC is
+-- absent on older minors, so probe pg_settings instead of testing a version; a
+-- plain SET inside DO persists for the rest of this session, which is where both
+-- the slot creation and the decode below run.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_settings WHERE name = 'output_plugin_libraries') THEN
+        -- Note the unquoted list form: output_plugin_libraries is a quoted
+        -- list GUC, so SET ... = 'a, b' would store ONE element named "a, b".
+        EXECUTE 'SET output_plugin_libraries TO pgoutput, pg_vault_tde';
+    END IF;
+END;
+$$;
+
 -- Create the slot (skip-guard for non-logical wal_level).
 DO $$
 BEGIN

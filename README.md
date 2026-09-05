@@ -737,6 +737,14 @@ HINT:  If this data was written by pg_vault_tde 1.7.0 or earlier it is not corru
 This is not corruption and not a key problem. Reinstall the 1.7.0 package,
 verify with `pg_vault_tde_build_version()`, then start from Step 1.
 
+### Also check your PostgreSQL minor
+
+Unrelated to 1.7.1, but it lands on the same people: PostgreSQL 17.11 / 18.x
+and newer refuse to load this extension's logical decoding output plugin unless
+it is listed in `output_plugin_libraries`. If you replicate encrypted tables,
+see [Logical replication on PostgreSQL 17.11 / 18.x and
+newer](#logical-replication-on-postgresql-1711--18x-and-newer) below.
+
 ---
 
 ## Compatibility
@@ -759,12 +767,39 @@ verify with `pg_vault_tde_build_version()`, then start from Step 1.
 | `pg_dump_tde` / `pg_restore_tde` | ⚠️ Full, except `pkcs11` | Encrypted logical backup: dump wrapped with AES-256-GCM + DEK sealed in backup header. Standalone tools have no PKCS#11 session/PIN handling yet — see "Configure Key Access → PKCS#11 / HSM" above. |
 | Streaming replication | ✅ Full | WAL ships encrypted bytes; standby decrypts at TAM layer |
 | Page checksums | ✅ Full | Checksums over encrypted content (complementary to GCM) |
-| Logical replication (non-TOAST) | ✅ Full (v1.2) | `pg_vault_tde_pgoutput` plugin decrypts tuples before streaming |
+| Logical replication (non-TOAST) | ✅ Full (v1.2) | `pg_vault_tde_pgoutput` plugin decrypts tuples before streaming. On PG ≥ 17.11 / 18.x the publisher must allow the plugin — see below |
 | TOAST (large values > ≈2 kB) | ✅ Full | Heap-level round-trips functional; per-chunk storage encryption |
-| Logical replication (TOAST columns) | ✅ Full (v1.7) | Custom WAL rmgr (`toast_custom_rmgr`) routes encrypted chunks past the reorder buffer; stitched in `change_cb`. UPDATE/DELETE need `REPLICA IDENTITY FULL` + PK |
+| Logical replication (TOAST columns) | ✅ Full (v1.7) | Custom WAL rmgr (`toast_custom_rmgr`) routes encrypted chunks past the reorder buffer; stitched in `change_cb`. UPDATE/DELETE need `REPLICA IDENTITY FULL` + PK. Same publisher requirement as above |
 | Range scans on TDE indexes | ⚠️ By design | `tde_btree` (GIN/Hash/GiST planned for v1.8, same AES-SIV pattern) — equality only; ranges return empty |
 | `CREATE INDEX USING gin/gist/hash/brin/btree` on `encrypted_heap` | ⚠️ `ERROR` by default | Not encrypted AMs; rejected unless `pg_vault_tde.allow_plaintext_index = on` (then allowed with `WARNING`) |
 | Column-level encryption | 🔜 v1.8 | Per-column `ENABLE COLUMN ENCRYPTION` DDL |
+
+### Logical replication on PostgreSQL 17.11 / 18.x and newer
+
+Those minors added the `output_plugin_libraries` GUC (default
+`pgoutput, test_decoding`): PostgreSQL now refuses to load any library outside
+that list as a logical decoding output plugin. Creating a slot with this
+extension's plugin therefore fails with:
+
+```
+ERROR:  library "pg_vault_tde" may not be used as an output plugin
+HINT:   ... add it to "output_plugin_libraries" and reload the server configuration.
+```
+
+Add the plugin on the **publisher** and reload — no restart needed:
+
+```conf
+# postgresql.conf on the publisher
+output_plugin_libraries = 'pgoutput, pg_vault_tde'
+```
+
+It has to be in the server configuration: the process that loads the plugin is
+the walsender, so a session-level `SET` does not reach it. Older minors have no
+such GUC, and an unrecognised parameter in `postgresql.conf` is fatal at
+startup — add the line only where `SELECT ... FROM pg_settings WHERE name =
+'output_plugin_libraries'` returns a row. Details in
+[doc/pg_vault_tde.md](doc/pg_vault_tde.md) → *Logical Decoding and Replication →
+Server configuration*.
 
 ---
 
