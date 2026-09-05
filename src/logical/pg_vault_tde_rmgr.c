@@ -400,7 +400,7 @@ tde_toast_stitch(Relation relation, ReorderBufferChange *change,
             if (c->rlocator.relNumber != toast_relfile)
                 continue;       /* belongs to a different toast relation */
 
-            dec = tde_decrypt_heap_tuple(&c->tup, toast_relid);
+            dec = tde_decrypt_heap_tuple(&c->tup, toast_relid, toast_desc);
 
             chunk_id  = DatumGetObjectId(fastgetattr(dec, 1, toast_desc, &cisnull));
             chunk_seq = DatumGetInt32(fastgetattr(dec, 2, toast_desc, &cisnull));
