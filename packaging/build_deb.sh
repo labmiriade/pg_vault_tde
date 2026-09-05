@@ -18,15 +18,14 @@
 # EVP layer — no CPU-specific build variant is needed or offered. See
 # wiki/Performance-and-Tuning.md.
 #
-# Output: ../postgresql-PG-pg-vault-tde_1.7-1_<arch>.deb
+# Output: ../postgresql-PG-pg-vault-tde_1.7.1-1_<arch>.deb
 #
 # Copyright (c) 2026 Miriade S.r.l. — PostgreSQL License
 
 set -e
 cd "$(dirname "$0")/.."   # move to project root
 
-VERSION="1.7"
-PKG_VERSION="1.7-1"
+PKG_VERSION="1.7.1-1"
 ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 
 # ---------------------------------------------------------------------------

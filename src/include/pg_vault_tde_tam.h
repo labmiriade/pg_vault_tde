@@ -50,11 +50,14 @@ HeapTuple tde_encrypt_heap_tuple(HeapTuple plain, Oid relid);
  * plugin calls this to produce plaintext before emitting changes.
  *
  * relid: the OID of the source relation (used for per-table DEK lookup).
+ * tupdesc: the row type of `enc`. Used to recompute HEAP_HASEXTERNAL on the
+ * decrypted tuple (see the function definition for why this is required —
+ * every caller must pass the relation's real tuple descriptor).
  *
  * Returns a palloc'd HeapTuple (caller must pfree after use).
  * Raises ERROR on GCM authentication failure.
  */
-HeapTuple tde_decrypt_heap_tuple(HeapTuple enc, Oid relid);
+HeapTuple tde_decrypt_heap_tuple(HeapTuple enc, Oid relid, TupleDesc tupdesc);
 
 int64 pg_vault_tde_reencrypt_table(Oid relid);
 

@@ -167,6 +167,26 @@ tde_crypto_ctx_cleanup(void)
  * table B even if both share the same DEK.  Binding the generation ensures
  * that a tuple encrypted before a key rotation cannot silently pass the old
  * tag check after rotation (belt-and-suspenders on top of the prev_dek path).
+ *
+ * ON-DISK CONTRACT — READ BEFORE TOUCHING THIS FUNCTION.
+ *
+ * The AAD is not stored on the wire, so the version byte in the tuple header
+ * says nothing about how it was derived: the reader has to reproduce the
+ * writer's derivation exactly, byte for byte, or every existing tuple fails
+ * its tag check.  Changing what goes in here — or how a caller's relid is
+ * resolved before it gets here — is therefore a BREAKING CHANGE for data
+ * already on disk, even though nothing about the wire layout moves.
+ *
+ * This bit us in 1.7.1: switching the callers to resolve_effective_relid()
+ * changed the AAD of TOAST chunks from the toast relation's own OID to its
+ * parent's, and made every out-of-line value written by <= 1.7.0 unreadable
+ * (main-table tuples were unaffected — their effective relid is unchanged).
+ * The release notes carry a dump-before-upgrading procedure for it.
+ *
+ * If the derivation has to change again, either version it explicitly on the
+ * wire (a separate AAD-scheme field, NOT the layout version byte) or ship the
+ * same kind of migration — but decide it deliberately, not as a side effect
+ * of "fixing" a caller.
  */
 static void
 tde_compute_aad(Oid relid, uint64 generation, unsigned char aad[TDE_V4_AAD_LEN])
@@ -272,7 +292,7 @@ tde_gcm_encrypt_core(const unsigned char* dek, int dek_len, Oid relid,
         unsigned char aad[TDE_V4_AAD_LEN];
         int           aad_len = 0;
 
-        tde_compute_aad(relid, gen, aad);
+        tde_compute_aad(resolve_effective_relid(relid), gen, aad);
         if(EVP_EncryptUpdate(ctx, NULL, &aad_len, aad, TDE_V4_AAD_LEN) != 1)
         {
             OPENSSL_cleanse(aad, TDE_V4_AAD_LEN);
@@ -462,7 +482,7 @@ tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len,
         unsigned char aad[TDE_V4_AAD_LEN];
         int           aad_len = 0;
 
-        tde_compute_aad(relid, stored_gen, aad);
+        tde_compute_aad(resolve_effective_relid(relid), stored_gen, aad);
         if (EVP_DecryptUpdate(ctx, NULL, &aad_len, aad, TDE_V4_AAD_LEN) != 1)
         {
             OPENSSL_cleanse(aad, TDE_V4_AAD_LEN);
@@ -489,12 +509,33 @@ tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len,
 
     if (auth_ok != 1)
     {
+        Oid effective_relid = resolve_effective_relid(relid);
+
         /* Wipe the caller buffer: never expose unauthenticated plaintext. */
         OPENSSL_cleanse(out_plain, pt_len);
 
+        /*
+         * When the tag is bound to an OID other than the relation's own
+         * (TOAST relations, and the transient relation of a table rewrite),
+         * by far the likeliest cause is not tampering but data written by
+         * pg_vault_tde <= 1.7.0, which bound the tag to the raw relid.
+         * Say so explicitly: the bare message sends an operator into
+         * disaster recovery for what is a reversible version mismatch.
+         */
         ereport(ERROR,
                 (errmsg("[CRYPTO] AES-256-GCM authentication FAILED: "
-                        "data integrity violation or wrong DEK")));
+                        "data integrity violation or wrong DEK"),
+                 effective_relid != relid
+                 ? errdetail("The AEAD tag for relation %u is bound to relation %u.",
+                             relid, effective_relid)
+                 : 0,
+                 effective_relid != relid
+                 ? errhint("If this data was written by pg_vault_tde 1.7.0 or earlier "
+                           "it is not corrupt: that release bound the tag to the "
+                           "relation's own OID instead. Reinstall 1.7.0, dump the "
+                           "affected tables, then upgrade and restore. See the 1.7.1 "
+                           "upgrade notes in the README.")
+                 : 0));
     }
 
     *out_len = (Size)(olen + flen);

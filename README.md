@@ -8,7 +8,7 @@ decrypted after it leaves. Encryption keys are managed by **HashiCorp Vault** /
 **OpenBao** or a **local PKCS#12 wallet** and cached in shared memory with
 automatic rotation.
 
-**Current release: v1.7** — 109 regression tests (52 v1.4 + 20 v1.5 + 37 v1.6), zero compiler warnings on PG 17 + PG 18.
+**Current release: v1.7** — 140 regression tests (52 v1.4 + 20 v1.5 + 38 v1.6 + 30 v1.7), zero compiler warnings on PG 17 + PG 18.
 
 ### Commercial Support
 
@@ -34,6 +34,10 @@ Contact our engineering team at [marketing@miriade.it](mailto:marketing@miriade.
 ---
 
 ## Quick Start
+
+> **Already running 1.7.0 or earlier?** Do not upgrade to 1.7.1 before reading
+> [Upgrading to 1.7.1](#upgrading-to-171). Tables holding out-of-line TOAST
+> values must be dumped *before* the new binary is installed.
 
 ### 1. Install
 
@@ -655,6 +659,86 @@ CREATE INDEX ON secrets USING tde_btree (id);
 
 ---
 
+## Upgrading to 1.7.1
+
+1.7.1 fixes `ALTER TABLE ... SET ACCESS METHOD encrypted_heap` on a populated
+table by binding the AEAD tag to the relation's *effective* OID — the same OID
+the DEK and generation counter were already looked up under. For a TOAST
+relation that effective OID is the parent table's, where releases up to 1.7.0
+used the TOAST relation's own OID.
+
+The AAD is never written to disk, so the reader has to reproduce the writer's
+derivation exactly. **Out-of-line TOAST values written by 1.7.0 or earlier
+therefore do not authenticate under 1.7.1.** The two schemes cannot coexist:
+during a table rewrite the transient TOAST relation gets a fresh OID, so the
+parent hop is what makes the ALTER work in the first place.
+
+**What is and is not affected** (verified by writing under 1.7.0 and reading
+back under 1.7.1 on the same data directory):
+
+| | Under 1.7.1 |
+|---|---|
+| `encrypted_heap` tables with no TOAST data | ✅ readable, byte-identical |
+| Inline values (below the ≈2 kB TOAST threshold) | ✅ readable, byte-identical |
+| Non-TOASTed columns of a table that has TOAST data | ✅ readable |
+| **Out-of-line TOAST values** | ❌ `AES-256-GCM authentication FAILED` |
+| **`pg_dump` of an affected table** | ❌ exits 1 |
+
+Nothing is lost: the ciphertext on disk is untouched, and reinstalling 1.7.0
+makes it readable again. But `pg_dump` stops working *after* the upgrade, so
+the export has to come first.
+
+### Step 1 — while still on 1.7.0, find the affected tables
+
+```sql
+SELECT c.oid::regclass                             AS table_to_export,
+       pg_size_pretty(pg_relation_size(c.reltoastrelid)) AS toast_size
+FROM   pg_class c
+JOIN   pg_am    a ON a.oid = c.relam
+WHERE  a.amname = 'encrypted_heap'
+  AND  c.reltoastrelid <> 0
+  AND  pg_relation_size(c.reltoastrelid) > 0;
+```
+
+No rows means nothing to do — install 1.7.1 and carry on.
+
+This only applies with `pg_vault_tde.toast_encryption = on`, which is the
+default. If it was turned off, TOAST chunks were never encrypted by this
+extension and the upgrade is unaffected either way.
+
+### Step 2 — dump those tables, still on 1.7.0
+
+```bash
+pg_dump -U postgres -d yourdb -t schema.affected_table --data-only \
+        -f affected_table.sql
+```
+
+### Step 3 — install 1.7.1, then truncate and restore
+
+```bash
+psql -U postgres -d yourdb -c 'TRUNCATE schema.affected_table;'
+psql -U postgres -d yourdb -f affected_table.sql
+```
+
+Confirm the running binary with `SELECT pg_vault_tde_build_version();` — it
+reports `1.7.1` while `pg_extension.extversion` stays at `1.7`, because 1.7.1
+ships no SQL changes.
+
+### If you upgraded first
+
+You will get:
+
+```
+ERROR:  [CRYPTO] AES-256-GCM authentication FAILED: data integrity violation or wrong DEK
+DETAIL:  The AEAD tag for relation 16541 is bound to relation 16537.
+HINT:  If this data was written by pg_vault_tde 1.7.0 or earlier it is not corrupt: ...
+```
+
+This is not corruption and not a key problem. Reinstall the 1.7.0 package,
+verify with `pg_vault_tde_build_version()`, then start from Step 1.
+
+---
+
 ## Compatibility
 
 | Feature | Status | Notes |
@@ -694,9 +778,9 @@ make ci-all
 PG_VERSION=17 make ci-all
 
 # Individual test stages:
-make ci-regress          # 109 SQL regression tests (vault provider) — tests 1-109 (test 110 deferred)
-make ci-wallet           # 109 SQL regression tests (local wallet provider)
-make ci-checksums        # 109 tests + page checksum compatibility
+make ci-regress          # 140 SQL regression tests (vault provider) — tests 1-140 (test 110 deferred)
+make ci-wallet           # SQL regression tests (local wallet provider)
+make ci-checksums        # regression tests + page checksum compatibility
 make ci-tap              # TAP tests with mock Vault
 make ci-isolation        # Concurrency / MVCC isolation tests
 make ci-vault            # Vault integration (Compose-based)
@@ -708,7 +792,7 @@ make ci-bench BENCH_ROWS=100000  # with custom row count
 make ci-clean            # Remove test containers and images
 ```
 
-Test coverage (109 tests = 52 v1.4 + 20 v1.5 + 37 v1.6):
+Test coverage (140 tests = 52 v1.4 + 20 v1.5 + 38 v1.6 + 30 v1.7):
 - Tests 1-11: AES-256-GCM crypto primitives, DEK rotation, tamper detection
 - Tests 12-14: TAM INSERT/SELECT/UPDATE end-to-end
 - Test 15: DELETE
@@ -763,11 +847,16 @@ Test coverage (109 tests = 52 v1.4 + 20 v1.5 + 37 v1.6):
 - Test 107: Tuple readable after `pg_vault_tde_rotation_online()` completes **(v1.6)**
 - Test 108: `CREATE TABLE AS` with `encrypted_heap` **(v1.6)**
 - Test 109: VACUUM FULL on table with STORAGE EXTERNAL columns **(v1.6)**
+- Tests 111-137: `tde_btree` native-type operator classes (int4/int8/uuid/date/timestamptz), DEK rotation + REINDEX, partitioned tables (routing, per-leaf DEK isolation, ATTACH/DETACH), FK relationships, `CREATE`/`REINDEX INDEX CONCURRENTLY` **(v1.7 — `sql/regression_test_v17.sql`)**
+- Test 138: `ALTER TABLE x SET ACCESS METHOD encrypted_heap` on a **populated** table with genuinely out-of-line TOAST data (~13 KB, high-entropy so PGLZ can't compress it back inline) — verifies an exact byte-for-byte round-trip via `SELECT` (Tests 105/106 only check on-disk bytes, never read the row back) plus post-ALTER `UPDATE`/`DELETE` across all four small/large transitions **(v1.7, PSQLE-135 regression coverage)**
+- Test 139: `ALTER TABLE x SET ACCESS METHOD heap` — reverse direction of Test 138, same coverage **(v1.7, PSQLE-135 regression coverage)**
+- Test 140: `CREATE TABLE AS SELECT` from an `encrypted_heap` table with genuinely out-of-line TOAST data must re-externalize into the **destination's own** TOAST table; verifies the destination survives the (unrelated, from its own point of view) source table being dropped **(v1.7, PSQLE-135 regression coverage)**
 
 > Test runner notes:
-> - `make ci-regress` (vault provider): 109/109 PASS, with conditional skips for `wal_level` (test 48), `pageinspect` (test 61) and wallet-only assertions (tests 74–80 when `kms_provider=local` is required).
+> - `make ci-regress` (vault provider): 140/140 PASS, with conditional skips for `wal_level` (test 48), `pageinspect` (test 61) and wallet-only assertions (tests 74–80 when `kms_provider=local` is required).
 > - `make ci-wallet` (local provider): tests 73–79 PASS; test 80 SKIPS unless `wallet_passphrase_env` is wired up; tests 81–109 also PASS in wallet mode.
 > - Test 110 (WITH HOLD cursor plaintext spill) is permanently deferred — the executor's tuplestore layer bypasses the TAM write path, so pg_vault_tde cannot intercept it without core modifications. The test is commented out in `regression_test_v16.sql`.
+> - Tests 138–140 exist because Tests 105/106 didn't catch two real bugs, both stemming from the same underlying cause: `tde_decrypt_heap_tuple()` copied the on-disk tuple header verbatim, including the `HEAP_HASEXTERNAL` bit that `tde_encrypt_heap_tuple()` deliberately clears so core never dereferences a TOAST pointer inside ciphertext — leaving that bit WRONG on the decrypted tuple whenever the attribute genuinely is out-of-line. (1) The AAD was also bound to the wrong (transient) relation OID during `ALTER TABLE`'s row-by-row rewrite — fixed via `resolve_effective_relid()` in `tde_compute_aad()`. (2) Any consumer trusting the stale `HEAP_HASEXTERNAL` bit instead of re-deriving it — `pg_vault_tde_toast_insert_or_update()`'s size-only gate, but also, more broadly, `CREATE TABLE AS SELECT`/`INSERT ... SELECT` reading out of an `encrypted_heap` table — silently skips re-externalizing the value, leaving it pointing at storage that later disappears. Fixed at the source: `tde_decrypt_heap_tuple()` now recomputes the bit from the actual decrypted attributes (`tde_tuple_has_external_desc()`) before returning, so every consumer sees a truthful tuple. Both only reproduce with a populated source table and a genuinely out-of-line (not just inline-compressed) value.
 
 ---
 
