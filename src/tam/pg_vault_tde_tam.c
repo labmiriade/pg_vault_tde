@@ -145,6 +145,7 @@ static TM_Result pg_vault_tde_tuple_delete(Relation rel,
                                            bool changingPart);
 
 static bool tde_tuple_has_external(HeapTuple tup, Relation rel);
+static bool tde_tuple_has_external_desc(HeapTuple tup, TupleDesc tupdesc);
 
 static HeapTuple tde_prepare_encrypt_tuple(Relation rel, HeapTuple plain, HeapTuple old, HeapTuple *toasted_out, int options);
 
@@ -263,9 +264,29 @@ tde_encrypt_heap_tuple(HeapTuple plain, Oid relid)
  *
  * Exported (non-static) so the logical decoding output plugin can decrypt
  * WAL-sourced tuples from encrypted_heap relations.
+ *
+ * tupdesc is required to recompute HEAP_HASEXTERNAL on the returned tuple.
+ * tde_encrypt_heap_tuple() deliberately CLEARS that bit on the on-disk
+ * (encrypted) representation so core never tries to dereference a TOAST
+ * pointer inside ciphertext; the memcpy() below copies that (now-stale)
+ * header verbatim, so the bit is WRONG on the decrypted tuple whenever the
+ * attribute genuinely is an out-of-line TOAST pointer. Most callers in this
+ * file already work around that locally via tde_tuple_has_external() before
+ * deciding whether to re-toast — but ANY consumer of a decrypted tuple that
+ * instead trusts the header bit (e.g. ExecFetchSlotHeapTuple's fast path,
+ * taken when the slot's own get_heap_tuple callback just hands back the
+ * existing tuple rather than rebuilding it via heap_form_tuple — exactly
+ * what CREATE TABLE AS SELECT / INSERT ... SELECT do) silently skips
+ * re-externalizing the value. The row then keeps pointing at the SOURCE
+ * relation's TOAST table, which breaks ("could not open relation" / "missing
+ * chunk") the moment that source is later altered/rewritten/dropped, even
+ * though the destination itself was never touched. Fixing the bit once here
+ * — the single choke point every decrypted tuple passes through — means
+ * every downstream consumer sees a truthful tuple, instead of requiring each
+ * one to remember to re-derive it.
  */
 HeapTuple
-tde_decrypt_heap_tuple(HeapTuple enc, Oid relid)
+tde_decrypt_heap_tuple(HeapTuple enc, Oid relid, TupleDesc tupdesc)
 {
     Size        hdr_len   = enc->t_data->t_hoff;
     char       *enc_data  = (char *) enc->t_data + hdr_len;
@@ -296,6 +317,13 @@ tde_decrypt_heap_tuple(HeapTuple enc, Oid relid)
     plain->t_len      = (uint32) (hdr_len + pt_len);
     plain->t_self     = enc->t_self;
     plain->t_tableOid = enc->t_tableOid;
+
+    /* Restore a truthful HEAP_HASEXTERNAL — see comment above. */
+    if (tde_tuple_has_external_desc(plain, tupdesc))
+        plain->t_data->t_infomask |= HEAP_HASEXTERNAL;
+    else
+        plain->t_data->t_infomask &= ~HEAP_HASEXTERNAL;
+
     return plain;
 }
 /*
@@ -367,7 +395,8 @@ pg_vault_tde_decode_slot(TupleTableSlot *slot)
      * when heap_copytuple runs above).
      * For tuples from index scans, t_tableOid is also set by heap_hot_search_buffer.
      */
-    plain = tde_decrypt_heap_tuple(bslot->base.tuple, saved_tableoid);
+    plain = tde_decrypt_heap_tuple(bslot->base.tuple, saved_tableoid,
+                                    slot->tts_tupleDescriptor);
 
 
     /* Stamp physical address onto decrypted tuple */
@@ -1135,8 +1164,20 @@ pg_vault_tde_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
  * encrypted TOAST chunks, stores them in the TOAST relation, and returns a
  * new tuple with external varlena pointers substituted in place.
  *
- * If the tuple fits within TOAST_TUPLE_THRESHOLD or the relation has no TOAST
- * table, the original tuple is returned unchanged (no allocation).
+ * If the tuple fits within TOAST_TUPLE_THRESHOLD, has no already-external
+ * attribute, or the relation has no TOAST table, the original tuple is
+ * returned unchanged (no allocation).
+ *
+ * The HeapTupleHasExternal(tup) check mirrors stock heap_prepare_insert()
+ * (heapam.c): a tuple can be small (small t_len) yet still carry an
+ * out-of-line pointer belonging to a DIFFERENT relation's TOAST table — e.g.
+ * a row copied row-by-row by ATRewriteTable() when a plain heap table with
+ * pre-existing out-of-line values is converted via ALTER TABLE ... SET
+ * ACCESS METHOD encrypted_heap.  Skipping pg_vault_tde_toast_tuple() (and
+ * thus toast_tuple_init()'s foreign-pointer detection) in that case leaves
+ * the stale pointer in place; once the source table/toast is dropped at the
+ * end of the rewrite, the pointer dangles and any later read/update/delete
+ * of that row fails with "could not open relation with OID ...".
  *
  * Called from every write path (tuple_insert, tuple_insert_speculative,
  * multi_insert, tuple_update) before tde_encrypt_heap_tuple so that the
@@ -1148,7 +1189,7 @@ pg_vault_tde_toast_insert_or_update(Relation rel, HeapTuple tup,
                                      HeapTuple old_tup, int options)
 {
     if (OidIsValid(rel->rd_rel->reltoastrelid) &&
-        tup->t_len > TOAST_TUPLE_THRESHOLD)
+        (HeapTupleHasExternal(tup) || tup->t_len > TOAST_TUPLE_THRESHOLD))
     {
         return pg_vault_tde_toast_tuple(rel, tup, old_tup, options);
     }
@@ -1500,30 +1541,25 @@ pg_vault_tde_tuple_update(Relation rel, ItemPointer otid,
 }
 
 /*
- * tde_tuple_has_external
+ * tde_tuple_has_external_desc
  *
  * Per-attribute scan for VARATT_IS_EXTERNAL varlenas on a decrypted heap
- * tuple. This is necessary because flag HEAP_HASEXTERNAL is cleansed 
- * in insert before calling heap_insert(), otherwise it will call
- * heap_toast_insert_or_update.
+ * tuple, given its TupleDesc directly (no Relation needed). This is
+ * necessary because flag HEAP_HASEXTERNAL is cleansed in insert before
+ * calling heap_insert(), otherwise it will call heap_toast_insert_or_update.
+ * Shared by tde_tuple_has_external() (Relation-based callers) and
+ * tde_decrypt_heap_tuple() (which only has a TupleDesc on hand).
 */
 static bool
-tde_tuple_has_external(HeapTuple tup, Relation rel)
+tde_tuple_has_external_desc(HeapTuple tup, TupleDesc tupdesc)
 {
-    int natts;
-    TupleDesc tupdesc;
+    int natts = tupdesc->natts;
     Datum stack_values[MAX_STACK_ATTRS];
     bool  stack_isnull[MAX_STACK_ATTRS];
-    
+
     Datum *values = stack_values;
     bool  *isnull = stack_isnull;
     bool  has_ext = false;
-
-    if(!OidIsValid(rel->rd_rel->reltoastrelid)) 
-        return false;
-    
-    tupdesc = RelationGetDescr(rel);
-    natts = tupdesc->natts;
 
     if (unlikely(natts > MAX_STACK_ATTRS))
     {
@@ -1531,13 +1567,13 @@ tde_tuple_has_external(HeapTuple tup, Relation rel)
         isnull = (bool *) palloc(natts * sizeof(bool));
     }
 
-    /* 
+    /*
      * Previous version was using heap_getattr (O(n)) in a for loop
-     * for every attr in heaptuple resulting in a O(n²). 
-     * In the current vesion: Deforming is O(n) so the total complexity 
+     * for every attr in heaptuple resulting in a O(n²).
+     * In the current vesion: Deforming is O(n) so the total complexity
      * is O(n + n) = O(n).
      */
-    heap_deform_tuple(tup, tupdesc, values, isnull); 
+    heap_deform_tuple(tup, tupdesc, values, isnull);
 
     for (int i = 0; i < natts; i++)
     {
@@ -1548,7 +1584,7 @@ tde_tuple_has_external(HeapTuple tup, Relation rel)
             if (VARATT_IS_EXTERNAL(DatumGetPointer(values[i])))
             {
                 has_ext = true;
-                break; 
+                break;
             }
         }
     }
@@ -1560,6 +1596,21 @@ tde_tuple_has_external(HeapTuple tup, Relation rel)
     }
 
     return has_ext;
+}
+
+/*
+ * tde_tuple_has_external
+ *
+ * Relation-based wrapper around tde_tuple_has_external_desc(): skips the
+ * scan entirely when the relation has no TOAST table at all.
+*/
+static bool
+tde_tuple_has_external(HeapTuple tup, Relation rel)
+{
+    if (!OidIsValid(rel->rd_rel->reltoastrelid))
+        return false;
+
+    return tde_tuple_has_external_desc(tup, RelationGetDescr(rel));
 }
 
 /*
@@ -1807,7 +1858,7 @@ pg_vault_tde_relation_copy_for_cluster(Relation OldTable,
              */
             PG_TRY(2);
             {
-                plain = tde_decrypt_heap_tuple(enc_copy, RelationGetRelid(OldTable));
+                plain = tde_decrypt_heap_tuple(enc_copy, RelationGetRelid(OldTable), tupdesc);
                 plain_for_write = plain;
 
                 /* Header bit is cleared on disk (see tde_encrypt_heap_tuple);
@@ -2267,7 +2318,8 @@ pg_vault_tde_verify_integrity(PG_FUNCTION_ARGS)
             PG_TRY(2);
             {
                 HeapTuple plain = tde_decrypt_heap_tuple(bslot->base.tuple,
-                                                          RelationGetRelid(rel));
+                                                          RelationGetRelid(rel),
+                                                          RelationGetDescr(rel));
                 pfree(plain);
             }
             PG_CATCH(2);
