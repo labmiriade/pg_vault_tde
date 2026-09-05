@@ -47,7 +47,15 @@ jobs:
         run: |
           set -euo pipefail
           INPUT_VERSION="${{ inputs.version }}"
-          SHORT="${INPUT_VERSION%.*}"   # 1.7.0 -> 1.7
+          # Packaging carries the full three-component version from 1.7.1 on, so
+          # that a C-only patch release produces a package version apt/dnf will
+          # actually consider an upgrade. Tags up to v1.7.0 used the 2-component
+          # short form in the packaging files; rebuild those from their own tag.
+          SHORT="${INPUT_VERSION%.*}"   # 1.7.0 -> 1.7 (legacy packaging form)
+          case "$INPUT_VERSION" in
+            1.0.*|1.6.*|1.7.0) PKG_EXPECTED="$SHORT" ;;
+            *)                 PKG_EXPECTED="$INPUT_VERSION" ;;
+          esac
 
           fail=0
           check() {
@@ -59,9 +67,9 @@ jobs:
           }
 
           check "VERSION file" "$(cat VERSION)" "$INPUT_VERSION"
-          check "rpm spec Version:" "$(grep -m1 '^Version:' packaging/rpm/pg_vault_tde.spec | awk '{print $2}')" "$SHORT"
-          check "build_rpm.sh VERSION=" "$(grep -m1 '^VERSION=' packaging/build_rpm.sh | cut -d'"' -f2)" "$SHORT"
-          check "debian/changelog top version" "$(sed -n '1p' packaging/debian/changelog | grep -oP '(?<=\()[^)]+(?=\))' | cut -d- -f1)" "$SHORT"
+          check "rpm spec Version:" "$(grep -m1 '^Version:' packaging/rpm/pg_vault_tde.spec | awk '{print $2}')" "$PKG_EXPECTED"
+          check "build_rpm.sh VERSION=" "$(grep -m1 '^VERSION=' packaging/build_rpm.sh | cut -d'"' -f2)" "$PKG_EXPECTED"
+          check "debian/changelog top version" "$(sed -n '1p' packaging/debian/changelog | grep -oP '(?<=\()[^)]+(?=\))' | cut -d- -f1)" "$PKG_EXPECTED"
 
           if [ "$fail" -ne 0 ]; then
             echo ""

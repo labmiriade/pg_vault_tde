@@ -65,12 +65,30 @@ dead weight in the packaging matrix again.
 
 ### Release Checklist
 
-When bumping version:
-- [ ] Update `packaging/debian/changelog` (version + date)
-- [ ] Update `Version:` in `packaging/rpm/pg_vault_tde.spec`
-- [ ] Update `pg_vault_tde.control` (`default_version`)
-- [ ] Verify `sql/pg_vault_tde--1.0.sql` filename matches control version
+Two kinds of release, and they touch different files.
+
+**Patch release (C-only, no SQL objects changed)** — e.g. 1.7.0 → 1.7.1:
+- [ ] Update `VERSION` (full three-component, e.g. `1.7.1`)
+- [ ] Update both `version` fields in `META.json`
+- [ ] Update `packaging/debian/changelog` (version + date), `Version:` in
+      `packaging/rpm/pg_vault_tde.spec`, `VERSION=` in `packaging/build_rpm.sh`,
+      `PKG_VERSION=` in `packaging/build_deb.sh` — all to `1.7.1`/`1.7.1-1`
+- [ ] Leave `pg_vault_tde.control` (`default_version`) and `sql/pg_vault_tde--*.sql`
+      **alone**: bumping extversion with no SQL delta only buys an empty
+      upgrade script and a pointless `ALTER EXTENSION UPDATE` for every user
+- [ ] `make clean` before building — plain `make` will not rebuild already
+      compiled `.o` files just because `VERSION` changed, so the version
+      baked in via `-DPG_VAULT_TDE_BUILD_VERSION` would stay stale
+- [ ] Verify at runtime: `SELECT pg_vault_tde_build_version()` reports the new
+      version while `pg_extension.extversion` still reports the old one
 - [ ] Tag the release commit
+
+**Minor/major release (SQL objects changed)** — e.g. 1.7.x → 1.8:
+- [ ] Everything above, plus:
+- [ ] Update `pg_vault_tde.control` (`default_version`)
+- [ ] Add `sql/pg_vault_tde--<new>.sql` and the `--<old>--<new>.sql` upgrade
+      script; update `DATA` in the `Makefile` and `provides.file` in `META.json`
+- [ ] Extend the upgrade chain in `ci/scripts/run-regress.sh` (phases 2 and 4)
 
 ---
 

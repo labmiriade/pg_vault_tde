@@ -2,7 +2,7 @@
    "name": "pg_vault_tde",
    "abstract": "Transparent Data Encryption (TDE) for PostgreSQL via a custom Table Access Method",
    "description": "pg_vault_tde encrypts every tuple with AES-256-GCM at the Table Access Method layer (encrypted_heap), transparently to applications: data is encrypted before it reaches the storage manager and decrypted after it leaves. An optional encrypted B-Tree index access method (tde_btree, AES-256-SIV) supports equality lookups on encrypted columns without exposing plaintext key values. Encryption keys are managed by HashiCorp Vault / OpenBao, a PKCS#11 / HSM token, or a local PKCS#12 wallet, and are cached in shared memory with support for online rotation.",
-   "version": "1.7.0",
+   "version": "1.7.1",
    "maintainer": [
       "Miriade S.r.l. <supportodb@miriade.it>"
    ],
@@ -12,7 +12,7 @@
          "abstract": "Transparent Data Encryption (TDE) for PostgreSQL via a custom Table Access Method",
          "file": "sql/pg_vault_tde--1.7.sql",
          "docfile": "doc/pg_vault_tde.md",
-         "version": "1.7.0"
+         "version": "1.7.1"
       }
    },
    "prereqs": {

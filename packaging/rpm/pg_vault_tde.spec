@@ -7,7 +7,7 @@
 %global pginstdir /usr/pgsql-%{pgmajorversion}
 
 Name:           postgresql%{pgmajorversion}-%{sname}
-Version:        1.7
+Version:        1.7.1
 Release:        1%{?dist}
 Summary:        Transparent Data Encryption (TDE) extension for PostgreSQL %{pgmajorversion}
 License:        BSD
@@ -79,6 +79,30 @@ chrpath -d %{buildroot}%{pginstdir}/lib/%{sname}.so
 %{pginstdir}/lib/bitcode/%{sname}*
 
 %changelog
+* Sat Sep 05 2026 Miriade S.r.l. <info@miriade.it> - 1.7.1-1
+- Fix: ALTER TABLE ... SET ACCESS METHOD encrypted_heap on a table that
+  already contained rows failed with "AES-256-GCM authentication FAILED";
+  the AEAD associated data is now derived from the effective relation OID
+  (resolve_effective_relid), the same OID the DEK and generation counter
+  were already looked up under
+- Fix: CREATE TABLE AS / INSERT ... SELECT from an encrypted_heap table
+  holding out-of-line TOAST values copied a dangling TOAST pointer instead
+  of the value, leaving the destination unreadable once the source was
+  dropped; HEAP_HASEXTERNAL is now recomputed on every decrypted tuple
+- No SQL changes: pg_extension.extversion stays at 1.7; use
+  pg_vault_tde_build_version() to tell 1.7.1 from 1.7.0 at runtime
+- 140 regression tests passing (52 v1.4 + 20 v1.5 + 38 v1.6 + 30 v1.7)
+- Decrypt failures on a relation whose AEAD tag is bound to a different OID
+  now carry a DETAIL/HINT naming the 1.7.0 -> 1.7.1 change, so the bare
+  "data integrity violation" no longer sends operators into disaster recovery
+- UPGRADE NOTE: with pg_vault_tde.toast_encryption = on (the default),
+  out-of-line TOAST values written by 1.7.0 or earlier do not authenticate
+  under this release, and pg_dump of an affected table fails. Everything else
+  (non-TOAST tables, inline values, non-TOASTed columns) reads back
+  byte-identical. Nothing is lost and reinstalling 1.7.0 restores access, but
+  the export must be taken BEFORE this package is installed. See
+  "Upgrading to 1.7.1" in README.md for the preflight query and procedure
+
 * Mon Jun 08 2026 Miriade S.r.l. <info@miriade.it> - 1.7-1
 - v1.7: tde_btree access method — encrypted (AES-256-SIV) index keys for
   bytea/text/int4/int8/numeric/uuid/date/timestamptz operator classes;

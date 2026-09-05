@@ -1,4 +1,4 @@
--- regression_test_v17.sql — TDE tests 111-137 for pg_vault_tde v1.7
+-- regression_test_v17.sql — TDE tests 111-140 for pg_vault_tde v1.7
 --
 -- These tests cover the tde_*_enc_ops operator classes introduced in v1.7,
 -- which encrypt fixed-size B-Tree index keys (int4, int8, uuid, date,
@@ -1377,10 +1377,303 @@ BEGIN
     
     RAISE NOTICE
         'TEST 137 PASSED: partial-index CREATE INDEX CONCURRENTLY works';
-    DROP TABLE tde_cic_137;   
+    DROP TABLE tde_cic_137;
 END;
 $$;
 
+
+-- ================================================================
+-- TESTS 138-139: ALTER TABLE SET ACCESS METHOD on a POPULATED table
+-- with genuinely out-of-line TOAST data (PSQLE-135 regression coverage)
+--
+-- TEST 106/105 (regression_test_v16.sql) only check that the on-disk bytes
+-- are/aren't a literal-plaintext match via pg_vault_tde_verify_plaintext_on_disk()
+-- — neither ever SELECTs the row back after the ALTER, and neither uses a
+-- value big enough to actually leave the main tuple (TOAST_TUPLE_THRESHOLD
+-- is ~2 KB; both use ~900 bytes of highly compressible repeat() text, which
+-- stays inline). That gap let two real bugs ship silently:
+--
+--   (a) ALTER TABLE ... SET ACCESS METHOD copies rows through a TRANSIENT
+--       relation (ATRewriteTable); the AAD used to be bound to that
+--       transient relid instead of the OID that survives the swap, so
+--       every rewritten row failed AES-256-GCM authentication on the next
+--       read. Fixed via resolve_effective_relid() in tde_compute_aad()
+--       (src/crypto/pg_vault_tde_crypto.c).
+--
+--   (b) A row that ALREADY had a genuinely out-of-line (TOASTed) value in
+--       the source table carries a small (pointer-sized) tuple into the
+--       rewrite, so pg_vault_tde_toast_insert_or_update()'s
+--       tup->t_len > TOAST_TUPLE_THRESHOLD gate skipped it entirely,
+--       leaving a dangling pointer to the (about-to-be-dropped) source
+--       TOAST table. Fixed by also checking HeapTupleHasExternal(tup)
+--       (src/tam/pg_vault_tde_tam.c), mirroring stock heap_prepare_insert().
+--
+-- Both tests below use ~13 KB of md5(random()) text — high-entropy, so
+-- PGLZ cannot compress it back inline — to force genuine out-of-line
+-- TOAST storage, then verify an exact byte-for-byte round-trip via SELECT
+-- (not just an on-disk forensic check) and confirm ordinary DML (UPDATE
+-- across all four small/large transitions, DELETE) still works afterward.
+-- ================================================================
+
+-- ================================================================
+-- TEST 138: heap -> encrypted_heap on a populated table with real
+-- out-of-line TOAST data.
+-- ================================================================
+DO $$
+DECLARE
+    rel_id     oid;
+    tam        name;
+    mismatches int;
+BEGIN
+    DROP TABLE IF EXISTS tde_altertoast_138, tde_altertoast_138_snap;
+
+    CREATE TABLE tde_altertoast_138 (
+        id        int PRIMARY KEY,
+        small_val text,
+        big_val   text
+    );
+
+    INSERT INTO tde_altertoast_138
+    SELECT g,
+           'small_' || g,
+           (SELECT string_agg(md5(random()::text || g || x), '')
+              FROM generate_series(1, 400) x)   -- ~12.8 KB, incompressible
+    FROM generate_series(1, 10) g;
+
+    CREATE TABLE tde_altertoast_138_snap AS SELECT * FROM tde_altertoast_138;
+
+    rel_id := 'tde_altertoast_138'::regclass::oid;
+
+    SELECT am.amname INTO tam FROM pg_am am, pg_class c
+    WHERE am.oid = c.relam AND c.oid = rel_id;
+    IF tam <> 'heap' THEN
+        RAISE EXCEPTION 'TEST 138 FAILED: table should start on heap AM, got %', tam;
+    END IF;
+
+    IF (SELECT pg_relation_size(reltoastrelid) FROM pg_class WHERE oid = rel_id) = 0 THEN
+        RAISE EXCEPTION 'TEST 138 FAILED: setup did not produce out-of-line TOAST data';
+    END IF;
+
+    -- convert the populated plain-heap table to encrypted_heap
+    ALTER TABLE tde_altertoast_138 SET ACCESS METHOD encrypted_heap;
+
+    SELECT am.amname INTO tam FROM pg_am am, pg_class c
+    WHERE am.oid = c.relam AND c.oid = rel_id;
+    IF tam <> 'encrypted_heap' THEN
+        RAISE EXCEPTION 'TEST 138 FAILED: table should be encrypted_heap after ALTER, got %', tam;
+    END IF;
+
+    -- byte-exact round trip: catches the AAD/relid-resolution regression (a)
+    SELECT count(*) INTO mismatches
+    FROM tde_altertoast_138 a JOIN tde_altertoast_138_snap s ON a.id = s.id
+    WHERE a.small_val IS DISTINCT FROM s.small_val
+       OR a.big_val   IS DISTINCT FROM s.big_val;
+    IF mismatches <> 0 THEN
+        RAISE EXCEPTION 'TEST 138 FAILED: % row(s) mismatched after heap->encrypted_heap', mismatches;
+    END IF;
+
+    -- post-ALTER DML across all four small/large transitions: catches the
+    -- dangling-TOAST-pointer regression (b)
+    UPDATE tde_altertoast_138 SET big_val   = 'now_small' WHERE id = 1;                -- large -> small
+    UPDATE tde_altertoast_138 SET small_val = (SELECT string_agg(md5(random()::text || x), '')
+                                                  FROM generate_series(1, 400) x)
+                                WHERE id = 2;                                          -- small -> large
+    UPDATE tde_altertoast_138 SET big_val   = (SELECT string_agg(md5(random()::text || x), '')
+                                                  FROM generate_series(1, 400) x)
+                                WHERE id = 3;                                          -- large -> large
+    DELETE FROM tde_altertoast_138 WHERE id = 4;
+
+    IF (SELECT big_val FROM tde_altertoast_138 WHERE id = 1) <> 'now_small' THEN
+        RAISE EXCEPTION 'TEST 138 FAILED: post-ALTER UPDATE (large->small) did not stick';
+    END IF;
+    IF (SELECT count(*) FROM tde_altertoast_138) <> 9 THEN
+        RAISE EXCEPTION 'TEST 138 FAILED: post-ALTER DELETE did not stick';
+    END IF;
+
+    DROP TABLE tde_altertoast_138, tde_altertoast_138_snap;
+
+    RAISE NOTICE 'TEST 138 PASSED: heap->encrypted_heap on populated table with out-of-line TOAST round-trips exactly and survives post-ALTER UPDATE/DELETE';
+END;
+$$;
+
+-- ================================================================
+-- TEST 139: encrypted_heap -> heap (reverse direction of TEST 138).
+-- ================================================================
+DO $$
+DECLARE
+    rel_id     oid;
+    tam        name;
+    mismatches int;
+    is_enc     boolean;
+BEGIN
+    DROP TABLE IF EXISTS tde_altertoast_139, tde_altertoast_139_snap;
+
+    CREATE TABLE tde_altertoast_139 (
+        id        int PRIMARY KEY,
+        small_val text,
+        big_val   text
+    ) USING encrypted_heap;
+
+    -- NOTE: the "expected values" table is generated INDEPENDENTLY (same
+    -- seed, same deterministic formula) rather than via
+    -- "CREATE TABLE ... AS SELECT * FROM tde_altertoast_139". The latter
+    -- would copy data OUT of an encrypted_heap row whose out-of-line TOAST
+    -- attribute already carries an external pointer; PostgreSQL's generic
+    -- CTAS/INSERT-SELECT path does not always re-externalize such a value
+    -- into the destination's own TOAST table, so the copy can end up
+    -- silently sharing the SOURCE table's TOAST storage — verified to break
+    -- ("could not open relation") the moment the source is later dropped or
+    -- rewritten. That is a separate, broader, not-yet-fixed defect (see
+    -- pg_vault_tde memory: tde-select-into-toast-dangling-pointer) and is
+    -- intentionally NOT exercised by this test, which only targets the
+    -- ALTER TABLE SET ACCESS METHOD regression.
+    PERFORM setseed(0.4242);
+    INSERT INTO tde_altertoast_139
+    SELECT g,
+           'small_' || g,
+           (SELECT string_agg(md5(random()::text || g || x), '')
+              FROM generate_series(1, 400) x)   -- ~12.8 KB, incompressible
+    FROM generate_series(1, 10) g;
+
+    CREATE TABLE tde_altertoast_139_snap (id int, small_val text, big_val text);
+    PERFORM setseed(0.4242);
+    INSERT INTO tde_altertoast_139_snap
+    SELECT g,
+           'small_' || g,
+           (SELECT string_agg(md5(random()::text || g || x), '')
+              FROM generate_series(1, 400) x)
+    FROM generate_series(1, 10) g;
+
+    rel_id := 'tde_altertoast_139'::regclass::oid;
+
+    SELECT am.amname INTO tam FROM pg_am am, pg_class c
+    WHERE am.oid = c.relam AND c.oid = rel_id;
+    IF tam <> 'encrypted_heap' THEN
+        RAISE EXCEPTION 'TEST 139 FAILED: table should start on encrypted_heap AM, got %', tam;
+    END IF;
+
+    SELECT is_encrypted INTO STRICT is_enc
+    FROM pg_vault_tde_verify_plaintext_on_disk('tde_altertoast_139', 'small_1');
+    IF NOT is_enc THEN
+        RAISE EXCEPTION 'TEST 139 FAILED: data should be encrypted on disk before ALTER';
+    END IF;
+
+    -- convert the populated encrypted_heap table back to plain heap
+    ALTER TABLE tde_altertoast_139 SET ACCESS METHOD heap;
+
+    SELECT am.amname INTO tam FROM pg_am am, pg_class c
+    WHERE am.oid = c.relam AND c.oid = rel_id;
+    IF tam <> 'heap' THEN
+        RAISE EXCEPTION 'TEST 139 FAILED: table should be heap after ALTER, got %', tam;
+    END IF;
+
+    IF EXISTS (SELECT 1 FROM pg_vault_tde_catalog WHERE relid = rel_id) THEN
+        RAISE EXCEPTION 'TEST 139 FAILED: table still registered in pg_vault_tde_catalog after ALTER to heap';
+    END IF;
+
+    SELECT is_encrypted INTO STRICT is_enc
+    FROM pg_vault_tde_verify_plaintext_on_disk('tde_altertoast_139', 'small_1');
+    IF is_enc THEN
+        RAISE EXCEPTION 'TEST 139 FAILED: data should be plaintext on disk after ALTER to heap';
+    END IF;
+
+    -- byte-exact round trip: catches the AAD/relid-resolution regression (a)
+    SELECT count(*) INTO mismatches
+    FROM tde_altertoast_139 a JOIN tde_altertoast_139_snap s ON a.id = s.id
+    WHERE a.small_val IS DISTINCT FROM s.small_val
+       OR a.big_val   IS DISTINCT FROM s.big_val;
+    IF mismatches <> 0 THEN
+        RAISE EXCEPTION 'TEST 139 FAILED: % row(s) mismatched after encrypted_heap->heap', mismatches;
+    END IF;
+
+    -- ordinary DML keeps working once back on stock heap AM
+    UPDATE tde_altertoast_139 SET big_val = 'now_small' WHERE id = 1;
+    DELETE FROM tde_altertoast_139 WHERE id = 2;
+
+    IF (SELECT big_val FROM tde_altertoast_139 WHERE id = 1) <> 'now_small' THEN
+        RAISE EXCEPTION 'TEST 139 FAILED: post-ALTER UPDATE did not stick';
+    END IF;
+    IF (SELECT count(*) FROM tde_altertoast_139) <> 9 THEN
+        RAISE EXCEPTION 'TEST 139 FAILED: post-ALTER DELETE did not stick';
+    END IF;
+
+    DROP TABLE tde_altertoast_139, tde_altertoast_139_snap;
+
+    RAISE NOTICE 'TEST 139 PASSED: encrypted_heap->heap on populated table with out-of-line TOAST round-trips exactly and survives post-ALTER UPDATE/DELETE';
+END;
+$$;
+
+
+-- ================================================================
+-- TEST 140: CREATE TABLE AS SELECT from an encrypted_heap table with real
+-- out-of-line TOAST data must re-externalize into the DESTINATION's own
+-- TOAST table, not keep pointing at the SOURCE's.
+--
+-- This is what regression test 139 originally tripped over while being
+-- written (see git history / PSQLE-135 notes): a naive
+-- "CREATE TABLE snap AS SELECT * FROM <encrypted_heap>" produced a snap
+-- table whose own TOAST relation was allocated but held ZERO bytes — the
+-- row was still silently pointing at the SOURCE table's TOAST storage.
+-- It read back fine right then, but broke the moment the (from the
+-- snapshot's point of view, completely unrelated) source table was later
+-- dropped, ALTERed, or CLUSTERed — with "could not open relation" or
+-- "missing chunk number N", on a table that was never itself touched.
+--
+-- Root cause: tde_decrypt_heap_tuple() (src/tam/pg_vault_tde_tam.c) copied
+-- the on-disk tuple header verbatim, including the HEAP_HASEXTERNAL bit
+-- that tde_encrypt_heap_tuple() deliberately CLEARS on the encrypted
+-- representation (so core never dereferences a TOAST pointer inside
+-- ciphertext). That makes the bit WRONG on the decrypted tuple whenever the
+-- attribute genuinely is an out-of-line pointer. CREATE TABLE AS SELECT /
+-- INSERT ... SELECT hand the scan's own slot straight to the destination's
+-- tuple_insert (ExecFetchSlotHeapTuple's "get_heap_tuple" fast path, no
+-- heap_form_tuple rebuild), so they trust that stale bit and skip
+-- re-externalizing. Fixed by having tde_decrypt_heap_tuple() recompute
+-- HEAP_HASEXTERNAL from the actual decrypted attributes
+-- (tde_tuple_has_external_desc()) before returning the tuple, so every
+-- consumer — not just the ones this codebase already special-cased — sees
+-- a truthful tuple.
+-- ================================================================
+DO $$
+DECLARE
+    toast_bytes bigint;
+    mismatches  int;
+BEGIN
+    DROP TABLE IF EXISTS tde_ctas_src_140, tde_ctas_snap_140;
+
+    CREATE TABLE tde_ctas_src_140 (id int PRIMARY KEY, big_val text) USING encrypted_heap;
+    INSERT INTO tde_ctas_src_140
+    SELECT g, (SELECT string_agg(md5(random()::text || g || x), '')
+                 FROM generate_series(1, 400) x)   -- ~12.8 KB, incompressible
+    FROM generate_series(1, 5) g;
+
+    -- CREATE TABLE AS SELECT while the source is STILL encrypted_heap
+    CREATE TABLE tde_ctas_snap_140 AS SELECT * FROM tde_ctas_src_140;
+
+    -- The destination must have re-externalized into its OWN TOAST table,
+    -- not merely kept referencing the source's.
+    SELECT pg_relation_size(reltoastrelid) INTO toast_bytes
+    FROM pg_class WHERE oid = 'tde_ctas_snap_140'::regclass;
+    IF toast_bytes = 0 THEN
+        RAISE EXCEPTION 'TEST 140 FAILED: destination TOAST table is empty -- CTAS did not re-externalize, still sharing the source''s TOAST storage';
+    END IF;
+
+    -- The definitive check: drop the (now unrelated) source and confirm the
+    -- destination is still fully readable.
+    DROP TABLE tde_ctas_src_140;
+
+    SELECT count(*) INTO mismatches
+    FROM tde_ctas_snap_140
+    WHERE big_val IS NULL OR length(big_val) <> 12800;
+    IF mismatches <> 0 THEN
+        RAISE EXCEPTION 'TEST 140 FAILED: % row(s) unreadable/wrong length after dropping the source table', mismatches;
+    END IF;
+
+    DROP TABLE tde_ctas_snap_140;
+
+    RAISE NOTICE 'TEST 140 PASSED: CREATE TABLE AS SELECT from encrypted_heap re-externalizes TOAST into its own table and survives the source being dropped';
+END;
+$$;
 
 
 -- ================================================================
@@ -1389,7 +1682,7 @@ $$;
 DO $$
 BEGIN
     RAISE NOTICE '============================================================';
-    RAISE NOTICE 'v1.7 Tests 111-137 — COMPLETE';
+    RAISE NOTICE 'v1.7 Tests 111-140 — COMPLETE';
     RAISE NOTICE '   tde_int4_enc_ops + disk forensic check ......test 111';
     RAISE NOTICE '   tde_int8_enc_ops equality lookup ........... test 112';
     RAISE NOTICE '   tde_uuid_enc_ops equality lookup ........... test 113';
@@ -1417,6 +1710,9 @@ BEGIN
     RAISE NOTICE '   CREATE INDEX CONCURRENTLY (index_validate) . test 135';
     RAISE NOTICE '   REINDEX INDEX CONCURRENTLY ................. test 136';
     RAISE NOTICE '   partial-index CREATE INDEX CONCURRENTLY .... test 137';
+    RAISE NOTICE '   ALTER heap->encrypted_heap, real TOAST (PSQLE-135) . test 138';
+    RAISE NOTICE '   ALTER encrypted_heap->heap, real TOAST (PSQLE-135) . test 139';
+    RAISE NOTICE '   CTAS from encrypted_heap survives source drop (PSQLE-135) test 140';
     RAISE NOTICE '============================================================';
 END;
 $$;
