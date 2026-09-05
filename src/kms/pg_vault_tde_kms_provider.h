@@ -148,9 +148,9 @@ typedef struct TdeKmsProvider
 /*
  * tde_active_kms_provider — the selected KMS backend for this connection.
  *
- * Assigned in pg_vault_tde.c _PG_init based on pg_vault_tde.kms_provider GUC.
- * All callers that need KMS operations use this pointer — NEVER call provider
- * functions directly.
+ * Assigned by the pg_vault_tde.kms_provider GUC assign hook.  All callers that
+ * need KMS operations go through tde_kms_provider() below — NEVER call provider
+ * functions directly, and never read this pointer before an operation.
  *
  * Defined in pg_vault_tde.c; declared extern here so kms.c and tam.c can read
  * it without including pg_vault_tde.c's internals.
@@ -171,11 +171,51 @@ typedef struct TdeKmsProvider
 extern const TdeKmsProvider *tde_active_kms_provider;
 
 /*
+ * tde_kms_provider — accessor: return the active provider, running its
+ * init() on first use.
+ *
+ * ALWAYS use this instead of reading tde_active_kms_provider directly before
+ * a KMS operation.  provider->init() is deliberately NOT called from the
+ * kms_provider GUC assign hook: PostgreSQL applies pg_db_role_setting entries
+ * one at a time (ProcessGUCArray walks setconfig in array order, and
+ * process_settings applies the DATABASE_USER scope before the DATABASE one),
+ * so at assign time the companion GUCs (wallet_path, wallet_passphrase_*,
+ * pkcs11_*) may still hold their defaults.  Initialising lazily — at the
+ * first actual KMS call, when the whole effective configuration is in place —
+ * makes the order of the ALTER DATABASE SET statements irrelevant.
+ *
+ * Returns NULL when no provider is configured; callers must ereport.
+ */
+extern const TdeKmsProvider *tde_kms_provider(void);
+
+/*
+ * tde_kms_provider_invalidate — clear the "already initialised" mark so the
+ * next tde_kms_provider() call re-runs init().  Wired to the assign hook of
+ * every GUC that init() reads, so a SET / ALTER DATABASE SET of any of them
+ * takes effect without a reconnect.
+ */
+extern void tde_kms_provider_invalidate(void);
+
+/*
  * Provider registration functions — one per provider implementation.
  * Called ONLY from pg_vault_tde.c to populate tde_active_kms_provider.
  */
 const TdeKmsProvider *pg_vault_tde_kms_vault_provider(void);   /* vault */
 const TdeKmsProvider *pg_vault_tde_kms_local_provider(void);   /* local wallet */
 const TdeKmsProvider *pg_vault_tde_kms_pkcs11_provider(void);  /* pkcs11 HSM */
+
+/*
+ * Local-provider entry points needed outside pg_vault_tde_kms_local.c.
+ *
+ * pg_vault_tde_kms_local_wallet_path() is registered as the GUC show_hook for
+ * pg_vault_tde.wallet_path so SHOW reports the computed per-database default
+ * instead of an empty string.  Signature must stay GucShowHook-compatible.
+ *
+ * pg_vault_tde_kms_local_reset() drops any cached KEK / open-wallet flag; it
+ * is called from tde_kms_provider_invalidate() so that changing a wallet GUC
+ * mid-session cannot leave key material derived from the previous settings.
+ */
+const char *pg_vault_tde_kms_local_wallet_path(void);
+void        pg_vault_tde_kms_local_reset(void);
 
 #endif /* PG_VAULT_TDE_KMS_PROVIDER_H */

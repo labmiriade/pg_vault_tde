@@ -7,6 +7,28 @@ pg_vault_tde.control`) or, where available, from the annotated release tag;
 commit was not (yet) tagged as a release at the time of writing. See
 doc/ROADMAP.md for the full feature-by-feature history, including v1.0-v1.3.
 
+1.7.1  (in-tree since 2026-09-05; C-only bugfixes, no SQL/catalog change —
+        pg_vault_tde_build_version() distinguishes these builds from 1.7.0)
+    - PSQLE-135: fix AAD relid resolution and HEAP_HASEXTERNAL on decrypt.
+    - PSQLE-126: KMS GUCs are now genuinely independent settings: the provider is
+      initialised on first use (tde_kms_provider()) instead of from the
+      pg_vault_tde.kms_provider assign hook, so the order and the scope of the
+      ALTER DATABASE SET / ALTER ROLE ... IN DATABASE SET statements no longer
+      matter.  Fixes the spurious "local wallet passphrase env var ... not set"
+      WARNING on every connection, and the silent use of the per-database
+      default wallet_path when wallet_path was set after kms_provider.
+    - The local wallet path is no longer snapshotted per backend; changing a
+      KMS GUC mid-session re-initialises the provider and drops any cached KEK.
+    - pg_vault_tde_wallet_status() resolves the provider before reporting, so
+      wallet_open still reflects the wallet and not "nothing has opened it in
+      this session yet" now that init() is lazy.
+    - SHOW pg_vault_tde.wallet_path now reports the computed per-database
+      default instead of an empty string (show_hook was never registered).
+    - The postmaster no longer attempts to open a local wallet at startup
+      (it has no database context), removing the "cannot open wallet \"\""
+      WARNING from every cluster-level 'local' setup.
+    - New TAP file: tap/18_guc_order_independence.t.
+
 1.7.0  (in-tree since 2026-06-09; current default_version, unreleased)
     - TOAST chunk-level storage encryption, KEK hierarchy / key rotation for
       all KMS providers, PKCS#11 / HSM support, audit logging, fixed-size
