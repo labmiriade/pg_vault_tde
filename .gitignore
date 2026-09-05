@@ -11,3 +11,4 @@ PRODUCT_INFORMATION.md
 PRODUCT_INFORMATION.html
 dist/
 demo/
+ci/docker-data/
