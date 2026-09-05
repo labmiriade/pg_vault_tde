@@ -1649,7 +1649,7 @@ pg_vault_tde_pkcs11_keygen_sql(PG_FUNCTION_ARGS)
     CK_OBJECT_HANDLE existing;
     CK_OBJECT_HANDLE kek;
 
-    if (tde_active_kms_provider == NULL ||
+    if (tde_kms_provider() == NULL ||
         strcmp(tde_active_kms_provider->name, "pkcs11") != 0)
         ereport(ERROR,
                 errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),

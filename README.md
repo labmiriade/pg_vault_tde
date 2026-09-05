@@ -370,6 +370,41 @@ to that database and do not require a server restart.  The cluster-level default
 in `postgresql.conf` (or `ALTER SYSTEM`) act as the fallback for any database
 that does not override a parameter.
 
+#### Order and scope do not matter
+
+Every `pg_vault_tde` KMS parameter is an ordinary, independent GUC:
+
+- a value set at database level **always overrides** the cluster-level one, and
+- the **order** in which the `ALTER DATABASE SET` statements are issued, and the
+  **scope** each one is set at, are irrelevant.
+
+You can therefore set `kms_provider` first, last, or in the middle, and mix
+`ALTER SYSTEM`, `ALTER DATABASE SET` and `ALTER ROLE … IN DATABASE … SET`
+freely.  The provider reads its configuration when it is first used to wrap or
+unwrap a key — after PostgreSQL has finished applying every setting that
+applies to the connection — not at the moment `kms_provider` is assigned.
+
+> **Versions before this fix** initialised the provider from the
+> `kms_provider` GUC assign hook, i.e. while PostgreSQL was still applying the
+> database's settings one at a time.  Setting `kms_provider` before the wallet
+> parameters produced a spurious
+> `local wallet passphrase env var "" not set` WARNING on every connection and,
+> worse, silently froze `wallet_path` to the per-database default.  If you are
+> upgrading and had worked around this by re-ordering your `ALTER DATABASE SET`
+> statements, that workaround is no longer needed (and was never reliable at
+> mixed scopes).  Regression coverage:
+> [`tap/18_guc_order_independence.t`](tap/18_guc_order_independence.t).
+
+To inspect where each effective value comes from, use PostgreSQL's own
+`pg_settings.source` (`database`, `configuration file`, `session`, …):
+
+```sql
+SELECT name, setting, source
+FROM   pg_settings
+WHERE  name LIKE 'pg_vault_tde.%' AND source <> 'default'
+ORDER  BY name;
+```
+
 ### Local Wallet Provider (v1.6 — Offline, No External Service)
 
 A PKCS#12-based encrypted file at
@@ -816,7 +851,7 @@ PG_VERSION=17 make ci-all
 make ci-regress          # 140 SQL regression tests (vault provider) — tests 1-140 (test 110 deferred)
 make ci-wallet           # SQL regression tests (local wallet provider)
 make ci-checksums        # regression tests + page checksum compatibility
-make ci-tap              # TAP tests with mock Vault
+make ci-tap              # 18 TAP test files (starts a real Vault container for the Vault-dependent ones)
 make ci-isolation        # Concurrency / MVCC isolation tests
 make ci-vault            # Vault integration (Compose-based)
 make ci-openbao          # OpenBao Raft 3-node HA integration (12 tests)

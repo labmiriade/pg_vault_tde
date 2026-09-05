@@ -1294,10 +1294,59 @@ Starts PostgreSQL with `initdb -k` (`--data-checksums`). Verifies that:
 
 ### TAP Tests (`tap/`)
 
+18 files, run together by `make ci-tap` (which also starts the Vault container
+the Vault-dependent files need; they `skip_all` when `VAULT_ADDR` is unset).
+
 | File | Coverage |
 |---|---|
 | `tap/01_load.t` | Extension load, AM registration, basic SQL round-trip |
-| `tap/02_backup.t` | `pg_basebackup` |
+| `tap/02_backup_local.t` | `pg_dump_tde` / `pg_restore_tde` round-trip, local wallet KMS |
+| `tap/03_backup_vault.t` | Same round-trip against a real Vault Transit backend |
+| `tap/04_backup_format.t` | Binary dump format, multi-object dump/restore |
+| `tap/05_backup_data_variety.t` | TOAST, Unicode, bytea, bulk rows, sequences |
+| `tap/06_backup_corruption.t` | Corrupted ciphertext, truncation, bad magic, IV randomness |
+| `tap/07_backup_cli.t` | CLI argument validation of the backup wrappers |
+| `tap/08_backup_security.t` | No plaintext leakage, IV uniqueness, opaque output |
+| `tap/09_backup_wrong_key.t` | Wrong passphrase and missing-wallet scenarios |
+| `tap/10_backup_cross_db.t` | Restore into a database other than the source |
+| `tap/11_multi_kms_cluster.t` | Different KMS providers per database in one cluster |
+| `tap/12_logical_repl_toast.t` | Logical replication of encrypted_heap TOAST values |
+| `tap/13_index_concurrently.t` | `CREATE INDEX CONCURRENTLY` / `REINDEX CONCURRENTLY` |
+| `tap/14_seal_keys.t` | Physical-backup key sealing bundle round-trip |
+| `tap/15_basebackup_tde.t` | `pg_basebackup_tde` wrapper, multi-database bundles |
+| `tap/16_pkcs11.t` | pkcs11 provider against a throwaway SoftHSM2 token |
+| `tap/17_index_constraints.t` | Index AM whitelist, PRIMARY KEY / UNIQUE behaviour |
+| `tap/18_guc_order_independence.t` | KMS GUCs are order- and scope-independent (see below) |
+
+#### `tap/18_guc_order_independence.t`
+
+Pins the contract that the KMS GUCs behave as plain independent settings: a
+value set at database level overrides the cluster-level one, and **nothing
+depends on the order or the scope in which they were set**.
+
+PostgreSQL applies a database's `pg_db_role_setting` entries one at a time —
+`ProcessGUCArray()` walks the `setconfig` array in order, and `GUCArrayAdd()`
+replaces an existing name *in place*, so re-issuing an `ALTER DATABASE SET`
+does not move it to the end — while `process_settings()` applies the
+`DATABASE_USER` scope before the `DATABASE` one.  Any provider `init()`
+performed from the `kms_provider` assign hook therefore ran against a
+half-applied configuration.  The test covers the four cases that broke:
+
+1. `kms_provider` set *before* the wallet GUCs — no spurious passphrase
+   WARNING, and the encrypted round-trip works.
+2. A custom `wallet_path` set *after* `kms_provider` is honoured, and the
+   per-database default path is not silently used instead.
+3. `kms_provider` at `ALTER ROLE … IN DATABASE` scope with the wallet GUCs at
+   `ALTER DATABASE` scope — the case that reordering the statements cannot fix.
+4. `pg_vault_tde_wallet_status()` on a fresh connection reports the state of
+   the *wallet*, not of the session: because `init()` is lazy, status has to go
+   through the provider accessor or it would answer "nothing opened it yet".
+5. Changing a passphrase source mid-session drops the KEK cached by
+   `pg_vault_tde_wallet_unlock()`.
+
+Plus a regression guard on the postmaster: a cluster-level `local` provider
+must not attempt to open a wallet at startup, where there is no database and
+therefore no wallet path.
 
 ### Isolation Tests (`isolation/dek_rotation.spec`)
 
