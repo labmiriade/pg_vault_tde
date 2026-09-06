@@ -38,10 +38,24 @@ concurrency:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.matrix.outputs.include }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag }}
+
+      - name: Load the build matrix
+        id: matrix
+        # Read from the tag being built, not from the default branch, so each
+        # release carries its own support window: a v1.7.x tag can keep
+        # targeting PG 17-18 after develop has moved on. See
+        # packaging/BUILD_MATRIX.md.
+        run: |
+          set -euo pipefail
+          jq -e 'type == "array" and length > 0' packaging/build-matrix.json >/dev/null
+          echo "include=$(jq -c . packaging/build-matrix.json)" >> "$GITHUB_OUTPUT"
+          echo "Building $(jq length packaging/build-matrix.json) package(s) for tag ${{ inputs.tag }}."
 
       - name: Verify version consistency at tag
         run: |
@@ -87,27 +101,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # DEB — packaging/build_in_container.sh VALID_DEB_OS
-          - { format: deb, os: "ubuntu:22.04", pg: "17", slug: ubuntu22.04 }
-          - { format: deb, os: "ubuntu:22.04", pg: "18", slug: ubuntu22.04 }
-          - { format: deb, os: "ubuntu:24.04", pg: "17", slug: ubuntu24.04 }
-          - { format: deb, os: "ubuntu:24.04", pg: "18", slug: ubuntu24.04 }
-          - { format: deb, os: "ubuntu:26.04", pg: "17", slug: ubuntu26.04 }
-          - { format: deb, os: "ubuntu:26.04", pg: "18", slug: ubuntu26.04 }
-          - { format: deb, os: "debian:12",    pg: "17", slug: debian12 }
-          - { format: deb, os: "debian:12",    pg: "18", slug: debian12 }
-          - { format: deb, os: "debian:13",    pg: "17", slug: debian13 }
-          - { format: deb, os: "debian:13",    pg: "18", slug: debian13 }
-          # RPM — packaging/build_in_container.sh VALID_RPM_OS
-          - { format: rpm, os: "rockylinux:9",  pg: "17", slug: rockylinux9 }
-          - { format: rpm, os: "rockylinux:9",  pg: "18", slug: rockylinux9 }
-          - { format: rpm, os: "rockylinux:10", pg: "17", slug: rockylinux10 }
-          - { format: rpm, os: "rockylinux:10", pg: "18", slug: rockylinux10 }
-          - { format: rpm, os: "almalinux:9",   pg: "17", slug: almalinux9 }
-          - { format: rpm, os: "almalinux:9",   pg: "18", slug: almalinux9 }
-          - { format: rpm, os: "almalinux:10",  pg: "17", slug: almalinux10 }
-          - { format: rpm, os: "almalinux:10",  pg: "18", slug: almalinux10 }
+        # Single source of truth: packaging/build-matrix.json, read from the
+        # tag by the validate job. Do not inline entries here — dev-prerelease.yml
+        # reads the same file, and a hand-edited copy would let the stable and
+        # dev channels drift apart silently.
+        include: ${{ fromJSON(needs.validate.outputs.include) }}
     steps:
       - uses: actions/checkout@v4
         with:

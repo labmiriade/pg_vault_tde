@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 🔒 Report a security vulnerability
+    url: https://github.com/labmiriade/pg_vault_tde/security/advisories/new
+    about: Never report a vulnerability in a public issue. Use private reporting — see SECURITY.md.
+  - name: 📖 Documentation and wiki
+    url: https://github.com/labmiriade/pg_vault_tde/wiki
+    about: Installation, KMS setup, key rotation, backup, limitations and troubleshooting.
+  - name: 💬 Questions and usage help
+    url: https://github.com/labmiriade/pg_vault_tde/discussions
+    about: For "how do I…" questions rather than defect reports.
+  - name: 🏢 Commercial support
+    url: https://www.miriade.it/en/products/mircrypt-it
+    about: Production SLAs, custom development, security audits and migration assistance from Miriade.
