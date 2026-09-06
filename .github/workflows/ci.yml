@@ -1,0 +1,73 @@
+name: Build
+
+# Compile check on every push and pull request, across the supported
+# PostgreSQL majors. This is what the README's Build badge reports.
+#
+# Deliberately build-only: the full regression, TAP, isolation and Vault
+# suites need containers and a live KMS, and run in the canonical Bitbucket
+# pipeline (see ci/README.md and bitbucket-pipelines.yml). What this workflow
+# guarantees is that the tree compiles cleanly — warnings included, since
+# `-Werror` is on — against both supported PostgreSQL server APIs.
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: PG ${{ matrix.pg }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["17", "18"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL ${{ matrix.pg }} headers and build dependencies
+        run: |
+          set -euo pipefail
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+            https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            postgresql-server-dev-${{ matrix.pg }} \
+            libpq-dev libssl-dev libcurl4-openssl-dev pkg-config
+
+      - name: Build (warnings are errors)
+        run: |
+          make -j"$(nproc)" \
+            PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config \
+            COPT=-Werror
+
+      - name: Install into the PostgreSQL tree
+        run: |
+          sudo make install \
+            PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+
+      - name: Verify the module and frontend tools were produced
+        run: |
+          set -euo pipefail
+          PKGLIBDIR=$(/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config --pkglibdir)
+          BINDIR=$(/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config --bindir)
+          test -f "$PKGLIBDIR/pg_vault_tde.so"
+          for tool in pg_dump_tde pg_restore_tde pg_basebackup_tde; do
+            test -x "$BINDIR/$tool"
+          done
+          echo "OK: extension module and frontend tools installed for PG ${{ matrix.pg }}."

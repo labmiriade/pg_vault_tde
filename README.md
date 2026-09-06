@@ -1,5 +1,12 @@
 # pg_vault_tde
 
+[![build main](https://img.shields.io/github/actions/workflow/status/labmiriade/pg_vault_tde/ci.yml?branch=main&label=build%20main)](https://github.com/labmiriade/pg_vault_tde/actions/workflows/ci.yml?query=branch%3Amain)
+[![build develop](https://img.shields.io/github/actions/workflow/status/labmiriade/pg_vault_tde/ci.yml?branch=develop&label=build%20develop)](https://github.com/labmiriade/pg_vault_tde/actions/workflows/ci.yml?query=branch%3Adevelop)
+[![packages](https://img.shields.io/github/actions/workflow/status/labmiriade/pg_vault_tde/build-packages.yml?label=packages)](https://github.com/labmiriade/pg_vault_tde/actions/workflows/build-packages.yml)
+[![PGXN](https://img.shields.io/badge/PGXN-pg__vault__tde-blue)](https://pgxn.org/dist/pg_vault_tde/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-17%20%7C%2018-336791)](#postgresql-version-compatibility)
+[![License](https://img.shields.io/badge/license-PostgreSQL-blue)](LICENSE)
+
 **Transparent Data Encryption (TDE) for PostgreSQL 17+** — Open-source (PostgreSQL License), plug-and-play, zero core modifications.
 
 pg_vault_tde encrypts every tuple with **AES-256-GCM** at the Table Access
@@ -43,7 +50,7 @@ Contact our engineering team at [marketing@miriade.it](mailto:marketing@miriade.
 
 ```bash
 # Build and install into your PostgreSQL instance
-git clone https://github.com/miriade/pg_vault_tde.git
+git clone https://github.com/labmiriade/pg_vault_tde.git
 cd pg_vault_tde
 
 # On Debian/Ubuntu (PG 18)
@@ -72,7 +79,7 @@ pip install pgxnclient   # or: apt-get install pgxnclient / dnf install pgxnclie
 pgxn install pg_vault_tde
 ```
 
-See [wiki: Installation](https://github.com/miriade/pg_vault_tde/wiki/Installation)
+See [wiki: Installation](https://github.com/labmiriade/pg_vault_tde/wiki/Installation)
 for package-based (`.deb`/`.rpm`) installs and full per-OS prerequisites.
 
 ### 2. Configure PostgreSQL
@@ -1213,10 +1220,10 @@ See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
    in **plaintext**. The tuplestore is populated directly by the executor, bypassing the table
    access method write path entirely, so `pg_vault_tde` never gets a chance to encrypt the data
    before it reaches disk — there is no extension hook anywhere in the `WITH HOLD` cursor
-   lifecycle (parse, plan, portal start, commit-time persist) that can intercept it. This is the
-   same class of gap documented for other TDE implementations (e.g. Percona's `pg_tde`): temporary
-   files produced by query execution that exceed `work_mem` are not covered by table-level
-   encryption. The spilled file can outlive the query that created it — it persists for as long as
+   lifecycle (parse, plan, portal start, commit-time persist) that can intercept it. This is an
+   inherent limit of the extension APIs, not of this implementation: temporary files produced by
+   query execution that exceed `work_mem` are not covered by table-level encryption. The spilled
+   file can outlive the query that created it — it persists for as long as
    the held cursor remains open, and, like any other PostgreSQL temp file, is not guaranteed to be
    cleaned up if the server crashes before the owning session ends normally.
 
@@ -1275,6 +1282,24 @@ See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
     **Mitigation:** always use `pg_dump_tde`/`pg_restore_tde` instead of plain
     `pg_dump`/`pg_restore` for logical backups of encrypted tables — see
     [Encrypted Backups](#encrypted-backups).
+
+---
+
+## Community & Contributing
+
+| | |
+|---|---|
+| **Report a bug** | [Open a bug report](https://github.com/labmiriade/pg_vault_tde/issues/new?template=bug_report.yml) — check [Known Limitations](https://github.com/labmiriade/pg_vault_tde/wiki/Known-Limitations-and-Troubleshooting) first |
+| **Request a feature** | [Open a feature request](https://github.com/labmiriade/pg_vault_tde/issues/new?template=feature_request.yml) |
+| **Report a vulnerability** | **Privately** — see [SECURITY.md](SECURITY.md). Never in a public issue. |
+| **Contribute code** | [CONTRIBUTING.md](CONTRIBUTING.md) explains the GitHub → Bitbucket mirror review flow |
+| **Community standards** | [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) |
+| **Documentation** | [Project wiki](https://github.com/labmiriade/pg_vault_tde/wiki) |
+| **Commercial support** | [Miriade / Mircrypt](https://www.miriade.it/en/products/mircrypt-it) — SLAs, custom development, security audits |
+
+Contributions are welcome from anyone. This project is part of the PostgreSQL
+community and holds itself to that community's standards of respectful,
+professional technical collaboration.
 
 ---
 

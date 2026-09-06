@@ -1,8 +1,40 @@
 # Contributing
 
-Thanks for your interest in pg_vault_tde. The canonical repository lives on an
-internal Bitbucket instance; this GitHub repository is a mirror that also
-accepts external contributions. Here's what happens after you open a PR:
+Thanks for your interest in pg_vault_tde.
+
+## Before You Start
+
+- **Everyone taking part in this project is expected to follow our
+  [Code of Conduct](CODE_OF_CONDUCT.md).**
+- **Found a security vulnerability?** Do not open an issue or a pull request.
+  Follow [SECURITY.md](SECURITY.md) and report it privately.
+- **Reporting a bug or proposing a feature?** Use the
+  [issue templates](https://github.com/labmiriade/pg_vault_tde/issues/new/choose).
+  For bugs, please check
+  [Known Limitations and Troubleshooting](https://github.com/labmiriade/pg_vault_tde/wiki/Known-Limitations-and-Troubleshooting)
+  first — several behaviours that look like defects are documented consequences
+  of what a PostgreSQL extension is able to intercept.
+
+By contributing, you agree that your work is licensed under the
+[PostgreSQL License](LICENSE), the same terms as the rest of the project.
+
+## Working on a Change
+
+- Build cleanly against **both PostgreSQL 17 and 18**, with no compiler
+  warnings. Every push and pull request is compile-checked on both by CI.
+- Run at least `make ci-regress` locally before opening a PR; see
+  [ci/README.md](ci/README.md) for the full set of suites (TAP, isolation,
+  Vault, wallet, memcheck).
+- Add tests that fail without your change.
+- The pull request template lists what reviewers will check — in particular
+  the extra checklists for changes touching cryptography, key material, or the
+  access methods. Reading it before you start will save you a review round.
+
+## How Review Works
+
+The canonical repository lives on an internal Bitbucket instance; this GitHub
+repository is a mirror that also accepts external contributions. Here's what
+happens after you open a PR:
 
 1. Open your pull request here against `develop` (or `main` for release-only
    fixes) as usual.

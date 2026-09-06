@@ -339,7 +339,8 @@ dnf -y module disable postgresql 2>/dev/null || true
 dnf install -y -q \\
     perl-IPC-Run postgresql${pg}-devel \\
     openssl-devel libcurl-devel pkgconfig \\
-    gcc make rsync rpm-build chrpath
+    gcc make rsync rpm-build chrpath \\
+    clang llvm-devel
 
 # ── Build ─────────────────────────────────────────────────────────────────
 export PATH=\"/usr/pgsql-${pg}/bin:\$PATH\"

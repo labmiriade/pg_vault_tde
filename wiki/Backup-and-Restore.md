@@ -67,8 +67,9 @@ All other `pg_dump`/`pg_restore` options are forwarded through. Internally:
 configuration on the primary**: encrypted relation files are copied as-is,
 and the wrapped DEKs travel with the data directory inside the
 `pg_vault_tde_catalog` table. Critically, **the KEK never travels with the
-backup** — it stays in the KMS/wallet/HSM, the same model used by Oracle
-RMAN, SQL Server TDE, and Percona `pg_tde`.
+backup** — it stays in the KMS/wallet/HSM, which is the standard operating
+model for encrypted database backups: the master key is provisioned on the
+restore target separately, never carried inside the backup artifact.
 
 ### Provisioning the KEK on a Standby / Restore Target
 

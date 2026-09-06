@@ -1,0 +1,88 @@
+name: Feature Request
+description: Suggest a capability or improvement for pg_vault_tde.
+title: "[Feature]: "
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion.
+
+        Two things worth checking before you write:
+
+        - The [Roadmap](https://github.com/labmiriade/pg_vault_tde/blob/develop/doc/ROADMAP.md)
+          may already have it planned.
+        - Some things are **permanently out of reach for an extension** — full
+          WAL encryption, for instance, needs a core hook that does not exist.
+          The [Known Limitations](https://github.com/labmiriade/pg_vault_tde/wiki/Known-Limitations-and-Troubleshooting)
+          page lists these.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: |
+        Describe the situation you are in, not the solution you have in mind.
+        Real operational or compliance context helps us far more than a feature name.
+      placeholder: |
+        Our auditor requires the KEK to be rotated every 90 days, and today
+        we have to script it externally because…
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like pg_vault_tde to do? SQL sketches and GUC names welcome.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which area does this touch?
+      multiple: true
+      options:
+        - Table access method (encrypted_heap)
+        - Index access method (tde_btree)
+        - Cryptography
+        - KMS — HashiCorp Vault / OpenBao
+        - KMS — local PKCS#12 wallet
+        - KMS — PKCS#11 / HSM
+        - Key rotation
+        - Backup and restore
+        - Logical replication
+        - Auditing and monitoring
+        - Packaging and installation
+        - Documentation
+        - Not sure
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Including whatever you are doing today to work around the gap.
+    validations:
+      required: false
+
+  - type: textarea
+    id: compat
+    attributes:
+      label: Compatibility impact
+      description: |
+        If you have a view on it — would this change the on-disk format, an
+        existing GUC's meaning, or the signature of an existing SQL function?
+        Answering "not sure" is fine; we will work it out.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Would you like to work on it?
+      options:
+        - label: I would be willing to submit a pull request for this.
+          required: false
