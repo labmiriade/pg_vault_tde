@@ -20,8 +20,8 @@
  * KNOWN LIMITATION: Range scans (>, <, BETWEEN) on TDE-encrypted indexed
  * columns are NOT supported and will return empty results.  Users requiring
  * range queries must either accept unencrypted indexes (SQL ACL protection
- * only) or restructure their queries.  This is the same trade-off made by
- * MySQL Enterprise TDE and AWS RDS Transparent Data Encryption.
+ * only) or restructure their queries.  This trade-off is inherent to
+ * deterministic encryption, not specific to this implementation.
  *
  * AES-SIV is available in OpenSSL 3.x via EVP_aes_256_siv().  It provides:
  *  - Deterministic encryption (same key + plaintext → same ciphertext)
