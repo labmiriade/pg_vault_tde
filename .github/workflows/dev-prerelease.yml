@@ -1,0 +1,251 @@
+name: Dev Pre-release
+
+# Publishes installable .deb/.rpm packages built from `develop`, so people can
+# try unreleased work without building from source.
+#
+# Relationship to the other pipelines:
+#   - Bitbucket already runs the PG 17/18 test suites on develop before it is
+#     mirrored here, so this workflow does not re-test — it only packages.
+#   - build-packages.yml publishes *stable* releases from a version tag and is
+#     deliberately strict about tag/version consistency. This one is the
+#     opposite channel and never touches a v* tag.
+#
+# The packages carry a `~dev<date>.<sha>` version suffix. `~` sorts *before*
+# the bare version in both dpkg and rpm, so 1.7.1~dev20260906.abc1234 is
+# treated as a pre-release of 1.7.1 — anyone who installs a dev build gets
+# upgraded automatically once the real 1.7.1 ships. Do not remove the tilde.
+#
+# The result is a single rolling GitHub pre-release tagged `dev-latest`, reset
+# on every run so it never accumulates stale assets from older commits.
+
+on:
+  schedule:
+    # Weekly, Sunday evening: 20:17 UTC — 21:17 in Italy in winter (CET),
+    # 22:17 in summer (CEST). GitHub cron is always UTC and has no timezone
+    # setting, so the local hour necessarily shifts by one across DST; both
+    # sides of that shift land on Sunday evening, which is what matters here.
+    # The odd minute is deliberate: scheduled runs cluster on the hour and
+    # GitHub delays them under load, so :17 starts closer to on time.
+    #
+    # Deliberately not on every push to develop: the full 18-package matrix on
+    # each sync would be a lot of churn for a preview channel, and a week-old
+    # dev build is still a useful dev build. Skipped automatically when develop
+    # has not moved (see the guard below); use the manual trigger for one sooner.
+    - cron: "17 20 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dev-prerelease
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.guard.outputs.should_run }}
+      sha: ${{ steps.stamp.outputs.sha }}
+      short_sha: ${{ steps.stamp.outputs.short_sha }}
+      version: ${{ steps.stamp.outputs.version }}
+      suffix: ${{ steps.stamp.outputs.suffix }}
+      full_version: ${{ steps.stamp.outputs.full_version }}
+      include: ${{ steps.matrix.outputs.include }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          fetch-depth: 0
+
+      - name: Skip the weekly run when develop has not moved
+        id: guard
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual run — building regardless of activity."
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # This window must stay wider than the cron interval above: a commit
+          # landing shortly before one run would otherwise be older than the
+          # window by the next one and never get packaged at all. 8 days for a
+          # weekly schedule — widen it too if the cron is ever made less frequent.
+          COUNT=$(git rev-list --since="8 days ago" --count HEAD)
+          if [ "$COUNT" -gt 0 ]; then
+            echo "$COUNT new commit(s) on develop in the last 8 days — building."
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No new commits on develop in the last 8 days — nothing to publish."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute the pre-release version
+        id: stamp
+        if: steps.guard.outputs.should_run == 'true'
+        run: |
+          set -euo pipefail
+          VERSION=$(cat VERSION)
+          SHA=$(git rev-parse HEAD)
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          SUFFIX="~dev$(date -u +%Y%m%d).${SHORT_SHA}"
+          {
+            echo "sha=${SHA}"
+            echo "short_sha=${SHORT_SHA}"
+            echo "version=${VERSION}"
+            echo "suffix=${SUFFIX}"
+            echo "full_version=${VERSION}${SUFFIX}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building ${VERSION}${SUFFIX} from develop @ ${SHORT_SHA}"
+
+      - name: Load the build matrix
+        id: matrix
+        if: steps.guard.outputs.should_run == 'true'
+        # Same file the stable release path reads, so dev builds always cover
+        # exactly the platforms the next release will. See packaging/BUILD_MATRIX.md.
+        run: |
+          set -euo pipefail
+          jq -e 'type == "array" and length > 0' packaging/build-matrix.json >/dev/null
+          echo "include=$(jq -c . packaging/build-matrix.json)" >> "$GITHUB_OUTPUT"
+          echo "Packaging $(jq length packaging/build-matrix.json) combination(s)."
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # packaging/build-matrix.json, the same file build-packages.yml reads.
+        # A dev build that covers fewer platforms than the release is a dev
+        # build nobody can actually try — keeping one list guarantees it can't
+        # happen by omission.
+        include: ${{ fromJSON(needs.prepare.outputs.include) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - name: Stamp the pre-release version into the packaging files
+        # Patched in the ephemeral checkout only — packaging/ is never modified
+        # in git, so the stable release path keeps reading the bare version.
+        run: |
+          set -euo pipefail
+          SUFFIX='${{ needs.prepare.outputs.suffix }}'
+          FULL='${{ needs.prepare.outputs.full_version }}'
+
+          # debian/changelog: "pkg (1.7.1-1) unstable;" -> "pkg (1.7.1~dev….-1) unstable;"
+          sed -i "1s/(\([^-]*\)-/(\1${SUFFIX}-/" packaging/debian/changelog
+          sed -i "s/^\(Version:[[:space:]]*\).*/\1${FULL}/" packaging/rpm/pg_vault_tde.spec
+          sed -i "s/^VERSION=.*/VERSION=\"${FULL}\"/" packaging/build_rpm.sh
+
+          echo "--- stamped versions ---"
+          head -1 packaging/debian/changelog
+          grep -m1 '^Version:' packaging/rpm/pg_vault_tde.spec
+          grep -m1 '^VERSION=' packaging/build_rpm.sh
+
+          # A silent sed failure here would ship dev packages carrying the
+          # stable version number, which is the exact bug this suffix exists
+          # to prevent — so verify rather than assume.
+          for f in packaging/debian/changelog packaging/rpm/pg_vault_tde.spec packaging/build_rpm.sh; do
+            grep -qF "$FULL" "$f" || { echo "ERROR: version stamp did not apply to $f"; exit 1; }
+          done
+
+      - name: Build ${{ matrix.format }} — ${{ matrix.os }} — PG${{ matrix.pg }}
+        run: |
+          bash packaging/build_in_container.sh \
+            --format "${{ matrix.format }}" \
+            --pg-version "${{ matrix.pg }}" \
+            --os-version "${{ matrix.os }}" \
+            --output-dir dist
+
+      - name: Qualify filename with OS
+        # Same reason as build-packages.yml: build_in_container.sh names
+        # packages after (format, pg) only, so rockylinux:9 and almalinux:9
+        # would otherwise collide as release assets.
+        run: |
+          set -euo pipefail
+          cd dist
+          for f in *.deb *.rpm; do
+            [ -e "$f" ] || continue
+            mv "$f" "${f%.*}.${{ matrix.slug }}.${f##*.}"
+          done
+          ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dev-${{ matrix.format }}-pg${{ matrix.pg }}-${{ matrix.slug }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts into one directory
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f \( -name '*.deb' -o -name '*.rpm' \) -exec cp {} dist/ \;
+          ls -la dist
+
+      - name: Reset the rolling pre-release
+        # dev-latest is rebuilt from scratch each run: without this, assets
+        # from previous commits (which carry a different ~dev suffix, so they
+        # never overwrite) would pile up and users would not know which is current.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release delete dev-latest --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" || true
+
+      - name: Publish dev-latest
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dev-latest
+          target_commitish: ${{ needs.prepare.outputs.sha }}
+          name: "Development build ${{ needs.prepare.outputs.full_version }}"
+          prerelease: true
+          make_latest: false
+          files: dist/*
+          body: |
+            **Unreleased development build — not supported for production.**
+
+            Built from `develop` at commit
+            [`${{ needs.prepare.outputs.short_sha }}`](https://github.com/${{ github.repository }}/commit/${{ needs.prepare.outputs.sha }}),
+            packaged as `${{ needs.prepare.outputs.full_version }}`.
+
+            This is a preview of the next `${{ needs.prepare.outputs.version }}`
+            release. It has passed the PG 17 and PG 18 test suites that gate
+            every commit on `develop`, but it has not been through release
+            qualification. Behaviour, GUCs, SQL signatures and the on-disk
+            format may still change before release, and no upgrade path is
+            guaranteed from a dev build.
+
+            For production use, install a
+            [stable release](https://github.com/${{ github.repository }}/releases/latest) instead.
+
+            ### Upgrading later
+
+            The `~dev` version suffix sorts *below* the final release in both
+            `apt` and `dnf`, so a normal upgrade will move you from this build
+            to `${{ needs.prepare.outputs.version }}` as soon as it ships — no
+            manual removal needed.
+
+            ### Installing
+
+            Pick the file matching your OS and PostgreSQL major version:
+
+            ```bash
+            # Debian / Ubuntu
+            sudo dpkg -i postgresql-<pg>-pg-vault-tde_*.<os>.deb
+
+            # RHEL / Rocky / Alma
+            sudo dnf install ./postgresql<pg>-pg_vault_tde-*.<os>.rpm
+            ```
+
+            Reporting a problem with this build is welcome — please say
+            `dev-latest ${{ needs.prepare.outputs.short_sha }}` in the issue.

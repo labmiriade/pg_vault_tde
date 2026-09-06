@@ -52,7 +52,7 @@ rpm -qi postgresql18-pg_vault_tde   # verify
 ## Option B — Build From Source
 
 ```bash
-git clone https://github.com/miriade/pg_vault_tde.git
+git clone https://github.com/labmiriade/pg_vault_tde.git
 cd pg_vault_tde
 ```
 

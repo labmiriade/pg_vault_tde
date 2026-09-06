@@ -6,7 +6,7 @@ pg_vault_tde's distribution metadata lives in [META.json](META.json)
 (mandatory for [PGXN](https://pgxn.org/), the PostgreSQL Extension Network)
 and [Changes](Changes) (release history). This section is for maintainers
 cutting a new release, not for end users installing the extension — see
-"1. Install" above or [wiki: Installation](https://github.com/miriade/pg_vault_tde/wiki/Installation)
+"1. Install" above or [wiki: Installation](https://github.com/labmiriade/pg_vault_tde/wiki/Installation)
 for that.
 
 ### One-time setup
