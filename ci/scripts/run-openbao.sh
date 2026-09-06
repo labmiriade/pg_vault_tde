@@ -40,17 +40,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
 
 if [ -n "${BITBUCKET_CLONE_DIR:-}" ]; then
+    # Bitbucket Pipelines rejects named volumes ("-v only supports
+    # $BITBUCKET_CLONE_DIR and its subdirectories"), so the CI compose file
+    # bind-mounts the Raft storage from here instead.  Its daemon also runs
+    # with user namespaces remapped: a chown to uid 100 from this build
+    # container lands on a uid the containers cannot see, and the chown the
+    # openbao entrypoint does itself fails with EPERM.  Mode bits DO survive
+    # the remap — hence 0777 here plus SKIP_CHOWN=1 in the compose file.
     COMPOSE_FILE="$CI_DIR/compose-openbao-bitbucket.yml"
-    # This compose file uses bind mounts where the local one uses named
-    # volumes.  A fresh named volume inherits owner/mode from the image path;
-    # a missing bind source is created by the daemon as root:root 0755.  The
-    # openbao image runs as uid 100 and must write its Raft storage there, so
-    # pre-create the directories with that owner or every node dies at boot.
     mkdir -p "$CI_DIR"/docker-data/bao-1-file \
              "$CI_DIR"/docker-data/bao-2-file \
              "$CI_DIR"/docker-data/bao-3-file \
              "$CI_DIR"/docker-data/bao-init-data
-    chown -R 100:1000 "$CI_DIR"/docker-data
+    chmod -R 0777 "$CI_DIR"/docker-data
 else
     COMPOSE_FILE="$CI_DIR/compose-openbao.yml"
 fi
