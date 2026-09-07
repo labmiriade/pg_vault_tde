@@ -72,10 +72,9 @@ without letting that job run.
    # PGXN's own build/test recipe — must pass before uploading:
    make USE_PGXS=1
    make USE_PGXS=1 install
-   make USE_PGXS=1 installcheck PGDATABASE=postgres   # needs a running server with
-                                                       # shared_preload_libraries=pg_vault_tde;
-                                                       # see ci/scripts/run-regress.sh /
-                                                       # run-isolation.sh for the required GUCs
+   make USE_PGXS=1 check-standalone   # throwaway cluster, no server to set up;
+                                      # `installcheck` also works if you already
+                                      # have one preloading pg_vault_tde
    ```
 4. **Validate META.json** before uploading (catches schema mistakes PGXN
    Manager would otherwise reject at upload time):

@@ -65,6 +65,9 @@ DATA = sql/pg_vault_tde--1.7.sql
 # pg_regress test targets (filenames without .sql suffix)
 REGRESS = pg_vault_tde_init
 
+# Artefacts left behind by `make check-standalone` (pg_regress).
+EXTRA_CLEAN = tmp_check results regression.diffs regression.out
+
 # Isolation test specs (test/isolation/{specs,expected}/per_table_dek_rotation.*)
 ISOLATION = per_table_dek_rotation
 ISOLATION_OPTS = --inputdir=test/isolation
@@ -192,6 +195,47 @@ ci-clean:
 	$$RT rm -f pg-tde-test pg-tde-checksums pg-tde-vault vault-mock 2>/dev/null || true; \
 	$$RT rmi -f pg-tde-test:latest vault-mock:latest 2>/dev/null || true; \
 	echo "CI cleanup complete."
+
+# ---------------------------------------------------------------------------
+# check-standalone: run the regression test with no container, no KMS service
+# and no server configuration to edit by hand.
+#
+# PGXS refuses `make check` for out-of-tree extensions ("\"make check\" is not
+# supported" in pgxs.mk), so this drives pg_regress directly: it creates a
+# throwaway cluster under tmp_check/ on a free port, appends test/regress.conf
+# to its postgresql.conf — the extension must be preloaded, which is precisely
+# why plain `make installcheck` fails on a fresh machine — runs the test, and
+# tears the cluster down. No existing cluster is touched.
+#
+# The extension must already be installed into the tree $(PG_CONFIG) points at:
+# pg_regress can create a cluster, but not populate an installation's extension
+# directory.
+#
+# This is the entry point for anyone outside the project, packagers included.
+# It does NOT replace the ci-* targets above: those cover the KMS providers,
+# TAP, isolation, checksums and benchmarks, and `make ci-all` remains the full
+# suite.
+# ---------------------------------------------------------------------------
+PG_REGRESS := $(shell $(PG_CONFIG) --pkglibdir)/pgxs/src/test/regress/pg_regress
+sharedir   := $(shell $(PG_CONFIG) --sharedir)
+
+.PHONY: check-standalone
+check-standalone: all
+	@test -f "$(sharedir)/extension/$(EXTENSION).control" || { \
+	    echo "ERROR: $(EXTENSION) is not installed in $(sharedir)/extension."; \
+	    echo "Run 'make install' first (as a user who can write there)."; \
+	    echo "pg_regress creates the cluster, but not the installation."; \
+	    exit 1; }
+	@test -x "$(PG_REGRESS)" || { \
+	    echo "ERROR: pg_regress not found at $(PG_REGRESS)."; \
+	    echo "Install the PostgreSQL server development package for this major."; \
+	    exit 1; }
+	$(PG_REGRESS) \
+	    --temp-instance=./tmp_check \
+	    --temp-config=$(srcdir)/test/regress.conf \
+	    --inputdir=$(srcdir) \
+	    --bindir=$(bindir) \
+	    $(REGRESS)
 
 # Full pipeline alias
 .PHONY: ci-full

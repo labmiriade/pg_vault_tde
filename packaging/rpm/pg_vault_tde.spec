@@ -70,6 +70,14 @@ export PG_CONFIG
 # instead of disabling the check wholesale.
 chrpath -d %{buildroot}%{pginstdir}/lib/%{sname}.so
 
+# No %%check section, deliberately. `make check-standalone` starts its own
+# throwaway cluster and contacts no KMS, but it needs the extension installed in
+# the tree pg_config points at, while %%install stages into %%{buildroot}.
+# Pointing a cluster at a staged tree requires extension_control_path
+# (PostgreSQL 18+), so it cannot be done uniformly for every major this package
+# builds for. Verify against an installed build instead:
+#   make install && make check-standalone
+
 %files
 %license LICENSE
 %doc doc/pg_vault_tde.md README.md
