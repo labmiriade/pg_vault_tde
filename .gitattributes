@@ -16,8 +16,11 @@
 /bench_tde.sh                      export-ignore
 /.gitignore                        export-ignore
 
-# Maintainer-only release procedure.
+# Maintainer-only: the release procedure, and the tool that regenerates the
+# Support Matrix in doc/. Neither is of any use to someone installing from a
+# release bundle; packaging/ is otherwise kept whole (see the note at the end).
 /PGXN.md                           export-ignore
+/packaging/gen-support-matrix.sh   export-ignore
 
 # GitHub Wiki source, published to the separate wiki repo.
 /wiki                              export-ignore
