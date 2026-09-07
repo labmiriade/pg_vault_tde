@@ -21,6 +21,13 @@ BuildRequires:  pkgconfig
 BuildRequires:  gcc
 BuildRequires:  make
 BuildRequires:  chrpath
+# PGXS emits LLVM bitcode (the %%{pginstdir}/lib/bitcode files listed below)
+# whenever PostgreSQL was built with JIT support, which is the case for every
+# PGDG build. Unlike Debian's postgresql-server-dev-NN, postgresqlNN-devel does
+# not pull clang/llvm in, so without these two the build dies on the first .bc
+# target in a clean buildroot such as mock's.
+BuildRequires:  clang
+BuildRequires:  llvm-devel
 
 Requires:       postgresql%{pgmajorversion}-server
 Requires:       openssl-libs
