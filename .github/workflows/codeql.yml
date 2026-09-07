@@ -1,0 +1,126 @@
+name: "CodeQL"
+
+# Static analysis for the extension's C sources, plus the workflows themselves.
+#
+# Unlike coverage, this needs no test harness: CodeQL only has to watch the
+# compiler work. That matters here, because ci/ is stripped from the public
+# GitHub mirror by git-filter-repo, so the containerised suites are not
+# available on these runners — but `make` is, and that is enough.
+#
+# Results land in the repository's Security tab; the first upload is what
+# switches code scanning on for a public repository. Nothing has to be enabled
+# by hand and nothing has to be bought.
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop, main]
+  schedule:
+    # CodeQL's query packs are updated over time, so the same code yields new
+    # findings without any commit. Weekly re-scan of the default branch.
+    - cron: '37 16 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    permissions:
+      security-events: write   # required to upload the SARIF results
+      packages: read
+      actions: read
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The C sources are compiled twice, once per supported major. The
+          # extension carries real `#if PG_VERSION_NUM < 180000` branches (see
+          # src/pg_vault_tde.c, src/tam/pg_vault_tde_tam.c): CodeQL only sees
+          # what the preprocessor actually emitted, so a single build would
+          # leave the other major's code unanalysed. The two uploads need
+          # distinct categories, otherwise the second overwrites the first
+          # instead of adding to it.
+          - language: c-cpp
+            build-mode: manual
+            pg: "17"
+            label: "C — PostgreSQL 17"
+            category: "/language:c-cpp/pg:17"
+            queries: security-extended
+          - language: c-cpp
+            build-mode: manual
+            pg: "18"
+            label: "C — PostgreSQL 18"
+            category: "/language:c-cpp/pg:18"
+            queries: security-extended
+          # The workflows interpolate ${{ }} values straight into `run:` blocks
+          # (build-packages.yml does it with the tag and version inputs), which
+          # is exactly the script-injection pattern these queries look for.
+          - language: actions
+            build-mode: none
+            label: "GitHub Actions"
+            category: "/language:actions"
+          # Not analysed: Go and Python. The only Go file lives in
+          # ci/vault-mock/, which never reaches this repository, and there is no
+          # Python anywhere. Shell has no CodeQL analyser.
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Must precede `init`: CodeQL observes the build, so the toolchain has to
+      # exist before it starts watching. Same PGDG setup as ci.yml.
+      - name: Install PostgreSQL ${{ matrix.pg }} headers and build dependencies
+        if: matrix.language == 'c-cpp'
+        run: |
+          set -euo pipefail
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+            https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            postgresql-server-dev-${{ matrix.pg }} \
+            libpq-dev libssl-dev libcurl4-openssl-dev pkg-config
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          # Set per matrix entry: security-extended for the C sources, which is
+          # the right trade for a product whose purpose is handling key
+          # material. Left empty (default suite) for `actions`, whose query
+          # pack does not necessarily ship an extended suite — an unknown suite
+          # name makes init fail. Empty means "use the default queries".
+          queries: ${{ matrix.queries }}
+
+      - name: Build against PostgreSQL ${{ matrix.pg }}
+        if: matrix.build-mode == 'manual'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The default target also builds pg_dump_tde / pg_restore_tde /
+          # pg_basebackup_tde, so src/backup is analysed too.
+          # COPT=-Werror is deliberately omitted: the zero-warning gate belongs
+          # to ci.yml, and failing here would lose the scan rather than the build.
+          make -j"$(nproc)" \
+            PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: ${{ matrix.category }}
