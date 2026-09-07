@@ -42,6 +42,10 @@ the extension API; zero modifications to PostgreSQL core are required.
 | 18 | ✅ Supported | `scan_bitmap_next_tuple` signature change — guarded with `PG_VERSION_NUM` |
 | 19 | 🔜 Planned | Infrastructure ready; audit at release |
 
+This is the canonical PostgreSQL support statement for the extension; it says
+nothing about operating systems or about which combinations are actually
+exercised in CI — see [Support Matrix](#support-matrix) under Packaging for that.
+
 ### Version-Specific API Differences
 
 | API / Struct | PG 17 | PG 18 | Guard Macro |
@@ -1432,13 +1436,82 @@ none of the corresponding preprocessor defines (`TDE_HW_AES_NI`,
 any `#ifdef`/`#if defined` in `src/`, so those variants never produced a
 measurably faster `.so` — they were removed.
 
-### Version Matrix
+### Support Matrix
 
-| pg_vault_tde | PostgreSQL | OpenSSL | Status |
+Which (OS, PostgreSQL major) combinations a package is built for, and how much
+verification stands behind each one.
+
+**Generated from `packaging/build-matrix.json` by
+`packaging/gen-support-matrix.sh`.** Edit the JSON and re-run the script; do not
+edit the table below by hand, or the two disagree the next time anyone does run
+it. No CI job enforces this — keeping them in step is part of changing the build
+matrix.
+
+- **Functional suite** — the regression, TAP, isolation, KMS and backup suites
+  run on this OS and PostgreSQL major (`make ci-all`), building from source.
+- **Package install** — the built `.deb`/`.rpm` is installed on a clean system
+  of this OS and `CREATE EXTENSION` is verified
+  (`ci/scripts/run-install-test.sh`).
+- **Neither** — the package is compiled for that combination and nothing more.
+
+The two columns are independent checks, not levels of one scale: a row may have
+its sources fully exercised while its package is never installed, and the other
+way round. Every combination requires OpenSSL 3.x, which is why distributions
+shipping only 1.1.1 (Debian 11, EL8) are absent from the matrix rather than
+listed as unsupported.
+
+<!-- BEGIN GENERATED: support matrix (packaging/gen-support-matrix.sh) -->
+
+| Format | OS | PG | Functional suite | Package install |
+|---|---|---|---|---|
+| deb | `ubuntu:22.04` | 17 | no | yes |
+| deb | `ubuntu:22.04` | 18 | no | yes |
+| deb | `ubuntu:24.04` | 17 | no | no |
+| deb | `ubuntu:24.04` | 18 | no | no |
+| deb | `ubuntu:26.04` | 17 | no | no |
+| deb | `ubuntu:26.04` | 18 | no | no |
+| deb | `debian:12` | 17 | no | no |
+| deb | `debian:12` | 18 | no | no |
+| deb | `debian:13` | 17 | yes | no |
+| deb | `debian:13` | 18 | yes | no |
+| rpm | `rockylinux:9` | 17 | no | yes |
+| rpm | `rockylinux:9` | 18 | no | yes |
+| rpm | `rockylinux:10` | 17 | no | no |
+| rpm | `rockylinux:10` | 18 | no | no |
+| rpm | `almalinux:9` | 17 | no | no |
+| rpm | `almalinux:9` | 18 | no | no |
+| rpm | `almalinux:10` | 17 | no | no |
+| rpm | `almalinux:10` | 18 | no | no |
+
+<!-- END GENERATED: support matrix -->
+
+### KMS Provider Coverage
+
+Which key-management backend each `pg_vault_tde.kms_provider` value is actually
+exercised against in CI, and with what. Maintained by hand — unlike the table
+above, nothing generates it.
+
+| Provider | Backend under test | Version under test | Suites |
 |---|---|---|---|
-| 1.6.x | 17.x, 18.x | 3.x | ✅ Completed |
-| 1.7.x | 17.x, 18.x | 3.x | 🔄 Current |
-| 1.8.x | 17.x, 18.x, 19.x | 3.x | 📋 Planned |
+| `local` | PKCS#12 wallet on local disk; no external service | — | `regress`, `wallet`, `checksums`, `isolation`, `schema`, `bench`, `tap/02_backup_local.t` |
+| `vault` | HashiCorp Vault, Transit secrets engine (`ci/dump-compose.yml`) | image tag `hashicorp/vault:latest`, **unpinned** | `vault`, `tap/03_backup_vault.t` |
+| `openbao` | OpenBao, Transit secrets engine, 3-node Raft cluster (`bao-1`…`bao-3` plus `bao-init`) | image tag `openbao/openbao:2` | `openbao` |
+| `pkcs11` | SoftHSM2 software token, created fresh per run in a tempdir | 2.6.1-3, from the base image's Debian | `pkcs11`, `tap/16_pkcs11.t` |
+
+Two things this table is saying, and one it is not:
+
+- **No physical HSM is exercised.** The `pkcs11` provider is verified against a
+  software token only. A vendor module is loaded through the same `dlopen`
+  path, but no real device, PIN policy or slot behaviour is covered here — see
+  [PKCS#11 / HSM Provider](#pkcs11--hsm-provider) for what the provider expects
+  of one.
+- **Both service images float**, so a new upstream release enters CI with no
+  change on our side. OpenBao's tag tracks the 2.x line and is overridable with
+  `$OPENBAO_IMAGE`. Vault's is not pinned at all and has no override: the
+  `real-vault` image is built locally from
+  `ci/containers/real-vault.Containerfile`, whose `FROM hashicorp/vault:latest`
+  is hardcoded, so pinning a Vault version means editing that file.
+
 
 ---
 
@@ -1454,8 +1527,8 @@ See [ROADMAP.md](ROADMAP.md) for the full release roadmap.
 | **v1.4** | CI/CD + tde_btree + Wire Format v2 | ✅ Completed | 52 |
 | **v1.5** | Per-Table DEK + Online Rotation + AAD | ✅ Completed | 72 |
 | **v1.6** | Local Wallet KMS (production-ready) | ✅ Completed | 109 |
-| **v1.7** | Per-database KMS + pg_restore_tde + PGC_SUSET + enc_ops indexes | 🔄 Current | 109 |
-| **v1.8** | KMIP + Column-Level + GIN/Hash/GiST/BRIN + HA + Dual-Control | 📋 Q2 2027 | ~130 |
+| **v1.7** | Per-database KMS + pg_restore_tde + PGC_SUSET + enc_ops indexes | 🔄 Current | 140 |
+| **v1.8** | KMIP + Column-Level + GIN/Hash/GiST/BRIN + HA + Dual-Control | 📋 Q2 2027 | ~160 |
 
 ### Permanent Deferrals
 

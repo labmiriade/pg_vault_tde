@@ -26,6 +26,9 @@ By contributing, you agree that your work is licensed under the
   [ci/README.md](ci/README.md) for the full set of suites (TAP, isolation,
   Vault, wallet, memcheck).
 - Add tests that fail without your change.
+- If you change `packaging/build-matrix.json`, run
+  `bash packaging/gen-support-matrix.sh` and commit the regenerated Support
+  Matrix in `doc/pg_vault_tde.md` in the same change. No CI job checks it.
 - The pull request template lists what reviewers will check — in particular
   the extra checklists for changes touching cryptography, key material, or the
   access methods. Reading it before you start will save you a review round.
