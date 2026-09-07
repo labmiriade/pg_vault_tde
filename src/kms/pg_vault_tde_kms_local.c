@@ -1008,14 +1008,32 @@ local_passphrase_from_file(char *pass_out, Size pass_max)
     struct stat st;
     size_t      n;
     char       *p;
+    int         fd;
 
     fpath = pg_vault_tde_wallet_passphrase_file;
     if (!fpath || fpath[0] == '\0')
         return false;
 
-    /* Permission sanity check */
-    if (stat(fpath, &st) != 0)
+    /*
+     * Open first, validate the descriptor afterwards. Checking the path with
+     * stat() and opening it in a second step leaves a window in which the path
+     * can be repointed at a different file, so the permissions that get
+     * approved need not be those of the file actually read. O_NOFOLLOW refuses
+     * a symlink outright: a passphrase file is never legitimately one.
+     */
+    fd = open(fpath, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0)
     {
+        ereport(WARNING,
+                errmsg("pg_vault_tde: cannot open passphrase file \"%s\": %m",
+                       fpath));
+        return false;
+    }
+
+    /* Permission sanity check, against the descriptor actually opened */
+    if (fstat(fd, &st) != 0)
+    {
+        close(fd);
         ereport(WARNING,
                 errmsg("pg_vault_tde: passphrase file \"%s\": %m", fpath));
         return false;
@@ -1027,6 +1045,7 @@ local_passphrase_from_file(char *pass_out, Size pass_max)
                        fpath, (unsigned)(st.st_mode & 0777)));
     if ((st.st_mode & 0777) & 0044)  /* group/other readable */
     {
+        close(fd);              /* ereport(ERROR) longjmps out of here */
         ereport(ERROR,
                 errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
                 errmsg("pg_vault_tde: passphrase file \"%s\" is group- or "
@@ -1034,9 +1053,10 @@ local_passphrase_from_file(char *pass_out, Size pass_max)
                        fpath, (unsigned)(st.st_mode & 0777)));
     }
 
-    fp = fopen(fpath, "r");
+    fp = fdopen(fd, "r");
     if (!fp)
     {
+        close(fd);
         ereport(WARNING,
                 errmsg("pg_vault_tde: cannot open passphrase file \"%s\": %m",
                        fpath));
