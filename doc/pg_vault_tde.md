@@ -12,8 +12,8 @@
 1. [Architecture](#architecture)
 2. [Table Access Method (TAM)](#table-access-method)
 3. [Crypto Layer](#crypto-layer)
-4. [KMS and Key Caching](#kms-and-key-caching)
-5. [Index Access Method (IAM)](#index-access-method)
+4. [Performance](#performance)
+5. [Index Access Method (IAM)](#index-access-method-iam)
 6. [Logical Decoding and Replication](#logical-decoding-and-replication)
 7. [PKCS#11 / HSM Provider](#pkcs11--hsm-provider)
 8. [Known Limitations](#known-limitations)
@@ -98,6 +98,13 @@ PostgreSQL Core
 ```
 
 ### Key Lifecycle
+
+How each provider is *configured* — GUCs, credentials, per-database settings —
+is covered in [Configure Key Access](../README.md#3-configure-key-access) for
+Vault / OpenBao, the local wallet and PKCS#11. This chapter describes what
+happens to key material once a provider is in place; the PKCS#11 provider gets
+its own chapter below because it is the only one with meaningful implementation
+surface of its own.
 
 ```
 Vault / OpenBao (KEK owner)  ──or──  Local wallet (PKCS#12, KEK-on-disk)

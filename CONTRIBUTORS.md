@@ -5,6 +5,9 @@ A huge thank you to everyone who has contributed to this PostgreSQL extension! Y
 ## Core Maintainers
 * **Matteo Durighetto** - Creator & Lead Maintainer & Code Reviewer
 
+## Tester
+* **Martino Echerle** - Main tester and Bug finder 
+
 ## Past Code Contributors
 * **Filippo Venzo** multi key database, key rotation, tap test
 * **Marco Sanguin** first version of PKS11, logical decoding implementation, testing
