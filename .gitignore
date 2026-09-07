@@ -12,3 +12,7 @@ PRODUCT_INFORMATION.html
 dist/
 demo/
 ci/docker-data/
+tmp_check/
+results/
+regression.diffs
+regression.out

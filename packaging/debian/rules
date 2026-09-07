@@ -20,8 +20,14 @@ override_dh_auto_install:
 		DESTDIR=$(CURDIR)/debian/$(PKG_NAME)
 
 override_dh_auto_test:
-	# Tests require a running PostgreSQL server; skip in package build
-	: skipping dpkg-build tests
+	# The smoke test is `make check-standalone`, which starts its own throwaway
+	# cluster and needs no external service — but it requires the extension to be
+	# installed in the tree pg_config points at, and a package build stages into
+	# debian/<pkg> instead. Redirecting a cluster at a staged tree needs
+	# extension_control_path, which exists from PostgreSQL 18 only, so there is no
+	# way to do this uniformly across the majors this package targets.
+	# Run it against an installed build instead:  make install && make check-standalone
+	: skipping tests during the package build
 
 override_dh_installchangelogs:
 	dh_installchangelogs

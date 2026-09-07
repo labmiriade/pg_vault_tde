@@ -846,6 +846,25 @@ Server configuration*.
 
 ## Testing
 
+Two entry points, for two different needs.
+
+**Building from source, or packaging?** One command, no container, no KMS
+service, no cluster to configure:
+
+```bash
+make install            # into the tree your pg_config points at
+make check-standalone   # creates a throwaway cluster, runs the test, tears it down
+```
+
+`make installcheck` on its own fails against a stock cluster: the extension
+registers a Table Access Method from `_PG_init` and must be preloaded.
+`check-standalone` supplies that (and nothing else) through
+[test/regress.conf](test/regress.conf), so it needs no existing server and
+touches none.
+
+**Working on the extension?** The containerised suites cover what the smoke
+test above does not — the KMS providers, TAP, isolation, checksums, benchmarks:
+
 ```bash
 # Full local CI pipeline (build + all tests + bench):
 make ci-all
