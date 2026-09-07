@@ -4,7 +4,7 @@
 [![build develop](https://img.shields.io/github/actions/workflow/status/labmiriade/pg_vault_tde/ci.yml?branch=develop&label=build%20develop)](https://github.com/labmiriade/pg_vault_tde/actions/workflows/ci.yml?query=branch%3Adevelop)
 [![packages](https://img.shields.io/github/actions/workflow/status/labmiriade/pg_vault_tde/build-packages.yml?label=packages)](https://github.com/labmiriade/pg_vault_tde/actions/workflows/build-packages.yml)
 [![PGXN](https://img.shields.io/badge/PGXN-pg__vault__tde-blue)](https://pgxn.org/dist/pg_vault_tde/)
-[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-17%20%7C%2018-336791)](#postgresql-version-compatibility)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-17%20%7C%2018-336791)](#compatibility)
 [![License](https://img.shields.io/badge/license-PostgreSQL-blue)](LICENSE)
 
 **Transparent Data Encryption (TDE) for PostgreSQL 17+** — Open-source (PostgreSQL License), plug-and-play, zero core modifications.
@@ -30,13 +30,12 @@ Learn more about our enterprise encryption solutions at [Mircrypt](https://www.m
 
 Contact our engineering team at [marketing@miriade.it](mailto:marketing@miriade.it) to discuss your requirements.
 
-### PostgreSQL Version Compatibility
+### Compatibility
 
-| PG Major | Status | Notes |
-|----------|--------|-------|
-| 17 | ✅ Supported | Baseline API set |
-| 18 | ✅ Supported | `scan_bitmap_next_tuple` signature change (guarded) |
-| 19 | 🔜 Planned | Infrastructure ready; audit at release |
+PostgreSQL 17 and 18, 19 planned; OpenSSL 3.x required. Per-major API notes in
+[Version Compatibility](doc/pg_vault_tde.md#postgresql-version-compatibility);
+packaged (OS, PG) combinations and what CI exercises on each in the
+[Support Matrix](doc/pg_vault_tde.md#support-matrix).
 
 ---
 
