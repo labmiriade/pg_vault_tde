@@ -1253,6 +1253,30 @@ dynamic LWLock tranche.
 
 ## Testing Strategy
 
+### Standalone Smoke Test
+
+```bash
+make install
+make check-standalone
+```
+
+`make check-standalone` drives `pg_regress` directly: it initialises a
+throwaway cluster under `tmp_check/` on a free port, appends
+`test/regress.conf` to its configuration, runs the `pg_vault_tde_init` test and
+removes the cluster. No existing installation is started or modified, no KMS
+service is contacted, and nothing is edited by hand.
+
+Two constraints explain its shape. PGXS declines `make check` for out-of-tree
+extensions, so the target cannot simply defer to the standard rule; and plain
+`make installcheck` fails against a stock cluster, because the extension
+registers its Table Access Method and requests shared memory from `_PG_init`
+and therefore has to be preloaded. `test/regress.conf` carries exactly that one
+setting — deliberately not a copy of the CI configuration.
+
+It verifies that the extension builds, installs and loads. It does **not**
+exercise key management: that is the job of the suites below and of the
+providers listed under [KMS Provider Coverage](#kms-provider-coverage).
+
 ### Regression Tests
 
 `make ci-regress` (driven by `ci/scripts/run-regress.sh`) runs four SQL files in
