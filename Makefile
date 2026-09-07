@@ -76,20 +76,27 @@ TDE_BUILD_VERSION := $(shell cat VERSION)
 
 # ---------------------------------------------------------------------------
 # dist: build a PGXN-ready release zip (dist/pg_vault_tde-<version>.zip) from
-# the current git HEAD. Requires META.json's "version" and the .control
-# file's "default_version" to have been bumped together beforehand.
-# See README.md § "Releasing to PGXN" for the full upload procedure.
+# the current git HEAD.
+#
+# The version comes from VERSION — the same string META.json declares, and the
+# only one PGXN ever reads — not from the .control file's default_version,
+# which stays 2-part (X.Y) and would name the bundle after a version that
+# appears nowhere in the metadata PGXN Manager parses.
+#
+# Content is filtered by .gitattributes (export-ignore): internal CI, wiki
+# sources and the container-only test suites stay out. The result must remain
+# buildable on its own — the pgxn-bundle job in
+# .github/workflows/build-packages.yml unpacks this zip and compiles it.
+#
+# See PGXN.md for the full upload procedure.
 # Lands in dist/ alongside the packaging/ .deb+.rpm build output — both are
 # git-ignored release artifacts, never committed.
 # ---------------------------------------------------------------------------
-EXTVERSION := $(shell grep default_version $(EXTENSION).control | \
-                sed -e "s/default_version[[:space:]]*=[[:space:]]*'\([^']*\)'/\1/")
-
 .PHONY: dist
 dist:
 	mkdir -p dist
-	git archive --format zip --prefix=$(EXTENSION)-$(EXTVERSION)/ \
-	    --output ./dist/$(EXTENSION)-$(EXTVERSION).zip HEAD
+	git archive --format zip --prefix=$(EXTENSION)-$(TDE_BUILD_VERSION)/ \
+	    --output ./dist/$(EXTENSION)-$(TDE_BUILD_VERSION).zip HEAD
 
 # Extra compiler/linker flags — must come AFTER include $(PGXS) so they
 # append to PGXS defaults rather than being overwritten by them.
