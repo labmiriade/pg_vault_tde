@@ -52,20 +52,35 @@ packaged (OS, PG) combinations and what CI exercises on each in the
 git clone https://github.com/labmiriade/pg_vault_tde.git
 cd pg_vault_tde
 
-# On Debian/Ubuntu (PG 18)
-apt-get install -y postgresql-server-dev-18 libssl-dev libcurl4-openssl-dev pkg-config
+# The PostgreSQL packages below come from the PGDG repository for any major your
+# distribution does not ship itself — PG 18 on Debian 13, every major on
+# RHEL/Rocky. Set it up first if you have not already:
+#   https://www.postgresql.org/download/
+# On RHEL/Rocky also run:  dnf -qy module disable postgresql
+
+# On Debian/Ubuntu (PG 18) — server-dev pulls in the clang/llvm PGXS needs for bitcode
+apt-get install -y build-essential postgresql-server-dev-18 \
+                   libssl-dev libcurl4-openssl-dev pkg-config
 make && sudo make install
 
 # On Debian/Ubuntu (PG 17)
-apt-get install -y postgresql-server-dev-17 libssl-dev libcurl4-openssl-dev pkg-config
+apt-get install -y build-essential postgresql-server-dev-17 \
+                   libssl-dev libcurl4-openssl-dev pkg-config
 make PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config && sudo make install
 
-# On RHEL/Rocky (PG 18)
-dnf install -y postgresql18-devel openssl-devel libcurl-devel
+# On RHEL/Rocky — EPEL and CRB first: postgresqlNN-devel needs perl(IPC::Run)
+dnf install -y epel-release
+dnf config-manager --set-enabled crb
+
+# On RHEL/Rocky (PG 18) — clang/llvm-devel are NOT pulled in by postgresqlNN-devel,
+# and redhat-rpm-config provides the hardening spec file pg_config injects
+dnf install -y postgresql18-devel openssl-devel libcurl-devel \
+               gcc make redhat-rpm-config clang llvm-devel
 make PG_CONFIG=/usr/pgsql-18/bin/pg_config && make install
 
 # On RHEL/Rocky (PG 17)
-dnf install -y postgresql17-devel openssl-devel libcurl-devel
+dnf install -y postgresql17-devel openssl-devel libcurl-devel \
+               gcc make redhat-rpm-config clang llvm-devel
 make PG_CONFIG=/usr/pgsql-17/bin/pg_config && make install
 ```
 
