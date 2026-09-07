@@ -21,6 +21,7 @@
 # release bundle; packaging/ is otherwise kept whole (see the note at the end).
 /PGXN.md                           export-ignore
 /packaging/gen-support-matrix.sh   export-ignore
+/packaging/PGDG.md                 export-ignore
 
 # GitHub Wiki source, published to the separate wiki repo.
 /wiki                              export-ignore
