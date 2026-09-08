@@ -1497,22 +1497,22 @@ listed as unsupported.
 |---|---|---|---|---|
 | deb | `ubuntu:22.04` | 17 | no | yes |
 | deb | `ubuntu:22.04` | 18 | no | yes |
-| deb | `ubuntu:24.04` | 17 | no | no |
-| deb | `ubuntu:24.04` | 18 | no | no |
-| deb | `ubuntu:26.04` | 17 | no | no |
-| deb | `ubuntu:26.04` | 18 | no | no |
-| deb | `debian:12` | 17 | no | no |
-| deb | `debian:12` | 18 | no | no |
-| deb | `debian:13` | 17 | yes | no |
-| deb | `debian:13` | 18 | yes | no |
+| deb | `ubuntu:24.04` | 17 | no | yes |
+| deb | `ubuntu:24.04` | 18 | no | yes |
+| deb | `ubuntu:26.04` | 17 | no | yes |
+| deb | `ubuntu:26.04` | 18 | no | yes |
+| deb | `debian:12` | 17 | no | yes |
+| deb | `debian:12` | 18 | no | yes |
+| deb | `debian:13` | 17 | yes | yes |
+| deb | `debian:13` | 18 | yes | yes |
 | rpm | `rockylinux:9` | 17 | no | yes |
 | rpm | `rockylinux:9` | 18 | no | yes |
-| rpm | `rockylinux:10` | 17 | no | no |
-| rpm | `rockylinux:10` | 18 | no | no |
-| rpm | `almalinux:9` | 17 | no | no |
-| rpm | `almalinux:9` | 18 | no | no |
-| rpm | `almalinux:10` | 17 | no | no |
-| rpm | `almalinux:10` | 18 | no | no |
+| rpm | `rockylinux:10` | 17 | no | yes |
+| rpm | `rockylinux:10` | 18 | no | yes |
+| rpm | `almalinux:9` | 17 | no | yes |
+| rpm | `almalinux:9` | 18 | no | yes |
+| rpm | `almalinux:10` | 17 | no | yes |
+| rpm | `almalinux:10` | 18 | no | yes |
 
 <!-- END GENERATED: support matrix -->
 
