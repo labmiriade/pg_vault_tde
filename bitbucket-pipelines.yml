@@ -24,7 +24,7 @@ definitions:
           - docker
         script:
           - apt-get update -qq
-          - apt-get install -y --no-install-recommends ca-certificates curl wget
+          - apt-get install -y --no-install-recommends ca-certificates curl wget jq
           # Docker Compose
           - curl -fsSL https://github.com/docker/compose/releases/download/v5.1.2/docker-compose-linux-x86_64 -o /usr/local/bin/docker-compose
           - chmod +x /usr/local/bin/docker-compose
@@ -41,7 +41,7 @@ definitions:
           - docker
         script:
           - apt-get update -qq
-          - apt-get install -y --no-install-recommends ca-certificates curl wget
+          - apt-get install -y --no-install-recommends ca-certificates curl wget jq
           # Docker Compose
           - curl -fsSL https://github.com/docker/compose/releases/download/v5.1.2/docker-compose-linux-x86_64 -o /usr/local/bin/docker-compose
           - chmod +x /usr/local/bin/docker-compose
