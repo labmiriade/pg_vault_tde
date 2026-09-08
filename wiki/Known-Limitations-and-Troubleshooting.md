@@ -26,9 +26,9 @@ tuplestore spills to a **plaintext** temporary file on disk. This happens
 because the executor populates the tuplestore directly, bypassing the table
 access method's write path entirely — there is no extension hook anywhere in
 the `WITH HOLD` cursor lifecycle (parse, plan, portal start, commit-time
-persist) that pg_vault_tde can intercept. (This is the same class of gap
-documented for other PostgreSQL TDE implementations, including Percona's
-`pg_tde`.)
+persist) that pg_vault_tde can intercept. (This is an inherent limit of what
+the PostgreSQL extension APIs expose, not a defect specific to this
+implementation.)
 
 The spilled file can outlive the query that created it — it persists for as
 long as the held cursor stays open, and like any other PostgreSQL temp file

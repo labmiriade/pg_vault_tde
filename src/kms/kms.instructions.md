@@ -177,7 +177,41 @@ typedef struct TdeKmsProvider {
 /* Active provider for this connection — resolved from pg_vault_tde.kms_provider
  * GUC at connection time (PGC_SUSET: may differ per database). */
 extern const TdeKmsProvider *tde_active_kms_provider;
+
+/* Accessor — ALWAYS use this before a KMS operation.  It runs the provider's
+ * init() on first use in the backend; reading tde_active_kms_provider directly
+ * gives you a provider that may not have initialised yet. */
+extern const TdeKmsProvider *tde_kms_provider(void);
+
+/* Clears the "initialised" mark; wired to the assign hook of every GUC that
+ * init() reads, so a SET / ALTER DATABASE SET takes effect without reconnect. */
+extern void tde_kms_provider_invalidate(void);
 ```
+
+### `init()` runs lazily — NEVER from the GUC assign hook
+
+`tde_kms_provider_assign()` only records which vtable is selected; it must not
+call `init()`.  PostgreSQL applies a database's `pg_db_role_setting` entries one
+at a time (`ProcessGUCArray()` walks the `setconfig` array in order, and
+`process_settings()` applies the `DATABASE_USER` scope before the `DATABASE`
+one), so at assign time the companion GUCs a provider reads — `wallet_path`,
+`wallet_passphrase_*`, `pkcs11_*` — may still hold their defaults.
+
+`init()` therefore runs from `tde_kms_provider()`, at the first wrap/unwrap,
+when the effective configuration is complete.  Consequences a provider author
+must respect:
+
+- **`init()` MUST be idempotent.** `tde_kms_provider_invalidate()` can schedule
+  another one in the same backend.
+- **`init()` MUST NOT be assumed to have run** by an SQL-callable function in
+  the same module: a session whose first KMS-touching action is such a function
+  reaches it before `init()`.  Allocate per-backend state on demand (see
+  `local_state()` in `pg_vault_tde_kms_local.c`), never only inside `init()`.
+- **`init()` MUST NOT be called from the postmaster.** There is no database
+  context there (`MyDatabaseId == InvalidOid`), so anything per-database — a
+  wallet path, an HSM session — can only half-succeed.
+
+Regression coverage: `tap/18_guc_order_independence.t`.
 
 ### `wrap_dek(out, &out_len)` Contract — MUST READ (v1.6 patch)
 
@@ -273,7 +307,7 @@ before the call — the same bidirectional contract holds for heap buffers.
 ### Provider Registration
 
 ```c
-/* In pg_vault_tde.c _PG_init: */
+/* In pg_vault_tde.c, tde_kms_provider_assign() — selection only, no init(): */
 if (strcmp(guc_kms_provider, "vault") == 0)
     tde_active_kms_provider = &tde_kms_vault_provider;
 else if (strcmp(guc_kms_provider, "local") == 0)
@@ -441,6 +475,7 @@ have a `pg_vault_tde_catalog` entry.
 - This module is the bottom of the dependency chain
 - Only PostgreSQL shmem/LWLock APIs, libcurl (vault provider), OpenSSL PKCS12 API (local provider), and dlfcn + the vendored OASIS pkcs11 headers (pkcs11 provider) are permitted external dependencies
 - `tde_active_kms_provider` is the ONLY global dispatch point — no `if (provider == vault)` outside `pg_vault_tde.c`
+- Reach it through `tde_kms_provider()`, never by reading the variable directly; the only exceptions are teardown paths (`on_proc_exit`), which must not initialise anything
 
 ---
 

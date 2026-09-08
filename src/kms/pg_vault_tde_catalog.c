@@ -24,7 +24,7 @@
  * Cache miss (first access after startup, or after key rotation):
  *   1. Read wrapped_dek from pg_vault_tde_catalog via direct catalog scan
  *      (table_open + systable_beginscan — no SPI, safe inside TAM callbacks)
- *   2. Call tde_active_kms_provider->unwrap_dek()
+ *   2. Call tde_kms_provider()->unwrap_dek()
  *   3. Acquire LW_EXCLUSIVE; insert or update the cache entry; release
  *
  * DEK HYGIENE:
@@ -433,6 +433,7 @@ pg_vault_tde_kms_get_rel_dek(Oid relid,
         TdeCatalogRow row;
         unsigned char dek_temp[TDE_DEK_LEN];
         bool          unwrap_ok;
+        const TdeKmsProvider *kms;
 
         /* Guard: catalog absent on fresh install before CREATE EXTENSION. */
         if (!tde_catalog_read_row(effective_relid, &row))
@@ -467,7 +468,9 @@ pg_vault_tde_kms_get_rel_dek(Oid relid,
             return false;
         }
 
-        if (!tde_active_kms_provider || !tde_active_kms_provider->unwrap_dek)
+        kms = tde_kms_provider();
+
+        if (!kms || !kms->unwrap_dek)
         {
             ereport(WARNING,
                     errmsg("pg_vault_tde: no active KMS provider for "
@@ -477,7 +480,7 @@ pg_vault_tde_kms_get_rel_dek(Oid relid,
 
         {
             int dek_temp_len = TDE_DEK_LEN;
-            unwrap_ok = tde_active_kms_provider->unwrap_dek(
+            unwrap_ok = kms->unwrap_dek(
                             row.wrapped_dek, row.wrapped_len, dek_temp, &dek_temp_len);
         }
 
@@ -557,7 +560,8 @@ pg_vault_tde_catalog_register_rel(Oid relid)
     unsigned char dek[TDE_DEK_LEN];
     unsigned char wrapped[512];
     int           wrapped_len = sizeof(wrapped);
-  
+    const TdeKmsProvider *kms;
+
     bytea *wrapped_bytea;
 
     Relation  rel;
@@ -581,7 +585,9 @@ pg_vault_tde_catalog_register_rel(Oid relid)
         return;
     }
 
-    if (!tde_active_kms_provider)
+    kms = tde_kms_provider();
+
+    if (!kms)
         ereport(ERROR,
                 errmsg("pg_vault_tde: no active KMS provider — cannot "
                        "register DEK for relid=%u", relid));
@@ -596,8 +602,7 @@ pg_vault_tde_catalog_register_rel(Oid relid)
     }
 
     /* Wrap the DEK */
-    if (!tde_active_kms_provider->wrap_dek(dek, TDE_DEK_LEN,
-                                            wrapped, &wrapped_len))
+    if (!kms->wrap_dek(dek, TDE_DEK_LEN, wrapped, &wrapped_len))
     {
         OPENSSL_cleanse(dek, TDE_DEK_LEN);
         ereport(ERROR,
@@ -680,6 +685,7 @@ pg_vault_tde_catalog_update_rel_dek(Oid relid)
     unsigned char dek[TDE_DEK_LEN];
     unsigned char wrapped[512];
     int           wrapped_len = sizeof(wrapped);
+    const TdeKmsProvider *kms;
 
     bytea        *wrapped_bytea;
 
@@ -700,7 +706,9 @@ pg_vault_tde_catalog_update_rel_dek(Oid relid)
 
     Assert(OidIsValid(relid));
 
-    if (!tde_active_kms_provider)
+    kms = tde_kms_provider();
+
+    if (!kms)
         ereport(ERROR,
                 errmsg("pg_vault_tde: no active KMS provider — cannot "
                        "update DEK for relid=%u", relid));
@@ -715,8 +723,7 @@ pg_vault_tde_catalog_update_rel_dek(Oid relid)
     }
 
     /* Wrap the DEK */
-    if (!tde_active_kms_provider->wrap_dek(dek, TDE_DEK_LEN,
-                                            wrapped, &wrapped_len))
+    if (!kms->wrap_dek(dek, TDE_DEK_LEN, wrapped, &wrapped_len))
     {
         OPENSSL_cleanse(dek, TDE_DEK_LEN);
         ereport(ERROR,
@@ -963,6 +970,17 @@ pg_vault_tde_catalog_rewrap_all(void)
     CatalogIndexState indstate;
     MemoryContext     old_ctx;
     MemoryContext     tuple_ctx;
+    const TdeKmsProvider *kms;
+
+    /*
+     * Resolve (and lazily initialise) the provider before opening the catalog:
+     * init() may ereport, and doing so with no relation lock held keeps the
+     * error path trivial.
+     */
+    kms = tde_kms_provider();
+
+    if (!kms)
+        ereport(ERROR, errmsg("pg_vault_tde: no active KMS provider — cannot rewrap"));
 
     ext_ns  = get_extension_schema(get_extension_oid(pg_vault_tde_extension_name, true));
     rel_oid = get_relname_relid("pg_vault_tde_catalog", ext_ns);
@@ -1018,7 +1036,7 @@ pg_vault_tde_catalog_rewrap_all(void)
 
         PG_TRY();
         {
-            if (!tde_active_kms_provider->rewrap_dek(
+            if (!kms->rewrap_dek(
                         (unsigned char *) VARDATA_ANY(wdek_bytea),
                         VARSIZE_ANY_EXHDR(wdek_bytea),
                         new_wrapped, &new_wrapped_len))
@@ -1241,23 +1259,27 @@ PG_FUNCTION_INFO_V1(pg_vault_tde_rotate_kek_sql);
 PGDLLEXPORT Datum
 pg_vault_tde_rotate_kek_sql(PG_FUNCTION_ARGS)
 {
+    const TdeKmsProvider *kms;
+
     if (!superuser())
         ereport(ERROR,
                 (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
                  errmsg("pg_vault_tde_rotate_kek requires superuser")));
 
-    if (!tde_active_kms_provider)
+    kms = tde_kms_provider();
+
+    if (!kms)
         ereport(ERROR,
                 errmsg("pg_vault_tde: no active KMS provider — cannot rotate KEK"));
 
-    if (!tde_active_kms_provider->prepare_kek_rotation())
+    if (!kms->prepare_kek_rotation())
         ereport(ERROR,
                 (errmsg("pg_vault_tde: prepare_kek_rotation failed")));
 
     PG_TRY();
     {
         pg_vault_tde_catalog_rewrap_all();
-        tde_active_kms_provider->commit_kek_rotation();
+        kms->commit_kek_rotation();
 
         tde_audit(KMS_KEK_ROTATE, NULL, true);
     }

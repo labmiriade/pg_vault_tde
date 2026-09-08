@@ -1,0 +1,141 @@
+name: Bug Report
+description: Something in pg_vault_tde behaves incorrectly, crashes, or fails to build.
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a report.
+
+        ⚠️ **Do not report security vulnerabilities here.** If the problem could
+        expose plaintext, key material, or otherwise weaken encryption, follow
+        [SECURITY.md](https://github.com/labmiriade/pg_vault_tde/blob/develop/SECURITY.md)
+        and report it privately instead.
+
+        Please check the
+        [Known Limitations and Troubleshooting](https://github.com/labmiriade/pg_vault_tde/wiki/Known-Limitations-and-Troubleshooting)
+        wiki page first — several behaviours that look like bugs are documented
+        consequences of what a PostgreSQL extension can and cannot intercept.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: This is not a security vulnerability (those go through SECURITY.md).
+          required: true
+        - label: I searched existing issues and the Known Limitations wiki page.
+          required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you observe, and what did you expect instead?
+      placeholder: |
+        Expected: SELECT returns the rows inserted.
+        Actual: ERROR: decryption failed for relation "customers"
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: |
+        The SQL and configuration needed to see this from a clean database.
+        A self-contained script is the single most useful thing you can give us.
+      render: sql
+      placeholder: |
+        CREATE EXTENSION pg_vault_tde;
+        CREATE TABLE t (id int, secret text) USING encrypted_heap;
+        INSERT INTO t VALUES (1, 'x');
+        SELECT * FROM t;  -- fails here
+    validations:
+      required: true
+
+  - type: input
+    id: tde-version
+    attributes:
+      label: pg_vault_tde version
+      description: "`SELECT extversion FROM pg_extension WHERE extname = 'pg_vault_tde';` — or the git commit if built from source."
+      placeholder: "1.7.1"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: pg-version
+    attributes:
+      label: PostgreSQL major version
+      options:
+        - "17"
+        - "18"
+        - "19 (development)"
+        - Other / older
+    validations:
+      required: true
+
+  - type: dropdown
+    id: kms
+    attributes:
+      label: KMS provider
+      description: The value of `pg_vault_tde.kms_provider`.
+      options:
+        - "vault (HashiCorp Vault / OpenBao)"
+        - "local (PKCS#12 wallet)"
+        - "pkcs11 (HSM)"
+        - Not applicable / not yet configured
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS and architecture
+      placeholder: "Ubuntu 24.04, x86_64 — or Rocky 9, aarch64"
+    validations:
+      required: true
+
+  - type: input
+    id: install-method
+    attributes:
+      label: How was it installed?
+      placeholder: ".deb from a release, built from source with make, PGXN, container image…"
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant configuration
+      description: |
+        The `pg_vault_tde.*` settings from `postgresql.conf`.
+        **Redact tokens, passphrases, and PINs** — we never need their values.
+      render: ini
+      placeholder: |
+        shared_preload_libraries = 'pg_vault_tde'
+        pg_vault_tde.kms_provider = 'vault'
+        pg_vault_tde.vault_addr = 'https://vault.example.internal:8200'
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs, errors, backtraces
+      description: |
+        Server log lines around the failure, including any `AUDIT` entries.
+        For a crash, a `bt full` from gdb against the core file is invaluable.
+        Redact any real data or key material first.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Workarounds you found, when it started, whether it is intermittent, how much data is involved.
+    validations:
+      required: false

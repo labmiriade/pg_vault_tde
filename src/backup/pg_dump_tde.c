@@ -10,6 +10,8 @@
 #include <string.h>
 #include <openssl/crypto.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 #include "pg_vault_tde_backup.h"
 
@@ -19,6 +21,8 @@ int main(int argc, char **argv) {
     int pipefd[2];
     pid_t pid;
     FILE *outfile;
+    int   outfd;
+    struct stat outst;
     tde_backup_header header;
     TdeBackupContext *bkp_ctx;
     char *output_file = NULL;
@@ -104,9 +108,28 @@ int main(int argc, char **argv) {
         goto error_cleanup;
     }
 
-    outfile = fopen(output_file, "wb");
+    /*
+     * 0600, not whatever the ambient umask allows. The dump is ciphertext, but
+     * its header carries the sealed DEK: a world-readable file hands anyone on
+     * the machine an offline target. O_CREAT's mode applies only when the file
+     * is created, so a dump left behind by an older version keeps its own mode
+     * and has to be tightened explicitly.
+     */
+    outfd = open(output_file, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (outfd < 0) {
+        perror("error: could not open output file");
+        goto error_cleanup;
+    }
+    if (fstat(outfd, &outst) == 0 && S_ISREG(outst.st_mode) &&
+        (outst.st_mode & 0777) != 0600 && fchmod(outfd, 0600) != 0) {
+        perror("error: could not restrict output file permissions");
+        close(outfd);
+        goto error_cleanup;
+    }
+    outfile = fdopen(outfd, "wb");
     if (!outfile) {
         perror("error: could not open output file");
+        close(outfd);
         goto error_cleanup;
     }
 

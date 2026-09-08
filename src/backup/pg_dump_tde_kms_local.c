@@ -21,6 +21,8 @@
 
 #include <stdio.h>              /* popen / pclose for passphrase_command */
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <openssl/evp.h>
 #include <openssl/pkcs12.h>
 #include <openssl/x509.h>
@@ -348,14 +350,31 @@ local_passphrase_from_file(char *pass_out, Size pass_max)
     struct stat st;
     size_t      n;
     char       *p;
+    int         fd;
 
     fpath = config->passphrase_file;
     if (!fpath || fpath[0] == '\0')
         return false;
 
-    /* Permission sanity check */
-    if (stat(fpath, &st) != 0)
+    /*
+     * Open first, validate the descriptor afterwards. Checking the path with
+     * stat() and opening it in a second step leaves a window in which the path
+     * can be repointed at a different file, so the permissions that get
+     * approved need not be those of the file actually read. O_NOFOLLOW refuses
+     * a symlink outright: a passphrase file is never legitimately one.
+     */
+    fd = open(fpath, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0)
     {
+        pg_log_error("pg_vault_tde: cannot open passphrase file \"%s\": %m",
+                       fpath);
+        return false;
+    }
+
+    /* Permission sanity check, against the descriptor actually opened */
+    if (fstat(fd, &st) != 0)
+    {
+        close(fd);
         pg_log_error("pg_vault_tde: passphrase file \"%s\": %m", fpath);
         return false;
     }
@@ -363,6 +382,7 @@ local_passphrase_from_file(char *pass_out, Size pass_max)
         pg_log_error("pg_vault_tde: passphrase file \"%s\" is mode %04o; "
                        "expected 0400 or 0600 (owner-only)",
                        fpath, (unsigned)(st.st_mode & 0777));
+        close(fd);
         return false;
     }
     if ((st.st_mode & 0777) & 0044)  /* group/other readable */
@@ -370,12 +390,14 @@ local_passphrase_from_file(char *pass_out, Size pass_max)
         pg_log_error("pg_vault_tde: passphrase file \"%s\" is group- or "
                        "world-readable (mode %04o); refusing to read passphrase",
                        fpath, (unsigned)(st.st_mode & 0777));
+        close(fd);
         return false;
     }
 
-    fp = fopen(fpath, "r");
+    fp = fdopen(fd, "r");
     if (!fp)
     {
+        close(fd);
         pg_log_error("pg_vault_tde: cannot open passphrase file \"%s\": %m",
                        fpath);
         return false;

@@ -145,7 +145,7 @@ tde_tuple_looks_encrypted(HeapTuple tup)
  * tuple unchanged when it is not one of ours (e.g. a replica-identity key).
  */
 static HeapTuple
-tde_maybe_decrypt(HeapTuple tup, Oid relid, const char *which)
+tde_maybe_decrypt(HeapTuple tup, Oid relid, TupleDesc tupdesc, const char *which)
 {
     HeapTuple plain;
 
@@ -169,7 +169,7 @@ tde_maybe_decrypt(HeapTuple tup, Oid relid, const char *which)
      * content is always <= the encrypted content (shorter by TDE_V2_OVERHEAD),
      * so it always fits.  Mirrors core's ReorderBufferToastReplace() copy-back.
      */
-    plain = tde_decrypt_heap_tuple(tup, relid);
+    plain = tde_decrypt_heap_tuple(tup, relid, tupdesc);
     Assert(plain->t_len <= tup->t_len);
     memcpy(tup->t_data, plain->t_data, plain->t_len);
     tup->t_len = plain->t_len;
@@ -208,7 +208,8 @@ tde_decrypt_change(Relation relation, ReorderBufferChange *change,
             if (change->data.tp.newtuple != NULL)
             {
                 change->data.tp.newtuple =
-                    tde_maybe_decrypt(change->data.tp.newtuple, src_relid, "new");
+                    tde_maybe_decrypt(change->data.tp.newtuple, src_relid,
+                                       RelationGetDescr(relation), "new");
                 /* splice plaintext TOAST values back into the tuple */
                 tde_toast_stitch(relation, change, xid);
             }
@@ -218,18 +219,21 @@ tde_decrypt_change(Relation relation, ReorderBufferChange *change,
             if (change->data.tp.newtuple != NULL)
             {
                 change->data.tp.newtuple =
-                    tde_maybe_decrypt(change->data.tp.newtuple, src_relid, "new");
+                    tde_maybe_decrypt(change->data.tp.newtuple, src_relid,
+                                       RelationGetDescr(relation), "new");
                 tde_toast_stitch(relation, change, xid);
             }
             if (change->data.tp.oldtuple != NULL)
                 change->data.tp.oldtuple =
-                    tde_maybe_decrypt(change->data.tp.oldtuple, src_relid, "old");
+                    tde_maybe_decrypt(change->data.tp.oldtuple, src_relid,
+                                       RelationGetDescr(relation), "old");
             break;
 
         case REORDER_BUFFER_CHANGE_DELETE:
             if (change->data.tp.oldtuple != NULL)
                 change->data.tp.oldtuple =
-                    tde_maybe_decrypt(change->data.tp.oldtuple, src_relid, "old");
+                    tde_maybe_decrypt(change->data.tp.oldtuple, src_relid,
+                                       RelationGetDescr(relation), "old");
             break;
 
         default:

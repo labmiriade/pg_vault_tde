@@ -65,6 +65,9 @@ DATA = sql/pg_vault_tde--1.7.sql
 # pg_regress test targets (filenames without .sql suffix)
 REGRESS = pg_vault_tde_init
 
+# Artefacts left behind by `make check-standalone` (pg_regress).
+EXTRA_CLEAN = tmp_check results regression.diffs regression.out
+
 # Isolation test specs (test/isolation/{specs,expected}/per_table_dek_rotation.*)
 ISOLATION = per_table_dek_rotation
 ISOLATION_OPTS = --inputdir=test/isolation
@@ -76,20 +79,27 @@ TDE_BUILD_VERSION := $(shell cat VERSION)
 
 # ---------------------------------------------------------------------------
 # dist: build a PGXN-ready release zip (dist/pg_vault_tde-<version>.zip) from
-# the current git HEAD. Requires META.json's "version" and the .control
-# file's "default_version" to have been bumped together beforehand.
-# See README.md § "Releasing to PGXN" for the full upload procedure.
+# the current git HEAD.
+#
+# The version comes from VERSION — the same string META.json declares, and the
+# only one PGXN ever reads — not from the .control file's default_version,
+# which stays 2-part (X.Y) and would name the bundle after a version that
+# appears nowhere in the metadata PGXN Manager parses.
+#
+# Content is filtered by .gitattributes (export-ignore): internal CI, wiki
+# sources and the container-only test suites stay out. The result must remain
+# buildable on its own — the pgxn-bundle job in
+# .github/workflows/build-packages.yml unpacks this zip and compiles it.
+#
+# See PGXN.md for the full upload procedure.
 # Lands in dist/ alongside the packaging/ .deb+.rpm build output — both are
 # git-ignored release artifacts, never committed.
 # ---------------------------------------------------------------------------
-EXTVERSION := $(shell grep default_version $(EXTENSION).control | \
-                sed -e "s/default_version[[:space:]]*=[[:space:]]*'\([^']*\)'/\1/")
-
 .PHONY: dist
 dist:
 	mkdir -p dist
-	git archive --format zip --prefix=$(EXTENSION)-$(EXTVERSION)/ \
-	    --output ./dist/$(EXTENSION)-$(EXTVERSION).zip HEAD
+	git archive --format zip --prefix=$(EXTENSION)-$(TDE_BUILD_VERSION)/ \
+	    --output ./dist/$(EXTENSION)-$(TDE_BUILD_VERSION).zip HEAD
 
 # Extra compiler/linker flags — must come AFTER include $(PGXS) so they
 # append to PGXS defaults rather than being overwritten by them.
@@ -185,6 +195,47 @@ ci-clean:
 	$$RT rm -f pg-tde-test pg-tde-checksums pg-tde-vault vault-mock 2>/dev/null || true; \
 	$$RT rmi -f pg-tde-test:latest vault-mock:latest 2>/dev/null || true; \
 	echo "CI cleanup complete."
+
+# ---------------------------------------------------------------------------
+# check-standalone: run the regression test with no container, no KMS service
+# and no server configuration to edit by hand.
+#
+# PGXS refuses `make check` for out-of-tree extensions ("\"make check\" is not
+# supported" in pgxs.mk), so this drives pg_regress directly: it creates a
+# throwaway cluster under tmp_check/ on a free port, appends test/regress.conf
+# to its postgresql.conf — the extension must be preloaded, which is precisely
+# why plain `make installcheck` fails on a fresh machine — runs the test, and
+# tears the cluster down. No existing cluster is touched.
+#
+# The extension must already be installed into the tree $(PG_CONFIG) points at:
+# pg_regress can create a cluster, but not populate an installation's extension
+# directory.
+#
+# This is the entry point for anyone outside the project, packagers included.
+# It does NOT replace the ci-* targets above: those cover the KMS providers,
+# TAP, isolation, checksums and benchmarks, and `make ci-all` remains the full
+# suite.
+# ---------------------------------------------------------------------------
+PG_REGRESS := $(shell $(PG_CONFIG) --pkglibdir)/pgxs/src/test/regress/pg_regress
+sharedir   := $(shell $(PG_CONFIG) --sharedir)
+
+.PHONY: check-standalone
+check-standalone: all
+	@test -f "$(sharedir)/extension/$(EXTENSION).control" || { \
+	    echo "ERROR: $(EXTENSION) is not installed in $(sharedir)/extension."; \
+	    echo "Run 'make install' first (as a user who can write there)."; \
+	    echo "pg_regress creates the cluster, but not the installation."; \
+	    exit 1; }
+	@test -x "$(PG_REGRESS)" || { \
+	    echo "ERROR: pg_regress not found at $(PG_REGRESS)."; \
+	    echo "Install the PostgreSQL server development package for this major."; \
+	    exit 1; }
+	$(PG_REGRESS) \
+	    --temp-instance=./tmp_check \
+	    --temp-config=$(srcdir)/test/regress.conf \
+	    --inputdir=$(srcdir) \
+	    --bindir=$(bindir) \
+	    $(REGRESS)
 
 # Full pipeline alias
 .PHONY: ci-full
@@ -285,9 +336,8 @@ bindir := $(shell $(PG_CONFIG) --bindir)
 
 .PHONY: install-pg-dump-tde
 install-pg-dump-tde: pg_dump_tde pg_restore_tde pg_basebackup_tde
-	install -m 755 pg_dump_tde $(bindir)/pg_dump_tde
-	install -m 755 pg_restore_tde $(bindir)/pg_restore_tde
-	install -m 755 pg_basebackup_tde $(bindir)/pg_basebackup_tde
+	install -d $(DESTDIR)$(bindir)
+	install -m 755 pg_dump_tde pg_restore_tde pg_basebackup_tde $(DESTDIR)$(bindir)/
 
 install: install-pg-dump-tde
 

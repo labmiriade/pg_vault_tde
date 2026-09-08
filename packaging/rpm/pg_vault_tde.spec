@@ -7,7 +7,7 @@
 %global pginstdir /usr/pgsql-%{pgmajorversion}
 
 Name:           postgresql%{pgmajorversion}-%{sname}
-Version:        1.7
+Version:        1.7.1
 Release:        1%{?dist}
 Summary:        Transparent Data Encryption (TDE) extension for PostgreSQL %{pgmajorversion}
 License:        BSD
@@ -21,6 +21,13 @@ BuildRequires:  pkgconfig
 BuildRequires:  gcc
 BuildRequires:  make
 BuildRequires:  chrpath
+# PGXS emits LLVM bitcode (the %%{pginstdir}/lib/bitcode files listed below)
+# whenever PostgreSQL was built with JIT support, which is the case for every
+# PGDG build. Unlike Debian's postgresql-server-dev-NN, postgresqlNN-devel does
+# not pull clang/llvm in, so without these two the build dies on the first .bc
+# target in a clean buildroot such as mock's.
+BuildRequires:  clang
+BuildRequires:  llvm-devel
 
 Requires:       postgresql%{pgmajorversion}-server
 Requires:       openssl-libs
@@ -70,15 +77,58 @@ export PG_CONFIG
 # instead of disabling the check wholesale.
 chrpath -d %{buildroot}%{pginstdir}/lib/%{sname}.so
 
+# No %%check section, deliberately. `make check-standalone` starts its own
+# throwaway cluster and contacts no KMS, but it needs the extension installed in
+# the tree pg_config points at, while %%install stages into %%{buildroot}.
+# Pointing a cluster at a staged tree requires extension_control_path
+# (PostgreSQL 18+), so it cannot be done uniformly for every major this package
+# builds for. Verify against an installed build instead:
+#   make install && make check-standalone
+
 %files
 %license LICENSE
 %doc doc/pg_vault_tde.md README.md
 %{pginstdir}/lib/%{sname}.so
+%{pginstdir}/bin/pg_dump_tde
+%{pginstdir}/bin/pg_restore_tde
+%{pginstdir}/bin/pg_basebackup_tde
 %{pginstdir}/share/extension/%{sname}.control
 %{pginstdir}/share/extension/%{sname}--*.sql
 %{pginstdir}/lib/bitcode/%{sname}*
 
 %changelog
+* Sat Sep 05 2026 Miriade S.r.l. <info@miriade.it> - 1.7.1-1
+- Fix: ALTER TABLE ... SET ACCESS METHOD encrypted_heap on a table that
+  already contained rows failed with "AES-256-GCM authentication FAILED";
+  the AEAD associated data is now derived from the effective relation OID
+  (resolve_effective_relid), the same OID the DEK and generation counter
+  were already looked up under
+- Fix: CREATE TABLE AS / INSERT ... SELECT from an encrypted_heap table
+  holding out-of-line TOAST values copied a dangling TOAST pointer instead
+  of the value, leaving the destination unreadable once the source was
+  dropped; HEAP_HASEXTERNAL is now recomputed on every decrypted tuple
+- No SQL changes: pg_extension.extversion stays at 1.7; use
+  pg_vault_tde_build_version() to tell 1.7.1 from 1.7.0 at runtime
+- 140 regression tests passing (52 v1.4 + 20 v1.5 + 38 v1.6 + 30 v1.7)
+- Decrypt failures on a relation whose AEAD tag is bound to a different OID
+  now carry a DETAIL/HINT naming the 1.7.0 -> 1.7.1 change, so the bare
+  "data integrity violation" no longer sends operators into disaster recovery
+- UPGRADE NOTE: with pg_vault_tde.toast_encryption = on (the default),
+  out-of-line TOAST values written by 1.7.0 or earlier do not authenticate
+  under this release, and pg_dump of an affected table fails. Everything else
+  (non-TOAST tables, inline values, non-TOASTed columns) reads back
+  byte-identical. Nothing is lost and reinstalling 1.7.0 restores access, but
+  the export must be taken BEFORE this package is installed. See
+  "Upgrading to 1.7.1" in README.md for the preflight query and procedure
+- COMPATIBILITY NOTE (not a change in this release): PostgreSQL 17.11, 18.x and
+  the matching minors of the older back branches only load a library named as a
+  logical decoding output plugin if it is listed in the output_plugin_libraries
+  GUC (default "pgoutput, test_decoding"); slot creation otherwise fails with
+  'library "pg_vault_tde" may not be used as an output plugin'. Publishers
+  replicating encrypted_heap tables need
+  output_plugin_libraries = 'pgoutput, pg_vault_tde' in postgresql.conf plus a
+  reload. Earlier minors have no such GUC and must not carry the line
+
 * Mon Jun 08 2026 Miriade S.r.l. <info@miriade.it> - 1.7-1
 - v1.7: tde_btree access method — encrypted (AES-256-SIV) index keys for
   bytea/text/int4/int8/numeric/uuid/date/timestamptz operator classes;
