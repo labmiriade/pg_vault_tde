@@ -6,7 +6,13 @@
 #    references a function that does not yet exist (wrong search_path,
 #    missing CREATE, wrong ordering …)"
 #
-# For each combination of (format=deb|rpm) × (pg=17|18), the test:
+# The combinations come from packaging/build-matrix.json: every row whose
+# install_test flag is true is exercised here, so the matrix that declares the
+# coverage and the coverage itself cannot drift apart. Narrow it with --os,
+# --format and --pg; with no filter at all, $PG_VERSION selects the major, which
+# is how the two parallel Bitbucket steps split the matrix between them.
+#
+# For each selected (format, os, pg) combination, the test:
 #   1. Builds the package from source inside a fresh container
 #   2. Starts a second container of the same OS with a clean PGDG install
 #   3. Installs the built package
@@ -20,7 +26,12 @@
 # Exit code: 0 = all combinations pass, 1 = at least one failure.
 #
 # Usage:
-#   bash ci/scripts/run-install-test.sh [--pg 17|18] [--format deb|rpm] [--all]
+#   bash ci/scripts/run-install-test.sh [--pg 17|18] [--format deb|rpm]
+#                                       [--os ubuntu:24.04] [--all] [--list]
+#
+# --list prints the combinations that would run, and exits.
+#
+# Requires jq, to read the build matrix.
 #
 # Copyright (c) 2026 Miriade S.r.l. — PostgreSQL License (BSD)
 
@@ -33,28 +44,87 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # Args
 # ---------------------------------------------------------------------------
 RUN_ALL=0
+LIST_ONLY=0
 PG_VERSIONS=()
 FORMATS=()
+OS_IMAGES=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --all)       RUN_ALL=1; shift ;;
         --pg)        PG_VERSIONS+=("$2"); shift 2 ;;
         --format)    FORMATS+=("$2"); shift 2 ;;
+        --os)        OS_IMAGES+=("$2"); shift 2 ;;
+        --list)      LIST_ONLY=1; shift ;;
         -h|--help)
-            sed -n '3,25p' "$0" | sed 's/^# \?//'
+            sed -n '3,31p' "$0" | sed 's/^# \?//'
             exit 0
             ;;
         *) echo "ERROR: unknown arg '$1'"; exit 1 ;;
     esac
 done
 
-if [[ "$RUN_ALL" -eq 1 ]]; then
-    PG_VERSIONS=(17 18)
-    FORMATS=(deb rpm)
+# With no filter and no --all, honour $PG_VERSION as before: run-all.sh calls
+# this script without arguments, and the Bitbucket pipeline runs it twice in
+# parallel with PG_VERSION=17 and PG_VERSION=18, so the two steps together
+# cover the matrix exactly once instead of each covering all of it.
+if [[ "$RUN_ALL" -eq 0 && ${#PG_VERSIONS[@]} -eq 0 && ${#FORMATS[@]} -eq 0 \
+      && ${#OS_IMAGES[@]} -eq 0 && -n "${PG_VERSION:-}" ]]; then
+    PG_VERSIONS=("$PG_VERSION")
 fi
-[[ ${#PG_VERSIONS[@]} -eq 0 ]] && PG_VERSIONS=("${PG_VERSION:-18}")
-[[ ${#FORMATS[@]} -eq 0 ]]    && FORMATS=(deb)
+
+command -v jq >/dev/null \
+    || { echo "ERROR: jq is required to read packaging/build-matrix.json"; exit 1; }
+
+MATRIX="${REPO_ROOT}/packaging/build-matrix.json"
+[[ -f "$MATRIX" ]] || { echo "ERROR: $MATRIX not found"; exit 1; }
+
+# Every row flagged install_test, then narrowed by whichever filters were given.
+_selected() {
+    local out
+    out=$(jq -r '.[] | select(.install_test) | "\(.format) \(.os) \(.pg)"' "$MATRIX")
+    if [[ ${#FORMATS[@]} -gt 0 ]]; then
+        out=$(echo "$out" | grep -E "^($(IFS='|'; echo "${FORMATS[*]}")) ")
+    fi
+    if [[ ${#OS_IMAGES[@]} -gt 0 ]]; then
+        out=$(echo "$out" | awk -v want="$(IFS=,; echo "${OS_IMAGES[*]}")" \
+              'BEGIN{n=split(want,a,",");for(i=1;i<=n;i++)w[a[i]]=1} w[$2]')
+    fi
+    if [[ ${#PG_VERSIONS[@]} -gt 0 ]]; then
+        out=$(echo "$out" | awk -v want="$(IFS=,; echo "${PG_VERSIONS[*]}")" \
+              'BEGIN{n=split(want,a,",");for(i=1;i<=n;i++)w[a[i]]=1} w[$3]')
+    fi
+    echo "$out"
+}
+
+mapfile -t COMBOS < <(_selected)
+if [[ "$LIST_ONLY" -eq 1 ]]; then
+    printf '%s\n' "${COMBOS[@]}"
+    exit 0
+fi
+if [[ ${#COMBOS[@]} -eq 0 ]]; then
+    echo "ERROR: no combination in $MATRIX matches the given filters"
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Image and EL-version mapping. Kept in step with the same two helpers in
+# packaging/build_in_container.sh, which is where they originate: Rocky Linux
+# stopped publishing to the Docker library namespace after 9.3, so rockylinux:*
+# only exists under docker.io/rockylinux/rockylinux.
+# ---------------------------------------------------------------------------
+_container_image_ref() {
+    case "$1" in
+        rockylinux:*) echo "docker.io/rockylinux/rockylinux:${1#rockylinux:}" ;;
+        *)            echo "docker.io/library/$1" ;;
+    esac
+}
+_el_version_from_image() {
+    case "$1" in
+        rockylinux:10|almalinux:10) echo "10" ;;
+        *)                          echo "9"  ;;
+    esac
+}
 
 # ---------------------------------------------------------------------------
 # Runtime detection
@@ -218,16 +288,18 @@ SELECT '"'"'ALL CHECKS PASSED'"'"';
 '
 
 # ---------------------------------------------------------------------------
-# Build and test DEB (Ubuntu 22.04 + PGDG)
+# Build and test DEB (any Debian/Ubuntu image from the matrix + PGDG).
+# The apt repository line derives the suite from lsb_release, so the image tag
+# is the only thing that has to change per distribution.
 # ---------------------------------------------------------------------------
 test_deb() {
-    local pg="$1"
-    local tag="install-test-deb${pg}-$$"
-    log_stage "INSTALL TEST  DEB  PG${pg}  (Ubuntu 22.04)"
+    local os="$1"
+    local pg="$2"
+    log_stage "INSTALL TEST  DEB  PG${pg}  (${os})"
 
     $RT run --rm \
         -v "${REPO_ROOT}":/src:ro \
-        docker.io/library/ubuntu:22.04 bash -c "
+        "$(_container_image_ref "$os")" bash -c "
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
@@ -295,29 +367,36 @@ echo 'DEB PG${pg}: PASS'
 }
 
 # ---------------------------------------------------------------------------
-# Build and test RPM (Rocky Linux 9 + PGDG)
+# Build and test RPM (any EL image from the matrix + PGDG).
 # ---------------------------------------------------------------------------
 test_rpm() {
-    local pg="$1"
-    log_stage "INSTALL TEST  RPM  PG${pg}  (Rocky Linux 9)"
+    local os="$1"
+    local pg="$2"
+    local el
+    el="$(_el_version_from_image "$os")"
+    log_stage "INSTALL TEST  RPM  PG${pg}  (${os}, EL${el})"
     PGDATA="/var/lib/pgsql/${pg}/data"
     PGBIN="/usr/pgsql-${pg}/bin"
 
     $RT run --rm \
         -v "${REPO_ROOT}":/src:ro \
-        docker.io/library/rockylinux:9 bash -c "
+        "$(_container_image_ref "$os")" bash -c "
 set -euo pipefail
 
 # ── PGDG + EPEL + CRB ─────────────────────────────────────────────────
 dnf install -y -q epel-release
 dnf config-manager --set-enabled crb
-dnf install -y -q https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-x86_64/pgdg-redhat-repo-latest.noarch.rpm
+dnf install -y -q https://download.postgresql.org/pub/repos/yum/reporpms/EL-${el}-x86_64/pgdg-redhat-repo-latest.noarch.rpm
 dnf -y module disable postgresql 2>/dev/null || true
 
 # ── Build + runtime dependencies ──────────────────────────────────────
+# Must satisfy every BuildRequires in packaging/rpm/pg_vault_tde.spec, since
+# rpmbuild refuses to start otherwise: chrpath, plus clang and llvm-devel for
+# the LLVM bitcode targets, which postgresqlNN-devel does not pull in.
 dnf install -y -q \
     perl-IPC-Run postgresql${pg}-devel postgresql${pg}-server \
-    openssl-devel libcurl-devel pkgconfig gcc make rsync rpm-build
+    openssl-devel libcurl-devel pkgconfig gcc make rsync rpm-build \
+    chrpath clang llvm-devel
 
 # ── Build RPM from source ──────────────────────────────────────────────
 echo '--- Building RPM ---'
@@ -378,32 +457,27 @@ echo 'RPM PG${pg}: PASS'
 # ---------------------------------------------------------------------------
 echo ""
 echo -e "${BOLD}pg_vault_tde  package install tests${NC}"
-echo -e "${BOLD}formats: ${FORMATS[*]}   pg versions: ${PG_VERSIONS[*]}${NC}"
+echo -e "${BOLD}${#COMBOS[@]} combination(s) from packaging/build-matrix.json${NC}"
+for c in "${COMBOS[@]}"; do echo "  - $c"; done
 echo ""
 
-RESULTS=()   # "FORMAT PG PASS|FAIL message"
+RESULTS=()   # "PASS|FAIL  label"
 
-for fmt in "${FORMATS[@]}"; do
-    for pg in "${PG_VERSIONS[@]}"; do
-        label="${fmt^^} PG${pg}"
-        if [[ "$fmt" == "deb" ]]; then
-            if test_deb "$pg"; then
-                tap_ok "$label — CREATE EXTENSION + smoke test"
-                RESULTS+=("PASS  $label")
-            else
-                tap_not_ok "$label — CREATE EXTENSION or smoke test FAILED"
-                RESULTS+=("FAIL  $label")
-            fi
-        else
-            if test_rpm "$pg"; then
-                tap_ok "$label — CREATE EXTENSION + smoke test"
-                RESULTS+=("PASS  $label")
-            else
-                tap_not_ok "$label — CREATE EXTENSION or smoke test FAILED"
-                RESULTS+=("FAIL  $label")
-            fi
-        fi
-    done
+for combo in "${COMBOS[@]}"; do
+    read -r fmt os pg <<<"$combo"
+    label="${fmt^^} PG${pg} ${os}"
+    if [[ "$fmt" == "deb" ]]; then
+        runner=test_deb
+    else
+        runner=test_rpm
+    fi
+    if "$runner" "$os" "$pg"; then
+        tap_ok "$label — CREATE EXTENSION + smoke test"
+        RESULTS+=("PASS  $label")
+    else
+        tap_not_ok "$label — CREATE EXTENSION or smoke test FAILED"
+        RESULTS+=("FAIL  $label")
+    fi
 done
 
 # ---------------------------------------------------------------------------
