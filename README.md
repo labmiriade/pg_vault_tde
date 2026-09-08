@@ -1,5 +1,13 @@
 # pg_vault_tde
 
+[![build main](https://img.shields.io/github/actions/workflow/status/labmiriade/pg_vault_tde/ci.yml?branch=main&label=build%20main)](https://github.com/labmiriade/pg_vault_tde/actions/workflows/ci.yml?query=branch%3Amain)
+[![build develop](https://img.shields.io/github/actions/workflow/status/labmiriade/pg_vault_tde/ci.yml?branch=develop&label=build%20develop)](https://github.com/labmiriade/pg_vault_tde/actions/workflows/ci.yml?query=branch%3Adevelop)
+[![CodeQL](https://img.shields.io/github/actions/workflow/status/labmiriade/pg_vault_tde/codeql.yml?branch=develop&label=CodeQL)](https://github.com/labmiriade/pg_vault_tde/security/code-scanning)
+[![packages](https://img.shields.io/github/actions/workflow/status/labmiriade/pg_vault_tde/build-packages.yml?label=packages)](https://github.com/labmiriade/pg_vault_tde/actions/workflows/build-packages.yml)
+[![PGXN](https://img.shields.io/badge/PGXN-pg__vault__tde-blue)](https://pgxn.org/dist/pg_vault_tde/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-17%20%7C%2018-336791)](#compatibility)
+[![License](https://img.shields.io/badge/license-PostgreSQL-blue)](LICENSE)
+
 **Transparent Data Encryption (TDE) for PostgreSQL 17+** — Open-source (PostgreSQL License), plug-and-play, zero core modifications.
 
 pg_vault_tde encrypts every tuple with **AES-256-GCM** at the Table Access
@@ -8,7 +16,7 @@ decrypted after it leaves. Encryption keys are managed by **HashiCorp Vault** /
 **OpenBao** or a **local PKCS#12 wallet** and cached in shared memory with
 automatic rotation.
 
-**Current release: v1.7** — 109 regression tests (52 v1.4 + 20 v1.5 + 37 v1.6), zero compiler warnings on PG 17 + PG 18.
+**Current release: v1.7** — 140 regression tests (52 v1.4 + 20 v1.5 + 38 v1.6 + 30 v1.7), zero compiler warnings on PG 17 + PG 18.
 
 ### Commercial Support
 
@@ -23,39 +31,57 @@ Learn more about our enterprise encryption solutions at [Mircrypt](https://www.m
 
 Contact our engineering team at [marketing@miriade.it](mailto:marketing@miriade.it) to discuss your requirements.
 
-### PostgreSQL Version Compatibility
+### Compatibility
 
-| PG Major | Status | Notes |
-|----------|--------|-------|
-| 17 | ✅ Supported | Baseline API set |
-| 18 | ✅ Supported | `scan_bitmap_next_tuple` signature change (guarded) |
-| 19 | 🔜 Planned | Infrastructure ready; audit at release |
+PostgreSQL 17 and 18, 19 planned; OpenSSL 3.x required. Per-major API notes in
+[Version Compatibility](doc/pg_vault_tde.md#postgresql-version-compatibility);
+packaged (OS, PG) combinations and what CI exercises on each in the
+[Support Matrix](doc/pg_vault_tde.md#support-matrix).
 
 ---
 
 ## Quick Start
 
+> **Already running 1.7.0 or earlier?** Do not upgrade to 1.7.1 before reading
+> [Upgrading to 1.7.1](#upgrading-to-171). Tables holding out-of-line TOAST
+> values must be dumped *before* the new binary is installed.
+
 ### 1. Install
 
 ```bash
 # Build and install into your PostgreSQL instance
-git clone https://github.com/miriade/pg_vault_tde.git
+git clone https://github.com/labmiriade/pg_vault_tde.git
 cd pg_vault_tde
 
-# On Debian/Ubuntu (PG 18)
-apt-get install -y postgresql-server-dev-18 libssl-dev libcurl4-openssl-dev pkg-config
+# The PostgreSQL packages below come from the PGDG repository for any major your
+# distribution does not ship itself — PG 18 on Debian 13, every major on
+# RHEL/Rocky. Set it up first if you have not already:
+#   https://www.postgresql.org/download/
+# On RHEL/Rocky also run:  dnf -qy module disable postgresql
+
+# On Debian/Ubuntu (PG 18) — server-dev pulls in the clang/llvm PGXS needs for bitcode
+apt-get install -y build-essential postgresql-server-dev-18 \
+                   libssl-dev libcurl4-openssl-dev pkg-config
 make && sudo make install
 
 # On Debian/Ubuntu (PG 17)
-apt-get install -y postgresql-server-dev-17 libssl-dev libcurl4-openssl-dev pkg-config
+apt-get install -y build-essential postgresql-server-dev-17 \
+                   libssl-dev libcurl4-openssl-dev pkg-config
 make PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config && sudo make install
 
-# On RHEL/Rocky (PG 18)
-dnf install -y postgresql18-devel openssl-devel libcurl-devel
+# On RHEL/Rocky — EPEL and CRB first: postgresqlNN-devel needs perl(IPC::Run)
+dnf install -y epel-release
+dnf config-manager --set-enabled crb
+
+# On RHEL/Rocky (PG 18) — clang/llvm-devel are NOT pulled in by postgresqlNN-devel,
+# and redhat-rpm-config provides the hardening spec file pg_config injects
+dnf install -y postgresql18-devel openssl-devel libcurl-devel \
+               gcc make redhat-rpm-config clang llvm-devel
 make PG_CONFIG=/usr/pgsql-18/bin/pg_config && make install
 
 # On RHEL/Rocky (PG 17)
-dnf install -y postgresql17-devel openssl-devel libcurl-devel
+dnf install -y postgresql17-devel openssl-devel libcurl-devel \
+               gcc make redhat-rpm-config clang llvm-devel
 make PG_CONFIG=/usr/pgsql-17/bin/pg_config && make install
 ```
 
@@ -68,7 +94,7 @@ pip install pgxnclient   # or: apt-get install pgxnclient / dnf install pgxnclie
 pgxn install pg_vault_tde
 ```
 
-See [wiki: Installation](https://github.com/miriade/pg_vault_tde/wiki/Installation)
+See [wiki: Installation](https://github.com/labmiriade/pg_vault_tde/wiki/Installation)
 for package-based (`.deb`/`.rpm`) installs and full per-OS prerequisites.
 
 ### 2. Configure PostgreSQL
@@ -366,6 +392,41 @@ to that database and do not require a server restart.  The cluster-level default
 in `postgresql.conf` (or `ALTER SYSTEM`) act as the fallback for any database
 that does not override a parameter.
 
+#### Order and scope do not matter
+
+Every `pg_vault_tde` KMS parameter is an ordinary, independent GUC:
+
+- a value set at database level **always overrides** the cluster-level one, and
+- the **order** in which the `ALTER DATABASE SET` statements are issued, and the
+  **scope** each one is set at, are irrelevant.
+
+You can therefore set `kms_provider` first, last, or in the middle, and mix
+`ALTER SYSTEM`, `ALTER DATABASE SET` and `ALTER ROLE … IN DATABASE … SET`
+freely.  The provider reads its configuration when it is first used to wrap or
+unwrap a key — after PostgreSQL has finished applying every setting that
+applies to the connection — not at the moment `kms_provider` is assigned.
+
+> **Versions before this fix** initialised the provider from the
+> `kms_provider` GUC assign hook, i.e. while PostgreSQL was still applying the
+> database's settings one at a time.  Setting `kms_provider` before the wallet
+> parameters produced a spurious
+> `local wallet passphrase env var "" not set` WARNING on every connection and,
+> worse, silently froze `wallet_path` to the per-database default.  If you are
+> upgrading and had worked around this by re-ordering your `ALTER DATABASE SET`
+> statements, that workaround is no longer needed (and was never reliable at
+> mixed scopes).  Regression coverage:
+> [`tap/18_guc_order_independence.t`](tap/18_guc_order_independence.t).
+
+To inspect where each effective value comes from, use PostgreSQL's own
+`pg_settings.source` (`database`, `configuration file`, `session`, …):
+
+```sql
+SELECT name, setting, source
+FROM   pg_settings
+WHERE  name LIKE 'pg_vault_tde.%' AND source <> 'default'
+ORDER  BY name;
+```
+
 ### Local Wallet Provider (v1.6 — Offline, No External Service)
 
 A PKCS#12-based encrypted file at
@@ -655,6 +716,94 @@ CREATE INDEX ON secrets USING tde_btree (id);
 
 ---
 
+## Upgrading to 1.7.1
+
+1.7.1 fixes `ALTER TABLE ... SET ACCESS METHOD encrypted_heap` on a populated
+table by binding the AEAD tag to the relation's *effective* OID — the same OID
+the DEK and generation counter were already looked up under. For a TOAST
+relation that effective OID is the parent table's, where releases up to 1.7.0
+used the TOAST relation's own OID.
+
+The AAD is never written to disk, so the reader has to reproduce the writer's
+derivation exactly. **Out-of-line TOAST values written by 1.7.0 or earlier
+therefore do not authenticate under 1.7.1.** The two schemes cannot coexist:
+during a table rewrite the transient TOAST relation gets a fresh OID, so the
+parent hop is what makes the ALTER work in the first place.
+
+**What is and is not affected** (verified by writing under 1.7.0 and reading
+back under 1.7.1 on the same data directory):
+
+| | Under 1.7.1 |
+|---|---|
+| `encrypted_heap` tables with no TOAST data | ✅ readable, byte-identical |
+| Inline values (below the ≈2 kB TOAST threshold) | ✅ readable, byte-identical |
+| Non-TOASTed columns of a table that has TOAST data | ✅ readable |
+| **Out-of-line TOAST values** | ❌ `AES-256-GCM authentication FAILED` |
+| **`pg_dump` of an affected table** | ❌ exits 1 |
+
+Nothing is lost: the ciphertext on disk is untouched, and reinstalling 1.7.0
+makes it readable again. But `pg_dump` stops working *after* the upgrade, so
+the export has to come first.
+
+### Step 1 — while still on 1.7.0, find the affected tables
+
+```sql
+SELECT c.oid::regclass                             AS table_to_export,
+       pg_size_pretty(pg_relation_size(c.reltoastrelid)) AS toast_size
+FROM   pg_class c
+JOIN   pg_am    a ON a.oid = c.relam
+WHERE  a.amname = 'encrypted_heap'
+  AND  c.reltoastrelid <> 0
+  AND  pg_relation_size(c.reltoastrelid) > 0;
+```
+
+No rows means nothing to do — install 1.7.1 and carry on.
+
+This only applies with `pg_vault_tde.toast_encryption = on`, which is the
+default. If it was turned off, TOAST chunks were never encrypted by this
+extension and the upgrade is unaffected either way.
+
+### Step 2 — dump those tables, still on 1.7.0
+
+```bash
+pg_dump -U postgres -d yourdb -t schema.affected_table --data-only \
+        -f affected_table.sql
+```
+
+### Step 3 — install 1.7.1, then truncate and restore
+
+```bash
+psql -U postgres -d yourdb -c 'TRUNCATE schema.affected_table;'
+psql -U postgres -d yourdb -f affected_table.sql
+```
+
+Confirm the running binary with `SELECT pg_vault_tde_build_version();` — it
+reports `1.7.1` while `pg_extension.extversion` stays at `1.7`, because 1.7.1
+ships no SQL changes.
+
+### If you upgraded first
+
+You will get:
+
+```
+ERROR:  [CRYPTO] AES-256-GCM authentication FAILED: data integrity violation or wrong DEK
+DETAIL:  The AEAD tag for relation 16541 is bound to relation 16537.
+HINT:  If this data was written by pg_vault_tde 1.7.0 or earlier it is not corrupt: ...
+```
+
+This is not corruption and not a key problem. Reinstall the 1.7.0 package,
+verify with `pg_vault_tde_build_version()`, then start from Step 1.
+
+### Also check your PostgreSQL minor
+
+Unrelated to 1.7.1, but it lands on the same people: PostgreSQL 17.11 / 18.x
+and newer refuse to load this extension's logical decoding output plugin unless
+it is listed in `output_plugin_libraries`. If you replicate encrypted tables,
+see [Logical replication on PostgreSQL 17.11 / 18.x and
+newer](#logical-replication-on-postgresql-1711--18x-and-newer) below.
+
+---
+
 ## Compatibility
 
 | Feature | Status | Notes |
@@ -675,16 +824,62 @@ CREATE INDEX ON secrets USING tde_btree (id);
 | `pg_dump_tde` / `pg_restore_tde` | ⚠️ Full, except `pkcs11` | Encrypted logical backup: dump wrapped with AES-256-GCM + DEK sealed in backup header. Standalone tools have no PKCS#11 session/PIN handling yet — see "Configure Key Access → PKCS#11 / HSM" above. |
 | Streaming replication | ✅ Full | WAL ships encrypted bytes; standby decrypts at TAM layer |
 | Page checksums | ✅ Full | Checksums over encrypted content (complementary to GCM) |
-| Logical replication (non-TOAST) | ✅ Full (v1.2) | `pg_vault_tde_pgoutput` plugin decrypts tuples before streaming |
+| Logical replication (non-TOAST) | ✅ Full (v1.2) | `pg_vault_tde_pgoutput` plugin decrypts tuples before streaming. On PG ≥ 17.11 / 18.x the publisher must allow the plugin — see below |
 | TOAST (large values > ≈2 kB) | ✅ Full | Heap-level round-trips functional; per-chunk storage encryption |
-| Logical replication (TOAST columns) | ✅ Full (v1.7) | Custom WAL rmgr (`toast_custom_rmgr`) routes encrypted chunks past the reorder buffer; stitched in `change_cb`. UPDATE/DELETE need `REPLICA IDENTITY FULL` + PK |
+| Logical replication (TOAST columns) | ✅ Full (v1.7) | Custom WAL rmgr (`toast_custom_rmgr`) routes encrypted chunks past the reorder buffer; stitched in `change_cb`. UPDATE/DELETE need `REPLICA IDENTITY FULL` + PK. Same publisher requirement as above |
 | Range scans on TDE indexes | ⚠️ By design | `tde_btree` (GIN/Hash/GiST planned for v1.8, same AES-SIV pattern) — equality only; ranges return empty |
 | `CREATE INDEX USING gin/gist/hash/brin/btree` on `encrypted_heap` | ⚠️ `ERROR` by default | Not encrypted AMs; rejected unless `pg_vault_tde.allow_plaintext_index = on` (then allowed with `WARNING`) |
 | Column-level encryption | 🔜 v1.8 | Per-column `ENABLE COLUMN ENCRYPTION` DDL |
 
+### Logical replication on PostgreSQL 17.11 / 18.x and newer
+
+Those minors added the `output_plugin_libraries` GUC (default
+`pgoutput, test_decoding`): PostgreSQL now refuses to load any library outside
+that list as a logical decoding output plugin. Creating a slot with this
+extension's plugin therefore fails with:
+
+```
+ERROR:  library "pg_vault_tde" may not be used as an output plugin
+HINT:   ... add it to "output_plugin_libraries" and reload the server configuration.
+```
+
+Add the plugin on the **publisher** and reload — no restart needed:
+
+```conf
+# postgresql.conf on the publisher
+output_plugin_libraries = 'pgoutput, pg_vault_tde'
+```
+
+It has to be in the server configuration: the process that loads the plugin is
+the walsender, so a session-level `SET` does not reach it. Older minors have no
+such GUC, and an unrecognised parameter in `postgresql.conf` is fatal at
+startup — add the line only where `SELECT ... FROM pg_settings WHERE name =
+'output_plugin_libraries'` returns a row. Details in
+[doc/pg_vault_tde.md](doc/pg_vault_tde.md) → *Logical Decoding and Replication →
+Server configuration*.
+
 ---
 
 ## Testing
+
+Two entry points, for two different needs.
+
+**Building from source, or packaging?** One command, no container, no KMS
+service, no cluster to configure:
+
+```bash
+make install            # into the tree your pg_config points at
+make check-standalone   # creates a throwaway cluster, runs the test, tears it down
+```
+
+`make installcheck` on its own fails against a stock cluster: the extension
+registers a Table Access Method from `_PG_init` and must be preloaded.
+`check-standalone` supplies that (and nothing else) through
+[test/regress.conf](test/regress.conf), so it needs no existing server and
+touches none.
+
+**Working on the extension?** The containerised suites cover what the smoke
+test above does not — the KMS providers, TAP, isolation, checksums, benchmarks:
 
 ```bash
 # Full local CI pipeline (build + all tests + bench):
@@ -694,10 +889,10 @@ make ci-all
 PG_VERSION=17 make ci-all
 
 # Individual test stages:
-make ci-regress          # 109 SQL regression tests (vault provider) — tests 1-109 (test 110 deferred)
-make ci-wallet           # 109 SQL regression tests (local wallet provider)
-make ci-checksums        # 109 tests + page checksum compatibility
-make ci-tap              # TAP tests with mock Vault
+make ci-regress          # 140 SQL regression tests (vault provider) — tests 1-140 (test 110 deferred)
+make ci-wallet           # SQL regression tests (local wallet provider)
+make ci-checksums        # regression tests + page checksum compatibility
+make ci-tap              # 18 TAP test files (starts a real Vault container for the Vault-dependent ones)
 make ci-isolation        # Concurrency / MVCC isolation tests
 make ci-vault            # Vault integration (Compose-based)
 make ci-openbao          # OpenBao Raft 3-node HA integration (12 tests)
@@ -708,7 +903,7 @@ make ci-bench BENCH_ROWS=100000  # with custom row count
 make ci-clean            # Remove test containers and images
 ```
 
-Test coverage (109 tests = 52 v1.4 + 20 v1.5 + 37 v1.6):
+Test coverage (140 tests = 52 v1.4 + 20 v1.5 + 38 v1.6 + 30 v1.7):
 - Tests 1-11: AES-256-GCM crypto primitives, DEK rotation, tamper detection
 - Tests 12-14: TAM INSERT/SELECT/UPDATE end-to-end
 - Test 15: DELETE
@@ -763,11 +958,16 @@ Test coverage (109 tests = 52 v1.4 + 20 v1.5 + 37 v1.6):
 - Test 107: Tuple readable after `pg_vault_tde_rotation_online()` completes **(v1.6)**
 - Test 108: `CREATE TABLE AS` with `encrypted_heap` **(v1.6)**
 - Test 109: VACUUM FULL on table with STORAGE EXTERNAL columns **(v1.6)**
+- Tests 111-137: `tde_btree` native-type operator classes (int4/int8/uuid/date/timestamptz), DEK rotation + REINDEX, partitioned tables (routing, per-leaf DEK isolation, ATTACH/DETACH), FK relationships, `CREATE`/`REINDEX INDEX CONCURRENTLY` **(v1.7 — `sql/regression_test_v17.sql`)**
+- Test 138: `ALTER TABLE x SET ACCESS METHOD encrypted_heap` on a **populated** table with genuinely out-of-line TOAST data (~13 KB, high-entropy so PGLZ can't compress it back inline) — verifies an exact byte-for-byte round-trip via `SELECT` (Tests 105/106 only check on-disk bytes, never read the row back) plus post-ALTER `UPDATE`/`DELETE` across all four small/large transitions **(v1.7, PSQLE-135 regression coverage)**
+- Test 139: `ALTER TABLE x SET ACCESS METHOD heap` — reverse direction of Test 138, same coverage **(v1.7, PSQLE-135 regression coverage)**
+- Test 140: `CREATE TABLE AS SELECT` from an `encrypted_heap` table with genuinely out-of-line TOAST data must re-externalize into the **destination's own** TOAST table; verifies the destination survives the (unrelated, from its own point of view) source table being dropped **(v1.7, PSQLE-135 regression coverage)**
 
 > Test runner notes:
-> - `make ci-regress` (vault provider): 109/109 PASS, with conditional skips for `wal_level` (test 48), `pageinspect` (test 61) and wallet-only assertions (tests 74–80 when `kms_provider=local` is required).
+> - `make ci-regress` (vault provider): 140/140 PASS, with conditional skips for `wal_level` (test 48), `pageinspect` (test 61) and wallet-only assertions (tests 74–80 when `kms_provider=local` is required).
 > - `make ci-wallet` (local provider): tests 73–79 PASS; test 80 SKIPS unless `wallet_passphrase_env` is wired up; tests 81–109 also PASS in wallet mode.
 > - Test 110 (WITH HOLD cursor plaintext spill) is permanently deferred — the executor's tuplestore layer bypasses the TAM write path, so pg_vault_tde cannot intercept it without core modifications. The test is commented out in `regression_test_v16.sql`.
+> - Tests 138–140 exist because Tests 105/106 didn't catch two real bugs, both stemming from the same underlying cause: `tde_decrypt_heap_tuple()` copied the on-disk tuple header verbatim, including the `HEAP_HASEXTERNAL` bit that `tde_encrypt_heap_tuple()` deliberately clears so core never dereferences a TOAST pointer inside ciphertext — leaving that bit WRONG on the decrypted tuple whenever the attribute genuinely is out-of-line. (1) The AAD was also bound to the wrong (transient) relation OID during `ALTER TABLE`'s row-by-row rewrite — fixed via `resolve_effective_relid()` in `tde_compute_aad()`. (2) Any consumer trusting the stale `HEAP_HASEXTERNAL` bit instead of re-deriving it — `pg_vault_tde_toast_insert_or_update()`'s size-only gate, but also, more broadly, `CREATE TABLE AS SELECT`/`INSERT ... SELECT` reading out of an `encrypted_heap` table — silently skips re-externalizing the value, leaving it pointing at storage that later disappears. Fixed at the source: `tde_decrypt_heap_tuple()` now recomputes the bit from the actual decrypted attributes (`tde_tuple_has_external_desc()`) before returning, so every consumer sees a truthful tuple. Both only reproduce with a populated source table and a genuinely out-of-line (not just inline-compressed) value.
 
 ---
 
@@ -1054,10 +1254,10 @@ See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
    in **plaintext**. The tuplestore is populated directly by the executor, bypassing the table
    access method write path entirely, so `pg_vault_tde` never gets a chance to encrypt the data
    before it reaches disk — there is no extension hook anywhere in the `WITH HOLD` cursor
-   lifecycle (parse, plan, portal start, commit-time persist) that can intercept it. This is the
-   same class of gap documented for other TDE implementations (e.g. Percona's `pg_tde`): temporary
-   files produced by query execution that exceed `work_mem` are not covered by table-level
-   encryption. The spilled file can outlive the query that created it — it persists for as long as
+   lifecycle (parse, plan, portal start, commit-time persist) that can intercept it. This is an
+   inherent limit of the extension APIs, not of this implementation: temporary files produced by
+   query execution that exceed `work_mem` are not covered by table-level encryption. The spilled
+   file can outlive the query that created it — it persists for as long as
    the held cursor remains open, and, like any other PostgreSQL temp file, is not guaranteed to be
    cleaned up if the server crashes before the owning session ends normally.
 
@@ -1116,6 +1316,24 @@ See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
     **Mitigation:** always use `pg_dump_tde`/`pg_restore_tde` instead of plain
     `pg_dump`/`pg_restore` for logical backups of encrypted tables — see
     [Encrypted Backups](#encrypted-backups).
+
+---
+
+## Community & Contributing
+
+| | |
+|---|---|
+| **Report a bug** | [Open a bug report](https://github.com/labmiriade/pg_vault_tde/issues/new?template=bug_report.yml) — check [Known Limitations](https://github.com/labmiriade/pg_vault_tde/wiki/Known-Limitations-and-Troubleshooting) first |
+| **Request a feature** | [Open a feature request](https://github.com/labmiriade/pg_vault_tde/issues/new?template=feature_request.yml) |
+| **Report a vulnerability** | **Privately** — see [SECURITY.md](SECURITY.md). Never in a public issue. |
+| **Contribute code** | [CONTRIBUTING.md](CONTRIBUTING.md) explains the GitHub → Bitbucket mirror review flow |
+| **Community standards** | [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) |
+| **Documentation** | [Project wiki](https://github.com/labmiriade/pg_vault_tde/wiki) |
+| **Commercial support** | [Miriade / Mircrypt](https://www.miriade.it/en/products/mircrypt-it) — SLAs, custom development, security audits |
+
+Contributions are welcome from anyone. This project is part of the PostgreSQL
+community and holds itself to that community's standards of respectful,
+professional technical collaboration.
 
 ---
 

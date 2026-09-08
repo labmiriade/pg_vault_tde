@@ -24,6 +24,15 @@
 #     entrypoint special-cases a bare `server` arg by injecting dev-only flags
 #     (-dev-root-token-id / -dev-listen-address), which crash a production node.
 #     Leading `bao` bypasses that injection while keeping the chown/drop-root.
+#   * This file exists only for Bitbucket Pipelines: it bind-mounts the Raft
+#     storage under the clone dir because the Pipelines docker daemon refuses
+#     named volumes ("-v only supports $BITBUCKET_CLONE_DIR and its
+#     subdirectories").  Do NOT merge it back into compose-openbao.yml.
+#   * SKIP_CHOWN=1 on the nodes: the image entrypoint chowns /openbao/file to
+#     uid 100 under `set -e`, and Pipelines runs dockerd with user namespaces
+#     remapped, so that chown always fails with EPERM on a bind mount and every
+#     node dies at boot.  run-openbao.sh pre-creates the bind sources 0777
+#     instead — mode bits survive the remap, ownership does not.
 #   * bao-init breaks the chicken-and-egg (nodes are sealed until init unseals
 #     them) by depending on `service_started`, not `service_healthy`.
 #
@@ -37,6 +46,8 @@ services:
     container_name: bao-1
     hostname: bao-1
     command: ["bao", "server", "-config=/openbao/config/main.hcl"]
+    environment:
+      SKIP_CHOWN: "1"          # see header note — the entrypoint chown is fatal here
     ports:
       - "${BAO_PORT_1:-18200}:8200"
     volumes:
@@ -59,6 +70,8 @@ services:
     container_name: bao-2
     hostname: bao-2
     command: ["bao", "server", "-config=/openbao/config/main.hcl"]
+    environment:
+      SKIP_CHOWN: "1"          # see header note — the entrypoint chown is fatal here
     ports:
       - "${BAO_PORT_2:-18201}:8200"
     volumes:
@@ -84,6 +97,8 @@ services:
     container_name: bao-3
     hostname: bao-3
     command: ["bao", "server", "-config=/openbao/config/main.hcl"]
+    environment:
+      SKIP_CHOWN: "1"          # see header note — the entrypoint chown is fatal here
     ports:
       - "${BAO_PORT_3:-18202}:8200"
     volumes:

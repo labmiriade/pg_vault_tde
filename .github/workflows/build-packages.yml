@@ -38,16 +38,38 @@ concurrency:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.matrix.outputs.include }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag }}
 
+      - name: Load the build matrix
+        id: matrix
+        # Read from the tag being built, not from the default branch, so each
+        # release carries its own support window: a v1.7.x tag can keep
+        # targeting PG 17-18 after develop has moved on. See
+        # packaging/BUILD_MATRIX.md.
+        run: |
+          set -euo pipefail
+          jq -e 'type == "array" and length > 0' packaging/build-matrix.json >/dev/null
+          echo "include=$(jq -c . packaging/build-matrix.json)" >> "$GITHUB_OUTPUT"
+          echo "Building $(jq length packaging/build-matrix.json) package(s) for tag ${{ inputs.tag }}."
+
       - name: Verify version consistency at tag
         run: |
           set -euo pipefail
           INPUT_VERSION="${{ inputs.version }}"
-          SHORT="${INPUT_VERSION%.*}"   # 1.7.0 -> 1.7
+          # Packaging carries the full three-component version from 1.7.1 on, so
+          # that a C-only patch release produces a package version apt/dnf will
+          # actually consider an upgrade. Tags up to v1.7.0 used the 2-component
+          # short form in the packaging files; rebuild those from their own tag.
+          SHORT="${INPUT_VERSION%.*}"   # 1.7.0 -> 1.7 (legacy packaging form)
+          case "$INPUT_VERSION" in
+            1.0.*|1.6.*|1.7.0) PKG_EXPECTED="$SHORT" ;;
+            *)                 PKG_EXPECTED="$INPUT_VERSION" ;;
+          esac
 
           fail=0
           check() {
@@ -59,9 +81,29 @@ jobs:
           }
 
           check "VERSION file" "$(cat VERSION)" "$INPUT_VERSION"
-          check "rpm spec Version:" "$(grep -m1 '^Version:' packaging/rpm/pg_vault_tde.spec | awk '{print $2}')" "$SHORT"
-          check "build_rpm.sh VERSION=" "$(grep -m1 '^VERSION=' packaging/build_rpm.sh | cut -d'"' -f2)" "$SHORT"
-          check "debian/changelog top version" "$(sed -n '1p' packaging/debian/changelog | grep -oP '(?<=\()[^)]+(?=\))' | cut -d- -f1)" "$SHORT"
+          check "rpm spec Version:" "$(grep -m1 '^Version:' packaging/rpm/pg_vault_tde.spec | awk '{print $2}')" "$PKG_EXPECTED"
+          check "build_rpm.sh VERSION=" "$(grep -m1 '^VERSION=' packaging/build_rpm.sh | cut -d'"' -f2)" "$PKG_EXPECTED"
+          check "debian/changelog top version" "$(sed -n '1p' packaging/debian/changelog | grep -oP '(?<=\()[^)]+(?=\))' | cut -d- -f1)" "$PKG_EXPECTED"
+
+          # PGXN metadata. META.json is what PGXN Manager parses out of the
+          # release zip, and `make dist` names the bundle after VERSION, so a
+          # drift here publishes a distribution that declares one version and
+          # installs another — and PGXN refuses a re-upload under the same
+          # number. default_version stays 2-part: it is PostgreSQL's own
+          # extension version, bound 1:1 to sql/pg_vault_tde--X.Y.sql.
+          check "META.json version" "$(jq -r '.version' META.json)" "$INPUT_VERSION"
+          check "META.json provides version" "$(jq -r '.provides.pg_vault_tde.version' META.json)" "$INPUT_VERSION"
+          check "control default_version" "$(grep -m1 default_version pg_vault_tde.control | sed -e "s/.*=[[:space:]]*'\([^']*\)'.*/\1/")" "$SHORT"
+
+          # The SQL script and the docfile PGXN renders must actually exist at
+          # the tag, or the upload is accepted and the distribution page is broken.
+          for f in "$(jq -r '.provides.pg_vault_tde.file' META.json)" \
+                   "$(jq -r '.provides.pg_vault_tde.docfile' META.json)"; do
+            if [ ! -f "$f" ]; then
+              echo "ERROR: META.json points at '$f', missing at tag '${{ inputs.tag }}'"
+              fail=1
+            fi
+          done
 
           if [ "$fail" -ne 0 ]; then
             echo ""
@@ -70,7 +112,7 @@ jobs:
             echo "bump was incomplete for this tag. See packaging/packaging.instructions.md."
             exit 1
           fi
-          echo "OK: version $INPUT_VERSION consistent across VERSION, spec, build_rpm.sh, changelog."
+          echo "OK: version $INPUT_VERSION consistent across VERSION, spec, build_rpm.sh, changelog, META.json, control."
 
   build:
     needs: validate
@@ -79,27 +121,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # DEB — packaging/build_in_container.sh VALID_DEB_OS
-          - { format: deb, os: "ubuntu:22.04", pg: "17", slug: ubuntu22.04 }
-          - { format: deb, os: "ubuntu:22.04", pg: "18", slug: ubuntu22.04 }
-          - { format: deb, os: "ubuntu:24.04", pg: "17", slug: ubuntu24.04 }
-          - { format: deb, os: "ubuntu:24.04", pg: "18", slug: ubuntu24.04 }
-          - { format: deb, os: "ubuntu:26.04", pg: "17", slug: ubuntu26.04 }
-          - { format: deb, os: "ubuntu:26.04", pg: "18", slug: ubuntu26.04 }
-          - { format: deb, os: "debian:12",    pg: "17", slug: debian12 }
-          - { format: deb, os: "debian:12",    pg: "18", slug: debian12 }
-          - { format: deb, os: "debian:13",    pg: "17", slug: debian13 }
-          - { format: deb, os: "debian:13",    pg: "18", slug: debian13 }
-          # RPM — packaging/build_in_container.sh VALID_RPM_OS
-          - { format: rpm, os: "rockylinux:9",  pg: "17", slug: rockylinux9 }
-          - { format: rpm, os: "rockylinux:9",  pg: "18", slug: rockylinux9 }
-          - { format: rpm, os: "rockylinux:10", pg: "17", slug: rockylinux10 }
-          - { format: rpm, os: "rockylinux:10", pg: "18", slug: rockylinux10 }
-          - { format: rpm, os: "almalinux:9",   pg: "17", slug: almalinux9 }
-          - { format: rpm, os: "almalinux:9",   pg: "18", slug: almalinux9 }
-          - { format: rpm, os: "almalinux:10",  pg: "17", slug: almalinux10 }
-          - { format: rpm, os: "almalinux:10",  pg: "18", slug: almalinux10 }
+        # Single source of truth: packaging/build-matrix.json, read from the
+        # tag by the validate job. Do not inline entries here — dev-prerelease.yml
+        # reads the same file, and a hand-edited copy would let the stable and
+        # dev channels drift apart silently.
+        include: ${{ fromJSON(needs.validate.outputs.include) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -133,8 +159,101 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  pgxn-bundle:
+    # Guard-rail for the PGXN release zip. `make dist` filters its content
+    # through .gitattributes (export-ignore), so one line too many silently
+    # drops a file the build needs — and nothing would notice until after the
+    # upload, which PGXN will not let you redo under the same version number.
+    # Build the bundle exactly the way PGXN's recipe does: from the unpacked
+    # zip, never from the checkout.
+    #
+    # PG 17 on purpose: it is the minimum META.json declares under
+    # prereqs.runtime.requires, so this is the stricter of the supported majors.
+    #
+    # installcheck is deliberately NOT run here — it needs a server started with
+    # shared_preload_libraries=pg_vault_tde and a reachable KMS. See PGXN.md.
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PG_MAJOR: "17"
+      BUNDLE: pg_vault_tde-${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Install PostgreSQL headers and build dependencies
+        run: |
+          set -euo pipefail
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+            https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            postgresql-server-dev-${PG_MAJOR} \
+            libpq-dev libssl-dev libcurl4-openssl-dev pkg-config unzip \
+            cpanminus
+          # PGXN::Meta::Validator is the very module PGXN Manager validates
+          # uploads with. pgxnclient has no validate-meta command — it is a
+          # client for installing distributions, not for checking metadata.
+          sudo cpanm --quiet --notest PGXN::Meta::Validator
+
+      - name: Validate META.json
+        # Catches schema mistakes PGXN Manager would otherwise reject at upload,
+        # after the version fields have already been checked by the validate job.
+        run: validate_pgxn_meta -v META.json
+
+      - name: Build the release bundle
+        run: |
+          set -euo pipefail
+          make dist PG_CONFIG=/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config
+          test -f "dist/${BUNDLE}.zip" \
+            || { echo "ERROR: make dist did not produce dist/${BUNDLE}.zip — VERSION and the requested version disagree"; exit 1; }
+          unzip -l "dist/${BUNDLE}.zip"
+
+      - name: Refuse internal paths in the bundle
+        run: |
+          set -euo pipefail
+          leaked=$(unzip -Z1 "dist/${BUNDLE}.zip" \
+            | grep -E '(^|/)(ci|wiki|tap)/|bitbucket-pipelines\.yml|regression_test.*\.sql' || true)
+          if [ -n "$leaked" ]; then
+            echo "ERROR: internal paths present in the PGXN bundle:"
+            echo "$leaked"
+            echo "Check the export-ignore rules in .gitattributes."
+            exit 1
+          fi
+          echo "OK: no internal path in the bundle."
+
+      - name: Build the extension from the unpacked bundle
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/pgxn-check && mkdir -p /tmp/pgxn-check
+          unzip -q "dist/${BUNDLE}.zip" -d /tmp/pgxn-check
+          cd "/tmp/pgxn-check/${BUNDLE}"
+          make USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config
+          make USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config \
+            install DESTDIR=/tmp/pgxn-install
+          find /tmp/pgxn-install -type f | sort
+
+      - name: Checksum
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum "${BUNDLE}.zip" > "${BUNDLE}.zip.sha256"
+          cat "${BUNDLE}.zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pgxn-bundle
+          path: dist/pg_vault_tde-*.zip*
+          if-no-files-found: error
+
   release:
-    needs: build
+    needs: [build, pgxn-bundle]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -145,7 +264,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          find artifacts -type f \( -name '*.deb' -o -name '*.rpm' \) -exec cp {} dist/ \;
+          find artifacts -type f \( -name '*.deb' -o -name '*.rpm' \
+            -o -name '*.zip' -o -name '*.zip.sha256' \) -exec cp {} dist/ \;
           ls -la dist
 
       - name: Create/update GitHub Release

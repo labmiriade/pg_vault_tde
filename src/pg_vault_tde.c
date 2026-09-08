@@ -112,23 +112,24 @@ char *pg_vault_tde_pkcs11_key_label   = NULL; /* CKA_LABEL of the KEK on the tok
 bool  pg_vault_tde_allow_plaintext_index = false;
 
 /*
- * tde_active_kms_provider — selected KMS backend (set in _PG_init).
- * All callers that need KMS operations go through this pointer.
+ * tde_active_kms_provider — selected KMS backend (set by the kms_provider GUC
+ * assign hook).  Callers that need KMS operations go through tde_kms_provider(),
+ * which also runs the provider's init() on first use; reading this pointer
+ * directly is reserved for teardown paths that must not initialise anything.
  * Declared extern in pg_vault_tde_kms_provider.h.
  */
 const TdeKmsProvider *tde_active_kms_provider = NULL;
 
 /*
- * tde_shmem_started — true after pg_vault_tde_shmem_startup() completes.
+ * tde_provider_initialized — true once tde_kms_provider() has run init() for
+ * the currently selected provider in this backend.
  *
- * Used by the kms_provider GUC assign hook to decide whether it is safe to
- * call provider->init() immediately (shmem is ready) or defer until the
- * shmem_startup_hook runs (postmaster pre-shmem phase).
- *
- * This is a plain static (process-local); each backend inherits the true value
- * from the postmaster after it has been forked post-startup.
+ * Cleared by tde_kms_provider_invalidate(), which every KMS-config GUC assign
+ * hook calls.  Plain static (process-local): a forked backend inherits the
+ * postmaster's value, which is always false because the postmaster performs
+ * no KMS operations.
  */
-static bool tde_shmem_started = false;
+static bool tde_provider_initialized = false;
 
 /* Hook chain pointers — we save the previous hook so we compose correctly. */
 static shmem_request_hook_type    prev_shmem_request_hook = NULL;
@@ -232,14 +233,15 @@ tde_kms_provider_check(char **newval, void **extra, GucSource source)
  * applied at backend connect time (inside InitPostgres), and on SET inside a
  * session.
  *
- * The hook updates tde_active_kms_provider to the new provider vtable.  If
- * shmem is already ready (tde_shmem_started == true) it also calls init() so
- * the provider can open its wallet / restore its DEK.  In the postmaster
- * pre-shmem phase tde_shmem_started is false, so init() is deferred until
- * pg_vault_tde_shmem_startup().
+ * The hook only records which vtable is selected and marks the provider as
+ * needing initialisation.  It deliberately does NOT call init(): at this
+ * point PostgreSQL may still be midway through applying the database's
+ * pg_db_role_setting entries (ProcessGUCArray applies them one at a time, in
+ * setconfig array order), so the companion GUCs the provider reads —
+ * wallet_path, wallet_passphrase_*, pkcs11_* — may still hold their defaults.
+ * init() runs on first use, from tde_kms_provider().
  *
- * This is the ONLY place that sets tde_active_kms_provider; the previous
- * assignment block in pg_vault_tde_shmem_startup() has been removed.
+ * This is the ONLY place that sets tde_active_kms_provider.
  */
 static void
 tde_kms_provider_assign(const char *newval, void *extra)
@@ -270,16 +272,82 @@ tde_kms_provider_assign(const char *newval, void *extra)
     }
 
     tde_active_kms_provider = new_provider;
+    tde_provider_initialized = false;
+}
 
-    /*
-     * Call init() only once shmem is available.  In the postmaster config-load
-     * phase tde_shmem_started is still false; init() will be called from
-     * pg_vault_tde_shmem_startup() instead.  In a backend (after fork) shmem
-     * is already attached, so we can initialise immediately — this is the path
-     * that makes ALTER DATABASE SET pg_vault_tde.kms_provider work.
-     */
-    if (tde_shmem_started && new_provider->init)
-        (void) new_provider->init();
+/*
+ * tde_kms_provider — public accessor; see pg_vault_tde_kms_provider.h.
+ *
+ * Runs the selected provider's init() exactly once per (backend, selected
+ * provider), on the first KMS operation rather than at GUC assign time.  By
+ * then InitPostgres has finished process_settings(), so the effective
+ * configuration is complete no matter in which order the ALTER DATABASE SET
+ * statements were issued or at which scope each GUC was set.
+ *
+ * The initialised flag is set BEFORE calling init() so a provider that cannot
+ * initialise (e.g. no passphrase source configured) reports once instead of
+ * on every relation access.  Every provider re-checks its own state inside
+ * wrap_dek/unwrap_dek anyway, so a failed init is never fatal by itself; the
+ * operation that needs the key is what raises the error.
+ */
+const TdeKmsProvider *
+tde_kms_provider(void)
+{
+    if (tde_active_kms_provider != NULL && !tde_provider_initialized)
+    {
+        tde_provider_initialized = true;
+
+        if (tde_active_kms_provider->init != NULL &&
+            !tde_active_kms_provider->init())
+            ereport(WARNING,
+                    errmsg("pg_vault_tde: KMS provider \"%s\" failed to "
+                           "initialise",
+                           tde_active_kms_provider->name));
+    }
+
+    return tde_active_kms_provider;
+}
+
+/*
+ * tde_kms_provider_invalidate — see pg_vault_tde_kms_provider.h.
+ *
+ * Also drops any key material the local provider derived from the previous
+ * settings: after changing wallet_path or a passphrase source, a cached KEK
+ * belongs to a wallet that is no longer the configured one.
+ */
+void
+tde_kms_provider_invalidate(void)
+{
+    tde_provider_initialized = false;
+    pg_vault_tde_kms_local_reset();
+}
+
+/*
+ * GUC assign hooks for every parameter a provider's init() reads.  They exist
+ * solely to call tde_kms_provider_invalidate(); three trivial wrappers are
+ * needed because GucStringAssignHook, GucBoolAssignHook and GucIntAssignHook
+ * have different signatures.
+ *
+ * These fire repeatedly (and harmlessly) while process_settings() applies a
+ * database's settings: init() has not run yet at that point, so there is
+ * nothing to redo — they only matter for a SET issued in a live session.
+ */
+static void
+tde_kms_config_assign_string(const char *newval, void *extra)
+{
+    tde_kms_provider_invalidate();
+}
+
+static void
+tde_kms_config_assign_bool(bool newval, void *extra)
+{
+    tde_kms_provider_invalidate();
+}
+
+static void
+tde_kms_config_assign_int(int newval, void *extra)
+{
+    tde_kms_provider_invalidate();
 }
 
 /*
@@ -1261,28 +1329,19 @@ pg_vault_tde_shmem_startup(void)
     pg_vault_tde_kms_pkcs11_shmem_init();
 
     /*
-     * Mark shmem as available.  The kms_provider assign hook checks this flag
-     * before calling provider->init(); from this point on any GUC change (e.g.
-     * ALTER DATABASE SET applied at backend connect) will trigger init()
-     * directly in the assign hook rather than requiring a second startup path.
+     * No provider->init() here.  The postmaster performs no KMS operation and
+     * has no database context (MyDatabaseId is InvalidOid), so initialising
+     * here could only ever half-succeed — the local provider used to log
+     * `cannot open wallet ""` on every cluster-level 'local' setup.  Each
+     * backend initialises its own provider on first use via
+     * tde_kms_provider().
      */
-    tde_shmem_started = true;
-
-    /*
-     * tde_active_kms_provider was already set by the GUC assign hook when
-     * postgresql.conf was processed during startup.  Call init() now that
-     * shmem is available.  If no provider was configured at the cluster level
-     * (per-database-only setup) tde_active_kms_provider is NULL here and
-     * each backend will activate its provider via the assign hook.
-     */
-    if (tde_active_kms_provider && tde_active_kms_provider->init)
-        (void) tde_active_kms_provider->init();
-    else if (!tde_active_kms_provider)
+    if (tde_active_kms_provider == NULL)
         ereport(LOG,
                 errmsg("pg_vault_tde: no cluster-level KMS provider configured; "
                        "per-database provider (ALTER DATABASE SET "
                        "pg_vault_tde.kms_provider) will be activated on first "
-                       "connection"));
+                       "use"));
 }
 
 
@@ -1501,7 +1560,8 @@ _PG_init(void)
         "Used only when pg_vault_tde.kms_provider = 'local'.  "
         "Default: /var/lib/pg_vault_tde/<DB_OID>/wallet.p12",
         &pg_vault_tde_wallet_path, "", PGC_SUSET,
-        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+        GUC_SUPERUSER_ONLY, NULL, tde_kms_config_assign_string,
+        pg_vault_tde_kms_local_wallet_path);
 
     /* Passphrase env var NAME — never the passphrase itself (v1.5) */
     DefineCustomStringVariable("pg_vault_tde.wallet_passphrase_env",
@@ -1509,7 +1569,7 @@ _PG_init(void)
         "The passphrase is read from getenv(wallet_passphrase_env) at "
         "startup.  NEVER put the passphrase in postgresql.conf directly.",
         &pg_vault_tde_wallet_passphrase_env, "",
-        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, tde_kms_config_assign_string, NULL);
 
     /* Auto-open wallet on startup (v1.5) */
     DefineCustomBoolVariable("pg_vault_tde.wallet_auto_open",
@@ -1518,7 +1578,7 @@ _PG_init(void)
         "if the passphrase env var is set.  When false, defers opening "
         "until the first encrypted relation access.",
         &pg_vault_tde_wallet_auto_open, true, PGC_SUSET,
-        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+        GUC_SUPERUSER_ONLY, NULL, tde_kms_config_assign_bool, NULL);
 
     /* Max encrypted relations in shmem cache (v1.5) */
     DefineCustomIntVariable("pg_vault_tde.max_encrypted_relations",
@@ -1567,7 +1627,7 @@ _PG_init(void)
         "Incompatible with wallet_passphrase_env if both are set.  "
         "wallet_passphrase_command takes priority if set.",
         &pg_vault_tde_wallet_passphrase_file, "",
-        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, tde_kms_config_assign_string, NULL);
 
     /*
      * wallet_passphrase_command — shell command whose stdout is the
@@ -1583,7 +1643,7 @@ _PG_init(void)
         "and wallet_passphrase_file.  Never use in production without "
         "securing the command output.",
         &pg_vault_tde_wallet_passphrase_command, "",
-        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, tde_kms_config_assign_string, NULL);
 
     /*
      * wallet_dev_mode_passphrase — literal plaintext passphrase for
@@ -1596,7 +1656,7 @@ _PG_init(void)
         "Emits a WARNING on every use.  Ignored when dev_mode = off.",
         &pg_vault_tde_wallet_dev_mode_passphrase, "",
         PGC_SUSET, GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE,
-        NULL, NULL, NULL);
+        NULL, tde_kms_config_assign_string, NULL);
 
     /*
      * dev_mode — enable development conveniences (v1.6).
@@ -1608,7 +1668,7 @@ _PG_init(void)
         "When true, pg_vault_tde.wallet_dev_mode_passphrase may be used "
         "as the wallet passphrase.  Always false in production.",
         &pg_vault_tde_dev_mode, false, PGC_SUSET,
-        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+        GUC_SUPERUSER_ONLY, NULL, tde_kms_config_assign_bool, NULL);
 
     /*
      * allow_plaintext_index — opt-in relaxation of the encrypted_heap index
@@ -1643,7 +1703,7 @@ _PG_init(void)
         "Used only when pg_vault_tde.kms_provider = 'pkcs11'.  "
         "Example: /usr/lib/softhsm/libsofthsm2.so",
         &pg_vault_tde_pkcs11_library, "", PGC_SUSET,
-        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+        GUC_SUPERUSER_ONLY, NULL, tde_kms_config_assign_string, NULL);
 
     /*
      * pkcs11_token_label — locate the token by its label.  Preferred over
@@ -1655,7 +1715,7 @@ _PG_init(void)
         "When set, slots are scanned for a token with this label.  "
         "Takes priority over pg_vault_tde.pkcs11_slot_id.",
         &pg_vault_tde_pkcs11_token_label, "", PGC_SUSET,
-        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+        GUC_SUPERUSER_ONLY, NULL, tde_kms_config_assign_string, NULL);
 
     /*
      * pkcs11_slot_id — explicit slot selection, used only when
@@ -1667,7 +1727,7 @@ _PG_init(void)
         "pg_vault_tde.pkcs11_token_label: slot IDs are not stable across "
         "restarts on some modules.  -1 = unset.",
         &pg_vault_tde_pkcs11_slot_id, -1, -1, INT_MAX,
-        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, tde_kms_config_assign_int, NULL);
 
     /* PIN env var NAME — never the PIN itself (same rule as the wallet) */
     DefineCustomStringVariable("pg_vault_tde.pkcs11_pin_env",
@@ -1675,7 +1735,7 @@ _PG_init(void)
         "The PIN is read from getenv(pkcs11_pin_env) at session setup.  "
         "NEVER put the PIN in postgresql.conf directly.",
         &pg_vault_tde_pkcs11_pin_env, "PG_TDE_PKCS11_PIN",
-        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, tde_kms_config_assign_string, NULL);
 
     /* CKA_LABEL of the AES-256 KEK object on the token */
     DefineCustomStringVariable("pg_vault_tde.pkcs11_key_label",
@@ -1684,7 +1744,7 @@ _PG_init(void)
         "pg_vault_tde_pkcs11_keygen() or with the HSM vendor tooling "
         "(CKA_WRAP, CKA_UNWRAP, CKA_EXTRACTABLE=FALSE).",
         &pg_vault_tde_pkcs11_key_label, "pg_vault_tde_kek",
-        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, tde_kms_config_assign_string, NULL);
 
     /* Chain hooks so other extensions coexist correctly. */
     prev_shmem_request_hook = shmem_request_hook;

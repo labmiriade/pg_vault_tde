@@ -24,13 +24,15 @@ definitions:
           - docker
         script:
           - apt-get update -qq
-          - apt-get install -y --no-install-recommends ca-certificates curl wget
+          - apt-get install -y --no-install-recommends ca-certificates curl wget jq
           # Docker Compose
           - curl -fsSL https://github.com/docker/compose/releases/download/v5.1.2/docker-compose-linux-x86_64 -o /usr/local/bin/docker-compose
           - chmod +x /usr/local/bin/docker-compose
           # Run test
           - export PG_VERSION=17
           - bash ci/scripts/run-all.sh $TEST_RUNALL_OPTIONS
+        artifacts:
+          - test/tap/**
 
     - step: &test-pg-18
         name: Testing — PostgreSQL 18
@@ -39,13 +41,15 @@ definitions:
           - docker
         script:
           - apt-get update -qq
-          - apt-get install -y --no-install-recommends ca-certificates curl wget
+          - apt-get install -y --no-install-recommends ca-certificates curl wget jq
           # Docker Compose
           - curl -fsSL https://github.com/docker/compose/releases/download/v5.1.2/docker-compose-linux-x86_64 -o /usr/local/bin/docker-compose
           - chmod +x /usr/local/bin/docker-compose
           # Run test
           - export PG_VERSION=18
           - bash ci/scripts/run-all.sh $TEST_RUNALL_OPTIONS
+        artifacts:
+          - test/tap/**
 
     - step: &package
         name: Build and Package Artifacts

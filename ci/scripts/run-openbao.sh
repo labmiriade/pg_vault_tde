@@ -40,7 +40,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
 
 if [ -n "${BITBUCKET_CLONE_DIR:-}" ]; then
+    # Bitbucket Pipelines rejects named volumes ("-v only supports
+    # $BITBUCKET_CLONE_DIR and its subdirectories"), so the CI compose file
+    # bind-mounts the Raft storage from here instead.  Its daemon also runs
+    # with user namespaces remapped: a chown to uid 100 from this build
+    # container lands on a uid the containers cannot see, and the chown the
+    # openbao entrypoint does itself fails with EPERM.  Mode bits DO survive
+    # the remap — hence 0777 here plus SKIP_CHOWN=1 in the compose file.
     COMPOSE_FILE="$CI_DIR/compose-openbao-bitbucket.yml"
+    mkdir -p "$CI_DIR"/docker-data/bao-1-file \
+             "$CI_DIR"/docker-data/bao-2-file \
+             "$CI_DIR"/docker-data/bao-3-file \
+             "$CI_DIR"/docker-data/bao-init-data
+    chmod -R 0777 "$CI_DIR"/docker-data
 else
     COMPOSE_FILE="$CI_DIR/compose-openbao.yml"
 fi
@@ -132,6 +144,11 @@ for i in $(seq 1 "$STARTUP_TIMEOUT"); do
     fi
     if [[ "$i" -eq "$STARTUP_TIMEOUT" ]]; then
         log_error "Timed out waiting for bao-1 (${STARTUP_TIMEOUT}s)"
+        $COMPOSE_CMD -f "$COMPOSE_FILE" ps 2>&1 || true
+        for n in bao-1 bao-2 bao-3; do
+            echo "--- $n (last 50 log lines) ---"
+            $RT logs --tail 50 "$n" 2>&1 || true
+        done
         exit 5
     fi
     sleep 1

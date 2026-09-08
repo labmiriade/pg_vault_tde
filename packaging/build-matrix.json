@@ -1,0 +1,20 @@
+[
+  { "format": "deb", "os": "ubuntu:22.04",   "pg": "17", "slug": "ubuntu22.04",   "functional_test": false, "install_test": true  },
+  { "format": "deb", "os": "ubuntu:22.04",   "pg": "18", "slug": "ubuntu22.04",   "functional_test": false, "install_test": true  },
+  { "format": "deb", "os": "ubuntu:24.04",   "pg": "17", "slug": "ubuntu24.04",   "functional_test": false, "install_test": true },
+  { "format": "deb", "os": "ubuntu:24.04",   "pg": "18", "slug": "ubuntu24.04",   "functional_test": false, "install_test": true },
+  { "format": "deb", "os": "ubuntu:26.04",   "pg": "17", "slug": "ubuntu26.04",   "functional_test": false, "install_test": true },
+  { "format": "deb", "os": "ubuntu:26.04",   "pg": "18", "slug": "ubuntu26.04",   "functional_test": false, "install_test": true },
+  { "format": "deb", "os": "debian:12",      "pg": "17", "slug": "debian12",      "functional_test": false, "install_test": true },
+  { "format": "deb", "os": "debian:12",      "pg": "18", "slug": "debian12",      "functional_test": false, "install_test": true },
+  { "format": "deb", "os": "debian:13",      "pg": "17", "slug": "debian13",      "functional_test": true,  "install_test": true },
+  { "format": "deb", "os": "debian:13",      "pg": "18", "slug": "debian13",      "functional_test": true,  "install_test": true },
+  { "format": "rpm", "os": "rockylinux:9",   "pg": "17", "slug": "rockylinux9",   "functional_test": false, "install_test": true  },
+  { "format": "rpm", "os": "rockylinux:9",   "pg": "18", "slug": "rockylinux9",   "functional_test": false, "install_test": true  },
+  { "format": "rpm", "os": "rockylinux:10",  "pg": "17", "slug": "rockylinux10",  "functional_test": false, "install_test": true },
+  { "format": "rpm", "os": "rockylinux:10",  "pg": "18", "slug": "rockylinux10",  "functional_test": false, "install_test": true },
+  { "format": "rpm", "os": "almalinux:9",    "pg": "17", "slug": "almalinux9",    "functional_test": false, "install_test": true },
+  { "format": "rpm", "os": "almalinux:9",    "pg": "18", "slug": "almalinux9",    "functional_test": false, "install_test": true },
+  { "format": "rpm", "os": "almalinux:10",   "pg": "17", "slug": "almalinux10",   "functional_test": false, "install_test": true },
+  { "format": "rpm", "os": "almalinux:10",   "pg": "18", "slug": "almalinux10",   "functional_test": false, "install_test": true }
+]

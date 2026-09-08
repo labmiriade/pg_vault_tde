@@ -9,14 +9,14 @@
 # Usage:
 #   bash packaging/build_rpm.sh [--pg-version 17|18]
 #
-# Output: ~/rpmbuild/RPMS/x86_64/postgresql{17,18}-pg_vault_tde-1.7-1.*.rpm
+# Output: ~/rpmbuild/RPMS/x86_64/postgresql{17,18}-pg_vault_tde-1.7.1-1.*.rpm
 #
 # Copyright (c) 2026 Miriade S.r.l. — PostgreSQL License
 
 set -e
 cd "$(dirname "$0")/.."  # move to project root
 
-VERSION="1.7"
+VERSION="1.7.1"
 RELEASE="1"
 PG_MAJOR="18"  # default; override with --pg-version
 SPEC="packaging/rpm/pg_vault_tde.spec"

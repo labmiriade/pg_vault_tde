@@ -90,15 +90,17 @@
  * Per-backend wallet state.
  *
  * Stored in TopMemoryContext (process lifetime).  The KEK is zeroed
- * immediately after DEK unwrap; only a boolean flag and file path are
- * retained for re-open on demand.
+ * immediately after DEK unwrap; only boolean flags are retained.
  *
- * wallet_path is palloc'd in TopMemoryContext.
+ * The wallet path is deliberately NOT cached here: it is re-resolved from the
+ * effective GUC through local_get_wallet_path() at every use, so an
+ * ALTER DATABASE SET pg_vault_tde.wallet_path applied after the provider was
+ * selected is honoured instead of being shadowed by a stale snapshot.
+ *
  * kek[] is wiped after every unwrap call — it MUST NOT persist in memory.
  */
 typedef struct LocalWalletState
 {
-    char        *wallet_path;   /* absolute path to wallet.p12 */
     bool         wallet_open;   /* true iff wallet was successfully opened */
     bool         kek_loaded;    /* true while wallet is open (unlock caches KEK here);
                                  * cleared by wallet_lock() or backend exit */
@@ -108,6 +110,31 @@ typedef struct LocalWalletState
 } LocalWalletState;
 
 static LocalWalletState *local_wallet_state = NULL;
+
+/*
+ * local_state — return the per-backend wallet state, allocating it on first
+ * use in TopMemoryContext so it survives query boundaries.
+ *
+ * Every site that *stores* into the state must go through this: since the
+ * provider is initialised lazily (tde_kms_provider()), a session whose first
+ * KMS-touching action is an SQL wallet function — wallet_unlock(),
+ * wallet_init(), change_passphrase(), rotate_kek(), migrate() — reaches that
+ * function before local_init() has ever run.  Read-only sites keep testing
+ * local_wallet_state directly: a read must never allocate.
+ */
+static LocalWalletState *
+local_state(void)
+{
+    if (local_wallet_state == NULL)
+    {
+        MemoryContext old_ctx = MemoryContextSwitchTo(TopMemoryContext);
+
+        local_wallet_state = palloc0(sizeof(LocalWalletState));
+        MemoryContextSwitchTo(old_ctx);
+    }
+
+    return local_wallet_state;
+}
 
 /*
  * KEK rotation context — allocated in TopMemoryContext by prepare_kek_rotation(),
@@ -195,6 +222,39 @@ pg_vault_tde_kms_local_provider(void)
     return &local_provider_impl;
 }
 
+/*
+ * pg_vault_tde_kms_local_wallet_path — GUC show_hook for
+ * pg_vault_tde.wallet_path.
+ *
+ * Without it SHOW returns an empty string whenever the GUC is not explicitly
+ * set, hiding the per-database default the provider actually uses.  Signature
+ * must stay GucShowHook-compatible: const char *(*)(void).
+ */
+const char *
+pg_vault_tde_kms_local_wallet_path(void)
+{
+    return local_get_wallet_path();
+}
+
+/*
+ * pg_vault_tde_kms_local_reset — drop cached key material and the open flag.
+ *
+ * Called from tde_kms_provider_invalidate() when any GUC that feeds the
+ * provider changes: a KEK derived from the previous wallet path / passphrase
+ * source must not survive into the new configuration.  No-op before the
+ * provider has ever been initialised in this backend.
+ */
+void
+pg_vault_tde_kms_local_reset(void)
+{
+    if (local_wallet_state == NULL)
+        return;
+
+    OPENSSL_cleanse(local_wallet_state->kek, TDE_DEK_LEN);
+    local_wallet_state->kek_loaded  = false;
+    local_wallet_state->wallet_open = false;
+}
+
 
 
 /* -------------------------------------------------------------------------
@@ -203,27 +263,26 @@ pg_vault_tde_kms_local_provider(void)
 static bool
 local_init(void)
 {
-    MemoryContext old_ctx;
     char          pass[1024];
-    const char   *path;
 
     /*
      * Allocate per-backend state in TopMemoryContext so it survives
      * query boundaries.  KEK buffer inside the struct is wiped after every
      * unwrap — it does NOT persist across calls.
+     *
+     * Must be idempotent: tde_kms_provider_invalidate() can schedule another
+     * init() in the same backend (e.g. after a SET of a wallet GUC, or the
+     * SetConfigOption that pg_vault_tde_wallet_init performs), and
+     * re-allocating here would leak the old state and discard a cached KEK.
      */
-    old_ctx = MemoryContextSwitchTo(TopMemoryContext);
-    local_wallet_state = palloc0(sizeof(LocalWalletState));
-    MemoryContextSwitchTo(old_ctx);
+    (void) local_state();
 
-    if(MyDatabaseId == InvalidOid) {
-        path = "";
-    }
-    else {
-        path = local_get_wallet_path();
-    }
-
-    local_wallet_state->wallet_path = MemoryContextStrdup(TopMemoryContext, path);
+    /*
+     * A KEK is already cached (wallet_unlock / wallet_init ran in this
+     * backend): the wallet is open by definition, nothing to re-derive.
+     */
+    if (local_wallet_state->kek_loaded)
+        return true;
 
     /*
      * If wallet_auto_open is off, defer opening until the first DEK request.
@@ -237,15 +296,29 @@ local_init(void)
         return true;
     }
 
-    /* Retrieve passphrase from the configured env var. */
+    /*
+     * Retrieve the passphrase from the configured source.  init() now runs at
+     * first KMS use rather than at GUC assign time, so reaching this branch
+     * means no passphrase source is effectively configured for this database
+     * — not merely that the GUCs had not been applied yet.
+     */
     if (!local_get_passphrase(pass, sizeof(pass)))
     {
         ereport(WARNING,
-                errmsg("pg_vault_tde: local wallet passphrase env var \"%s\" "
-                       "not set — wallet not opened; encryption-at-rest is "
-                       "unavailable until wallet is opened",
-                       pg_vault_tde_wallet_passphrase_env
-                           ? pg_vault_tde_wallet_passphrase_env : "(unset)"));
+                errmsg("pg_vault_tde: no wallet passphrase source configured "
+                       "— wallet not opened; encryption-at-rest is "
+                       "unavailable until it is"),
+                errdetail("Passphrase sources: wallet_passphrase_command=\"%s\", "
+                          "wallet_passphrase_env=\"%s\", "
+                          "wallet_passphrase_file=\"%s\".",
+                          pg_vault_tde_wallet_passphrase_command
+                              ? pg_vault_tde_wallet_passphrase_command : "",
+                          pg_vault_tde_wallet_passphrase_env
+                              ? pg_vault_tde_wallet_passphrase_env : "",
+                          pg_vault_tde_wallet_passphrase_file
+                              ? pg_vault_tde_wallet_passphrase_file : ""),
+                errhint("Set one of them, or call "
+                        "pg_vault_tde_wallet_unlock('<passphrase>')."));
         OPENSSL_cleanse(pass, sizeof(pass));
         return false;
     }
@@ -258,7 +331,7 @@ local_init(void)
     {
         unsigned char kek_temp[TDE_DEK_LEN];
 
-        if (!local_open_wallet(local_wallet_state->wallet_path, pass, kek_temp))
+        if (!local_open_wallet(local_get_wallet_path(), pass, kek_temp))
         {
             OPENSSL_cleanse(pass, sizeof(pass));
             OPENSSL_cleanse(kek_temp, TDE_DEK_LEN);
@@ -568,10 +641,8 @@ local_wrap_dek(const unsigned char *dek, int dek_len,
             return false;
         }
 
-        path = (local_wallet_state && local_wallet_state->wallet_path[0])
-               ? local_wallet_state->wallet_path
-               : local_get_wallet_path();
-               
+        path = local_get_wallet_path();
+
         ok = local_wrap_dek_with_pass(dek, dek_len, wrapped_out, out_len,
                                       pass, path);
         OPENSSL_cleanse(pass, sizeof(pass));
@@ -609,9 +680,7 @@ local_unwrap_dek(const unsigned char *wrapped, int wrapped_len,
         return false;
     }
 
-    path = (local_wallet_state && local_wallet_state->wallet_path[0])
-           ? local_wallet_state->wallet_path
-           : local_get_wallet_path();
+    path = local_get_wallet_path();
 
     ok = local_unwrap_dek_with_pass(wrapped, wrapped_len, dek_out, dek_len,
                                     pass, path);
@@ -761,13 +830,13 @@ local_commit_kek_rotation(void)
     local_create_wallet_file(path, pass, local_kek_rotation_ctx->new_kek, TDE_DEK_LEN);
     OPENSSL_cleanse(pass, sizeof(pass));
 
-    if (local_wallet_state)
     {
-        memcpy(local_wallet_state->kek, local_kek_rotation_ctx->new_kek,
-               TDE_DEK_LEN);
-        local_wallet_state->kek_loaded  = true;
-        local_wallet_state->wallet_open = true;
-        local_wallet_state->last_opened = GetCurrentTimestamp();
+        LocalWalletState *st = local_state();
+
+        memcpy(st->kek, local_kek_rotation_ctx->new_kek, TDE_DEK_LEN);
+        st->kek_loaded  = true;
+        st->wallet_open = true;
+        st->last_opened = GetCurrentTimestamp();
     }
 
     local_kek_rotation_ctx_free();
@@ -784,8 +853,8 @@ local_health_check(void)
     if (!local_wallet_state)
         return false;
 
-    path = local_wallet_state->wallet_path;
-    if (!path)
+    path = local_get_wallet_path();
+    if (!path || !path[0])
         return false;
 
     /* Quick accessibility check: file must exist and be readable. */
@@ -939,14 +1008,32 @@ local_passphrase_from_file(char *pass_out, Size pass_max)
     struct stat st;
     size_t      n;
     char       *p;
+    int         fd;
 
     fpath = pg_vault_tde_wallet_passphrase_file;
     if (!fpath || fpath[0] == '\0')
         return false;
 
-    /* Permission sanity check */
-    if (stat(fpath, &st) != 0)
+    /*
+     * Open first, validate the descriptor afterwards. Checking the path with
+     * stat() and opening it in a second step leaves a window in which the path
+     * can be repointed at a different file, so the permissions that get
+     * approved need not be those of the file actually read. O_NOFOLLOW refuses
+     * a symlink outright: a passphrase file is never legitimately one.
+     */
+    fd = open(fpath, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0)
     {
+        ereport(WARNING,
+                errmsg("pg_vault_tde: cannot open passphrase file \"%s\": %m",
+                       fpath));
+        return false;
+    }
+
+    /* Permission sanity check, against the descriptor actually opened */
+    if (fstat(fd, &st) != 0)
+    {
+        close(fd);
         ereport(WARNING,
                 errmsg("pg_vault_tde: passphrase file \"%s\": %m", fpath));
         return false;
@@ -958,6 +1045,7 @@ local_passphrase_from_file(char *pass_out, Size pass_max)
                        fpath, (unsigned)(st.st_mode & 0777)));
     if ((st.st_mode & 0777) & 0044)  /* group/other readable */
     {
+        close(fd);              /* ereport(ERROR) longjmps out of here */
         ereport(ERROR,
                 errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
                 errmsg("pg_vault_tde: passphrase file \"%s\" is group- or "
@@ -965,9 +1053,10 @@ local_passphrase_from_file(char *pass_out, Size pass_max)
                        fpath, (unsigned)(st.st_mode & 0777)));
     }
 
-    fp = fopen(fpath, "r");
+    fp = fdopen(fd, "r");
     if (!fp)
     {
+        close(fd);
         ereport(WARNING,
                 errmsg("pg_vault_tde: cannot open passphrase file \"%s\": %m",
                        fpath));
@@ -1375,20 +1464,16 @@ pg_vault_tde_wallet_init_sql(PG_FUNCTION_ARGS)
      * slow path (re-read passphrase from GUC source), which adds latency and
      * fails if the env var passphrase differs from the one just used here.
      */
-    if (local_wallet_state)
     {
-        unsigned char kek_cache[TDE_DEK_LEN];
+        LocalWalletState *st = local_state();
+        unsigned char     kek_cache[TDE_DEK_LEN];
 
         if (local_open_wallet(path, passphrase, kek_cache))
         {
-            memcpy(local_wallet_state->kek, kek_cache, TDE_DEK_LEN);
-            local_wallet_state->kek_loaded  = true;
-            local_wallet_state->wallet_open = true;
-            local_wallet_state->last_opened = GetCurrentTimestamp();
-            if (local_wallet_state->wallet_path == NULL ||
-                local_wallet_state->wallet_path[0] == '\0')
-                local_wallet_state->wallet_path =
-                    MemoryContextStrdup(TopMemoryContext, path);
+            memcpy(st->kek, kek_cache, TDE_DEK_LEN);
+            st->kek_loaded  = true;
+            st->wallet_open = true;
+            st->last_opened = GetCurrentTimestamp();
         }
         else
         {
@@ -1396,7 +1481,7 @@ pg_vault_tde_wallet_init_sql(PG_FUNCTION_ARGS)
             ereport(WARNING,
                     errmsg("pg_vault_tde: wallet created but could not be "
                            "re-opened for KEK caching at \"%s\"", path));
-            local_wallet_state->wallet_open = true;
+            st->wallet_open = true;
         }
         OPENSSL_cleanse(kek_cache, TDE_DEK_LEN);
     }
@@ -1547,6 +1632,15 @@ pg_vault_tde_wallet_status_sql(PG_FUNCTION_ARGS)
     rsinfo->setDesc    = tupdesc;
     MemoryContextSwitchTo(old_ctx);
 
+    /*
+     * Resolve the provider first.  Since init() is lazy, a session whose first
+     * action is this function would otherwise report wallet_open = false
+     * simply because nothing had opened the wallet yet — a monitoring answer
+     * about the session, not about the wallet.  Going through the accessor
+     * gives auto-open its chance, so the reported state is the real one.
+     */
+    (void) tde_kms_provider();
+
     /* Gather state */
     path          = local_get_wallet_path();
     wallet_exists = (stat(path, &st) == 0);
@@ -1685,7 +1779,6 @@ pg_vault_tde_wallet_change_passphrase_sql(PG_FUNCTION_ARGS)
      */
     local_create_wallet_file(path, new_pass, new_kek, TDE_DEK_LEN);
 
-    if (local_wallet_state)
     {
         /*
          * Always cache the new KEK and mark it loaded, regardless of whether
@@ -1695,10 +1788,12 @@ pg_vault_tde_wallet_change_passphrase_sql(PG_FUNCTION_ARGS)
          * against a wallet file already re-MAC'd under new_pass, producing a
          * "MAC verification failed" error on the very next SELECT.
          */
-        memcpy(local_wallet_state->kek, new_kek, TDE_DEK_LEN);
-        local_wallet_state->kek_loaded   = true;
-        local_wallet_state->wallet_open  = true;
-        local_wallet_state->last_opened  = GetCurrentTimestamp();
+        LocalWalletState *st = local_state();
+
+        memcpy(st->kek, new_kek, TDE_DEK_LEN);
+        st->kek_loaded   = true;
+        st->wallet_open  = true;
+        st->last_opened  = GetCurrentTimestamp();
     }
 
     OPENSSL_cleanse(old_pass, strlen(old_pass));
@@ -1768,12 +1863,13 @@ pg_vault_tde_wallet_unlock_sql(PG_FUNCTION_ARGS)
      *
      * kek_loaded is cleared by wallet_lock() and local_shutdown().
      */
-    if (local_wallet_state)
     {
-        memcpy(local_wallet_state->kek, kek_test, TDE_DEK_LEN);
-        local_wallet_state->kek_loaded  = true;
-        local_wallet_state->wallet_open = true;
-        local_wallet_state->last_opened = GetCurrentTimestamp();
+        LocalWalletState *st = local_state();
+
+        memcpy(st->kek, kek_test, TDE_DEK_LEN);
+        st->kek_loaded  = true;
+        st->wallet_open = true;
+        st->last_opened = GetCurrentTimestamp();
     }
     OPENSSL_cleanse(kek_test, TDE_DEK_LEN);
 
@@ -1978,7 +2074,7 @@ pg_vault_tde_migrate_vault_to_wallet_sql(PG_FUNCTION_ARGS)
                     * Unwrap using the active (Vault) provider.  The scan filter on
                     * kms_provider = 'vault' guarantees we only land here for vault rows.
                     */
-                    if (!tde_active_kms_provider)
+                    if (!tde_kms_provider())
                         ereport(ERROR,
                                 errmsg("pg_vault_tde: migrate_vault_to_wallet: no active KMS provider"));
                     {
@@ -2050,10 +2146,11 @@ pg_vault_tde_migrate_vault_to_wallet_sql(PG_FUNCTION_ARGS)
 
     pg_vault_tde_catalog_evict_all();
 
-    if (local_wallet_state)
     {
-        local_wallet_state->wallet_open = true;
-        local_wallet_state->last_opened = GetCurrentTimestamp();
+        LocalWalletState *st = local_state();
+
+        st->wallet_open = true;
+        st->last_opened = GetCurrentTimestamp();
     }
 
     OPENSSL_cleanse(new_pass, strlen(new_pass));
