@@ -25,7 +25,7 @@
 set -e
 cd "$(dirname "$0")/.."   # move to project root
 
-PKG_VERSION="1.7.1-1"
+PKG_VERSION="1.7.2-1"
 ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 
 # ---------------------------------------------------------------------------
