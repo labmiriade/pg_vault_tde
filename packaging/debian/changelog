@@ -1,3 +1,44 @@
+postgresql-pg-vault-tde (1.7.2-1) unstable; urgency=medium
+
+  * Fix: INSERT, COPY, UPDATE, UPSERT and the VACUUM FULL / CLUSTER rewrite
+    crashed the backend (SIGSEGV in toast_save_datum) for values whose tuple
+    crossed TOAST_TUPLE_THRESHOLD only once encrypted. The pre-TOAST gate
+    tested the plaintext length while heap_prepare_insert re-tests the
+    encrypted one, leaving a window as wide as the AES-GCM overhead in which
+    PostgreSQL tried to TOAST opaque ciphertext. The gate now tests the
+    encrypted length and the TOAST writer reserves TDE_V4_OVERHEAD in its
+    target, so the guarantee holds end to end. A 2000-byte STORAGE EXTERNAL
+    value crashed while 1995 and 2005 did not, which is why this survived
+    until a boundary sweep looked for it.
+  * Fix: the server failed to start when built with --enable-cassert.
+    _PG_init called GetUserId() to test its own validity, but that function
+    opens with Assert(OidIsValid(CurrentUserId)) and no session user exists
+    during process_shared_preload_libraries(). Packagers and anyone testing
+    on an assert-enabled build could not load the extension at all.
+  * Fix: ten catalog scans passed an unregistered snapshot to
+    systable_beginscan(). Nothing pinned it for the life of the scan, and an
+    assert-enabled server rejected it outright on ordinary CREATE TABLE.
+  * Fix: three try_relation_open() calls used NoLock without holding a lock,
+    so the relation could be dropped underneath them.
+  * Fix: hint bits were written during the CLUSTER rewrite without the buffer
+    content lock.
+  * Fix: freeze decisions during VACUUM FULL / CLUSTER read uninitialised
+    fields of struct VacuumCutoffs. The call was also redundant --
+    rewrite_heap_tuple() already freezes with correctly sourced cutoffs --
+    and has been removed.
+  * Fix: locals read by PG_CATCH after a longjmp were missing volatile, so
+    their cleanup was skipped on the error path, including an
+    OPENSSL_cleanse() of decrypted tuple data.
+  * Fix: the source tarball used for packaging no longer picks up the
+    tmp_* scratch directories left by the test stages. Some hold files
+    written under a container uid that the packaging build cannot read, which
+    aborted the build rather than merely enlarging the tarball.
+  * No SQL or catalog change: pg_extension.extversion stays at 1.7. Use
+    pg_vault_tde_build_version() to tell 1.7.2 from 1.7.1 and 1.7.0 at
+    runtime.
+
+ -- Miriade S.r.l. <info@miriade.it>  Sat, 19 Sep 2026 13:02:25 +0200
+
 postgresql-pg-vault-tde (1.7.1-1) unstable; urgency=medium
 
   * Fix: ALTER TABLE ... SET ACCESS METHOD encrypted_heap on a table that
