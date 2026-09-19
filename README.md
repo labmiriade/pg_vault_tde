@@ -892,7 +892,7 @@ PG_VERSION=17 make ci-all
 # Individual test stages:
 make ci-regress          # 140 SQL regression tests (vault provider) — tests 1-140 (test 110 deferred)
 make ci-errorpath        # 13 error-path tests (141-153) — exercises the PG_CATCH handlers
-make ci-regress-matrix   # the SQL suite on the other supported PG majors (17, 19 when published)
+make ci-matrix           # regress + TAP on the other supported PG majors (17, 19 when published)
 make ci-scan-build       # Clang static analyzer over the sources (compile only, ~1 min)
 make ci-ubsan            # Extension built with -fsanitize=undefined
 make ci-valgrind         # Valgrind memcheck over the full TDE workload (slow: 10-50x)
@@ -910,7 +910,7 @@ make ci-bench BENCH_ROWS=100000  # with custom row count
 make ci-clean            # Remove test containers and images
 ```
 
-Test coverage — 153 SQL regression tests (52 v1.4 + 20 v1.5 + 38 v1.6 + 30 v1.7 + 13 error-path), plus 239 assertions across 20 TAP files:
+Test coverage — 153 SQL regression tests (52 v1.4 + 20 v1.5 + 38 v1.6 + 30 v1.7 + 13 error-path), plus 240 assertions across 20 TAP files:
 - Tests 1-11: AES-256-GCM crypto primitives, DEK rotation, tamper detection
 - Tests 12-14: TAM INSERT/SELECT/UPDATE end-to-end
 - Test 15: DELETE
@@ -1010,9 +1010,13 @@ Flips 72 random bits across the heap file over 6 rounds (fixed seed, so a failur
 
 A third outcome is counted separately and accepted: the row *vanishing*. Our wire format keeps the `HeapTupleHeader` in plaintext and authenticates only `[t_hoff .. t_len)`, so a flip in xmin, infomask or the null bitmap is outside the GCM tag by construction and can make the tuple invisible. That is data loss from unauthenticated-header damage, not a forged value — the test distinguishes the two rather than conflating them.
 
-Cross-version — `make ci-regress-matrix`:
+Cross-version — `make ci-matrix`:
 
-Every other stage runs on PG 18 only. This one runs the full SQL suite on the remaining supported majors, so a change that compiles everywhere but misbehaves on 17 cannot ship green. Not hypothetical here: `pg_vault_tde_ambuild` carries a PG17-specific impersonation, and the TAM notes a PG17 read-stream requirement in `heapgettup`. A major whose base image is not published yet is skipped rather than failed, so PG 19 starts being covered on its own the day `postgres:19` ships.
+Every other stage runs on PG 18 only. This one runs the SQL regression suite **and** the TAP suite on the remaining supported majors, so a change that compiles everywhere but misbehaves on 17 cannot ship green. Not hypothetical here: `pg_vault_tde_ambuild` carries a PG17-specific impersonation, and the TAM notes a PG17 read-stream requirement in `heapgettup`.
+
+TAP is in the matrix because it is the stage that needed it most. `tap/20_ondisk_fuzz.t` passed locally on PG 18 and broke CI on PG 17: `initdb --no-data-checksums` only exists from PG 18. TAP tests depend on the `PostgreSQL::Test` framework and on `initdb`/`pg_ctl` option spellings, all of which move between majors far more than SQL does.
+
+A major whose base image is not published yet is skipped rather than failed, so PG 19 starts being covered on its own the day `postgres:19` ships.
 
 Memory safety — `make ci-valgrind` (`sql/valgrind_workload.sql`, `ci/scripts/run-valgrind.sh`):
 
