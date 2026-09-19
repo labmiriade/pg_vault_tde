@@ -222,8 +222,16 @@ tde_progress_upsert(Oid relid, const char *status,
 
     ScanKeyInit(&skey, Anum_rot_prog_relid,
                 BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(relid));
+    /*
+     * NULL, not GetTransactionSnapshot(): systable_beginscan() then picks the
+     * catalog snapshot itself.  A transaction snapshot is neither registered
+     * nor active, so HeapTupleSatisfiesVisibility asserts
+     * (regd_count > 0 || active_count > 0) on an assert-enabled server and,
+     * worse, nothing pins it for the life of the scan.  Core passes NULL for
+     * every catalog scan; see make ci-cassert.
+     */
     scan = systable_beginscan(prog_rel, idx_oid, OidIsValid(idx_oid),
-                              GetTransactionSnapshot(), 1, &skey);
+                              NULL, 1, &skey);
     old_tup = systable_getnext(scan);
 
     if (HeapTupleIsValid(old_tup))

@@ -42,9 +42,10 @@ packaged (OS, PG) combinations and what CI exercises on each in the
 
 ## Quick Start
 
-> **Already running 1.7.0 or earlier?** Do not upgrade to 1.7.1 before reading
-> [Upgrading to 1.7.1](#upgrading-to-171). Tables holding out-of-line TOAST
-> values must be dumped *before* the new binary is installed.
+> **Already running 1.7.0 or earlier?** Do not upgrade to 1.7.1 or later before
+> reading [Upgrading to 1.7.1](#upgrading-to-171). Tables holding out-of-line
+> TOAST values must be dumped *before* the new binary is installed. The break is
+> between 1.7.0 and 1.7.1; upgrading 1.7.1 → 1.7.2 needs nothing.
 
 ### 1. Install
 
@@ -890,10 +891,16 @@ PG_VERSION=17 make ci-all
 
 # Individual test stages:
 make ci-regress          # 140 SQL regression tests (vault provider) — tests 1-140 (test 110 deferred)
+make ci-errorpath        # 13 error-path tests (141-153) — exercises the PG_CATCH handlers
+make ci-regress-matrix   # the SQL suite on the other supported PG majors (17, 19 when published)
+make ci-scan-build       # Clang static analyzer over the sources (compile only, ~1 min)
+make ci-ubsan            # Extension built with -fsanitize=undefined
+make ci-valgrind         # Valgrind memcheck over the full TDE workload (slow: 10-50x)
+make ci-cassert          # PostgreSQL built --enable-cassert -DUSE_VALGRIND (builds PG from source)
 make ci-wallet           # SQL regression tests (local wallet provider)
 make ci-checksums        # regression tests + page checksum compatibility
-make ci-tap              # 18 TAP test files (starts a real Vault container for the Vault-dependent ones)
-make ci-isolation        # Concurrency / MVCC isolation tests
+make ci-tap              # 20 TAP test files (starts a real Vault container for the Vault-dependent ones)
+make ci-isolation        # 2 isolation specs: DEK rotation under load, relation rewrite under a concurrent reader
 make ci-vault            # Vault integration (Compose-based)
 make ci-openbao          # OpenBao Raft 3-node HA integration (12 tests)
 make ci-bench            # Performance benchmark (encrypted vs plain heap)
@@ -903,7 +910,7 @@ make ci-bench BENCH_ROWS=100000  # with custom row count
 make ci-clean            # Remove test containers and images
 ```
 
-Test coverage (140 tests = 52 v1.4 + 20 v1.5 + 38 v1.6 + 30 v1.7):
+Test coverage — 153 SQL regression tests (52 v1.4 + 20 v1.5 + 38 v1.6 + 30 v1.7 + 13 error-path), plus 239 assertions across 20 TAP files:
 - Tests 1-11: AES-256-GCM crypto primitives, DEK rotation, tamper detection
 - Tests 12-14: TAM INSERT/SELECT/UPDATE end-to-end
 - Test 15: DELETE
@@ -963,8 +970,59 @@ Test coverage (140 tests = 52 v1.4 + 20 v1.5 + 38 v1.6 + 30 v1.7):
 - Test 139: `ALTER TABLE x SET ACCESS METHOD heap` — reverse direction of Test 138, same coverage **(v1.7, PSQLE-135 regression coverage)**
 - Test 140: `CREATE TABLE AS SELECT` from an `encrypted_heap` table with genuinely out-of-line TOAST data must re-externalize into the **destination's own** TOAST table; verifies the destination survives the (unrelated, from its own point of view) source table being dropped **(v1.7, PSQLE-135 regression coverage)**
 
+Error-path coverage — tests 141-153 (`sql/regression_test_errorpath.sql`, `make ci-errorpath`):
+
+Every other test file exercises the success path. These exercise the `PG_CATCH` handlers in the TAM write paths — code that only ever runs after a `longjmp`, and that cleanses plaintext key material and frees intermediates. No success-path test can reach it. The suite locks the wallet so `tde_gcm_encrypt()` raises from inside `tde_encrypt_heap_tuple()`, i.e. from inside the `PG_TRY` of every write path, then forces 145 aborted writes through those handlers.
+
+- Test 141: `pg_vault_tde_tuple_insert` handler ×25 — also the guard that the DEK really is unreachable (a vacuous run is a failure, not a pass)
+- Test 142: `pg_vault_tde_multi_insert` handler ×10 batched COPY of 100 **small** rows — the aliasing case where `toasted_inflight == plain_inflight`
+- Test 143: `pg_vault_tde_multi_insert` + `pg_vault_tde_toast_save_datum` handlers ×5 via the custom TOAST chunk writer
+- Test 144: `pg_vault_tde_tuple_update` handler ×25
+- Test 145: `pg_vault_tde_tuple_insert_speculative` handler ×25 (ON CONFLICT)
+- Tests 146-147: `pg_vault_tde_relation_copy_for_cluster` handler ×20 (VACUUM FULL, CLUSTER)
+- Test 148: fixture is byte-identical after the error storm — this is what proves 142/143/146/147 aborted rather than committed
+- Test 149: TOAST payloads still decrypt byte-for-byte
+- Tests 150-151: no plaintext in the main fork or the TOAST relation afterwards (`STORAGE EXTERNAL` is required, and asserted, so the TOAST scan cannot pass vacuously on a 0-byte file)
+- Test 152: every write path, plus VACUUM FULL and CLUSTER, healthy again after 145 longjmps
+- Test 153: core must not re-TOAST the ciphertext — sweeps 29 payload sizes across `TOAST_TUPLE_THRESHOLD` plus UPDATE, UPSERT and COPY at the boundary. Guards a segfault: `heap_toast_insert_or_update()` fires on tuple *size* as well as on external attributes, so clearing `HEAP_HASEXTERNAL` alone leaves a window as wide as the AES-GCM overhead in which core deforms ciphertext as varlena and `toast_save_datum()` crashes
+
+Deep-checking stages — four tools, four different bug classes. `run-all.sh --skip-deep` skips all of them; they are the only stages that cost more than a couple of minutes.
+
+| stage | sees | cost |
+|---|---|---|
+| `ci-scan-build` | per-path symbolic execution: NULL deref on one branch, sizes from a length that can be zero | ~1 min, compile only |
+| `ci-ubsan` | undefined behaviour: signed overflow, oversized shifts, misaligned loads, `nonnull` violations | minutes, no PG rebuild |
+| `ci-valgrind` | memory ownership: invalid/double `free()` of malloc'd state, out-of-bounds, uninitialised reads | 10-50x runtime |
+| `ci-cassert` | `Assert()` calls that run nowhere else, plus `MEMORY_CONTEXT_CHECKING` — the only stage that catches a double `pfree()` of a palloc chunk | builds PostgreSQL from source |
+
+`ci-cassert` is the one worth the wall-clock. `--enable-cassert` executes the `Assert()` calls this codebase is full of — none of which run in any packaged build — and turns on `MEMORY_CONTEXT_CHECKING`, which poisons freed chunks and validates the header on every `pfree()`. A double free in a `PG_CATCH` handler becomes a loud failure instead of a silent no-op that the aborting transaction covers up moments later. Neither flag exists in a PGDG or Debian package, which is why the image builds the server from source.
+
+`ci-ubsan` uses the `TDE_SANITIZE` Makefile knob (`make TDE_SANITIZE=undefined`), which instruments only our objects — the server binary stays stock, so no PostgreSQL rebuild is needed.
+
+Concurrency — `make ci-isolation` (`test/isolation/specs/`):
+
+- `per_table_dek_rotation.spec` — online DEK rotation racing readers, writers and VACUUM
+- `encrypted_rewrite_concurrency.spec` — `VACUUM FULL` / `CLUSTER` (i.e. `pg_vault_tde_relation_copy_for_cluster`) with a second backend holding a `REPEATABLE READ` snapshot across the relfilenode change, and with an uncommitted writer the rewrite must wait for. Payloads are `STORAGE EXTERNAL` so the rewrite has real TOAST chunks to migrate. This spec found the `toast_save_datum()` segfault that TEST 153 now guards; it does **not** cover `wallet_lock()`, because the stage sets `wallet_dev_mode_passphrase` and those permutations would pass vacuously — the spec says so in a comment rather than shipping a test that checks nothing
+
+On-disk corruption — `tap/20_ondisk_fuzz.t`:
+
+Flips 72 random bits across the heap file over 6 rounds (fixed seed, so a failure reproduces) and classifies every row afterwards. The property under test is that the layer has exactly two behaviours under arbitrary damage — correct data, or a refusal — and never hands the client a value derived from damaged ciphertext. Data page checksums are **disabled** for this test on purpose: with them on, PostgreSQL rejects the page before the extension is asked to decrypt anything, and the test would measure core's checksums instead of AES-256-GCM.
+
+A third outcome is counted separately and accepted: the row *vanishing*. Our wire format keeps the `HeapTupleHeader` in plaintext and authenticates only `[t_hoff .. t_len)`, so a flip in xmin, infomask or the null bitmap is outside the GCM tag by construction and can make the tuple invisible. That is data loss from unauthenticated-header damage, not a forged value — the test distinguishes the two rather than conflating them.
+
+Cross-version — `make ci-regress-matrix`:
+
+Every other stage runs on PG 18 only. This one runs the full SQL suite on the remaining supported majors, so a change that compiles everywhere but misbehaves on 17 cannot ship green. Not hypothetical here: `pg_vault_tde_ambuild` carries a PG17-specific impersonation, and the TAM notes a PG17 read-stream requirement in `heapgettup`. A major whose base image is not published yet is skipped rather than failed, so PG 19 starts being covered on its own the day `postgres:19` ships.
+
+Memory safety — `make ci-valgrind` (`sql/valgrind_workload.sql`, `ci/scripts/run-valgrind.sh`):
+
+Runs the postmaster under Valgrind memcheck with `.valgrind.supp`, over a workload covering every crypto-touching path on both the success and error side, then filters findings to stacks naming `pg_vault_tde`. Costs 10-50x, so `--skip-valgrind` is available in `run-all.sh`.
+
+Note what it can and cannot see: the stock server package is not built with `-DUSE_VALGRIND` or `--enable-cassert`, so memcheck cannot see inside `palloc` — a use-after-`pfree` looks like a valid access into a malloc'd arena. It does catch invalid/double `free()` of malloc'd state (libcurl handles on the `vault_transit_request` error path), out-of-bounds access, uninitialised reads, and definite leaks. That limitation is why `ci-errorpath` exists alongside it rather than being replaced by it.
+
 > Test runner notes:
 > - `make ci-regress` (vault provider): 140/140 PASS, with conditional skips for `wal_level` (test 48), `pageinspect` (test 61) and wallet-only assertions (tests 74–80 when `kms_provider=local` is required).
+> - `make ci-errorpath` (local provider, **no** `wallet_dev_mode_passphrase`): 13/13 PASS. The absent GUC is load-bearing — with it set, `wallet_lock()` silently re-opens on the next DEK request and every statement succeeds, so the handlers are never entered. Test 141 detects that and fails rather than passing vacuously.
 > - `make ci-wallet` (local provider): tests 73–79 PASS; test 80 SKIPS unless `wallet_passphrase_env` is wired up; tests 81–109 also PASS in wallet mode.
 > - Test 110 (WITH HOLD cursor plaintext spill) is permanently deferred — the executor's tuplestore layer bypasses the TAM write path, so pg_vault_tde cannot intercept it without core modifications. The test is commented out in `regression_test_v16.sql`.
 > - Tests 138–140 exist because Tests 105/106 didn't catch two real bugs, both stemming from the same underlying cause: `tde_decrypt_heap_tuple()` copied the on-disk tuple header verbatim, including the `HEAP_HASEXTERNAL` bit that `tde_encrypt_heap_tuple()` deliberately clears so core never dereferences a TOAST pointer inside ciphertext — leaving that bit WRONG on the decrypted tuple whenever the attribute genuinely is out-of-line. (1) The AAD was also bound to the wrong (transient) relation OID during `ALTER TABLE`'s row-by-row rewrite — fixed via `resolve_effective_relid()` in `tde_compute_aad()`. (2) Any consumer trusting the stale `HEAP_HASEXTERNAL` bit instead of re-deriving it — `pg_vault_tde_toast_insert_or_update()`'s size-only gate, but also, more broadly, `CREATE TABLE AS SELECT`/`INSERT ... SELECT` reading out of an `encrypted_heap` table — silently skips re-externalizing the value, leaving it pointing at storage that later disappears. Fixed at the source: `tde_decrypt_heap_tuple()` now recomputes the bit from the actual decrypted attributes (`tde_tuple_has_external_desc()`) before returning, so every consumer sees a truthful tuple. Both only reproduce with a populated source table and a genuinely out-of-line (not just inline-compressed) value.

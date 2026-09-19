@@ -191,7 +191,15 @@ pg_vault_tde_get_parent_relid(Oid toast_relid)
     /* DependRelationId is the OID of pg_depend generated in pg_depend_d.h */
     pg_depend_rel = table_open(DependRelationId, AccessShareLock);
 
-    scan = systable_beginscan(pg_depend_rel, DependDependerIndexId, true, GetTransactionSnapshot(), 1, &scan_key);
+    /*
+     * NULL, not GetTransactionSnapshot(): systable_beginscan() then picks the
+     * catalog snapshot itself.  A transaction snapshot is neither registered
+     * nor active, so HeapTupleSatisfiesVisibility asserts
+     * (regd_count > 0 || active_count > 0) on an assert-enabled server and,
+     * worse, nothing pins it for the life of the scan.  Core passes NULL for
+     * every catalog scan; see make ci-cassert.
+     */
+    scan = systable_beginscan(pg_depend_rel, DependDependerIndexId, true, NULL, 1, &scan_key);
 
     while(HeapTupleIsValid(search_tuple = systable_getnext(scan))){
 
@@ -304,7 +312,7 @@ tde_catalog_read_row(Oid relid, TdeCatalogRow *out)
     ScanKeyInit(&scan_key, Anum_pg_vault_tde_relid, BTEqualStrategyNumber,
                 F_OIDEQ, ObjectIdGetDatum(relid));
     scan = systable_beginscan(catalog_rel, catalog_idx, true,
-                              GetTransactionSnapshot(), 1, &scan_key);
+                              NULL, 1, &scan_key);
 
     if (HeapTupleIsValid(tuple = systable_getnext(scan)))
     {
@@ -632,7 +640,7 @@ pg_vault_tde_catalog_register_rel(Oid relid)
     catalog_idx = get_relname_relid("pg_vault_tde_catalog_pkey", ext_ns);
 
     ScanKeyInit(&scan_key, Anum_pg_vault_tde_relid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(relid));
-    scan = systable_beginscan(rel, catalog_idx, true, GetTransactionSnapshot(), 1, &scan_key);
+    scan = systable_beginscan(rel, catalog_idx, true, NULL, 1, &scan_key);
 
     found_tuple = systable_getnext(scan);
 
@@ -743,7 +751,7 @@ pg_vault_tde_catalog_update_rel_dek(Oid relid)
     ScanKeyInit(&scan_key, Anum_pg_vault_tde_relid, BTEqualStrategyNumber,
                 F_OIDEQ, ObjectIdGetDatum(relid));
     scan = systable_beginscan(rel, catalog_idx, true,
-                              GetTransactionSnapshot(), 1, &scan_key);
+                              NULL, 1, &scan_key);
 
     old_tuple = systable_getnext(scan);
     if (!HeapTupleIsValid(old_tuple))
@@ -818,7 +826,7 @@ pg_vault_tde_catalog_deregister_rel(Oid relid)
     catalog_idx = get_relname_relid("pg_vault_tde_catalog_pkey", ext_ns);
 
     ScanKeyInit(&scan_key, Anum_pg_vault_tde_relid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(relid));
-    scan = systable_beginscan(rel, catalog_idx, true, GetTransactionSnapshot(), 1, &scan_key);
+    scan = systable_beginscan(rel, catalog_idx, true, NULL, 1, &scan_key);
 
     tuple = systable_getnext(scan);
 
@@ -1005,7 +1013,7 @@ pg_vault_tde_catalog_rewrap_all(void)
                 CStringGetTextDatum(pg_vault_tde_kms_provider));
 
     scan = systable_beginscan(catalog_rel, InvalidOid, false,
-                              GetTransactionSnapshot(), 1, &scan_key);
+                              NULL, 1, &scan_key);
 
     while (HeapTupleIsValid(old_tuple = systable_getnext(scan)))
     {
@@ -1118,7 +1126,7 @@ pg_vault_tde_catalog_read_all_wrapped(TdeCatalogSealRow **rows_out)
 
     /* 0 scan keys on the pkey index = full scan in relid order */
     scan = systable_beginscan(catalog_rel, catalog_idx, true,
-                            GetTransactionSnapshot(), 0, NULL);
+                            NULL, 0, NULL);
 
     while (HeapTupleIsValid(tuple = systable_getnext(scan)))
     {
@@ -1213,7 +1221,7 @@ pg_vault_tde_catalog_upsert_row(Oid relid, uint64 generation,
     ScanKeyInit(&scan_key, Anum_pg_vault_tde_relid, BTEqualStrategyNumber,
                 F_OIDEQ, ObjectIdGetDatum(relid));
     scan = systable_beginscan(rel, catalog_idx, true,
-                            GetTransactionSnapshot(), 1, &scan_key);
+                            NULL, 1, &scan_key);
     old_tuple = systable_getnext(scan);
 
     memset(values, 0,     sizeof(values));

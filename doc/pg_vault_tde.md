@@ -1352,6 +1352,42 @@ the Vault-dependent files need; they `skip_all` when `VAULT_ADDR` is unset).
 | `tap/16_pkcs11.t` | pkcs11 provider against a throwaway SoftHSM2 token |
 | `tap/17_index_constraints.t` | Index AM whitelist, PRIMARY KEY / UNIQUE behaviour |
 | `tap/18_guc_order_independence.t` | KMS GUCs are order- and scope-independent (see below) |
+| `tap/20_ondisk_fuzz.t` | Arbitrary on-disk bit flips must yield correct data or a refusal, never a forged value (checksums disabled so the GCM tag is the line under test) |
+| `tap/19_crash_recovery_rmgr.t` | Encrypted TOAST chunks survive WAL replay after an unclean shutdown — the only test that executes the custom resource manager's `rm_redo` (see below) |
+
+#### `tap/19_crash_recovery_rmgr.t`
+
+Replays WAL written by the custom resource manager after an unclean shutdown.
+
+`pg_vault_tde_rmgr.c` registers a resource manager whose `rm_redo` callback,
+`tde_rmgr_redo()`, executes in exactly one situation: **WAL replay** — crash
+recovery, PITR, or a standby applying the stream. Encrypted TOAST chunks are
+routed through it by `tde_toast_wal_insert()` when
+`pg_vault_tde.toast_custom_rmgr` is on.
+
+Until this test existed, nothing in the suite ever replayed that WAL. The
+`$node->restart` calls in other files are *clean* shutdowns, which checkpoint on
+the way down and therefore replay nothing, so the redo path only ever ran on a
+production system during recovery.
+
+Three details are load-bearing, and each has an assertion guarding it:
+
+- **`stop('immediate')`** — SIGQUIT, no shutdown checkpoint, so everything since
+  the last checkpoint must be replayed. The test asserts
+  `database system was not properly shut down` appears in the log after the
+  restart; without it the test would keep passing if it silently stopped
+  exercising recovery.
+- **`STORAGE EXTERNAL` + incompressible payload** — with the default `EXTENDED`
+  storage PostgreSQL compresses these values inline, no TOAST chunks are
+  written, and the custom rmgr is never reached. The test asserts the TOAST
+  relation exceeds 8 kB so it cannot pass vacuously.
+- **A per-row payload seed** — the md5 over the whole column would not notice a
+  row being replayed as a copy of its neighbour if every row held the same
+  bytes.
+
+Both branches of the `toast_custom_rmgr` GUC run: `on` is the path under test,
+`off` is the control through `heap_insert`/`RM_HEAP`. If both fail, the fault is
+in encryption or TOAST rather than in the resource manager.
 
 #### `tap/18_guc_order_independence.t`
 

@@ -123,6 +123,32 @@ override CFLAGS  += -Wall -Wextra -std=c99 \
 override SHLIB_LINK += $(shell pkg-config --libs openssl libcurl) -ldl
 
 # ---------------------------------------------------------------------------
+# TDE_SANITIZE: build the extension under a compiler sanitizer.
+#
+#   make TDE_SANITIZE=undefined      # UBSan  (used by make ci-ubsan)
+#   make TDE_SANITIZE=address        # ASan   (needs the server LD_PRELOADed)
+#
+# UBSan is the one that pays for itself here: it is a pure compile-time
+# instrumentation of OUR objects, so the stock server binary stays untouched
+# and no PostgreSQL rebuild is needed.  It catches the undefined behaviour a
+# crypto/wire-format layer actually hits — signed overflow in length
+# arithmetic, shifts past the width of the type, misaligned loads out of a
+# packed on-disk tuple, pointer arithmetic that leaves the object.
+#
+# The .so gains a DT_NEEDED on the sanitizer runtime, so libubsan must be
+# present at run time (ci/containers/pg-ubsan.Containerfile installs it).
+# Reports are non-fatal by default and go wherever UBSAN_OPTIONS=log_path
+# points; run-ubsan.sh collects and greps them.
+#
+# ASan is listed for completeness but is NOT wired into CI: it needs its
+# runtime loaded before libc in the postmaster itself, which means an
+# LD_PRELOAD on a server this Makefile does not build.
+ifdef TDE_SANITIZE
+override CFLAGS     += -fsanitize=$(TDE_SANITIZE) -fno-omit-frame-pointer -g
+override SHLIB_LINK += -fsanitize=$(TDE_SANITIZE)
+endif
+
+# ---------------------------------------------------------------------------
 # check-cpu: print CPU hardware encryption capabilities. This does not affect
 # the build — OpenSSL detects and uses these instructions automatically at
 # runtime regardless of how pg_vault_tde.so was compiled.
@@ -152,13 +178,31 @@ bench-cpu:
 # All targets delegate to ci/scripts/ which auto-detect podman/docker.
 # Override container runtime:  make ci-all CONTAINER_RT=docker
 # ===========================================================================
-.PHONY: ci-all ci-regress ci-checksums ci-tap ci-isolation ci-vault ci-wallet ci-pkcs11 ci-schema ci-bench ci-install-test ci-clean
+.PHONY: ci-all ci-regress ci-regress-matrix ci-errorpath ci-checksums ci-tap ci-isolation ci-vault ci-wallet ci-pkcs11 ci-schema ci-valgrind ci-cassert ci-ubsan ci-scan-build ci-bench ci-install-test ci-clean
 
 ci-all:
 	@bash ci/scripts/run-all.sh
 
 ci-regress:
 	@bash ci/scripts/run-regress.sh
+
+ci-regress-matrix:
+	@bash ci/scripts/run-regress-matrix.sh
+
+ci-errorpath:
+	@bash ci/scripts/run-errorpath.sh
+
+ci-valgrind:
+	@bash ci/scripts/run-valgrind.sh
+
+ci-cassert:
+	@bash ci/scripts/run-cassert.sh
+
+ci-ubsan:
+	@bash ci/scripts/run-ubsan.sh
+
+ci-scan-build:
+	@bash ci/scripts/run-scan-build.sh
 
 ci-checksums:
 	@bash ci/scripts/run-checksums.sh

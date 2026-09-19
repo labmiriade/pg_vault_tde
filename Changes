@@ -7,6 +7,22 @@ pg_vault_tde.control`) or, where available, from the annotated release tag;
 commit was not (yet) tagged as a release at the time of writing. See
 doc/ROADMAP.md for the full feature-by-feature history, including v1.0-v1.3.
 
+1.7.2  (in-tree since 2026-09-19; C-only bugfixes, no SQL/catalog change —
+        pg_vault_tde_build_version() distinguishes these builds from 1.7.1)
+      - Fix a segfault when a value crosses TOAST_TUPLE_THRESHOLD only after
+        encryption: the pre-TOAST gate now tests the encrypted length and the
+        TOAST writer reserves TDE_V4_OVERHEAD in its target, so core is never
+        handed ciphertext it would try to TOAST (INSERT, COPY, UPDATE, UPSERT
+        and the VACUUM FULL / CLUSTER rewrite).
+      - Fix an assertion failure at startup on assert-enabled servers:
+        _PG_init read GetUserId() to test its own validity.
+      - Fix unregistered snapshots passed to systable_beginscan (10 sites).
+      - Fix try_relation_open(NoLock) without holding a lock (3 sites) and a
+        hint-bit write without the buffer content lock in the rewrite path.
+      - Fix uninitialised VacuumCutoffs driving freeze decisions during
+        VACUUM FULL / CLUSTER; the redundant freeze call was removed.
+      - Add missing volatile on locals read by PG_CATCH after longjmp.
+
 1.7.1  (in-tree since 2026-09-05; C-only bugfixes, no SQL/catalog change —
         pg_vault_tde_build_version() distinguishes these builds from 1.7.0)
     - PSQLE-148: pg_dump_tde creates its output file with mode 0600 instead of
