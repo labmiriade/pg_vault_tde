@@ -15,11 +15,27 @@
 #
 # CHECKSUMS ARE DISABLED ON PURPOSE
 #
-# initdb enables data page checksums by default, and they would catch nearly
-# every flip before our code ever sees it -- turning this into a test of
-# PostgreSQL's checksums rather than of AES-256-GCM.  With --no-data-checksums
-# the authentication tag is the last line of defence, which is exactly the line
-# this test is about.
+# Data page checksums would catch nearly every flip before our code ever sees
+# it, turning this into a test of PostgreSQL's checksums rather than of
+# AES-256-GCM.  With them off, the authentication tag is the last line of
+# defence, which is exactly the line this test is about.
+#
+# How to switch them off depends on the major:
+#
+#   PG 17 and earlier  checksums OFF by default, and initdb does not accept
+#                      --no-data-checksums at all (it exits 1)
+#   PG 18 onwards      checksums ON by default, --no-data-checksums opts out
+#
+# Hence the `>= 18` test below: every major from 18 up gets the flag, so PG 19
+# and later are covered as they arrive, not just 18.
+#
+# The version test says what we expect; the assertion after startup says what
+# actually happened.  Both are here because only the second one survives a
+# future change of default -- without it this file would keep passing while
+# silently measuring PostgreSQL's checksums instead of our GCM tag.  (If a
+# future major ever drops the flag entirely, initdb fails and the test needs
+# rethinking rather than patching: core would be catching every flip before we
+# are asked to decrypt anything.)
 #
 # DETERMINISM
 #
@@ -41,9 +57,11 @@ use constant FLIPS_ROUND => 12;
 srand(FUZZ_SEED);
 
 my $node = PostgreSQL::Test::Cluster->new('fuzz_node');
-# --no-data-checksums: see the header.  Without it PostgreSQL rejects the page
-# before pg_vault_tde is asked to decrypt anything.
-$node->init(extra => ['--no-data-checksums']);
+
+# See the header: the flag exists from PG 18 onwards, where it is also needed.
+my @initdb_extra;
+push @initdb_extra, '--no-data-checksums' if $node->pg_version >= 18;
+$node->init(extra => \@initdb_extra);
 $node->append_conf('postgresql.conf',
     "shared_preload_libraries = 'pg_vault_tde'\n" .
     "pg_vault_tde.kms_provider = 'local'\n" .
@@ -54,6 +72,12 @@ $node->append_conf('postgresql.conf',
     "zero_damaged_pages = off\n" .
     "full_page_writes = on\n");
 $node->start;
+
+# Guard the premise of the whole test.  If checksums are on, every flip is
+# rejected by core and the GCM tag is never consulted -- the test would pass
+# while measuring nothing.
+is($node->safe_psql('postgres', 'SHOW data_checksums'), 'off',
+    'data page checksums are off, so the GCM tag is the line under test');
 
 $node->safe_psql('postgres', 'CREATE EXTENSION pg_vault_tde;');
 system('/bin/sh', '-c', 'rm -rf /var/lib/pg_vault_tde/*');
