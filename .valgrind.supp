@@ -14,12 +14,23 @@
 }
 
 # OpenSSL EVP cipher context error-path cleanup (upstream known)
+#
+# SCOPING MATTERS HERE.  This entry used to read
+#     Memcheck:Cond / ... / fun:EVP_CIPHER_CTX_free / ...
+# with bare wildcards on both sides and no object constraint, which suppresses
+# a conditional-on-uninitialised error *anywhere* a stack passes through that
+# frame — including one raised inside our own tde_gcm_encrypt/decrypt cleanup,
+# which is exactly the bug class this file is supposed to leave visible.
+#
+# The form below requires the error to occur INSIDE libcrypto (innermost frame
+# is an obj: match) with EVP_CIPHER_CTX_free somewhere up the stack.  An
+# uninitialised value originating in pg_vault_tde still reports.
 {
    openssl_evp_ctx_free
    Memcheck:Cond
+   obj:*/libcrypto.so*
    ...
    fun:EVP_CIPHER_CTX_free
-   ...
 }
 
 # libcurl SSL context setup (one-time per handle)

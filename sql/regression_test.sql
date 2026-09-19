@@ -1284,6 +1284,14 @@ $$;
 --
 -- Ensures that TIDs are correctly propagated from heap_multi_insert
 -- back to slots, so that index entries point to the right heap tuples.
+--
+-- DO NOT SHRINK THE ROW COUNT BELOW.  This test doubles as the only thing
+-- standing between a regression in pg_vault_tde_aminsert's relam swap and a
+-- silent release.  nbtree checks rd_rel->relam == BTREE_AM_OID inside
+-- BTGetDeduplicateItems (nbtinsert.c) and BTGetFillFactor (nbtsplitloc.c),
+-- and neither macro is reached until a leaf page fills.  A handful of rows
+-- never gets there: 500 does.  Verified by removing the swap and watching
+-- `make ci-cassert` fail here.
 -- ================================================================
 DO $$
 DECLARE

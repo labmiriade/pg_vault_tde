@@ -687,7 +687,7 @@ vault_wrap_dek(const unsigned char *dek, int dek_len,
 static bool vault_unwrap_dek(const unsigned char* wrapped_dek, int wrapped_len,
                                  unsigned char* dek_out, int *dek_len)
 {
-    vault_resp_buf      resp;
+    vault_resp_buf      resp = {0};
     char               *plaintext_b64  = NULL;
     char               *post_body      = NULL;
     bool                success        = false;

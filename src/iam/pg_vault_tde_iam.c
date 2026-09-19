@@ -443,7 +443,7 @@ Datum
 tde_iam_encrypt_fixed_type_datum(Relation index_rel, Datum datum, Oid typoid)
 {
     uint8   plain_buf[16];   /* max 16 bytes for uuid */
-    Size    plain_len;
+    Size volatile plain_len;   /* live across the PG_TRY sigsetjmp */
     Size    enc_len    = 0;
     char   *encrypted;
     bytea  *enc_bytea  = NULL;
@@ -657,23 +657,48 @@ tde_iam_encrypt_index_datum(Relation index_rel, Datum datum, bool typbyval, int1
  * non-btree relam. Forcing a single-process build keeps every scan/sort
  * call inside this (correctly impersonated) backend.
  */
+/*
+ * tde_assert_not_impersonated
+ *
+ * pg_vault_tde_ambuild and pg_vault_tde_aminsert temporarily set
+ * rd_rel->relam = BTREE_AM_OID around their delegation to nbtree, and must
+ * restore it on every exit path including the error one.
+ *
+ * A leaked impersonation is invisible to every checking stage we run: a stale
+ * relam is not invalid memory (valgrind), not undefined behaviour (UBSan), not
+ * an unreachable branch (scan-build), and not something PostgreSQL itself
+ * asserts on (cassert).  It is simply wrong, and it persists in the backend's
+ * relcache until an unrelated invalidation happens to heal it.  The only way
+ * to make that class visible is to state the invariant ourselves.
+ *
+ * The invariant needs no oid lookup: tde_btree_methods is returned by our
+ * handler alone, which is registered for the tde_btree access method, so every
+ * relation reaching these callbacks must still carry tde_btree's oid.  If one
+ * carries btree's, an earlier delegated call leaked out of its window.
+ *
+ * Compiles to nothing without --enable-cassert; see make ci-cassert.
+ */
+static inline void
+tde_assert_not_impersonated(Relation index)
+{
+    Assert(index->rd_rel->relam != BTREE_AM_OID);
+}
+
 static IndexBuildResult *
 pg_vault_tde_ambuild(Relation heap, Relation index, IndexInfo *index_info)
 {
     IndexBuildResult *result;
     Oid               saved_relam = index->rd_rel->relam;
-      
+
     Assert(saved_btree_methods_valid);
+    tde_assert_not_impersonated(index);
     
     /*
-     * On PG17, tuplesort_begin_index_btree() hard-asserts
-     * indexRel->rd_rel->relam == BTREE_AM_OID before it will build a sort
-     * for the index (removed/relaxed in PG18). Since tde_btree registers
-     * its own AM oid, btbuild() would fail with "unexpected non-btree AM"
-     * for every build. Impersonate BTREE_AM_OID for the duration of the
-     * delegated build call, same pattern used for rd_tableam in
-     * pg_vault_tde_relation_copy_for_cluster (tam.c) — RelationData is
-     * per-backend, so the swap is safe from concurrency.
+     * nbtree reads BTGetFillFactor/BTGetTargetPageFreeSpace/BTGetDeduplicateItems
+     * (nbtree.h), macros whose AssertMacro requires rd_rel->relam == BTREE_AM_OID.
+     * On the build path they expand at nbtsort.c:667 and :1154.  PG17 also
+     * asserted in tuplesort_begin_index_btree().  Both reasons are live; 
+     * do not drop this swap on the assumption that PG18 relaxed it.
      */
     index->rd_rel->relam = BTREE_AM_OID;
 
@@ -706,8 +731,11 @@ pg_vault_tde_aminsert(Relation index, Datum *values, bool *isnull,
     bool    enc_isnull[INDEX_MAX_KEYS];
     int     ncols = index_info->ii_NumIndexAttrs;
     int     i;
+    bool    result;
+    Oid     saved_relam;
 
     Assert(saved_btree_methods_valid);
+    tde_assert_not_impersonated(index);
 
     memcpy(enc_isnull, isnull, ncols * sizeof(bool));
 
@@ -736,10 +764,48 @@ pg_vault_tde_aminsert(Relation index, Datum *values, bool *isnull,
         }
     }
 
-    return saved_btree_methods.aminsert(index, enc_values, enc_isnull,
+    /*
+     * nbtree reads BTGetDeduplicateItems (nbtinsert.c:2779, the dedup /
+     * bottom-up delete pass) and BTGetFillFactor (nbtsplitloc.c:172, via
+     * _bt_split), macros in nbtree.h whose AssertMacro requires
+     * rd_rel->relam == BTREE_AM_OID.  tde_btree registers its own AM oid, so
+     * impersonate btree for the delegated call — same pattern as
+     * pg_vault_tde_ambuild above and rd_tableam in
+     * pg_vault_tde_relation_copy_for_cluster (tam.c).  RelationData is a
+     * per-backend relcache copy, so the swap is invisible to other backends.
+     *
+     * Neither macro is reached until a leaf page fills, which is why a single
+     * INSERT never trips the assert and only a bulk load catches a regression.
+     *
+     * The swap sits AFTER the encryption loop on purpose: tde_iam_encrypt_*
+     * can ereport(ERROR), and an error thrown before the swap has nothing to
+     * restore.  Widening this window would leave relam impersonated in the
+     * relcache for the rest of the session — a corruption no assert, no
+     * sanitizer and no memory checker can see.
+     *
+     * PG_TRY restores relam even if the delegated aminsert raises.
+     */
+    saved_relam = index->rd_rel->relam;
+    index->rd_rel->relam = BTREE_AM_OID;
+
+    
+    PG_TRY();
+    { 
+        result = saved_btree_methods.aminsert(index, enc_values, enc_isnull,
                                     heap_tid, heap,
                                     check_unique, index_unchanged,
                                     index_info);
+    }
+    PG_CATCH();
+    {
+        index->rd_rel->relam = saved_relam;
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+
+    index->rd_rel->relam = saved_relam;
+
+    return result;                                
 }
 
 /* ── AMBEGINSCAN ────────────────────────────────────────────────────────── */
@@ -747,6 +813,7 @@ pg_vault_tde_aminsert(Relation index, Datum *values, bool *isnull,
 static IndexScanDesc
 pg_vault_tde_ambeginscan(Relation index, int nkeys, int norderbys)
 {
+    tde_assert_not_impersonated(index);
     /*
      * Delegate entirely to btree.  The ScanKey encryption happens in
      * amrescan, called immediately after by the executor.
@@ -762,6 +829,8 @@ pg_vault_tde_amrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
                       ScanKey orderbys, int norderbys)
 {
     int i;
+
+    tde_assert_not_impersonated(scan->indexRelation);
 
     Assert(saved_btree_methods_valid);
 

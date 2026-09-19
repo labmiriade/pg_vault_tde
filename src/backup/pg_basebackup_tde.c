@@ -90,7 +90,17 @@ static char *
 opt_value(char **argv, int argc, int *i, const char *sopt, const char *lopt)
 {
     char *arg = argv[*i];
-    size_t lopt_len = strlen(lopt);
+    size_t lopt_len;
+    
+    /*
+     * argv[0..argc-1] are not null C11 5.1.2.2.1, e 
+     * to avoid false positive from static analyzer 
+     * we add this declaration
+     */
+    if (arg == NULL)
+        return NULL;
+    
+    lopt_len = strlen(lopt);
 
     if (sopt != NULL && strncmp(arg, sopt, 2) == 0)
     {

@@ -16,3 +16,6 @@ tmp_check/
 results/
 regression.diffs
 regression.out
+tmp_valgrind/
+tmp_scanbuild/
+tmp_ubsan/

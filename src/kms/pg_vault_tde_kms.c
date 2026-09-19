@@ -1254,9 +1254,11 @@ static bool vault_transit_request(const char *path,
 {
     const char          *vault_token  = NULL;
     char                url[1024];
-    CURL                *curl          = NULL;
+    /* volatile: assigned inside PG_TRY, read by PG_CATCH after the longjmp.
+     * These are libcurl malloc()s — an abort does NOT reclaim them. */
+    CURL                * volatile curl    = NULL;
     char                auth_hdr[512];
-    struct curl_slist   *headers       = NULL;
+    struct curl_slist   * volatile headers = NULL;
     CURLcode            res;
     long                http_code;
     bool volatile       success = false;

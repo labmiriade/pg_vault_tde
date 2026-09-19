@@ -2032,7 +2032,15 @@ pg_vault_tde_migrate_vault_to_wallet_sql(PG_FUNCTION_ARGS)
 
     ScanKeyInit(&scan_key, Anum_pg_vault_tde_kms_provider, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum("vault"));
 
-    scan = systable_beginscan(catalog_rel, InvalidOid, false, GetTransactionSnapshot(), 1, &scan_key);
+    /*
+     * NULL, not GetTransactionSnapshot(): systable_beginscan() then picks the
+     * catalog snapshot itself.  A transaction snapshot is neither registered
+     * nor active, so HeapTupleSatisfiesVisibility asserts
+     * (regd_count > 0 || active_count > 0) on an assert-enabled server and,
+     * worse, nothing pins it for the life of the scan.  Core passes NULL for
+     * every catalog scan; see make ci-cassert.
+     */
+    scan = systable_beginscan(catalog_rel, InvalidOid, false, NULL, 1, &scan_key);
 
     while (HeapTupleIsValid(old_tuple = systable_getnext(scan)))
     {

@@ -390,12 +390,18 @@ static bool
 tde_is_safe_index_am(const char *am_name)
 {
     int i;
-    for(i = 0; tde_safe_index_ams[i] != NULL; i++)
+    int num_ams;
+    /* introduce the mesaure of array lenght to avoid static code false positive */
+    num_ams=sizeof(tde_safe_index_ams) / sizeof(tde_safe_index_ams[0]);
+
+    for(i = 0; i < num_ams && tde_safe_index_ams[i] != NULL; i++)
     {
         if(strcmp(tde_safe_index_ams[i], am_name) == 0)
             return true;
     }
+    
     return false;
+
 }
 
 /*
@@ -414,17 +420,24 @@ tde_rel_or_inheritors_use_encrypted_heap(Oid relid)
 
     foreach_oid(irid, inheritors_oids)
     {
-        Relation irel = try_relation_open(irid, NoLock);
+        /*
+         * AccessShareLock, not NoLock: try_relation_open() asserts that a
+         * NoLock caller already holds a lock on the relation, and this hook
+         * runs before the utility command takes its own.  Weakest mode that
+         * makes reading rd_rel->relam safe against a concurrent drop.
+         * (Caught by make ci-cassert.)
+         */
+        Relation irel = try_relation_open(irid, AccessShareLock);
         if (irel != NULL)
         {
             if (OidIsValid(irel->rd_rel->relam) &&
                 strcmp(get_am_name(irel->rd_rel->relam), "encrypted_heap") == 0)
             {
                 found = true;
-                relation_close(irel, NoLock);
+                relation_close(irel, AccessShareLock);
                 break;
             }
-            relation_close(irel, NoLock);
+            relation_close(irel, AccessShareLock);
         }
     }
     return found;
@@ -814,7 +827,7 @@ tde_process_utility_hook(PlannedStmt *pstmt,
 
                 if (OidIsValid(rid))
                 {
-                    Relation rel = try_relation_open(rid, NoLock);
+                    Relation rel = try_relation_open(rid, AccessShareLock);
                     if (rel != NULL)
                     {
                         if (OidIsValid(rel->rd_rel->relam) &&
@@ -838,7 +851,7 @@ tde_process_utility_hook(PlannedStmt *pstmt,
                                         evict_only_oids,
                                         rel->rd_rel->reltoastrelid);
                         }
-                        relation_close(rel, NoLock);
+                        relation_close(rel, AccessShareLock);
                     }
                 }
             }
@@ -921,7 +934,7 @@ tde_process_utility_hook(PlannedStmt *pstmt,
 
             if (OidIsValid(rid))
             {
-                Relation rel = try_relation_open(rid, NoLock);
+                Relation rel = try_relation_open(rid, AccessShareLock);
                 if (rel != NULL)
                 {
                     bool guard = tde_rel_or_inheritors_use_encrypted_heap(rid);
@@ -951,7 +964,7 @@ tde_process_utility_hook(PlannedStmt *pstmt,
                                         "pg_vault_tde.allow_plaintext_index = on to allow "
                                         "this with a WARNING.")));
                     }
-                    relation_close(rel, NoLock);
+                    relation_close(rel, AccessShareLock);
                 }
             }
 
@@ -1259,7 +1272,18 @@ tde_event_string(TdeAuditEvent event)
 
 static void tde_audit_handler(TdeAuditEvent event, const char* reloid, bool success)
 {
-    const char *rolname = OidIsValid(GetUserId())
+    /*
+     * GetUserId() cannot be used as its own validity test: it opens with
+     * Assert(OidIsValid(CurrentUserId)), so the assertion fires before the
+     * ternary can choose "(system)".  _PG_init runs in the postmaster during
+     * process_shared_preload_libraries(), where no session user exists yet,
+     * and AUDIT_LOG_START is emitted from there — which kills an
+     * assert-enabled server at startup (found by make ci-cassert).
+     *
+     * IsNormalProcessingMode() is false until InitPostgres has run
+     * InitializeSessionUserId, so it has to be the first test.
+     */
+    const char *rolname = (IsNormalProcessingMode() && OidIsValid(GetUserId()))
                           ? GetUserNameFromId(GetUserId(), true)
                           : "(system)";
     ereport(LOG,

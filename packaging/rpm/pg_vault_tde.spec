@@ -10,7 +10,7 @@ Name:           postgresql%{pgmajorversion}-%{sname}
 Version:        1.7.1
 Release:        1%{?dist}
 Summary:        Transparent Data Encryption (TDE) extension for PostgreSQL %{pgmajorversion}
-License:        BSD
+License:        PostgreSQL
 URL:            https://github.com/miriade/pg_vault_tde
 Source0:        %{sname}-%{version}.tar.gz
 

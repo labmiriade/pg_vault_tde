@@ -214,8 +214,29 @@ Datum pg_vault_tde_toast_save_datum(Relation rel, Datum value,
         toast_pointer.va_rawsize = VARDATA_COMPRESSED_GET_EXTSIZE(dval) + VARHDRSZ;
         VARATT_EXTERNAL_SET_SIZE_AND_COMPRESS_METHOD(toast_pointer, data_todo, 
                                                      VARDATA_COMPRESSED_GET_COMPRESS_METHOD(dval));
-
+        /*
+         * The comparison lives entirely inside PostgreSQL's own macro:
+         *     varatt.h:354  VARATT_EXTERNAL_IS_COMPRESSED(toast_pointer)
+         *       (VARATT_EXTERNAL_GET_EXTSIZE(tp) < (tp).va_rawsize - VARHDRSZ)
+         * Left side is uint32 (va_extinfo & mask), right side is int
+         * (va_rawsize is int32), so -Wsign-compare fires.  We see it and core
+         * does not for two reasons that must BOTH hold: our Makefile adds
+         * -Wextra (core builds with -Wall only), and Assert() expands to
+         * nothing without --enable-cassert, so the macro is only instantiated
+         * in the cassert build.
+         *
+         * Safe on this path: va_rawsize was set two lines above to
+         * VARDATA_COMPRESSED_GET_EXTSIZE(dval) + VARHDRSZ, so the subtraction
+         * yields that extsize back and can never be negative.
+         *
+         * Scoped to this one statement on purpose.  A global -Wno-sign-compare
+         * would also silence signed/unsigned mistakes in the length arithmetic
+         * of tde_gcm_encrypt/decrypt, which is where they would be dangerous.
+         */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wsign-compare"
         Assert(VARATT_EXTERNAL_IS_COMPRESSED(toast_pointer));
+#pragma GCC diagnostic pop
     }
     else {
         data_p = VARDATA(dval);
@@ -317,7 +338,7 @@ Datum pg_vault_tde_toast_save_datum(Relation rel, Datum value,
             * PG_TRY ensures toast_enc is pfree'd on error; the outer PG_TRY in
             * pg_vault_tde_toast_tuple handles toast_rel / idx cleanup.
             */
-            HeapTuple chunk_enc = NULL;
+            HeapTuple volatile chunk_enc = NULL;
             
             PG_TRY();
             {
@@ -470,7 +491,23 @@ pg_vault_tde_toast_tuple(Relation rel, HeapTuple newtup, HeapTuple oldtup, int o
 		hoff += BITMAPLEN(natts);
 	hoff = MAXALIGN(hoff);
 	/* now convert to a limit on the tuple data size */
-	maxDataLen = (Size) RelationGetToastTupleTarget(rel, (int) TOAST_TUPLE_TARGET) - hoff;
+	/*
+	 * Reserve room for the encryption overhead.
+	 *
+	 * This loop shrinks the tuple until it fits TOAST_TUPLE_TARGET, but the
+	 * tuple handed to core is not this one: tde_encrypt_heap_tuple() then adds
+	 * TDE_V4_OVERHEAD bytes (IV + tag + version + generation).  Targeting the
+	 * bare TOAST_TUPLE_TARGET therefore produces a tuple that is under the
+	 * threshold here and over it by the time heap_prepare_insert() re-tests it
+	 * (heapam.c:2334) -- whereupon core tries to TOAST opaque ciphertext and
+	 * segfaults in toast_save_datum().
+	 *
+	 * Subtracting the overhead here makes the guarantee hold end to end: what
+	 * this function returns, once encrypted, is still <= TOAST_TUPLE_TARGET.
+	 * See TEST 153, which sweeps the boundary.
+	 */
+	maxDataLen = (Size) RelationGetToastTupleTarget(rel, (int) TOAST_TUPLE_TARGET)
+	             - hoff - TDE_V4_OVERHEAD;
 
     /*
         * 1. Inline compress of the biggest, the largest attribute & 
