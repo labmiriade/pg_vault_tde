@@ -1,0 +1,32 @@
+# Git metadata
+.git
+
+# File di log temporanei Bitbucket / locali (non servono mai nelle immagini)
+pipelineLog-*.txt
+
+# Dati di runtime dei container CI (directory create con permessi root)
+# Questa è la causa principale del fallimento di scan-build
+ci/docker-data/
+
+# Directory di output dei tool di analisi (generate a runtime, non nel build context)
+tmp_scanbuild/
+tmp_ubsan/
+tmp_valgrind/
+
+# Artefatti di compilazione host (evitano conflitti con la build in-container)
+# I Containerfile fanno già `make clean`, ma per sicurezza:
+results/
+regression.diffs
+regression.out
+
+# IDE e documentazione interna (non usati da nessun Containerfile)
+.vscode/
+.claude/
+CLAUDE.md
+REFACTOR.md
+AGENTS.md
+ONBOARDING.md
+PRODUCT_INFORMATION.md
+PRODUCT_INFORMATION.html
+demo/
+dist/
