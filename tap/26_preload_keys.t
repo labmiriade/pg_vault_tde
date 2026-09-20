@@ -115,8 +115,15 @@ like($log, qr/gave up on database "\w+" after 3 consecutive unwrap failure\(s\)/
 
 # Giving up is not breaking: the keys are simply loaded on first access, which
 # still works because a session can unlock the wallet for itself.
-$node->safe_psql('cold_db', "SELECT pg_vault_tde_wallet_unlock('test-password')");
-is($node->safe_psql('cold_db', 'SELECT val FROM t3 WHERE id = 3'),
-   'cold_db-three', 'a database the preload gave up on still reads normally');
+#
+# Both statements go in ONE psql invocation on purpose.  wallet_unlock()
+# caches the KEK for the calling backend only — the same design that has the
+# provider re-derive it per unwrap rather than hold it — so a separate
+# safe_psql() would open a new connection and find the wallet shut again.
+my $recovered = $node->safe_psql('cold_db',
+    "SELECT pg_vault_tde_wallet_unlock('test-password'); "
+  . "SELECT val FROM t3 WHERE id = 3");
+like($recovered, qr/cold_db-three/,
+     'a database the preload gave up on still reads after a session unlock');
 
 $node->stop;
