@@ -50,5 +50,6 @@ void pg_vault_tde_kms_pkcs11_shmem_init(void);
  * Must be called from _PG_init() before postmaster fork.
  */
 void   pg_vault_tde_register_bgw(void);
+void   pg_vault_tde_register_preload_bgw(void);
 
 #endif /* PG_VAULT_TDE_KMS_H */

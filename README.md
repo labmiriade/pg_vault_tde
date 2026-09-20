@@ -459,6 +459,40 @@ SELECT pg_vault_tde_wallet_lock();
 SELECT pg_vault_tde_rotate_kek();
 ```
 
+#### Keeping the wallet on a network share
+
+The wallet file is read far more often than its size suggests. The KEK is
+**not** cached between operations — it is re-derived from the file on every
+wrap and unwrap, deliberately, so that it does not sit in process memory
+between them. A backend that gets its passphrase from
+`wallet_passphrase_env` / `_command` (rather than from an interactive
+`pg_vault_tde_wallet_unlock()`, which does cache it for that session)
+therefore opens and parses the PKCS#12 once per DEK. A startup warm-up with
+`preload_keys` does it once per relation.
+
+On local storage that is unremarkable. On NFS or SMB it means one network
+round-trip per unwrap, so:
+
+- **Mount it with client-side caching enabled** — the file changes only on
+  `wallet_init`, `wallet_change_passphrase` and `rotate_kek`, so it caches
+  well. On NFS keep the default attribute and data caching (do not mount
+  `noac` or `actimeo=0`); `fsc` with `cachefilesd` helps further on a slow
+  link.
+- **Know what caching does not fix.** It removes the network round-trip, not
+  the PBKDF2 derivation, which is CPU and runs every time regardless. If the
+  warm-up is slow on local disk too, that is what you are measuring.
+- **Invalidate after a key operation.** A cached copy is a *stale KEK* after
+  `wallet_change_passphrase()` or `rotate_kek()`. On a single server the
+  writes invalidate the local cache. If several hosts read the same wallet
+  file, drop their caches before they next touch an encrypted table — and see
+  the warning under "Key Rotation" first, because a wallet shared between
+  databases cannot have its KEK rotated safely at all.
+- **Raise `preload_max_failures`.** A network share has transient failures a
+  local disk does not, and the default of 5 is tuned for the local case.
+
+If none of that is appealing, keep the wallet on local storage and replicate
+it out of band — it is one small file that changes only when you rotate.
+
 ### Production (HashiCorp Vault / OpenBao)
 
 The KMS layer calls Vault's Transit secrets engine:
@@ -620,7 +654,9 @@ startup.
 | `wallet_dev_mode_passphrase` | string | `''` | suset | Convenience passphrase for dev/CI (only honoured when `dev_mode = on`) **(v1.6)** |
 | `dev_mode` | boolean | `off` | suset | Enable development mode features (wallet_dev_mode_passphrase) **(v1.6)** |
 | `wallet_auto_open` | boolean | `on` | suset | Auto-open wallet on startup if passphrase env var is set |
-| `max_encrypted_relations` | integer | `1024` | postmaster | Maximum number of per-table DEK entries in shmem (64–65536), **cluster-wide**: entries are keyed by `(dbid, relid)`, so budget for the sum across all databases. Requires restart — affects shared memory sizing. |
+| `preload_keys` | boolean | `off` | suset | Warm this database's DEK cache at startup: a background worker per database unwraps every DEK in `pg_vault_tde_catalog` once the server accepts connections, so the first query on a table does not pay a KMS round-trip. Needs a KMS usable without an interactive unlock (`wallet_passphrase_command` / `wallet_passphrase_env`). Stops at `max_encrypted_relations`. Scope it with `ALTER DATABASE SET`. |
+| `preload_max_failures` | integer | `5` | suset | Consecutive DEK unwrap failures the startup preload tolerates in one database before giving up on it. Consecutive, so a missing passphrase stops the pass at once while a one-off does not. Relevant to the local wallet too: the KEK is re-derived from the wallet file on every unwrap rather than cached, so a wallet on NFS or SMB is reopened once per relation. `0` stops at the first failure. |
+| `max_encrypted_relations` | integer | `1024` | postmaster | Maximum number of per-table DEK entries in shmem (64–65536), **cluster-wide**: entries are keyed by `(dbid, relid)`, so budget for the sum across all databases. Enforced since 1.7.2 — before that the cache silently grew past it (ShmemInitHash's size is not a cap), so count your encrypted relations across all databases before upgrading. ~112 bytes per relation, reserved at startup. Max 1048576. Requires restart. |
 | `toast_encryption` | boolean | `on` | suset | Encrypt TOAST chunks with the parent relation's DEK (v1.5) |
 
 ### Vault / OpenBao (`kms_provider = 'vault'`)

@@ -54,3 +54,28 @@
    fun:AllocSetAlloc
    ...
 }
+
+# PostgreSQL relcache init file: padding bytes written to pg_internal.init
+#
+# write_relcache_init_file() fwrites RelationData/tuple descriptors straight
+# out of memory, padding included, and padding is never initialised.  Core
+# PostgreSQL behaviour on any backend, and PostgreSQL ships the same
+# suppression in src/tools/valgrind.supp.
+#
+# It only became visible here with the startup DEK preload: its workers
+# connect at BgWorkerStart_RecoveryFinished, so under valgrind they are the
+# first processes to find the init file missing and write it.  Ordinary
+# backends in the workload arrived after it already existed.
+#
+# SCOPING: anchored on the write(buf) parameter AND on a frame inside
+# RelationCacheInitializePhase*, which is relcache bootstrap in core.  No
+# pg_vault_tde code runs inside it, so this cannot mask an uninitialised value
+# of ours — see the note on openssl_evp_ctx_free above for why that matters.
+{
+   pg_relcache_init_file_padding
+   Memcheck:Param
+   write(buf)
+   ...
+   fun:RelationCacheInitializePhase*
+   ...
+}

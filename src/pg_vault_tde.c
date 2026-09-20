@@ -74,6 +74,8 @@ char *pg_vault_tde_vault_k8s_role       = NULL;
 char *pg_vault_tde_vault_k8s_mount      = NULL;
 char *pg_vault_tde_crypto_provider      = NULL;
 bool        pg_vault_tde_bgw_enabled              = false;
+bool        pg_vault_tde_preload_keys             = false;
+int         pg_vault_tde_preload_max_failures      = 5;
 int         pg_vault_tde_token_renewal_interval   = 3600;
 char *pg_vault_tde_extension_name       = "pg_vault_tde";
 
@@ -1604,14 +1606,43 @@ _PG_init(void)
         &pg_vault_tde_wallet_auto_open, true, PGC_SUSET,
         GUC_SUPERUSER_ONLY, NULL, tde_kms_config_assign_bool, NULL);
 
+    /* Startup DEK cache warm-up (v1.7) */
+    DefineCustomBoolVariable("pg_vault_tde.preload_keys",
+        "Load this database's DEKs into the shared cache at startup",
+        "A background worker per database unwraps every DEK in "
+        "pg_vault_tde_catalog once the server is accepting connections, so "
+        "the first query on a table does not pay for a KMS round-trip.  "
+        "Requires a KMS usable without an interactive unlock.  Stops at "
+        "pg_vault_tde.max_encrypted_relations, which every database shares.  "
+        "Can be scoped with ALTER DATABASE SET.",
+        &pg_vault_tde_preload_keys, false, PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_vault_tde.preload_max_failures",
+        "Consecutive DEK unwrap failures the startup preload tolerates",
+        "Applies per database, and counts CONSECUTIVE failures, so that a "
+        "systemic fault stops the pass at once while a one-off does not: a "
+        "missing passphrase fails every relation, whereas a timeout does not "
+        "and the next success clears the count.  This matters for the local "
+        "wallet too, not just a remote KMS — the KEK is deliberately "
+        "re-derived from the wallet file on every unwrap rather than cached, "
+        "so a wallet on NFS or SMB is reopened once per relation.  0 stops at "
+        "the first failure.  Only meaningful with pg_vault_tde.preload_keys "
+        "on.",
+        &pg_vault_tde_preload_max_failures, 5, 0, 10000,
+        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+
     /* Max encrypted relations in shmem cache (v1.5) */
     DefineCustomIntVariable("pg_vault_tde.max_encrypted_relations",
         "Maximum number of independently-keyed encrypted_heap relations",
         "Controls the size of the per-table DEK cache in shared memory.  "
-        "Increase if you have more than 1024 encrypted tables.  "
+        "Increase if you have more than 1024 encrypted tables; note the cache "
+        "is one cluster-wide segment keyed by (dbid, relid), so this budgets "
+        "every database together.  Costs about 112 bytes per relation, "
+        "reserved at startup whether used or not.  "
         "Requires server restart to take effect.",
         &pg_vault_tde_max_encrypted_relations,
-        TDE_REL_DEK_CACHE_DEFAULT, 64, 65536,
+        TDE_REL_DEK_CACHE_DEFAULT, 64, 1048576,
         PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
     /* TOAST encryption switch (v1.5) */
@@ -1849,6 +1880,14 @@ _PG_init(void)
      * Only starts if bgw_enabled=true; the BGW itself checks auth_method.
      */
     pg_vault_tde_register_bgw();
+
+    /*
+     * Startup DEK cache warm-up (v1.7).  Registered unconditionally:
+     * preload_keys can be turned on for a single database with ALTER
+     * DATABASE SET, which is invisible from here, and the launcher is
+     * a few milliseconds when no database wants it.
+     */
+    pg_vault_tde_register_preload_bgw();
 
     ereport(LOG,
             (errmsg("pg_vault_tde: hooks registered, awaiting shmem startup")));

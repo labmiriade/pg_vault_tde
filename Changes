@@ -9,6 +9,60 @@ doc/ROADMAP.md for the full feature-by-feature history, including v1.0-v1.3.
 
 1.7.2  (in-tree since 2026-09-19; C-only bugfixes, no SQL/catalog change —
         pg_vault_tde_build_version() distinguishes these builds from 1.7.1)
+      - PSQLE-156: pg_vault_tde.preload_keys — warm a database's DEK cache at
+        startup instead of on first access, so the first query on an encrypted
+        table does not pay a KMS round-trip.  A launcher registered in
+        _PG_init reads the shared pg_database catalog and runs one short-lived
+        worker per database, sequentially: everything the warm-up needs is
+        per-database and unreachable from elsewhere (pg_vault_tde_catalog is a
+        per-database table, the wallet holding the KEK is a per-database file)
+        and a background worker may connect exactly once in its life.
+        Off by default, PGC_SUSET so it can be scoped with ALTER DATABASE SET;
+        the worker reads it after connecting, since a per-database value does
+        not resolve before that.  It never blocks startup — the postmaster
+        accepts connections while it runs, so a slow or unreachable KMS costs
+        a cold cache, not availability — and it stops at
+        max_encrypted_relations rather than spending KMS round-trips the cache
+        would refuse.  Requires a KMS that opens without an interactive
+        unlock: wallet_passphrase_command or wallet_passphrase_env.
+      - PSQLE-156: pg_vault_tde.preload_max_failures (default 5) — consecutive
+        unwrap failures the preload tolerates in one database before giving up
+        on it.  Consecutive rather than total, so a systemic fault stops the
+        pass immediately while a one-off does not and the next success clears
+        the count; 0 restores stop-at-the-first.  It matters for the local
+        wallet as much as for a remote KMS: the KEK is deliberately re-derived
+        from the wallet file on every unwrap instead of being cached, to keep
+        it out of process memory between operations, so a preload reopens the
+        wallet once per relation and a wallet on NFS or SMB fails the same
+        transient way a network KMS does.  Without a limit a closed wallet
+        also meant one provider WARNING per relation in the log while the
+        server was still starting.
+      - UPGRADE NOTE — pg_vault_tde.max_encrypted_relations is now enforced.
+        It never was: the size passed to ShmemInitHash() sizes the initial
+        allocation and the bucket directory, and once the freelist empties
+        dynahash keeps allocating elements from the main shared memory
+        segment, so the cache grew to many times the configured number and
+        only failed when shared memory as a whole ran out.  Measured: 2000
+        relations cached against a setting of 64.
+        This matters because the cache holds plaintext DEKs — the number an
+        administrator sets is how much key material sits unencrypted in
+        shared memory, and it is a cluster-wide budget shared by every
+        database (entries are keyed by (dbid, relid)).
+        BEFORE UPGRADING, count your encrypted relations — tables plus
+        tde_btree indexes, summed across all databases — and raise
+        max_encrypted_relations past that number if it exceeds the setting;
+        it needs a restart.  A cluster left below its real count keeps
+        working, but relations past the budget are re-unwrapped from the KMS
+        on every access, which is a significant slowdown with a network KMS.
+        Each backend says so once, at WARNING.  The maximum accepted value is
+        raised from 65536 to 1048576 for clusters that genuinely need it; the
+        cache costs about 112 bytes per relation, reserved at startup.
+      - Relations past the budget lose their cache entry, never their data.
+        tde_rel_dek_cache_store() used to ereport(ERROR) when it could not
+        insert, even though pg_vault_tde_kms_get_rel_dek() had already
+        unwrapped the DEK and filled the caller's buffer before calling it —
+        so a serviceable request failed because its memoisation did.  It now
+        returns false and the operation proceeds.
       - Fix a segfault when a value crosses TOAST_TUPLE_THRESHOLD only after
         encryption: the pre-TOAST gate now tests the encrypted length and the
         TOAST writer reserves TDE_V4_OVERHEAD in its target, so core is never

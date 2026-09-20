@@ -1232,7 +1232,7 @@ value; no shared state is changed.
 | `bgw_enabled` | boolean | `off` | suset | Enable background worker for automatic token renewal. **Requires cluster restart**: the BGW is registered via `RegisterBackgroundWorker()` at postmaster startup; changing via `pg_reload_conf()` updates the value but does not start/stop the worker dynamically. |
 | `token_renewal_interval` | integer | `3600` | suset | Token renewal interval in seconds (60–86400) |
 | `enabled` | boolean | `on` | postmaster | Master switch: `off` disables crypto for benchmarking overhead. Fixed at server startup |
-| `max_encrypted_relations` | integer | `1024` | postmaster | Max per-table DEK entries in shmem (64–65536), **cluster-wide** — entries are keyed by `(dbid, relid)`, so budget for the sum across all databases. **Requires restart** — controls shared-memory allocation. |
+| `max_encrypted_relations` | integer | `1024` | postmaster | Max per-table DEK entries in shmem (64–65536), **cluster-wide** — entries are keyed by `(dbid, relid)`, so budget for the sum across all databases. Enforced since 1.7.2 — before that the cache silently grew past it (ShmemInitHash's size is not a cap), so count your encrypted relations across all databases before upgrading. ~112 bytes per relation, reserved at startup. Max 1048576. **Requires restart**. |
 | `crypto_provider` | string | `''` | postmaster | OpenSSL 3.x provider name (`qatprovider`, `fips`; empty = built-in dispatch). **Requires restart**. |
 
 All variables are declared `extern` in `src/include/pg_vault_tde_guc.h`
@@ -1395,6 +1395,9 @@ the Vault-dependent files need; they `skip_all` when `VAULT_ADDR` is unset).
 | `tap/22_rotate_cold_cache.t` | `pg_vault_tde_rotate_online()` must preserve the outgoing DEK when the shmem entry is cold (after a restart, or a wallet lock/unlock) |
 | `tap/23_rotation_generation_drift.t` | An aborted rotation must not leave the shmem cache a generation ahead of the catalog (fault injection: the catalog row is removed mid-rotation) |
 | `tap/24_shared_wallet_warning.t` | KEK rotation warns when the wallet is not this database's own file, and stays quiet on the per-database default |
+| `tap/25_cache_full_degrades.t` | `max_encrypted_relations` is honoured, and relations past it keep reading and writing |
+| `tap/26_preload_keys.t` | The startup warm-up loads a database's DEKs when it asks, skips the databases that did not, keeps their keys apart, and honours `preload_max_failures` |
+| `tap/27_preload_providers.t` | The warm-up works with the KEK outside the server: Vault/OpenBao and PKCS#11 (each half skips when its backend is absent) |
 
 #### `tap/19_crash_recovery_rmgr.t`
 

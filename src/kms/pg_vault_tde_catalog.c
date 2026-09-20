@@ -75,6 +75,9 @@
 static HTAB     *rel_dek_map    = NULL;
 static LWLock   *rel_dek_lock   = NULL;
 
+/* Warn once per backend that the cache is full; see tde_rel_dek_cache_store. */
+static bool      cache_full_warned = false;
+
 /* -------------------------------------------------------------------------
  * tde_rel_dek_key — build the shmem cache key for a relation
  *
@@ -400,16 +403,75 @@ tde_rel_dek_cache_store(Oid relid,
         ereport(ERROR, errmsg("pg_vault_tde: error: shmem cache is null, the extension must be loaded via shared_preload_libraries"));
 
     LWLockAcquire(rel_dek_lock, LW_EXCLUSIVE);
+
+    /*
+     * Enforce pg_vault_tde.max_encrypted_relations ourselves, before
+     * HASH_ENTER gets the chance to ignore it.
+     *
+     * The size handed to ShmemInitHash() is not a cap: it sizes the initial
+     * allocation and the bucket directory, and once the freelist is empty
+     * dynahash keeps allocating elements from the main shared memory segment.
+     * HASH_ENTER_NULL therefore only fails when shared memory as a whole is
+     * exhausted — by which point the cluster has larger problems — and the
+     * table happily grows to many times the configured number in between.
+     *
+     * That is the wrong shape for this particular cache: it holds plaintext
+     * DEKs.  An administrator who budgets 1024 relations is budgeting how much
+     * key material sits unencrypted in shared memory, and silently keeping ten
+     * times that is not a service.  Bounding it also makes the shmem footprint
+     * predictable, which is what the GUC's documentation has always claimed.
+     *
+     * Only new keys are refused.  An existing entry is always refreshed —
+     * declining there would break the refill half of a rotation window, where
+     * the entry is already present and merely missing its current DEK.
+     */
+    if (hash_search(rel_dek_map, &search_key, HASH_FIND, NULL) == NULL &&
+        hash_get_num_entries(rel_dek_map) >= pg_vault_tde_max_encrypted_relations)
+    {
+        LWLockRelease(rel_dek_lock);
+
+        if (!cache_full_warned)
+        {
+            cache_full_warned = true;
+            ereport(WARNING,
+                    errmsg("pg_vault_tde: DEK cache is at its configured limit "
+                           "of %d relations; further relations are re-unwrapped "
+                           "from the KMS on every access",
+                           pg_vault_tde_max_encrypted_relations),
+                    errhint("Increase pg_vault_tde.max_encrypted_relations and "
+                            "restart; the cache costs about 112 bytes per "
+                            "relation and the limit is shared by every "
+                            "database. Reported once per backend."));
+        }
+
+        return false;
+    }
+
     stored_slot = (TdeRelDekMap*) hash_search(rel_dek_map, &search_key, HASH_ENTER_NULL, &found);
 
     if(!stored_slot){
         LWLockRelease(rel_dek_lock);
-        OPENSSL_cleanse(dek, TDE_DEK_LEN);
 
-        ereport(ERROR, 
-                errmsg("pg_vault_tde: DEK cache full (capacity=%d); "
-                         "consider increasing pg_vault_tde.max_encrypted_relations.",
-                         pg_vault_tde_max_encrypted_relations));
+        /*
+         * Shared memory itself is exhausted — the budget check above already
+         * handled the ordinary "cache is full" case.  Still not a reason to
+         * fail: by the time this runs the DEK has been unwrapped and handed to
+         * the caller (pg_vault_tde_kms_get_rel_dek fills dek_out before
+         * calling us), so the request is serviceable and only its memoisation
+         * failed.  Raising an ERROR here would make a relation unreadable for
+         * a reason that has nothing to do with its key.
+         */
+        if (!cache_full_warned)
+        {
+            cache_full_warned = true;
+            ereport(WARNING,
+                    errmsg("pg_vault_tde: out of shared memory for the DEK "
+                           "cache; this relation is re-unwrapped from the KMS "
+                           "on every access"),
+                    errhint("Reported once per backend."));
+        }
+
+        return false;
     }
 
     if(found && stored_slot->dek_valid)
@@ -973,6 +1035,30 @@ pg_vault_tde_catalog_evict_db(void)
                    "cache for database %u", removed, MyDatabaseId));
 }
 
+
+/* -------------------------------------------------------------------------
+ * pg_vault_tde_catalog_cache_entries — cached DEKs, all databases
+ *
+ * The count is cluster-wide because the cache is: entries are keyed by
+ * (dbid, relid) in one shared segment, so pg_vault_tde.max_encrypted_relations
+ * is a budget shared by every database.  A caller that fills the cache in bulk
+ * (the startup preload) compares this against the GUC to stop before it starts
+ * spending KMS round-trips it cannot memoise.
+ * -------------------------------------------------------------------------*/
+long
+pg_vault_tde_catalog_cache_entries(void)
+{
+    long n;
+
+    if (!rel_dek_map)
+        return 0;
+
+    LWLockAcquire(rel_dek_lock, LW_SHARED);
+    n = hash_get_num_entries(rel_dek_map);
+    LWLockRelease(rel_dek_lock);
+
+    return n;
+}
 
 uint64
 pg_vault_tde_catalog_get_rel_generation(Oid relid)

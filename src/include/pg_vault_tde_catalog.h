@@ -187,6 +187,15 @@ void pg_vault_tde_catalog_evict_rel(Oid relid);
 void pg_vault_tde_catalog_evict_db(void);
 
 /*
+ * pg_vault_tde_catalog_cache_entries:
+ *   How many DEKs are cached right now, across ALL databases — the cache is
+ *   one shared segment keyed by (dbid, relid), so its capacity is a
+ *   cluster-wide budget.  Compare against
+ *   pg_vault_tde.max_encrypted_relations.
+ */
+long pg_vault_tde_catalog_cache_entries(void);
+
+/*
  * pg_vault_tde_catalog_zero_rel_dek:
  *   Demote the relation's current DEK into prev_dek[] and invalidate dek[],
  *   opening the rotation window.  Recovers the outgoing DEK through

@@ -50,6 +50,7 @@ OBJS = \
 	src/kms/pg_vault_tde_kms_pkcs11.o \
 	src/kms/pg_vault_tde_catalog.o \
 	src/kms/pg_vault_tde_rotation_bgw.o \
+	src/kms/pg_vault_tde_preload_bgw.o \
 	src/kms/pg_vault_tde_seal.o \
 	src/crypto/pg_vault_tde_crypto.o \
 	src/crypto/pg_vault_tde_hw_accel.o \
