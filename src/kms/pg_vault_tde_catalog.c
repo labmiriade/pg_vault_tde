@@ -992,20 +992,52 @@ pg_vault_tde_catalog_get_rel_generation(Oid relid)
 void pg_vault_tde_catalog_zero_rel_dek(Oid relid)
 {
     Oid              effective_relid = resolve_effective_relid(relid);
+    unsigned char    outgoing_dek[TDE_DEK_LEN];
     TdeRelDekMap    *e;
     TdeRelDekMapKey  search_key;
-
-    tde_rel_dek_key(&search_key, effective_relid);
+    bool             demoted;
 
     if (!rel_dek_map)
         return;
 
+    /*
+     * Recover the outgoing DEK BEFORE touching the cache, and unconditionally.
+     *
+     * prev_dek[] is the only copy of this key once the caller goes on to
+     * overwrite the catalog row (pg_vault_tde_catalog_update_rel_dek), and
+     * every pre-rotation tuple needs it: those tuples carry generation N on
+     * the wire while the catalog moves to N+1, so tde_gcm_decrypt routes them
+     * to pg_vault_tde_kms_get_rel_prev_dek().
+     *
+     * This used to read e->dek straight out of the cache and, when the entry
+     * was missing, do nothing at all — silently, with no error.  A cold entry
+     * is not exotic: it is the normal state after a restart, and after
+     * wallet_lock() or wallet_unlock(), which evict.  The rotation then
+     * re-keyed the catalog and immediately failed to read its own rows
+     * ("pg_vault_tde: decryption failed").
+     *
+     * pg_vault_tde_kms_get_rel_dek() is the right recovery path: a plain
+     * LW_SHARED hit when the entry is warm, an unwrap from the catalog when it
+     * is not.  It has to run before the lock below because it takes
+     * rel_dek_lock itself, and demoting our own copy rather than re-reading
+     * e->dek closes the window where an eviction in between loses the key.
+     */
+    if (!pg_vault_tde_kms_get_rel_dek(effective_relid, outgoing_dek,
+                                      TDE_DEK_LEN))
+        ereport(ERROR,
+                errmsg("pg_vault_tde: cannot rotate relid=%u: its current DEK "
+                       "is neither cached nor recoverable from the catalog",
+                       effective_relid));
+
+    tde_rel_dek_key(&search_key, effective_relid);
+
     LWLockAcquire(rel_dek_lock, LW_EXCLUSIVE);
 
     e = (TdeRelDekMap*) hash_search(rel_dek_map, &search_key, HASH_FIND, NULL);
-    if (e)
+    demoted = (e != NULL);
+    if (demoted)
     {
-        memcpy(e->prev_dek, e->dek, TDE_DEK_LEN);
+        memcpy(e->prev_dek, outgoing_dek, TDE_DEK_LEN);
         OPENSSL_cleanse(e->dek, TDE_DEK_LEN);
         e->dek_valid      = false;
         e->prev_dek_valid = true;
@@ -1013,7 +1045,22 @@ void pg_vault_tde_catalog_zero_rel_dek(Oid relid)
     }
     LWLockRelease(rel_dek_lock);
 
-    ereport(LOG, errmsg("pg_vault_tde: Old dek saved and setted dek invalid"));
+    OPENSSL_cleanse(outgoing_dek, TDE_DEK_LEN);
+
+    /*
+     * get_rel_dek() installed the entry a moment ago, so this only fires if a
+     * concurrent wallet_lock()/rotate_kek()/DROP raced us.  Fail the rotation
+     * rather than continue without the prev_dek the pre-rotation rows need.
+     */
+    if (!demoted)
+        ereport(ERROR,
+                errmsg("pg_vault_tde: DEK cache entry for relid=%u was evicted "
+                       "while starting a rotation; retry the rotation",
+                       effective_relid));
+
+    ereport(LOG,
+            errmsg("pg_vault_tde: relid=%u DEK demoted to prev_dek; "
+                   "awaiting the new DEK", effective_relid));
 }
 
 
