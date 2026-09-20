@@ -64,7 +64,7 @@
 #include "src/include/pg_vault_tde_kms.h"
 #include "src/include/pg_vault_tde_guc.h"
 #include "src/include/pg_vault_tde_audit.h"
-#include "src/include/pg_vault_tde_catalog.h" /* pg_vault_tde_catalog_evict_all */
+#include "src/include/pg_vault_tde_catalog.h" /* pg_vault_tde_catalog_evict_db */
 #include "src/include/pg_vault_tde_catalog_d.h"
 
 /* -------------------------------------------------------------------------
@@ -190,6 +190,8 @@ static bool local_unwrap_dek_with_kek(const unsigned char *wrapped,
                                       const unsigned char *kek);
 static bool local_derive_kek_from_pass(const char *passphrase,
                                        unsigned char *kek_out);
+#define TDE_DEFAULT_WALLET_FMT "/var/lib/pg_vault_tde/%u/wallet.p12"
+
 static const char *local_get_wallet_path(void);
 static void local_set_wallet(const char *path);
 static bool local_get_passphrase(char *pass_out, Size pass_max);
@@ -917,9 +919,34 @@ local_get_wallet_path(void)
         return "";
 
     snprintf(path_buf, sizeof(path_buf),
-             "/var/lib/pg_vault_tde/%u/wallet.p12", MyDatabaseId);
+             TDE_DEFAULT_WALLET_FMT, MyDatabaseId);
 
     return path_buf;
+}
+
+/*
+ * pg_vault_tde_local_wallet_is_overridden — is the wallet not this database's
+ * own default file?
+ *
+ * Note this cannot be answered by testing whether pg_vault_tde.wallet_path is
+ * set: pg_vault_tde_wallet_init() persists the resolved path with ALTER
+ * DATABASE ... SET FROM CURRENT (local_set_wallet), so after an ordinary setup
+ * the GUC is always populated — with the per-database default.  Comparing
+ * against that default is what actually distinguishes "somewhere else, and
+ * possibly shared" from "this database's own file".
+ */
+bool
+pg_vault_tde_local_wallet_is_overridden(void)
+{
+    char dflt[MAXPGPATH];
+
+    /* No database attached: nothing to compare against. */
+    if (!OidIsValid(MyDatabaseId))
+        return false;
+
+    snprintf(dflt, sizeof(dflt), TDE_DEFAULT_WALLET_FMT, MyDatabaseId);
+
+    return strcmp(local_get_wallet_path(), dflt) != 0;
 }
 
 /*
@@ -1771,7 +1798,7 @@ pg_vault_tde_wallet_change_passphrase_sql(PG_FUNCTION_ARGS)
     local_kek_rotation_ctx_free();
 
     /* Evict shmem — next access loads with new KEK */
-    pg_vault_tde_catalog_evict_all();
+    pg_vault_tde_catalog_evict_db();
 
     /* 
      * Write new wallet file with new passphrase (atomic rename).
@@ -1879,7 +1906,7 @@ pg_vault_tde_wallet_unlock_sql(PG_FUNCTION_ARGS)
      * the GUC passphrase source; if that is also absent they must call
      * wallet_unlock() themselves.
      */
-    pg_vault_tde_catalog_evict_all();
+    pg_vault_tde_catalog_evict_db();
 
     ereport(LOG, errmsg("pg_vault_tde: wallet unlocked by superuser"));
 
@@ -1905,7 +1932,7 @@ pg_vault_tde_wallet_lock_sql(PG_FUNCTION_ARGS)
                 errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
                 errmsg("pg_vault_tde_wallet_lock requires superuser"));
 
-    pg_vault_tde_catalog_evict_all();
+    pg_vault_tde_catalog_evict_db();
 
     if (local_wallet_state)
     {
@@ -1920,7 +1947,7 @@ pg_vault_tde_wallet_lock_sql(PG_FUNCTION_ARGS)
         local_wallet_state->wallet_open = false;
     }
 
-    ereport(LOG, errmsg("pg_vault_tde: wallet locked; KEK and all DEKs cleared from shmem"));
+    ereport(LOG, errmsg("pg_vault_tde: wallet locked; KEK and this database's DEKs cleared from shmem"));
 
     PG_RETURN_VOID();
 }
@@ -2152,7 +2179,7 @@ pg_vault_tde_migrate_vault_to_wallet_sql(PG_FUNCTION_ARGS)
     CatalogCloseIndexes(indstate);
     table_close(catalog_rel, ShareRowExclusiveLock);
 
-    pg_vault_tde_catalog_evict_all();
+    pg_vault_tde_catalog_evict_db();
 
     {
         LocalWalletState *st = local_state();

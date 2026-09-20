@@ -121,6 +121,13 @@ extern char       *pg_vault_tde_wallet_path;
 extern const char *wallet_path_show_hook(void);
 
 /*
+ * True when the effective local wallet is not this database's default
+ * file, i.e. when it may be shared with other databases.  See the KEK
+ * rotation warning in pg_vault_tde_catalog_rewrap_all().
+ */
+extern bool pg_vault_tde_local_wallet_is_overridden(void);
+
+/*
  * Environment variable name that holds the wallet passphrase
  * (PGC_POSTMASTER).  NEVER the passphrase itself — only the NAME of the
  * environment variable.  Example: "PG_TDE_WALLET_PASS".

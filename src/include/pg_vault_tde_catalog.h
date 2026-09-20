@@ -8,7 +8,7 @@
  * ----------------
  * Each encrypted_heap relation has its own DEK (v1.5+), fetched from the
  * active KMS provider and cached in a shared-memory hash table (the
- * TdeRelDekMap HTAB, keyed by relid).
+ * TdeRelDekMap HTAB, keyed by (dbid, relid)).
  *
  * On-disk persistence: pg_vault_tde_catalog(relid, generation,
  * wrapped_dek, created_at).  The in-memory cache is authoritative at runtime;
@@ -41,12 +41,48 @@
 #define TDE_REL_DEK_CACHE_DEFAULT  1024
 #define TDE_WRAPPED_DEK_MAX_LEN    256
 
+/*
+ * Cache key: (dbid, relid).
+ *
+ * relid is unique only WITHIN a database — never across databases, never
+ * cluster-wide — while this HTAB lives in shared memory and is read by the
+ * backends of every database.  A relid-only key returns one database's DEK to
+ * another; because the GCM AAD binds MyDatabaseId, the victim sees an
+ * authentication failure on intact data rather than wrong plaintext.
+ *
+ * dbid is always MyDatabaseId and is filled in by tde_rel_dek_key() in
+ * pg_vault_tde_catalog.c, so it is not part of any public signature here.
+ *
+ * The on-disk side needs no dbid: pg_vault_tde_catalog is an ordinary table
+ * created by CREATE EXTENSION, so it already exists once per database.
+ */
+typedef struct TdeRelDekMapKey
+{
+    Oid dbid;
+    Oid relid;
+} TdeRelDekMapKey;
+
+/*
+ * INVARIANT: generation is the generation OF dek[], and is only meaningful
+ * while dek_valid is true.
+ *
+ * The authoritative generation is the pg_vault_tde_catalog row, which rolls
+ * back with its transaction; this copy lives in shared memory, which does not.
+ * The two are therefore only allowed to move together, in
+ * tde_rel_dek_cache_store(), where dek[] and generation are written from the
+ * same catalog read.  Nothing else may advance it — see the comment in
+ * pg_vault_tde_catalog_zero_rel_dek(), which deliberately does not.
+ *
+ * While dek_valid is false (the rotation window) readers must ignore this
+ * field and ask the catalog instead; that is what
+ * pg_vault_tde_catalog_get_rel_generation() does.
+ */
 typedef struct TdeRelDekMap
 {
-    Oid          relid;
+    TdeRelDekMapKey key;
     char         dek[TDE_DEK_LEN];     /* current AES-256 DEK, 32 bytes */
     char         prev_dek[TDE_DEK_LEN];/* previous DEK (valid during rotation) */
-    uint64       generation;            /* rotation epoch for this relation */
+    uint64       generation;            /* epoch of dek[]; see INVARIANT above */
     bool         dek_valid;             /* true iff dek[] holds a live key */
     bool         prev_dek_valid;        /* true iff prev_dek[] is populated */
 } TdeRelDekMap;
@@ -126,19 +162,39 @@ void pg_vault_tde_catalog_deregister_rel(Oid relid);
 void pg_vault_tde_catalog_evict_rel(Oid relid);
 
 /*
- * pg_vault_tde_catalog_evict_all:
- *   Evict ALL per-table DEK entries from shared memory, OPENSSL_cleanse'ing
- *   every dek[] and prev_dek[] buffer in the process.  The catalog rows are
- *   NOT touched — DEKs are reloaded from the catalog on next access.
+ * pg_vault_tde_catalog_evict_db:
+ *   Evict this database's per-table DEK entries from shared memory,
+ *   OPENSSL_cleanse'ing every dek[] and prev_dek[] buffer in the process.  The
+ *   catalog rows are NOT touched — DEKs are reloaded from the catalog on next
+ *   access.  Acquires LW_EXCLUSIVE on the cache lock for the duration, and is
+ *   effective across ALL backends of this database, because the cache lives in
+ *   shared memory rather than per-backend memory.
  *
- *   Called by pg_vault_tde_wallet_lock() to flush all plaintext key material
- *   from shared memory (effective across ALL backends because the cache lives
- *   in shared memory, not per-backend memory).
+ *   Scoped to MyDatabaseId because every caller is: the wallet is per-database
+ *   (/var/lib/pg_vault_tde/<db_oid>/wallet.p12) and pg_vault_tde_catalog is a
+ *   per-database table, so wallet_lock/_unlock/_change_passphrase,
+ *   migrate_vault_to_wallet, unseal_keys and rotate_kek can only ever
+ *   invalidate this database's keys.  Entries belonging to other databases are
+ *   not stale, and dropping them would just force unrelated backends into a
+ *   needless KMS round-trip — or into an outright failure, if their own wallet
+ *   happens to be locked.
  *
- *   Acquires LW_EXCLUSIVE on the cache lock for the duration.
+ *   There is deliberately no cluster-wide variant.  Nothing needs one today,
+ *   and an uncalled one would be untested code pretending to be a feature; if
+ *   a global flush is ever required, it is this function without the
+ *   MyDatabaseId test.
  */
-void pg_vault_tde_catalog_evict_all(void);
+void pg_vault_tde_catalog_evict_db(void);
 
+/*
+ * pg_vault_tde_catalog_zero_rel_dek:
+ *   Demote the relation's current DEK into prev_dek[] and invalidate dek[],
+ *   opening the rotation window.  Recovers the outgoing DEK through
+ *   pg_vault_tde_kms_get_rel_dek() first, so it works on a cold cache; call it
+ *   BEFORE pg_vault_tde_catalog_update_rel_dek() overwrites the catalog row,
+ *   which is the last place that DEK still exists.  ereports on failure — a
+ *   rotation that cannot preserve the outgoing DEK must not proceed.
+ */
 void pg_vault_tde_catalog_zero_rel_dek(Oid relid);
 
 /*

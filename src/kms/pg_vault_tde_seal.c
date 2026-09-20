@@ -32,7 +32,7 @@
 #include <openssl/evp.h>            /* PKCS5_PBKDF2_HMAC */
 #include <openssl/crypto.h>         /* OPENSSL_cleanse, CRYPTO_memcmp */
 
-#include "src/include/pg_vault_tde_catalog.h"  /* pg_vault_tde_catalog_evict_all  pg_vault_tde_catalog_read_all_wrapped*/
+#include "src/include/pg_vault_tde_catalog.h"  /* pg_vault_tde_catalog_evict_db, pg_vault_tde_catalog_read_all_wrapped */
 
 
 /* --- Bundle format constants (independent from the local-wallet bundle) --- */
@@ -406,7 +406,7 @@ pg_vault_tde_unseal_keys_sql(PG_FUNCTION_ARGS)
 
     pfree(buf);
 
-    pg_vault_tde_catalog_evict_all();
+    pg_vault_tde_catalog_evict_db();
 
     ereport(LOG,
             errmsg("pg_vault_tde: unsealed %d wrapped DEK(s) from \"%s\"", imported, src));

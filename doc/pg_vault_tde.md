@@ -117,10 +117,12 @@ pg_vault_tde_kms_get_rel_dek(relid)    [src/kms/pg_vault_tde_catalog.c]
         │   slow path: read pg_vault_tde_catalog.wrapped_dek → provider
         │              unwrap → hash_search(HASH_ENTER) under LW_EXCLUSIVE
         ▼
-TdeRelDekMap (shmem HTAB)              [one entry per relid; single shared
-        │                               LWLock; generation + prev_dek window]
+TdeRelDekMap (shmem HTAB)              [one entry per (dbid, relid); single
+        │                               shared LWLock; generation + prev_dek]
         │  DEK (32 bytes) copied into a stack buffer on every call; the crypto
-        │  layer caches the AES key schedule keyed by (relid, generation)
+        │  layer caches the AES key schedule keyed by (relid, generation) — no
+        │  dbid there, those statics are per-backend and a backend is bound to
+        │  one database
         ▼
 tde_gcm_encrypt() / tde_gcm_decrypt()  [src/crypto/pg_vault_tde_crypto.c]
         │
@@ -130,13 +132,26 @@ Disk: [HeapTupleHeader | IV(12) | Ciphertext | GCM-TAG(16) | VER(1) | GEN(8)]
 
 ### Shared Memory Layout
 
-Since v1.7 the cache is a shared-memory **hash table** (`HTAB`) keyed by
-`relid`, not a fixed array scanned linearly. Each entry is one `TdeRelDekMap`:
+Since v1.7 the cache is a shared-memory **hash table** (`HTAB`), not a fixed
+array scanned linearly. Each entry is one `TdeRelDekMap`, keyed by
+`(dbid, relid)`:
 
 ```c
+/*
+ * Cache key.  relid is unique only WITHIN a database — never across
+ * databases, never cluster-wide — while this HTAB is one segment read by the
+ * backends of every database.  CREATE DATABASE physically copies the
+ * template's directory, so a clone hands out pg_class OIDs identical to its
+ * template's: colliding relids are normal, not a corner case.
+ */
+typedef struct TdeRelDekMapKey {
+    Oid     dbid;                    /* always MyDatabaseId */
+    Oid     relid;                   /* effective relid (TOAST → parent, etc.) */
+} TdeRelDekMapKey;
+
 /* Per-relation DEK entry — value type of the TdeRelDekMap HTAB (v1.5+) */
 typedef struct TdeRelDekMap {
-    Oid     relid;                   /* hash key */
+    TdeRelDekMapKey key;             /* hash key */
     char    dek[TDE_DEK_LEN];        /* current AES-256 DEK, 32 bytes */
     char    prev_dek[TDE_DEK_LEN];   /* previous DEK (valid during rotation) */
     uint64  generation;              /* rotation epoch for this relation */
@@ -145,11 +160,33 @@ typedef struct TdeRelDekMap {
 } TdeRelDekMap;
 ```
 
+- `dbid` is **not** a parameter of any public function in
+  `pg_vault_tde_catalog.h`.  `tde_rel_dek_key()` fills it from `MyDatabaseId`
+  when it builds the key, because every path that reaches the cache runs
+  connected to the database owning the relation: a regular backend, the
+  rotation BGW after `BackgroundWorkerInitializeConnectionByOid()`, or a
+  walsender during logical decoding.  One derivation point instead of
+  fourteen call sites that could each pass the wrong value.
+- The **on-disk** catalog needs no dbid.  `pg_vault_tde_catalog` is an
+  ordinary table created by `CREATE EXTENSION` in the extension's schema, so
+  it exists once per database and its `relid` primary key is unambiguous
+  there; every access (`tde_catalog_read_row`, `rewrap_all`,
+  `read_all_wrapped`, `upsert_row`) goes through `table_open()` in the current
+  backend's database.  The local wallet is per-database for the same reason,
+  at `/var/lib/pg_vault_tde/<db_oid>/wallet.p12`.  Shared memory was the only
+  place where per-database namespaces met.
+- A relid-only key does **not** silently return wrong plaintext: the GCM AAD
+  binds `MyDatabaseId` (`tde_compute_aad()`), so the victim database gets
+  `AES-256-GCM authentication FAILED` on intact data.  A read outage, not a
+  corruption — covered by `tap/21_cache_key_cross_db.t`.
 - `TDE_DEK_LEN` is defined **only** in `src/include/pg_vault_tde_kms.h`.
 - The HTAB lives in `src/kms/pg_vault_tde_catalog.c`, created with
   `ShmemInitHash("TdeRelDekMap", capacity, capacity, &info, HASH_ELEM | HASH_BLOBS)`
   where `capacity = pg_vault_tde.max_encrypted_relations`. The segment is sized
-  with `hash_estimate_size(capacity, sizeof(TdeRelDekMap))`.
+  with `hash_estimate_size(capacity, sizeof(TdeRelDekMap))`.  `HASH_BLOBS`
+  means the key is hashed as raw bytes, so `tde_rel_dek_key()` zeroes the
+  struct before filling it — padding must not leak into the hash.  Capacity is
+  cluster-wide: with encrypted tables in several databases, budget for the sum.
 - There is **no per-entry lock**. A single `LWLock` (file-scope `rel_dek_lock`)
   from a **named** tranche guards the whole table:
   `RequestNamedLWLockTranche("TdeRelDekMap", 1)` in the `shmem_request_hook`,
@@ -1182,7 +1219,7 @@ value; no shared state is changed.
 | `vault_key_name` | string | `pg-tde-dek` | suset | Transit key name for DEK wrapping. Override per-database to isolate tenant keys. |
 | `vault_ca_cert` | string | `''` | suset | Path to CA bundle for Vault TLS (`CURLOPT_CAINFO`) |
 | `vault_timeout_ms` | integer | `5000` | suset | Vault HTTP timeout in ms (0 = no timeout; range 0–300000) |
-| `wallet_path` | string | `/var/lib/pg_vault_tde/<OID>/wallet.p12` | suset | Local wallet PKCS#12 path (`kms_provider = 'local'`) |
+| `wallet_path` | string | `/var/lib/pg_vault_tde/<OID>/wallet.p12` | suset | Local wallet PKCS#12 path (`kms_provider = 'local'`). Cluster-wide value = one KEK for every database; rotating it is then destructive (see Shared Memory Layout) |
 | `wallet_passphrase_env` | string | `''` | suset | Env var NAME holding the wallet passphrase |
 | `wallet_passphrase_file` | string | `''` | suset | File path containing the wallet passphrase (mode 0400 enforced) |
 | `wallet_passphrase_command` | string | `''` | suset | Shell command whose stdout is the passphrase (highest priority) |
@@ -1195,7 +1232,7 @@ value; no shared state is changed.
 | `bgw_enabled` | boolean | `off` | suset | Enable background worker for automatic token renewal. **Requires cluster restart**: the BGW is registered via `RegisterBackgroundWorker()` at postmaster startup; changing via `pg_reload_conf()` updates the value but does not start/stop the worker dynamically. |
 | `token_renewal_interval` | integer | `3600` | suset | Token renewal interval in seconds (60–86400) |
 | `enabled` | boolean | `on` | postmaster | Master switch: `off` disables crypto for benchmarking overhead. Fixed at server startup |
-| `max_encrypted_relations` | integer | `1024` | postmaster | Max per-table DEK entries in shmem (64–65536). **Requires restart** — controls shared-memory allocation. |
+| `max_encrypted_relations` | integer | `1024` | postmaster | Max per-table DEK entries in shmem (64–65536), **cluster-wide** — entries are keyed by `(dbid, relid)`, so budget for the sum across all databases. **Requires restart** — controls shared-memory allocation. |
 | `crypto_provider` | string | `''` | postmaster | OpenSSL 3.x provider name (`qatprovider`, `fips`; empty = built-in dispatch). **Requires restart**. |
 
 All variables are declared `extern` in `src/include/pg_vault_tde_guc.h`
@@ -1354,6 +1391,10 @@ the Vault-dependent files need; they `skip_all` when `VAULT_ADDR` is unset).
 | `tap/18_guc_order_independence.t` | KMS GUCs are order- and scope-independent (see below) |
 | `tap/20_ondisk_fuzz.t` | Arbitrary on-disk bit flips must yield correct data or a refusal, never a forged value (checksums disabled so the GCM tag is the line under test) |
 | `tap/19_crash_recovery_rmgr.t` | Encrypted TOAST chunks survive WAL replay after an unclean shutdown — the only test that executes the custom resource manager's `rm_redo` (see below) |
+| `tap/21_cache_key_cross_db.t` | Two databases holding the same relid (a `CREATE DATABASE ... TEMPLATE` clone) with different DEKs must not share a shmem cache entry |
+| `tap/22_rotate_cold_cache.t` | `pg_vault_tde_rotate_online()` must preserve the outgoing DEK when the shmem entry is cold (after a restart, or a wallet lock/unlock) |
+| `tap/23_rotation_generation_drift.t` | An aborted rotation must not leave the shmem cache a generation ahead of the catalog (fault injection: the catalog row is removed mid-rotation) |
+| `tap/24_shared_wallet_warning.t` | KEK rotation warns when the wallet is not this database's own file, and stays quiet on the per-database default |
 
 #### `tap/19_crash_recovery_rmgr.t`
 

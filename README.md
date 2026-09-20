@@ -320,8 +320,9 @@ Crypto Layer — AES-256-GCM (OpenSSL 3.x EVP)           src/crypto/
    │
    ▼
 KMS Layer — per-relation DEK cache                     src/kms/
-   │  ┌─ TdeRelDekMap (shmem HTAB, one shared LWLock, per-relation generation)
-   │  └─ pg_vault_tde_catalog (on-disk wrapped DEKs, one row per relation)
+   │  ┌─ TdeRelDekMap (shmem HTAB keyed by (dbid, relid), one shared LWLock)
+   │  └─ pg_vault_tde_catalog (on-disk wrapped DEKs, one row per relation,
+   │     one table per database — see "DEK Cache (Shared Memory)")
    │
    ▼
 HashiCorp Vault / OpenBao (GUC-configurable endpoint)
@@ -478,19 +479,52 @@ and timeout are all configurable via GUC parameters registered at startup
 
 ### DEK Cache (Shared Memory)
 
-Since v1.7 the cache is a shared-memory hash table (`HTAB`) keyed by `relid`,
-not a fixed array. A single `LWLock` from the `"TdeRelDekMap"` named tranche
-guards the whole table (no per-entry lock).
+Since v1.7 the cache is a shared-memory hash table (`HTAB`), not a fixed array.
+A single `LWLock` from the `"TdeRelDekMap"` named tranche guards the whole table
+(no per-entry lock).
 
 ```
 TdeRelDekMap (shmem HTAB, ShmemInitHash, capacity = pg_vault_tde.max_encrypted_relations, default 1024)
- └─ TdeRelDekMap entry, keyed by relid:
-     ├─ relid          : Oid  (hash key)
+ └─ TdeRelDekMap entry, keyed by (dbid, relid):
+     ├─ key            : TdeRelDekMapKey  (hash key)
      ├─ dek[32]        : AES-256 key bytes (OPENSSL_cleanse'd on rotation)
      ├─ prev_dek[32]   : previous DEK (rotation window fallback)
      ├─ generation     : uint64 per-relation counter
      └─ dek_valid / prev_dek_valid : bool
 ```
+
+**The key is `(dbid, relid)`, not `relid` alone.**  A relid is unique only
+*within* a database — never across databases, and never cluster-wide — while
+this HTAB is one segment read by the backends of every database.  `CREATE
+DATABASE` is a physical copy of the template's directory, so a cloned database
+hands out pg_class OIDs identical to its template's; two unrelated databases
+sharing a relid is normal, not a corner case.
+
+```c
+typedef struct TdeRelDekMapKey
+{
+    Oid dbid;      /* always MyDatabaseId */
+    Oid relid;     /* effective relid: TOAST → parent, relrewrite → base */
+} TdeRelDekMapKey;
+```
+
+`dbid` is not part of any public signature: the catalog module fills it from
+`MyDatabaseId` when it builds the key.  Every path that reaches the cache runs
+connected to the database that owns both the relation and its
+`pg_vault_tde_catalog` row — a regular backend, the rotation BGW after
+`BackgroundWorkerInitializeConnectionByOid()`, a walsender during logical
+decoding — so deriving it in one place makes "caller passed the wrong dbid"
+unrepresentable.
+
+The on-disk side needs no such key.  `pg_vault_tde_catalog` is an ordinary
+table created by `CREATE EXTENSION` in the extension's schema, so it already
+exists once per database and its `relid` primary key is unambiguous there; the
+local wallet is likewise per-database, at
+`/var/lib/pg_vault_tde/<db_oid>/wallet.p12`.  Shared memory was the one place
+where per-database namespaces met, and the one place that needed the dbid.
+
+Note that `max_encrypted_relations` sizes a single cluster-wide segment: with
+encrypted tables in several databases, budget for their sum.
 
 DEK access via `pg_vault_tde_kms_get_rel_dek(relid)`:
 1. **Fast path**: `hash_search(HASH_FIND)` under `LW_SHARED` — O(1) average; cache hit returns immediately.
@@ -531,6 +565,31 @@ SELECT pg_vault_tde_rotate_kek();
 > attacker already holds the old passphrase, they already have the old KEK — changing
 > the passphrase without rotating the KEK provides no additional protection.
 
+> **KEK rotation is per-database, so never share one wallet between databases
+> you intend to rotate.**  Both `pg_vault_tde_rotate_kek()` and
+> `pg_vault_tde_wallet_change_passphrase()` rewrap only the
+> `pg_vault_tde_catalog` of the database they run in — that table is
+> per-database and no backend can reach another database's copy — and then
+> replace the wallet file.  With the default per-database `wallet_path`
+> (`/var/lib/pg_vault_tde/<DB_OID>/wallet.p12`) the two always match.  Set
+> `wallet_path` to one shared file in `postgresql.conf` and they no longer do:
+> the first database to rotate strands every other database's wrapped DEKs
+> under a KEK that no longer exists anywhere, and their data becomes
+> permanently unreadable.  Running the rotation in each database afterwards
+> does not repair it — the old KEK is gone after the first commit.
+>
+> Since `pg_vault_tde_wallet_init()` persists the resolved path per database
+> (`ALTER DATABASE ... SET FROM CURRENT`), and a database-level setting wins
+> over `postgresql.conf`, sharing a wallet is something you have to ask for
+> explicitly on each database rather than something you fall into. When the
+> effective wallet is not this database's own default file, both rotation
+> paths emit a `WARNING` naming the database they actually covered.
+
+> Note this is about the *KEK*, not about relids.  Per-table DEKs never
+> collide across databases: each is 32 independent random bytes in its own
+> database's catalog, and the GCM AAD binds `MyDatabaseId`, so one database's
+> key can never silently decrypt another's rows.
+
 ---
 
 ## GUC Parameters
@@ -554,14 +613,14 @@ startup.
 | Parameter | Type | Default | Context | Description |
 |---|---|---|---|---|
 | `kms_provider` | string | `''` (unset — must be configured) | suset | Active KMS backend: `vault`, `local` (v1.6), `pkcs11` (v1.7), `kmip` (v1.8). No default is shipped; encrypted tables cannot be used until this is set. Settable per-database via `ALTER DATABASE SET`. |
-| `wallet_path` | string | `/var/lib/pg_vault_tde/<DB_OID>/wallet.p12` | suset | Local wallet PKCS#12 file path (`kms_provider = 'local'`). Default computed at runtime — `SHOW` returns the effective path even when not set in `postgresql.conf`. Deliberately outside `PGDATA` so a plain `pg_basebackup` does not copy it. |
+| `wallet_path` | string | `/var/lib/pg_vault_tde/<DB_OID>/wallet.p12` | suset | Local wallet PKCS#12 file path (`kms_provider = 'local'`). Default computed at runtime — `SHOW` returns the effective path even when not set in `postgresql.conf`. Deliberately outside `PGDATA` so a plain `pg_basebackup` does not copy it. **Setting this in `postgresql.conf` makes every database share one KEK — see the warning under "Key Rotation" before doing so.** |
 | `wallet_passphrase_env` | string | `''` | suset | Env var name holding wallet passphrase — env var NAME only, never the value |
 | `wallet_passphrase_file` | string | `''` | suset | File path containing wallet passphrase (trimmed; `0400` permission enforced) **(v1.6)** |
 | `wallet_passphrase_command` | string | `''` | suset | Shell command to retrieve passphrase (analogous to PG's `ssl_passphrase_command`) **(v1.6)** |
 | `wallet_dev_mode_passphrase` | string | `''` | suset | Convenience passphrase for dev/CI (only honoured when `dev_mode = on`) **(v1.6)** |
 | `dev_mode` | boolean | `off` | suset | Enable development mode features (wallet_dev_mode_passphrase) **(v1.6)** |
 | `wallet_auto_open` | boolean | `on` | suset | Auto-open wallet on startup if passphrase env var is set |
-| `max_encrypted_relations` | integer | `1024` | postmaster | Maximum number of per-table DEK entries in shmem (64–65536). Requires restart — affects shared memory sizing. |
+| `max_encrypted_relations` | integer | `1024` | postmaster | Maximum number of per-table DEK entries in shmem (64–65536), **cluster-wide**: entries are keyed by `(dbid, relid)`, so budget for the sum across all databases. Requires restart — affects shared memory sizing. |
 | `toast_encryption` | boolean | `on` | suset | Encrypt TOAST chunks with the parent relation's DEK (v1.5) |
 
 ### Vault / OpenBao (`kms_provider = 'vault'`)

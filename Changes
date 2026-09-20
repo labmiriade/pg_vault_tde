@@ -22,6 +22,71 @@ doc/ROADMAP.md for the full feature-by-feature history, including v1.0-v1.3.
       - Fix uninitialised VacuumCutoffs driving freeze decisions during
         VACUUM FULL / CLUSTER; the redundant freeze call was removed.
       - Add missing volatile on locals read by PG_CATCH after longjmp.
+      - PSQLE-158: key the shared-memory DEK cache on (dbid, relid) instead of
+        relid alone.  A relid is unique only within a database, but
+        TdeRelDekMap is one segment read by the backends of every database, so
+        two databases holding the same relid — the normal case after CREATE
+        DATABASE ... TEMPLATE, which copies pg_class OIDs verbatim — shared a
+        single entry: the first one to populate it handed its DEK to the
+        other.  The GCM AAD binds MyDatabaseId, so this surfaced as
+        "AES-256-GCM authentication FAILED" on intact data rather than as
+        wrong plaintext, and a DROP TABLE in one database evicted the other's
+        live entry.  No SQL or on-disk change: pg_vault_tde_catalog is per
+        database already.  Note that max_encrypted_relations now budgets
+        entries across all databases.
+      - PSQLE-158: fix pg_vault_tde_rotate_online() against a relation whose
+        shmem DEK entry is cold — the normal state after a restart, or after
+        wallet_lock()/wallet_unlock(), which evict.  zero_rel_dek() populated
+        prev_dek[] straight from the cache entry and did nothing at all when
+        that entry was absent, so the rotation re-keyed the catalog and then
+        could not decrypt a single pre-rotation row ("decryption failed").
+        Phase 2 runs in one transaction, so the catalog re-key rolled back and
+        no data was lost, but the rotation could never succeed on a cold
+        relation.  It now recovers the outgoing DEK via
+        pg_vault_tde_kms_get_rel_dek() before demoting it, and errors out
+        rather than proceeding when that DEK cannot be recovered.
+      - PSQLE-158: scope the administrative DEK flush to the current database.
+        All six callers act on per-database state — the wallet lives at
+        /var/lib/pg_vault_tde/<db_oid>/wallet.p12 and pg_vault_tde_catalog is a
+        per-database table — so wallet_lock/_unlock/_change_passphrase,
+        migrate_vault_to_wallet, unseal_keys and rotate_kek can only ever
+        invalidate this database's keys.  pg_vault_tde_catalog_evict_all() is
+        replaced by pg_vault_tde_catalog_evict_db(); evicting every database's
+        keys forced unrelated backends into a needless KMS round-trip, or an
+        outright failure if their own wallet was locked.  No cluster-wide
+        variant is kept: nothing calls one, and an uncalled one would be
+        untested code pretending to be a feature.
+      - PSQLE-158: stop the shmem DEK cache drifting a generation ahead of the
+        catalog.  zero_rel_dek() bumped the generation in shared memory, which
+        no transaction rolls back, while update_rel_dek() bumped the catalog
+        copy inside the rotation's transaction, which does.  An aborted
+        rotation left the two disagreeing for the lifetime of the cluster;
+        reads still resolved via prev_dek, so it stayed quiet, but rows written
+        afterwards were tagged N+1 while encrypted under DEK N, and the next
+        rotation moved shared memory to N+2 and could match neither branch for
+        the oldest rows — they stopped decrypting and the relation could no
+        longer be rotated.  The cached generation is now read only next to a
+        live DEK (otherwise the catalog is consulted), is written only
+        alongside the DEK it describes, and zero_rel_dek() no longer bumps it,
+        so an aborted rotation simply re-reads the catalog.
+      - ci: stop packaging host-built objects.  run-install-test.sh tar'd the
+        working tree into the distro container without excluding *.o/*.bc/*.so,
+        so a build left behind by an earlier stage was picked up as up to date
+        and linked into the RPM — producing packages that required
+        GLIBC_2.38/CURL_OPENSSL_4 and would not install on EL9.
+      - Warn before a KEK rotation that can only cover one of the databases
+        sharing a local wallet.  pg_vault_tde_catalog_rewrap_all() walks a
+        per-database table, so it covers exactly the database it runs in, while
+        the local provider replaces the wallet file outright — so with a wallet
+        shared between databases the first one to run pg_vault_tde_rotate_kek()
+        or pg_vault_tde_wallet_change_passphrase() strands every other
+        database's DEKs under a KEK that no longer exists.  A WARNING rather
+        than an ERROR, because a single-database cluster may legitimately
+        point wallet_path elsewhere.  It fires on the effective path differing
+        from this database's default, not on wallet_path merely being set:
+        wallet_init() persists the resolved path per database, so the GUC is
+        always populated after an ordinary setup.  Vault and PKCS#11 are
+        unaffected — both keep previous KEK versions.
 
 1.7.1  (in-tree since 2026-09-05; C-only bugfixes, no SQL/catalog change —
         pg_vault_tde_build_version() distinguishes these builds from 1.7.0)
