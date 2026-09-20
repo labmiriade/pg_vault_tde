@@ -8,7 +8,7 @@
 
 Manages the Data Encryption Key (DEK) lifecycle:
 1. **Shared-memory cache** — per-relation DEK cache (`TdeRelDekMap`, an `HTAB`
-   keyed by relid), guarded by a single `LWLock`. Lives in
+   keyed by **`(dbid, relid)`**), guarded by a single `LWLock`. Lives in
    `src/kms/pg_vault_tde_catalog.c`.
 2. **Vault token cache** — fixed-size `pg_vault_tde_kms_cache` shmem struct in
    `pg_vault_tde_kms.c` holding the shared Vault auth token (dynamic tranche).
@@ -448,12 +448,17 @@ the very first `wrap_dek` call after `wallet_init`.  Always use `PKCS12_DEFAULT_
 ```c
 /*
  * Each encrypted relation has its own DEK entry, stored as the value type of
- * the TdeRelDekMap HTAB (ShmemInitHash, HASH_BLOBS) keyed by relid.
+ * the TdeRelDekMap HTAB (ShmemInitHash, HASH_BLOBS) keyed by (dbid, relid).
  * There is NO per-entry lock — a single file-scope `rel_dek_lock` (named
  * tranche "TdeRelDekMap") guards the whole table.
  */
+typedef struct TdeRelDekMapKey {
+    Oid          dbid;                   /* always MyDatabaseId */
+    Oid          relid;                  /* effective relid */
+} TdeRelDekMapKey;
+
 typedef struct TdeRelDekMap {
-    Oid          relid;                  /* hash key */
+    TdeRelDekMapKey key;                 /* hash key */
     char         dek[TDE_DEK_LEN];       /* current AES-256 DEK, 32 bytes */
     char         prev_dek[TDE_DEK_LEN];  /* previous DEK (valid during rotation) */
     uint64       generation;             /* rotation epoch for this relation */
@@ -465,6 +470,79 @@ typedef struct TdeRelDekMap {
 Defined in `src/include/pg_vault_tde_catalog.h`. The v1.4 global DEK
 (`TdeShmemData`, `relid = 0` sentinel) was removed in v1.7. All relations must
 have a `pg_vault_tde_catalog` entry.
+
+### The cache key MUST include the dbid
+
+**A relid is unique only within a database** — not across databases, not
+cluster-wide.  `CREATE DATABASE` physically copies the template's directory,
+so a clone hands out pg_class OIDs identical to its template's; colliding
+relids between unrelated databases are normal.  `TdeRelDekMap` is a single
+shmem segment read by the backends of every database, so a relid-only key
+lets one database's DEK be served to another, and a `DROP TABLE` in one
+database evict another's live entry.  Regression: `tap/21_cache_key_cross_db.t`.
+
+Never add a `dbid` parameter to the accessors in
+`src/include/pg_vault_tde_catalog.h`.  Build the key with the file-scope
+helper instead:
+
+```c
+static inline void tde_rel_dek_key(TdeRelDekMapKey *key, Oid relid);
+```
+
+It fills `dbid` from `MyDatabaseId`, which is correct on every path that can
+reach the cache — a regular backend, the rotation BGW after
+`BackgroundWorkerInitializeConnectionByOid()`, a walsender during logical
+decoding — and it `MemSet`s the struct first because `HASH_BLOBS` hashes
+padding bytes too.  One derivation point cannot be given the wrong value;
+fourteen call sites can.
+
+### The cached `generation` belongs to the cached DEK
+
+`TdeRelDekMap.generation` mirrors a value whose home is the
+`pg_vault_tde_catalog` row.  The row rolls back with its transaction; shared
+memory rolls back with nothing.  Two rules keep them from diverging:
+
+1. **Write it only alongside the DEK it describes.**  `tde_rel_dek_cache_store()`
+   sets `dek[]` and `generation` from the same catalog read — including the
+   refill branch that reopens a rotation window.  Nothing else advances it.
+   In particular `pg_vault_tde_catalog_zero_rel_dek()` deliberately does *not*
+   bump it: that bump is `pg_vault_tde_catalog_update_rel_dek()`'s job, and it
+   is transactional.
+2. **Read it only while `dek_valid` is true.**  An entry with `dek_valid = false`
+   is mid-rotation, the one window where shared memory and the catalog can
+   disagree; `pg_vault_tde_catalog_get_rel_generation()` reads through to the
+   catalog there.
+
+Breaking either rule reproduces the PSQLE-158 failure: an aborted rotation
+strands shared memory at N+1 while the catalog is back at N, rows written
+afterwards are tagged N+1 but encrypted under DEK N, and the next rotation
+moves to N+2 where the oldest rows match neither `generation` nor
+`generation - 1` — they stop decrypting.  Regression:
+`tap/23_rotation_generation_drift.t`.
+
+### Evicting many entries is per-database
+
+There is one entry point, `pg_vault_tde_catalog_evict_db()`, and it covers
+`MyDatabaseId` only.  Every caller — `wallet_lock`, `wallet_unlock`,
+`wallet_change_passphrase`, `migrate_vault_to_wallet`, `unseal_keys`,
+`rotate_kek` — acts on per-database state, so none of them can invalidate
+another database's keys.  Do not reintroduce a cluster-wide variant unless
+something actually calls it; it is this function minus the `MyDatabaseId` test.
+
+**The on-disk side needs no dbid.**  `pg_vault_tde_catalog` is an ordinary
+table created by `CREATE EXTENSION` in the extension's schema, so it exists
+once per database and its `relid` primary key is unambiguous there; every
+access goes through `table_open()` in the current backend's database.  The
+local wallet is per-database for the same reason
+(`/var/lib/pg_vault_tde/<db_oid>/wallet.p12`).  Shared memory is the one place
+where per-database namespaces meet.
+
+A consequence for any **startup preload BGW**: it cannot read every database's
+DEKs from one connection.  Both the catalog table and the wallet are
+per-database, so it must connect to each database in turn
+(`BackgroundWorkerInitializeConnectionByOid(dboid, ...)`) and call
+`pg_vault_tde_kms_get_rel_dek()` there — the cache store then picks up the
+right dbid on its own.
 
 ---
 
