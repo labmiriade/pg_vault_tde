@@ -62,12 +62,27 @@ typedef struct TdeRelDekMapKey
     Oid relid;
 } TdeRelDekMapKey;
 
+/*
+ * INVARIANT: generation is the generation OF dek[], and is only meaningful
+ * while dek_valid is true.
+ *
+ * The authoritative generation is the pg_vault_tde_catalog row, which rolls
+ * back with its transaction; this copy lives in shared memory, which does not.
+ * The two are therefore only allowed to move together, in
+ * tde_rel_dek_cache_store(), where dek[] and generation are written from the
+ * same catalog read.  Nothing else may advance it — see the comment in
+ * pg_vault_tde_catalog_zero_rel_dek(), which deliberately does not.
+ *
+ * While dek_valid is false (the rotation window) readers must ignore this
+ * field and ask the catalog instead; that is what
+ * pg_vault_tde_catalog_get_rel_generation() does.
+ */
 typedef struct TdeRelDekMap
 {
     TdeRelDekMapKey key;
     char         dek[TDE_DEK_LEN];     /* current AES-256 DEK, 32 bytes */
     char         prev_dek[TDE_DEK_LEN];/* previous DEK (valid during rotation) */
-    uint64       generation;            /* rotation epoch for this relation */
+    uint64       generation;            /* epoch of dek[]; see INVARIANT above */
     bool         dek_valid;             /* true iff dek[] holds a live key */
     bool         prev_dek_valid;        /* true iff prev_dek[] is populated */
 } TdeRelDekMap;

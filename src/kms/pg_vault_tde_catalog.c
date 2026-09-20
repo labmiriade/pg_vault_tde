@@ -419,12 +419,20 @@ tde_rel_dek_cache_store(Oid relid,
     }
     else if(found && !stored_slot->dek_valid && stored_slot->prev_dek_valid)
     {
+        /*
+         * Refilling the rotation window: prev_dek[] stays, dek[] comes back.
+         * generation moves with dek[] — see the invariant on the struct.
+         * Leaving it behind is what let a failed rotation strand the entry a
+         * generation ahead of the catalog.
+         */
         memcpy(stored_slot->dek, dek, TDE_DEK_LEN);
-        stored_slot->dek_valid = true; 
-        
+        stored_slot->dek_valid  = true;
+        stored_slot->generation = generation;
+
         LWLockRelease(rel_dek_lock);
         return true;
     }
+
 
     if(!found)
     {
@@ -968,8 +976,17 @@ pg_vault_tde_catalog_get_rel_generation(Oid relid)
 
     LWLockAcquire(rel_dek_lock, LW_SHARED);
 
+    /*
+     * Only trust the cached generation next to a live DEK.
+     *
+     * generation is written to shared memory, which no transaction rolls back,
+     * while the value it mirrors lives in a pg_vault_tde_catalog row, which
+     * every transaction does roll back.  An entry with dek_valid = false is
+     * mid-rotation, exactly the window in which the two can disagree, so read
+     * through to the catalog there: it is the side that is always right.
+     */
     e = (TdeRelDekMap*) hash_search(rel_dek_map, &search_key, HASH_FIND, NULL);
-    if(e) 
+    if(e && e->dek_valid)
         gen = e->generation;
 
     LWLockRelease(rel_dek_lock);
@@ -977,7 +994,7 @@ pg_vault_tde_catalog_get_rel_generation(Oid relid)
     if (gen > 0)
         return gen;
 
-    /* Cache miss (e.g. after restart): read generation from the catalog. */
+    /* No live cached DEK (fresh backend, restart, or rotation in progress). */
     {
         TdeCatalogRow row;
 
@@ -1041,8 +1058,23 @@ void pg_vault_tde_catalog_zero_rel_dek(Oid relid)
         OPENSSL_cleanse(e->dek, TDE_DEK_LEN);
         e->dek_valid      = false;
         e->prev_dek_valid = true;
-        e->generation++;
+        /*
+         * Deliberately NOT bumping e->generation here.  The generation belongs
+         * to the catalog row that pg_vault_tde_catalog_update_rel_dek() is
+         * about to write, and that write is transactional while this one is
+         * not: an aborted rotation rolled the catalog back to N while shared
+         * memory kept N+1 for the lifetime of the cluster.  Reads then
+         * resolved against a generation nothing on disk agreed with, and the
+         * next rotation could not decrypt the oldest rows at all.
+         *
+         * Nothing needs the bump: readers ignore a cached generation while
+         * dek_valid is false (pg_vault_tde_catalog_get_rel_generation) and go
+         * to the catalog, which has the new value as soon as update_rel_dek()
+         * commits it.  The refill in tde_rel_dek_cache_store() then brings
+         * dek[] and generation back in step together.
+         */
     }
+
     LWLockRelease(rel_dek_lock);
 
     OPENSSL_cleanse(outgoing_dek, TDE_DEK_LEN);
