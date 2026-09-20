@@ -1608,10 +1608,13 @@ _PG_init(void)
     DefineCustomIntVariable("pg_vault_tde.max_encrypted_relations",
         "Maximum number of independently-keyed encrypted_heap relations",
         "Controls the size of the per-table DEK cache in shared memory.  "
-        "Increase if you have more than 1024 encrypted tables.  "
+        "Increase if you have more than 1024 encrypted tables; note the cache "
+        "is one cluster-wide segment keyed by (dbid, relid), so this budgets "
+        "every database together.  Costs about 112 bytes per relation, "
+        "reserved at startup whether used or not.  "
         "Requires server restart to take effect.",
         &pg_vault_tde_max_encrypted_relations,
-        TDE_REL_DEK_CACHE_DEFAULT, 64, 65536,
+        TDE_REL_DEK_CACHE_DEFAULT, 64, 1048576,
         PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
     /* TOAST encryption switch (v1.5) */

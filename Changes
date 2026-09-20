@@ -9,6 +9,32 @@ doc/ROADMAP.md for the full feature-by-feature history, including v1.0-v1.3.
 
 1.7.2  (in-tree since 2026-09-19; C-only bugfixes, no SQL/catalog change —
         pg_vault_tde_build_version() distinguishes these builds from 1.7.1)
+      - UPGRADE NOTE — pg_vault_tde.max_encrypted_relations is now enforced.
+        It never was: the size passed to ShmemInitHash() sizes the initial
+        allocation and the bucket directory, and once the freelist empties
+        dynahash keeps allocating elements from the main shared memory
+        segment, so the cache grew to many times the configured number and
+        only failed when shared memory as a whole ran out.  Measured: 2000
+        relations cached against a setting of 64.
+        This matters because the cache holds plaintext DEKs — the number an
+        administrator sets is how much key material sits unencrypted in
+        shared memory, and it is a cluster-wide budget shared by every
+        database (entries are keyed by (dbid, relid)).
+        BEFORE UPGRADING, count your encrypted relations — tables plus
+        tde_btree indexes, summed across all databases — and raise
+        max_encrypted_relations past that number if it exceeds the setting;
+        it needs a restart.  A cluster left below its real count keeps
+        working, but relations past the budget are re-unwrapped from the KMS
+        on every access, which is a significant slowdown with a network KMS.
+        Each backend says so once, at WARNING.  The maximum accepted value is
+        raised from 65536 to 1048576 for clusters that genuinely need it; the
+        cache costs about 112 bytes per relation, reserved at startup.
+      - Relations past the budget lose their cache entry, never their data.
+        tde_rel_dek_cache_store() used to ereport(ERROR) when it could not
+        insert, even though pg_vault_tde_kms_get_rel_dek() had already
+        unwrapped the DEK and filled the caller's buffer before calling it —
+        so a serviceable request failed because its memoisation did.  It now
+        returns false and the operation proceeds.
       - Fix a segfault when a value crosses TOAST_TUPLE_THRESHOLD only after
         encryption: the pre-TOAST gate now tests the encrypted length and the
         TOAST writer reserves TDE_V4_OVERHEAD in its target, so core is never
