@@ -9,6 +9,22 @@ doc/ROADMAP.md for the full feature-by-feature history, including v1.0-v1.3.
 
 1.7.2  (in-tree since 2026-09-19; C-only bugfixes, no SQL/catalog change —
         pg_vault_tde_build_version() distinguishes these builds from 1.7.1)
+      - PSQLE-156: pg_vault_tde.preload_keys — warm a database's DEK cache at
+        startup instead of on first access, so the first query on an encrypted
+        table does not pay a KMS round-trip.  A launcher registered in
+        _PG_init reads the shared pg_database catalog and runs one short-lived
+        worker per database, sequentially: everything the warm-up needs is
+        per-database and unreachable from elsewhere (pg_vault_tde_catalog is a
+        per-database table, the wallet holding the KEK is a per-database file)
+        and a background worker may connect exactly once in its life.
+        Off by default, PGC_SUSET so it can be scoped with ALTER DATABASE SET;
+        the worker reads it after connecting, since a per-database value does
+        not resolve before that.  It never blocks startup — the postmaster
+        accepts connections while it runs, so a slow or unreachable KMS costs
+        a cold cache, not availability — and it stops at
+        max_encrypted_relations rather than spending KMS round-trips the cache
+        would refuse.  Requires a KMS that opens without an interactive
+        unlock: wallet_passphrase_command or wallet_passphrase_env.
       - UPGRADE NOTE — pg_vault_tde.max_encrypted_relations is now enforced.
         It never was: the size passed to ShmemInitHash() sizes the initial
         allocation and the bucket directory, and once the freelist empties

@@ -620,6 +620,7 @@ startup.
 | `wallet_dev_mode_passphrase` | string | `''` | suset | Convenience passphrase for dev/CI (only honoured when `dev_mode = on`) **(v1.6)** |
 | `dev_mode` | boolean | `off` | suset | Enable development mode features (wallet_dev_mode_passphrase) **(v1.6)** |
 | `wallet_auto_open` | boolean | `on` | suset | Auto-open wallet on startup if passphrase env var is set |
+| `preload_keys` | boolean | `off` | suset | Warm this database's DEK cache at startup: a background worker per database unwraps every DEK in `pg_vault_tde_catalog` once the server accepts connections, so the first query on a table does not pay a KMS round-trip. Needs a KMS usable without an interactive unlock (`wallet_passphrase_command` / `wallet_passphrase_env`). Stops at `max_encrypted_relations`. Scope it with `ALTER DATABASE SET`. |
 | `max_encrypted_relations` | integer | `1024` | postmaster | Maximum number of per-table DEK entries in shmem (64–65536), **cluster-wide**: entries are keyed by `(dbid, relid)`, so budget for the sum across all databases. Enforced since 1.7.2 — before that the cache silently grew past it (ShmemInitHash's size is not a cap), so count your encrypted relations across all databases before upgrading. ~112 bytes per relation, reserved at startup. Max 1048576. Requires restart. |
 | `toast_encryption` | boolean | `on` | suset | Encrypt TOAST chunks with the parent relation's DEK (v1.5) |
 

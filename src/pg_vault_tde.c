@@ -74,6 +74,7 @@ char *pg_vault_tde_vault_k8s_role       = NULL;
 char *pg_vault_tde_vault_k8s_mount      = NULL;
 char *pg_vault_tde_crypto_provider      = NULL;
 bool        pg_vault_tde_bgw_enabled              = false;
+bool        pg_vault_tde_preload_keys             = false;
 int         pg_vault_tde_token_renewal_interval   = 3600;
 char *pg_vault_tde_extension_name       = "pg_vault_tde";
 
@@ -1604,6 +1605,18 @@ _PG_init(void)
         &pg_vault_tde_wallet_auto_open, true, PGC_SUSET,
         GUC_SUPERUSER_ONLY, NULL, tde_kms_config_assign_bool, NULL);
 
+    /* Startup DEK cache warm-up (v1.7) */
+    DefineCustomBoolVariable("pg_vault_tde.preload_keys",
+        "Load this database's DEKs into the shared cache at startup",
+        "A background worker per database unwraps every DEK in "
+        "pg_vault_tde_catalog once the server is accepting connections, so "
+        "the first query on a table does not pay for a KMS round-trip.  "
+        "Requires a KMS usable without an interactive unlock.  Stops at "
+        "pg_vault_tde.max_encrypted_relations, which every database shares.  "
+        "Can be scoped with ALTER DATABASE SET.",
+        &pg_vault_tde_preload_keys, false, PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+
     /* Max encrypted relations in shmem cache (v1.5) */
     DefineCustomIntVariable("pg_vault_tde.max_encrypted_relations",
         "Maximum number of independently-keyed encrypted_heap relations",
@@ -1852,6 +1865,14 @@ _PG_init(void)
      * Only starts if bgw_enabled=true; the BGW itself checks auth_method.
      */
     pg_vault_tde_register_bgw();
+
+    /*
+     * Startup DEK cache warm-up (v1.7).  Registered unconditionally:
+     * preload_keys can be turned on for a single database with ALTER
+     * DATABASE SET, which is invisible from here, and the launcher is
+     * a few milliseconds when no database wants it.
+     */
+    pg_vault_tde_register_preload_bgw();
 
     ereport(LOG,
             (errmsg("pg_vault_tde: hooks registered, awaiting shmem startup")));

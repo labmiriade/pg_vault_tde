@@ -128,6 +128,16 @@ extern const char *wallet_path_show_hook(void);
 extern bool pg_vault_tde_local_wallet_is_overridden(void);
 
 /*
+ * pg_vault_tde.preload_keys — warm this database's DEK cache at startup.
+ *
+ * PGC_SUSET so it can be scoped with ALTER DATABASE SET.  The launcher cannot
+ * read a per-database value before connecting, so it visits every database and
+ * the worker checks this once connected; what a false skips is the catalog
+ * scan and one KMS round-trip per relation, not the connection.
+ */
+extern bool pg_vault_tde_preload_keys;
+
+/*
  * Environment variable name that holds the wallet passphrase
  * (PGC_POSTMASTER).  NEVER the passphrase itself — only the NAME of the
  * environment variable.  Example: "PG_TDE_WALLET_PASS".
