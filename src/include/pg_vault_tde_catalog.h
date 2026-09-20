@@ -162,19 +162,39 @@ void pg_vault_tde_catalog_deregister_rel(Oid relid);
 void pg_vault_tde_catalog_evict_rel(Oid relid);
 
 /*
- * pg_vault_tde_catalog_evict_all:
- *   Evict ALL per-table DEK entries from shared memory, OPENSSL_cleanse'ing
- *   every dek[] and prev_dek[] buffer in the process.  The catalog rows are
- *   NOT touched — DEKs are reloaded from the catalog on next access.
+ * pg_vault_tde_catalog_evict_db:
+ *   Evict this database's per-table DEK entries from shared memory,
+ *   OPENSSL_cleanse'ing every dek[] and prev_dek[] buffer in the process.  The
+ *   catalog rows are NOT touched — DEKs are reloaded from the catalog on next
+ *   access.  Acquires LW_EXCLUSIVE on the cache lock for the duration, and is
+ *   effective across ALL backends of this database, because the cache lives in
+ *   shared memory rather than per-backend memory.
  *
- *   Called by pg_vault_tde_wallet_lock() to flush all plaintext key material
- *   from shared memory (effective across ALL backends because the cache lives
- *   in shared memory, not per-backend memory).
+ *   Scoped to MyDatabaseId because every caller is: the wallet is per-database
+ *   (/var/lib/pg_vault_tde/<db_oid>/wallet.p12) and pg_vault_tde_catalog is a
+ *   per-database table, so wallet_lock/_unlock/_change_passphrase,
+ *   migrate_vault_to_wallet, unseal_keys and rotate_kek can only ever
+ *   invalidate this database's keys.  Entries belonging to other databases are
+ *   not stale, and dropping them would just force unrelated backends into a
+ *   needless KMS round-trip — or into an outright failure, if their own wallet
+ *   happens to be locked.
  *
- *   Acquires LW_EXCLUSIVE on the cache lock for the duration.
+ *   There is deliberately no cluster-wide variant.  Nothing needs one today,
+ *   and an uncalled one would be untested code pretending to be a feature; if
+ *   a global flush is ever required, it is this function without the
+ *   MyDatabaseId test.
  */
-void pg_vault_tde_catalog_evict_all(void);
+void pg_vault_tde_catalog_evict_db(void);
 
+/*
+ * pg_vault_tde_catalog_zero_rel_dek:
+ *   Demote the relation's current DEK into prev_dek[] and invalidate dek[],
+ *   opening the rotation window.  Recovers the outgoing DEK through
+ *   pg_vault_tde_kms_get_rel_dek() first, so it works on a cold cache; call it
+ *   BEFORE pg_vault_tde_catalog_update_rel_dek() overwrites the catalog row,
+ *   which is the last place that DEK still exists.  ereports on failure — a
+ *   rotation that cannot preserve the outgoing DEK must not proceed.
+ */
 void pg_vault_tde_catalog_zero_rel_dek(Oid relid);
 
 /*

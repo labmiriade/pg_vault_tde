@@ -927,38 +927,52 @@ pg_vault_tde_catalog_evict_rel(Oid relid)
 }
 
 /* -------------------------------------------------------------------------
- * pg_vault_tde_catalog_evict_all — flush all cached DEKs from shared memory
+ * pg_vault_tde_catalog_evict_db — flush THIS database's cached DEKs
  *
- * OPENSSL_cleanse every dek[] and prev_dek[] buffer, then reset used = 0.
- * The pg_vault_tde_catalog rows are NOT removed; DEKs are reloaded from
- * the catalog on the next pg_vault_tde_kms_get_rel_dek() call.
+ * OPENSSL_cleanse every dek[]/prev_dek[] belonging to MyDatabaseId and drop
+ * the entries.  The pg_vault_tde_catalog rows are NOT removed; DEKs are
+ * reloaded from the catalog on the next pg_vault_tde_kms_get_rel_dek() call.
  *
- * Used by pg_vault_tde_wallet_lock() to ensure plaintext key material does
- * not persist in shared memory after the wallet is administratively locked.
+ * This is what the administrative commands actually mean, because everything
+ * they act on is per-database: pg_vault_tde_wallet_lock() locks this
+ * database's wallet (/var/lib/pg_vault_tde/<db_oid>/wallet.p12), and
+ * pg_vault_tde_rotate_kek() rewraps this database's pg_vault_tde_catalog.
+ * Entries belonging to other databases are neither stale nor unreachable, so
+ * flushing them only forces unrelated backends into a needless KMS round-trip
+ * — or into an outright failure, if their own wallet happens to be locked.
  * -------------------------------------------------------------------------*/
 void
-pg_vault_tde_catalog_evict_all(void)
+pg_vault_tde_catalog_evict_db(void)
 {
-    HASH_SEQ_STATUS seq;
-    TdeRelDekMap    *e; 
+    HASH_SEQ_STATUS  seq;
+    TdeRelDekMap    *e;
+    long             removed = 0;
 
     if(!rel_dek_map)
         return;
 
     LWLockAcquire(rel_dek_lock, LW_EXCLUSIVE);
-    
+
+    /* Removing the current entry mid-scan is supported by dynahash. */
     hash_seq_init(&seq, rel_dek_map);
     while((e = (TdeRelDekMap*) hash_seq_search(&seq)) != NULL)
     {
+        if (e->key.dbid != MyDatabaseId)
+            continue;
+
         OPENSSL_cleanse(e->dek, TDE_DEK_LEN);
         OPENSSL_cleanse(e->prev_dek, TDE_DEK_LEN);
         hash_search(rel_dek_map, &e->key, HASH_REMOVE, NULL);
+        removed++;
     }
 
     LWLockRelease(rel_dek_lock);
 
-    ereport(LOG, errmsg("pg_vault_tde: all DEKs evicted from shared memory cache"));
+    ereport(LOG,
+            errmsg("pg_vault_tde: %ld DEK(s) evicted from the shared memory "
+                   "cache for database %u", removed, MyDatabaseId));
 }
+
 
 uint64
 pg_vault_tde_catalog_get_rel_generation(Oid relid)
@@ -1432,6 +1446,6 @@ pg_vault_tde_rotate_kek_sql(PG_FUNCTION_ARGS)
     }
     PG_END_TRY();
 
-    pg_vault_tde_catalog_evict_all();
+    pg_vault_tde_catalog_evict_db();
     PG_RETURN_VOID();
 }

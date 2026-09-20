@@ -64,7 +64,7 @@
 #include "src/include/pg_vault_tde_kms.h"
 #include "src/include/pg_vault_tde_guc.h"
 #include "src/include/pg_vault_tde_audit.h"
-#include "src/include/pg_vault_tde_catalog.h" /* pg_vault_tde_catalog_evict_all */
+#include "src/include/pg_vault_tde_catalog.h" /* pg_vault_tde_catalog_evict_db */
 #include "src/include/pg_vault_tde_catalog_d.h"
 
 /* -------------------------------------------------------------------------
@@ -1771,7 +1771,7 @@ pg_vault_tde_wallet_change_passphrase_sql(PG_FUNCTION_ARGS)
     local_kek_rotation_ctx_free();
 
     /* Evict shmem — next access loads with new KEK */
-    pg_vault_tde_catalog_evict_all();
+    pg_vault_tde_catalog_evict_db();
 
     /* 
      * Write new wallet file with new passphrase (atomic rename).
@@ -1879,7 +1879,7 @@ pg_vault_tde_wallet_unlock_sql(PG_FUNCTION_ARGS)
      * the GUC passphrase source; if that is also absent they must call
      * wallet_unlock() themselves.
      */
-    pg_vault_tde_catalog_evict_all();
+    pg_vault_tde_catalog_evict_db();
 
     ereport(LOG, errmsg("pg_vault_tde: wallet unlocked by superuser"));
 
@@ -1905,7 +1905,7 @@ pg_vault_tde_wallet_lock_sql(PG_FUNCTION_ARGS)
                 errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
                 errmsg("pg_vault_tde_wallet_lock requires superuser"));
 
-    pg_vault_tde_catalog_evict_all();
+    pg_vault_tde_catalog_evict_db();
 
     if (local_wallet_state)
     {
@@ -1920,7 +1920,7 @@ pg_vault_tde_wallet_lock_sql(PG_FUNCTION_ARGS)
         local_wallet_state->wallet_open = false;
     }
 
-    ereport(LOG, errmsg("pg_vault_tde: wallet locked; KEK and all DEKs cleared from shmem"));
+    ereport(LOG, errmsg("pg_vault_tde: wallet locked; KEK and this database's DEKs cleared from shmem"));
 
     PG_RETURN_VOID();
 }
@@ -2152,7 +2152,7 @@ pg_vault_tde_migrate_vault_to_wallet_sql(PG_FUNCTION_ARGS)
     CatalogCloseIndexes(indstate);
     table_close(catalog_rel, ShareRowExclusiveLock);
 
-    pg_vault_tde_catalog_evict_all();
+    pg_vault_tde_catalog_evict_db();
 
     {
         LocalWalletState *st = local_state();
