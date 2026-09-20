@@ -19,3 +19,14 @@ regression.out
 tmp_valgrind/
 tmp_scanbuild/
 tmp_ubsan/
+
+# Build artifacts.  Not just repo hygiene: ci/scripts/run-install-test.sh tars
+# the working tree into the distro containers, and a stray host-built object
+# gets linked into the package (see the *.o/*.bc/*.so excludes there).
+# Commit aaa5f42 had to remove a .so and five .o files that reached the repo.
+*.o
+*.bc
+*.so
+/pg_dump_tde
+/pg_restore_tde
+/pg_basebackup_tde
