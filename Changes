@@ -25,6 +25,18 @@ doc/ROADMAP.md for the full feature-by-feature history, including v1.0-v1.3.
         max_encrypted_relations rather than spending KMS round-trips the cache
         would refuse.  Requires a KMS that opens without an interactive
         unlock: wallet_passphrase_command or wallet_passphrase_env.
+      - PSQLE-156: pg_vault_tde.preload_max_failures (default 5) — consecutive
+        unwrap failures the preload tolerates in one database before giving up
+        on it.  Consecutive rather than total, so a systemic fault stops the
+        pass immediately while a one-off does not and the next success clears
+        the count; 0 restores stop-at-the-first.  It matters for the local
+        wallet as much as for a remote KMS: the KEK is deliberately re-derived
+        from the wallet file on every unwrap instead of being cached, to keep
+        it out of process memory between operations, so a preload reopens the
+        wallet once per relation and a wallet on NFS or SMB fails the same
+        transient way a network KMS does.  Without a limit a closed wallet
+        also meant one provider WARNING per relation in the log while the
+        server was still starting.
       - UPGRADE NOTE — pg_vault_tde.max_encrypted_relations is now enforced.
         It never was: the size passed to ShmemInitHash() sizes the initial
         allocation and the bucket directory, and once the freelist empties

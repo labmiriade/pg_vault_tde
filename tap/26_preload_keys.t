@@ -16,7 +16,7 @@
 # worker's own log line, plus the negative case where it must be absent.
 use strict;
 use warnings;
-use Test::More tests => 7;
+use Test::More tests => 9;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 END { system('/bin/sh', '-c', 'rm -rf /var/lib/pg_vault_tde/*') }
@@ -92,5 +92,31 @@ is($node->safe_psql('cold_db', 'SELECT val FROM t2 WHERE id = 2'),
 # the other.
 is($node->safe_psql('cold_db', 'SELECT val FROM t1 WHERE id = 1'),
    'cold_db-one', 'warming one database did not leak its keys into the other');
+
+# ── The failure tolerance ─────────────────────────────────────────────────
+# Break the passphrase source so every unwrap returns false, and check the
+# worker gives up where pg_vault_tde.preload_max_failures says rather than
+# grinding through the whole catalog logging one provider warning per row.
+# A later line in postgresql.conf wins, so this overrides the working command.
+$node->safe_psql('postgres',
+    'ALTER DATABASE cold_db SET pg_vault_tde.preload_keys = on');
+$node->append_conf('postgresql.conf',
+    "pg_vault_tde.wallet_passphrase_command = '/bin/false'\n" .
+    "pg_vault_tde.preload_max_failures = 2\n");
+
+$logstart = -s $node->logfile;
+$node->restart;
+$node->wait_for_log(qr/DEK preload finished/, $logstart);
+$log = PostgreSQL::Test::Utils::slurp_file($node->logfile, $logstart);
+
+like($log, qr/gave up on database "\w+" after 3 consecutive unwrap failure\(s\)/,
+     'the worker gave up one failure past the configured tolerance of 2')
+    or diag "log tail:\n" . substr($log, -2000);
+
+# Giving up is not breaking: the keys are simply loaded on first access, which
+# still works because a session can unlock the wallet for itself.
+$node->safe_psql('cold_db', "SELECT pg_vault_tde_wallet_unlock('test-password')");
+is($node->safe_psql('cold_db', 'SELECT val FROM t3 WHERE id = 3'),
+   'cold_db-three', 'a database the preload gave up on still reads normally');
 
 $node->stop;

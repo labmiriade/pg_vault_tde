@@ -99,6 +99,7 @@ tde_preload_one_database(bool *stopped_early)
     SysScanDesc   scan;
     HeapTuple     tuple;
     int           loaded = 0;
+    int           streak = 0;   /* consecutive unwrap failures */
 
     *stopped_early = false;
 
@@ -172,24 +173,45 @@ tde_preload_one_database(bool *stopped_early)
         if (!pg_vault_tde_kms_get_rel_dek(relid, dek, TDE_DEK_LEN))
         {
             /*
-             * The first failure ends the pass.  These are not independent
-             * events: a locked wallet or an unreachable KMS fails every
-             * relation, and grinding through thousands of them would fill the
-             * log with one WARNING each while the server is still starting.
+             * Give up once the failures stop looking transient.
+             *
+             * They are counted consecutively because that is the question
+             * actually being asked: a missing passphrase fails every relation
+             * and trips the limit straight away, while a one-off failure
+             * should not cost the whole warm-up — the next success clears the
+             * streak.  Grinding on regardless would fill the log with one
+             * provider WARNING per relation while the server is still
+             * starting.
+             *
+             * Worth noting this is not only about remote KMS providers.  The
+             * local provider re-derives the KEK from the wallet file on every
+             * unwrap rather than caching it, deliberately, to keep the KEK out
+             * of process memory between operations — so a preload reopens the
+             * wallet once per relation, and a wallet on NFS or SMB fails the
+             * same transient way a network KMS does.
              */
-            *stopped_early = true;
-            ereport(WARNING,
-                    errmsg("pg_vault_tde: preload stopped after %d key(s) in "
-                           "database \"%s\": relation %u could not be unwrapped",
-                           loaded, get_database_name(MyDatabaseId), relid),
-                    errhint("The KMS must be usable without an interactive "
-                            "unlock — configure "
-                            "pg_vault_tde.wallet_passphrase_command or "
-                            "pg_vault_tde.wallet_passphrase_env. Keys are "
-                            "still loaded on first access."));
-            break;
+            if (++streak > pg_vault_tde_preload_max_failures)
+            {
+                *stopped_early = true;
+                ereport(WARNING,
+                        errmsg("pg_vault_tde: preload gave up on database "
+                               "\"%s\" after %d consecutive unwrap failure(s), "
+                               "having loaded %d key(s)",
+                               get_database_name(MyDatabaseId), streak, loaded),
+                        errhint("The KMS must be usable without an interactive "
+                                "unlock — configure "
+                                "pg_vault_tde.wallet_passphrase_command, "
+                                "pg_vault_tde.wallet_passphrase_env or the "
+                                "pkcs11 PIN variable. Raise "
+                                "pg_vault_tde.preload_max_failures to ride out "
+                                "a flaky remote KMS. Keys are still loaded on "
+                                "first access."));
+                break;
+            }
+            continue;
         }
 
+        streak = 0;         /* progress: the failures were not systemic */
         OPENSSL_cleanse(dek, TDE_DEK_LEN);
         loaded++;
     }

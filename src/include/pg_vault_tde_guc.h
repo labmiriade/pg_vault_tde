@@ -138,6 +138,23 @@ extern bool pg_vault_tde_local_wallet_is_overridden(void);
 extern bool pg_vault_tde_preload_keys;
 
 /*
+ * pg_vault_tde.preload_max_failures — CONSECUTIVE unwrap failures the startup
+ * warm-up tolerates in one database before giving up on it.
+ *
+ * Consecutive, not total, because the question being asked is "is this
+ * systemic?".  A missing passphrase fails every relation and trips the limit
+ * immediately; a one-off timeout does not, and the next success clears the
+ * streak.  0 restores stop-at-the-first.
+ *
+ * Not a remote-KMS concern only.  The local provider re-derives the KEK from
+ * the wallet file on every unwrap instead of caching it — a deliberate
+ * trade-off that keeps the KEK out of process memory between operations, see
+ * local_init() — so a preload reopens the wallet once per relation, and a
+ * wallet on NFS or SMB has exactly the transient failures this rides out.
+ */
+extern int  pg_vault_tde_preload_max_failures;
+
+/*
  * Environment variable name that holds the wallet passphrase
  * (PGC_POSTMASTER).  NEVER the passphrase itself — only the NAME of the
  * environment variable.  Example: "PG_TDE_WALLET_PASS".

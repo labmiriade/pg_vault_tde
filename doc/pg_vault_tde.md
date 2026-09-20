@@ -1396,7 +1396,8 @@ the Vault-dependent files need; they `skip_all` when `VAULT_ADDR` is unset).
 | `tap/23_rotation_generation_drift.t` | An aborted rotation must not leave the shmem cache a generation ahead of the catalog (fault injection: the catalog row is removed mid-rotation) |
 | `tap/24_shared_wallet_warning.t` | KEK rotation warns when the wallet is not this database's own file, and stays quiet on the per-database default |
 | `tap/25_cache_full_degrades.t` | `max_encrypted_relations` is honoured, and relations past it keep reading and writing |
-| `tap/26_preload_keys.t` | The startup warm-up loads a database's DEKs when it asks, skips the databases that did not, and keeps their keys apart |
+| `tap/26_preload_keys.t` | The startup warm-up loads a database's DEKs when it asks, skips the databases that did not, keeps their keys apart, and honours `preload_max_failures` |
+| `tap/27_preload_providers.t` | The warm-up works with the KEK outside the server: Vault/OpenBao and PKCS#11 (each half skips when its backend is absent) |
 
 #### `tap/19_crash_recovery_rmgr.t`
 
