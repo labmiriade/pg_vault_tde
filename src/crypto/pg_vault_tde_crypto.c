@@ -54,6 +54,11 @@
  *
  * Thread safety: each PostgreSQL backend is single-threaded, so no locking
  * is required for these file-scope statics.
+ *
+ * No dbid in this key, unlike the shmem TdeRelDekMap: these are process-local
+ * statics and a backend is bound to one database for its whole life, so relid
+ * cannot be ambiguous here.  The shmem cache is shared across databases and
+ * therefore does need (dbid, relid) — see tde_rel_dek_key().
  * ============================================================ */
 /* One reusable EVP context per direction; re-keyed only when (relid, gen) changes. */
 typedef struct TdeCipherSlot

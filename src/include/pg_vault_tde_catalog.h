@@ -8,7 +8,7 @@
  * ----------------
  * Each encrypted_heap relation has its own DEK (v1.5+), fetched from the
  * active KMS provider and cached in a shared-memory hash table (the
- * TdeRelDekMap HTAB, keyed by relid).
+ * TdeRelDekMap HTAB, keyed by (dbid, relid)).
  *
  * On-disk persistence: pg_vault_tde_catalog(relid, generation,
  * wrapped_dek, created_at).  The in-memory cache is authoritative at runtime;
@@ -41,9 +41,30 @@
 #define TDE_REL_DEK_CACHE_DEFAULT  1024
 #define TDE_WRAPPED_DEK_MAX_LEN    256
 
+/*
+ * Cache key: (dbid, relid).
+ *
+ * relid is unique only WITHIN a database — never across databases, never
+ * cluster-wide — while this HTAB lives in shared memory and is read by the
+ * backends of every database.  A relid-only key returns one database's DEK to
+ * another; because the GCM AAD binds MyDatabaseId, the victim sees an
+ * authentication failure on intact data rather than wrong plaintext.
+ *
+ * dbid is always MyDatabaseId and is filled in by tde_rel_dek_key() in
+ * pg_vault_tde_catalog.c, so it is not part of any public signature here.
+ *
+ * The on-disk side needs no dbid: pg_vault_tde_catalog is an ordinary table
+ * created by CREATE EXTENSION, so it already exists once per database.
+ */
+typedef struct TdeRelDekMapKey
+{
+    Oid dbid;
+    Oid relid;
+} TdeRelDekMapKey;
+
 typedef struct TdeRelDekMap
 {
-    Oid          relid;
+    TdeRelDekMapKey key;
     char         dek[TDE_DEK_LEN];     /* current AES-256 DEK, 32 bytes */
     char         prev_dek[TDE_DEK_LEN];/* previous DEK (valid during rotation) */
     uint64       generation;            /* rotation epoch for this relation */
