@@ -74,6 +74,19 @@ doc/ROADMAP.md for the full feature-by-feature history, including v1.0-v1.3.
         so a build left behind by an earlier stage was picked up as up to date
         and linked into the RPM — producing packages that required
         GLIBC_2.38/CURL_OPENSSL_4 and would not install on EL9.
+      - Warn before a KEK rotation that can only cover one of the databases
+        sharing a local wallet.  pg_vault_tde_catalog_rewrap_all() walks a
+        per-database table, so it covers exactly the database it runs in, while
+        the local provider replaces the wallet file outright — so with a wallet
+        shared between databases the first one to run pg_vault_tde_rotate_kek()
+        or pg_vault_tde_wallet_change_passphrase() strands every other
+        database's DEKs under a KEK that no longer exists.  A WARNING rather
+        than an ERROR, because a single-database cluster may legitimately
+        point wallet_path elsewhere.  It fires on the effective path differing
+        from this database's default, not on wallet_path merely being set:
+        wallet_init() persists the resolved path per database, so the GUC is
+        always populated after an ordinary setup.  Vault and PKCS#11 are
+        unaffected — both keep previous KEK versions.
 
 1.7.1  (in-tree since 2026-09-05; C-only bugfixes, no SQL/catalog change —
         pg_vault_tde_build_version() distinguishes these builds from 1.7.0)

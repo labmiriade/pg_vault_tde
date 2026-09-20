@@ -128,6 +128,13 @@ no longer exists. Their data becomes permanently unreadable, and rotating
 them afterwards cannot recover it. Share a wallet only across databases whose
 KEK you will never rotate.
 
+Since `pg_vault_tde_wallet_init()` persists the resolved path per database
+(`ALTER DATABASE ... SET FROM CURRENT`), and a database-level setting wins
+over `postgresql.conf`, sharing a wallet is something you have to ask for
+explicitly on each database rather than something you fall into. When the
+effective wallet is not this database's own default file, both rotation
+paths emit a `WARNING` naming the database they actually covered.
+
 This concerns the KEK only. Per-table **DEKs** never collide across
 databases, even with a shared wallet: each DEK is 32 independent random bytes
 stored in its own database's catalog row, and the GCM AAD binds

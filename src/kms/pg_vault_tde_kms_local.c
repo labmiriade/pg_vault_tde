@@ -190,6 +190,8 @@ static bool local_unwrap_dek_with_kek(const unsigned char *wrapped,
                                       const unsigned char *kek);
 static bool local_derive_kek_from_pass(const char *passphrase,
                                        unsigned char *kek_out);
+#define TDE_DEFAULT_WALLET_FMT "/var/lib/pg_vault_tde/%u/wallet.p12"
+
 static const char *local_get_wallet_path(void);
 static void local_set_wallet(const char *path);
 static bool local_get_passphrase(char *pass_out, Size pass_max);
@@ -917,9 +919,34 @@ local_get_wallet_path(void)
         return "";
 
     snprintf(path_buf, sizeof(path_buf),
-             "/var/lib/pg_vault_tde/%u/wallet.p12", MyDatabaseId);
+             TDE_DEFAULT_WALLET_FMT, MyDatabaseId);
 
     return path_buf;
+}
+
+/*
+ * pg_vault_tde_local_wallet_is_overridden — is the wallet not this database's
+ * own default file?
+ *
+ * Note this cannot be answered by testing whether pg_vault_tde.wallet_path is
+ * set: pg_vault_tde_wallet_init() persists the resolved path with ALTER
+ * DATABASE ... SET FROM CURRENT (local_set_wallet), so after an ordinary setup
+ * the GUC is always populated — with the per-database default.  Comparing
+ * against that default is what actually distinguishes "somewhere else, and
+ * possibly shared" from "this database's own file".
+ */
+bool
+pg_vault_tde_local_wallet_is_overridden(void)
+{
+    char dflt[MAXPGPATH];
+
+    /* No database attached: nothing to compare against. */
+    if (!OidIsValid(MyDatabaseId))
+        return false;
+
+    snprintf(dflt, sizeof(dflt), TDE_DEFAULT_WALLET_FMT, MyDatabaseId);
+
+    return strcmp(local_get_wallet_path(), dflt) != 0;
 }
 
 /*

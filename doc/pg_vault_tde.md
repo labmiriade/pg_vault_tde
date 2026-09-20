@@ -1394,6 +1394,7 @@ the Vault-dependent files need; they `skip_all` when `VAULT_ADDR` is unset).
 | `tap/21_cache_key_cross_db.t` | Two databases holding the same relid (a `CREATE DATABASE ... TEMPLATE` clone) with different DEKs must not share a shmem cache entry |
 | `tap/22_rotate_cold_cache.t` | `pg_vault_tde_rotate_online()` must preserve the outgoing DEK when the shmem entry is cold (after a restart, or a wallet lock/unlock) |
 | `tap/23_rotation_generation_drift.t` | An aborted rotation must not leave the shmem cache a generation ahead of the catalog (fault injection: the catalog row is removed mid-rotation) |
+| `tap/24_shared_wallet_warning.t` | KEK rotation warns when the wallet is not this database's own file, and stays quiet on the per-database default |
 
 #### `tap/19_crash_recovery_rmgr.t`
 

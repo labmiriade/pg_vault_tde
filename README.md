@@ -578,6 +578,13 @@ SELECT pg_vault_tde_rotate_kek();
 > permanently unreadable.  Running the rotation in each database afterwards
 > does not repair it — the old KEK is gone after the first commit.
 >
+> Since `pg_vault_tde_wallet_init()` persists the resolved path per database
+> (`ALTER DATABASE ... SET FROM CURRENT`), and a database-level setting wins
+> over `postgresql.conf`, sharing a wallet is something you have to ask for
+> explicitly on each database rather than something you fall into. When the
+> effective wallet is not this database's own default file, both rotation
+> paths emit a `WARNING` naming the database they actually covered.
+
 > Note this is about the *KEK*, not about relids.  Per-table DEKs never
 > collide across databases: each is 32 independent random bytes in its own
 > database's catalog, and the GCM AAD binds `MyDatabaseId`, so one database's
