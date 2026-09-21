@@ -53,10 +53,12 @@ OBJS = \
 	src/kms/pg_vault_tde_preload_bgw.o \
 	src/kms/pg_vault_tde_seal.o \
 	src/crypto/pg_vault_tde_crypto.o \
+	src/crypto/pg_vault_tde_crypto_ope.o \
 	src/crypto/pg_vault_tde_hw_accel.o \
 	src/tam/pg_vault_tde_tam.o \
 	src/tam/pg_vault_tde_toast.o \
 	src/iam/pg_vault_tde_iam.o \
+	src/iam/pg_vault_tde_iam_ope.o \
 	src/logical/pg_vault_tde_pgoutput.o \
 	src/logical/pg_vault_tde_rmgr.o
 
