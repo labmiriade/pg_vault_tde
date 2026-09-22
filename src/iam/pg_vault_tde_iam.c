@@ -368,6 +368,86 @@ tde_iam_serialize_fixed_type(Datum datum, Oid typoid, uint8 *buf)
 }
 
 /*
+ * tde_iam_type_is_serializable — does tde_iam_serialize_fixed_type() above
+ * handle this type, or does it fall through to `return 0`?
+ *
+ * This must list exactly the typoids that switch accepts.  The scan-key
+ * lifetime logic below decides whether a datum left behind in scan->keyData
+ * was allocated here, and freeing one that was not is a wild pfree: when the
+ * serializer declines, tde_iam_encrypt_fixed_type_datum() hands the caller's
+ * own datum straight back, and for a by-value type that "pointer" is the
+ * value itself.
+ */
+static bool
+tde_iam_type_is_serializable(Oid typoid)
+{
+    switch (typoid)
+    {
+        case INT4OID:
+        case DATEOID:
+        case INT8OID:
+        case TIMESTAMPTZOID:
+        case UUIDOID:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/*
+ * tde_iam_owns_scan_key — would the encrypt path have allocated for this
+ * column, rather than returning its input unchanged?
+ */
+static bool
+tde_iam_owns_scan_key(Relation index, int col)
+{
+    Form_pg_attribute att;
+
+    if (col < 0 || col >= index->rd_att->natts)
+        return false;
+
+    if (TDE_IS_ENC_OPS_COL(index, col))
+        return tde_iam_type_is_serializable(index->rd_opcintype[col]);
+
+    att = TupleDescAttr(index->rd_att, col);
+    return att->attlen == -1 || att->attlen == -2;
+}
+
+/*
+ * tde_iam_release_scan_key — free the encrypted key slot i was given earlier.
+ *
+ * The keys cannot be released where they are built: btrescan() memmoves the
+ * ScanKeyData into scan->keyData and reads the datum for the whole scan, so
+ * the earliest safe moment is the next rescan — or amendscan for the last set.
+ * Without this a nested loop pays one encrypted key per outer row and keeps
+ * every one of them.
+ *
+ * Ownership is not guessed from the pointer: it is recomputed from the index
+ * and the key, which cannot change between rescans of one scan.  The NULL test
+ * is what makes the first rescan safe, and it only works because
+ * pg_vault_tde_ambeginscan() zeroes keyData — RelationGetIndexScan() allocates
+ * it with palloc(), not palloc0(), so it arrives full of garbage that would
+ * otherwise be pfree'd as if it were ours.
+ */
+static void
+tde_iam_release_scan_key(IndexScanDesc scan, int i)
+{
+    if (scan->keyData == NULL || i < 0 || i >= scan->numberOfKeys)
+        return;
+    if (DatumGetPointer(scan->keyData[i].sk_argument) == NULL)
+        return;
+    if ((scan->keyData[i].sk_flags & SK_ISNULL) != 0)
+        return;
+    if (scan->keyData[i].sk_strategy != BTEqualStrategyNumber)
+        return;
+    if (!tde_iam_owns_scan_key(scan->indexRelation, scan->keyData[i].sk_attno - 1))
+        return;
+
+    pfree(DatumGetPointer(scan->keyData[i].sk_argument));
+    scan->keyData[i].sk_argument = (Datum) 0;
+}
+
+/*
  * tde_iam_encrypt_fixed_type_datum
  *
  * Encrypts a fixed-size typed Datum using AES-256-SIV.
@@ -793,7 +873,21 @@ pg_vault_tde_ambeginscan(Relation index, int nkeys, int norderbys)
      * amrescan, called immediately after by the executor.
      */
     Assert(saved_btree_methods_valid);
-    return saved_btree_methods.ambeginscan(index, nkeys, norderbys);
+    {
+        IndexScanDesc scan = saved_btree_methods.ambeginscan(index, nkeys, norderbys);
+
+        /*
+         * RelationGetIndexScan() allocates keyData with palloc(), not
+         * palloc0(), and nothing reads it until btrescan() overwrites it
+         * wholesale.  Zeroing it here buys the one piece of per-scan state the
+         * key lifetime logic needs: on the first rescan an empty slot is
+         * reliably NULL instead of garbage that looks like a pointer.
+         */
+        if (scan->keyData != NULL && scan->numberOfKeys > 0)
+            memset(scan->keyData, 0, scan->numberOfKeys * sizeof(ScanKeyData));
+
+        return scan;
+    }
 }
 
 /* ── AMRESCAN ───────────────────────────────────────────────────────────── */
@@ -817,6 +911,13 @@ pg_vault_tde_amrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
      * encrypted values do not preserve ordering — this is the documented
      * v1.4 limitation of tde_btree.
      */
+    /*
+     * Release what the previous rescan built, before btrescan() overwrites the
+     * pointers with this round's keys and they become unreachable.
+     */
+    for (i = 0; i < scan->numberOfKeys; i++)
+        tde_iam_release_scan_key(scan, i);
+
     if (keys != NULL)
     {
         for (i = 0; i < nkeys; i++)
@@ -848,6 +949,22 @@ pg_vault_tde_amrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
     }
 
     saved_btree_methods.amrescan(scan, keys, nkeys, orderbys, norderbys);
+}
+
+/* ── AMENDSCAN ──────────────────────────────────────────────────────────── */
+
+static void
+pg_vault_tde_amendscan(IndexScanDesc scan)
+{
+    int i;
+
+    Assert(saved_btree_methods_valid);
+
+    /* The set the last rescan built has no next rescan to release it. */
+    for (i = 0; i < scan->numberOfKeys; i++)
+        tde_iam_release_scan_key(scan, i);
+
+    saved_btree_methods.amendscan(scan);
 }
 
 /* ── AMVALIDATE ─────────────────────────────────────────────────────────── */
@@ -953,6 +1070,7 @@ tde_iam_init(void)
     tde_btree_methods.ambuild     = pg_vault_tde_ambuild;
     tde_btree_methods.aminsert    = pg_vault_tde_aminsert;
     tde_btree_methods.ambeginscan = pg_vault_tde_ambeginscan;
+    tde_btree_methods.amendscan   = pg_vault_tde_amendscan;
     tde_btree_methods.amrescan    = pg_vault_tde_amrescan;
     tde_btree_methods.amvalidate  = pg_vault_tde_amvalidate;
 

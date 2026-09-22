@@ -270,16 +270,6 @@ my @workloads = (
         run   => sub { my $t = shift; "SELECT sum(length(pad)) FROM $t;" } },
 
     {   name  => 'Nested loop, one index rescan per outer row',
-        # KNOWN LEAK, not yet fixed.  amrescan encrypts the scan keys on every
-        # rescan and nothing releases the previous set: a nested loop pays one
-        # encrypted key per outer row and keeps them all.  The keys cannot be
-        # freed where they are built -- btrescan memmoves the ScanKeyData into
-        # scan->keyData and reads the datum for the whole scan -- so the fix
-        # needs real per-scan ownership tracking.  Inferring ownership from
-        # scan->keyData is NOT enough: under a parallel plan the worker's key
-        # data is not the memory this backend allocated, and freeing it
-        # segfaults the worker (tried, reverted).
-        todo  => 'per-rescan scan-key leak: needs per-scan ownership tracking',
         setup => sub { my ($t, $m) = @_; (
             "DROP TABLE IF EXISTS $t", "DROP TABLE IF EXISTS ${t}_outer",
             "CREATE TABLE $t (k int4, pad text)" . amend($m),
