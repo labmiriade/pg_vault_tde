@@ -127,7 +127,7 @@ TdeRelDekMap (shmem HTAB)              [one entry per (dbid, relid); single
 tde_gcm_encrypt() / tde_gcm_decrypt()  [src/crypto/pg_vault_tde_crypto.c]
         │
         ▼
-Disk: [HeapTupleHeader | IV(12) | Ciphertext | GCM-TAG(16) | VER(1) | GEN(8)]
+Disk: [HeapTupleHeader | attributes, value bytes encrypted | IV(12) | GCM-TAG(16) | VER(1) | GEN(8)]
 ```
 
 ### Shared Memory Layout
@@ -417,23 +417,54 @@ or modifying this callback.
 
 ### Wire Format per Encrypted Region
 
-**Version 4** is the **only** on-disk tuple format. It is an **IV-first trailer**
-layout: the version byte and generation counter sit at the **end** of the blob, so
-the data differs from byte 0 on every encryption (this is what disables HOT — see
-[Known Limitations](#known-limitations)). The legacy v1/v2/v3 formats were **removed**.
-(The byte `0x02` still appears only in the `pg_dump_tde` *backup block* format — a
-separate code path, see [Backup](../README.md#encrypted-backups).)
+**Version 5** is the format written today; **version 4** is still read, so a table
+written before the upgrade keeps working. The legacy v1/v2/v3 formats were
+**removed**. (The byte `0x02` still appears only in the `pg_dump_tde` *backup
+block* format — a separate code path, see [Backup](../README.md#encrypted-backups).)
+
+v5 is **structure preserving**: every attribute stays at its own offset with its
+own length, and only the bytes of the VALUES are replaced by ciphertext.
 
 ```
-+----------+----------------------------+----------+-------+----------+
-| IV       | CIPHERTEXT                 | GCM TAG  | VER   | GEN      |
-| 12 bytes | N bytes (= plaintext len)  | 16 bytes | 1 byte| 8 bytes  |
-+----------+----------------------------+----------+-------+----------+
-  random                                            0x04   uint64 LE
++--------------------------------+----------+----------+-------+----------+
+| ATTRIBUTES, values encrypted   | IV       | GCM TAG  | VER   | GEN      |
+| D bytes (= plaintext data len) | 12 bytes | 16 bytes | 1 byte| 8 bytes  |
++--------------------------------+----------+----------+-------+----------+
+                                   random               0x05   uint64 LE
 ```
 
 Total overhead: `TDE_V4_OVERHEAD = 37` bytes
-(`TDE_GCM_IV_LEN=12` + `TDE_GCM_TAG_LEN=16` + `1` version byte + `TDE_V4_GEN_LEN=8`).
+(`TDE_GCM_IV_LEN=12` + `TDE_GCM_TAG_LEN=16` + `1` version byte + `TDE_V4_GEN_LEN=8`),
+identical to v4 — a v5 tuple is exactly as long as the v4 tuple for the same row.
+
+v4 replaced the whole user-data region with one opaque blob
+(`[IV | CIPHERTEXT | TAG | VER | GEN]`) while the tuple header, copied verbatim,
+still advertised `natts` attributes laid out per the tuple descriptor. Core code
+that deforms an on-disk tuple then walked ciphertext as if it were a tuple —
+and `heap_update()` does exactly that, reading the indexed attributes straight
+off the page to decide HOT and which indexes to maintain. Past the first
+variable-length column the attribute offset is not cached, so the walk read a
+varlena length header out of ciphertext, got a length of up to 1 GB and left the
+page: **SIGSEGV** (PSQLE-165). Any index on such a column was enough, `tde_btree`
+included — the trigger is the index attribute bitmap, not the access method.
+
+What v5 gives up in exchange: the structural bytes stay in clear, because they
+are what makes the walk possible. Concretely the **exact byte length of every
+variable-length column** is visible in the heap file, along with whether the
+value is compressed or held out of line. Fixed-length columns leak nothing (their
+length is in the catalog), and the row length and null bitmap were already
+visible in v4. Attribute values themselves are never in clear — regression test
+143 reads the raw heap file and asserts it.
+
+The AEAD is unchanged: the value bytes are gathered into one buffer, handed to
+`tde_gcm_encrypt()` and scattered back, so ciphertext, tag and AAD are
+bit-identical to what v4 produced for the same input.
+
+**Upgrading an existing table.** v4 tuples are read transparently, but they keep
+their old layout: `UPDATE` on a v4 row with an index behind a variable-length
+column still crashes, because nothing can make that layout walkable after the
+fact. `VACUUM FULL` (or `CLUSTER`) rewrites every row through the TAM and
+migrates the table to v5.
 
 v4 binds each tuple to its location by passing
 `[MyDatabaseId(4) | relid(4) | generation(8)]` (little-endian, `TDE_V4_AAD_LEN = 16`
@@ -994,7 +1025,7 @@ where the `softhsm2` package is installed; it skips itself otherwise.
 | 9 | **`WITH HOLD` cursor plaintext temp file** — a held cursor's result set is materialized into a tuplestore at `COMMIT` and spills to a plain temp file on disk past `work_mem`, bypassing the TAM entirely; no extension hook exists anywhere in the `WITH HOLD` cursor lifecycle to intercept it. See README.md § Limitations item 6. | Permanently deferred |
 | 10 | **Plain `COPY <table> TO` / `pg_dump` produce a plaintext dump, with no warning** — encryption lives entirely in the TAM's read callbacks (`scan_getnextslot` and friends), which decrypt unconditionally and cannot distinguish a `COPY TO` from a `SELECT`; `pg_dump`'s default table-data path is exactly this form of `COPY`. No `ProcessUtility_hook` guard or GUC-gated `WARNING` exists yet (designed, never implemented). Use `pg_dump_tde`/`pg_restore_tde` instead. See README.md § Limitations item 10. | v1.8 |
 
-### HOT updates are disabled by design (v4 IV-first wire format)
+### HOT updates are disabled by design
 
 On an `encrypted_heap` table, `heap_update` never chooses a HOT (heap-only tuple)
 update: every UPDATE writes new index entries. This is **intentional** and is what
@@ -1002,23 +1033,28 @@ keeps `tde_btree` indexes coherent across UPDATEs of indexed columns — the ind
 follows the row to its new key, with no `REINDEX` needed.
 
 **Mechanism.** `heap_update` decides whether an update can be HOT by comparing the
-indexed columns byte-for-byte between the old and new tuple image. On an `encrypted_heap`
-table both images are the encrypted wire format. The v4 layout (see
-[Wire Format per Encrypted Region](#wire-format-per-encrypted-region)) is **IV-first**:
-it begins with the random GCM IV, which is freshly generated on every encryption. The
-encrypted image therefore differs from **byte 0** for any re-encryption — including when
-the plaintext is unchanged — so `heap_update` always sees the indexed column as modified
-and skips the HOT path. The constant `[VERSION | GENERATION]` bytes were moved to the
-**end** of the blob precisely so they fall outside the comparison window.
+indexed columns between the old and the new tuple image, on disk. On an
+`encrypted_heap` table both images are encrypted, and every version of a row is
+encrypted under a fresh random GCM IV, so no attribute is ever byte-stable across
+an update: `heap_update` always sees the indexed column as modified and skips the
+HOT path. The constant `[VERSION | GENERATION]` bytes sit at the **end** of the
+region, outside every attribute, so they cannot create a byte-stable window.
 
-> **Historical note (v3 bug, fixed in v4).** The previous v3 format placed a constant
+> **Historical note (v3 bug, fixed in v4).** The v3 format placed a constant
 > `[VERSION(1)=0x03 | GENERATION(8)]` prefix *first*. An indexed column whose datum landed
 > inside that 9-byte prefix — typically a leading fixed-width `int4`/`int8` key — looked
 > *unchanged* to `heap_update`, which then chose a HOT update and silently skipped the
 > index maintenance, leaving the index pointing at the old key. Moving the constant bytes
-> to the trailer removed the byte-stable region and resolved the bug structurally; the
-> workarounds that v3 required (`REINDEX`, or arranging the indexed column past the first
-> 9 bytes) are no longer needed.
+> to the trailer removed the byte-stable region; the workarounds v3 required (`REINDEX`,
+> or arranging the indexed column past the first 9 bytes) are no longer needed.
+
+> **Historical note (v4 bug, fixed in v5 — PSQLE-165).** v4 made the comparison
+> read a region that was not laid out as a tuple at all, so past the first
+> variable-length column `heap_update` walked ciphertext looking for attribute
+> boundaries. Usually that left the page and the backend died; when it stayed on
+> the page it compared garbage, and an updated indexed column could come out
+> *unchanged* — the v3 failure mode again, by a different route. v5 keeps the
+> attribute layout intact, so the comparison reads real per-attribute ciphertext.
 
 ### Historical Limitations (v1.0) — Many Resolved Since
 
@@ -1124,7 +1160,7 @@ access control but do not replace it.
 │  ... tuples grow downward from end of page ...                     │
 │                                                                    │
 │  ┌─────────────────────────────┬─────────────────────────────────┐ │
-│  │  HeapTupleHeaderData        │IV(12)│CT│TAG(16)│VER(1)│GEN(8)│ │
+│  │  HeapTupleHeaderData        │ attrs (values enc.) │IV│TAG│V│G│ │
 │  │  (t_hoff bytes, PLAINTEXT)  │                                 │ │
 │  └─────────────────────────────┴─────────────────────────────────┘ │
 └────────────────────────────────────────────────────────────────────┘
@@ -1331,10 +1367,12 @@ sequence, gated on the live extension version:
 | `sql/regression_test.sql` | 1–52 | v1.0–v1.4 baseline: crypto, TAM, TOAST, tde_btree |
 | `sql/regression_test_v15.sql` | 53–72 | v1.5: per-table DEK, online rotation, AAD |
 | `sql/regression_test_v16.sql` | 73–109 | v1.6: local wallet KMS |
-| `sql/regression_test_v17.sql` | 111–134 | v1.7: `enc_ops` indexes, partition trees, HOT/REINDEX, FK lifecycle, TidRangeScan|
+| `sql/regression_test_v17.sql` | 111–140, 154–158 | v1.7: `enc_ops` indexes, partition trees, HOT/REINDEX, FK lifecycle, TidRangeScan, on-disk tuple layout |
+| `sql/regression_test_errorpath.sql` | 141–153 | error paths (`make ci-errorpath`) |
 
-Test 110 (`WITH HOLD` cursor spill) is permanently deferred. The full suite is therefore
-**134 tests**. The table below details the v1.0–v1.4 baseline file:
+Test numbers are one sequence shared by every suite, which is why 141–153 are missing
+from the v1.7 file rather than being a gap. Test 110 (`WITH HOLD` cursor spill) is
+permanently deferred, so `make ci-regress` runs **145 tests**. The table below details the v1.0–v1.4 baseline file:
 
 | Range | Area |
 |---|---|
@@ -1638,7 +1676,7 @@ See [ROADMAP.md](ROADMAP.md) for the full release roadmap.
 | **v1.4** | CI/CD + tde_btree + Wire Format v2 | ✅ Completed | 52 |
 | **v1.5** | Per-Table DEK + Online Rotation + AAD | ✅ Completed | 72 |
 | **v1.6** | Local Wallet KMS (production-ready) | ✅ Completed | 109 |
-| **v1.7** | Per-database KMS + pg_restore_tde + PGC_SUSET + enc_ops indexes | 🔄 Current | 140 |
+| **v1.7** | Per-database KMS + pg_restore_tde + PGC_SUSET + enc_ops indexes | 🔄 Current | 145 |
 | **v1.8** | KMIP + Column-Level + GIN/Hash/GiST/BRIN + HA + Dual-Control | 📋 Q2 2027 | ~160 |
 
 ### Permanent Deferrals

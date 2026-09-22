@@ -14,8 +14,8 @@
 | Job | Purpose | PG Versions | Dependencies |
 |-----|---------|-------------|-------------|
 | `build` | Compile with `-Wall -Wextra`, zero warnings required | 17, 18 | None |
-| `regress` | Run 84 `pg_regress` SQL tests (vault provider) | 17, 18 | `build` |
-| `wallet` | Run 84 `pg_regress` SQL tests (local wallet provider) | 17, 18 | `build` |
+| `regress` | Run the SQL regression suite (vault provider) | 17, 18 | `build` |
+| `wallet` | Run the SQL regression suite (local wallet provider) | 17, 18 | `build` |
 | `tap` | Run TAP tests with mock Vault | 17, 18 | `build` |
 | `isolation` | Run isolation tests (concurrency / MVCC) | 17, 18 | `build` |
 | `memcheck` | Valgrind + AddressSanitizer | 17, 18 | `build` |
@@ -101,12 +101,13 @@ The pipeline auto-detects `podman` or `docker` and uses a mock Vault for integra
 
 | Command | What It Tests |
 |---------|---------------|
-| `make ci-regress` | 84-test SQL regression suite (vault provider) |
-| `make ci-wallet` | 84-test SQL regression suite (local wallet provider) |
+| `make ci-regress` | SQL regression suite (vault provider) |
+| `make ci-wallet` | SQL regression suite (local wallet provider) |
 | `make ci-checksums` | Same + page checksums (`initdb -k`) |
 | `make ci-tap` | TAP tests (extension load, backup hooks) |
 | `make ci-isolation` | MVCC / DEK rotation concurrency |
 | `make ci-vault` | Vault Transit API integration (Compose) |
+| `make ci-upgrade` | Data written by the previous release tag still reads |
 | `make ci-bench` | Performance benchmark (informational) |
 | `make ci-all` | All of the above in sequence |
 

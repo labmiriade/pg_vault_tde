@@ -39,9 +39,11 @@ void pg_vault_tde_tam_init(void);
  * tde_encrypt_heap_tuple - encrypt a HeapTuple payload for on-disk storage.
  *
  * Exported for TOAST chunk write path in pg_vault_tde_toast.c.
- * relid is used for per-table DEK lookup.
+ * relid is used for per-table DEK lookup; tupdesc is the row type of
+ * `plain` and drives the attribute walk the on-disk layout is built from,
+ * so it must be the descriptor of the relation being written to.
  */
-HeapTuple tde_encrypt_heap_tuple(HeapTuple plain, Oid relid);
+HeapTuple tde_encrypt_heap_tuple(HeapTuple plain, Oid relid, TupleDesc tupdesc);
 /*
  * tde_decrypt_heap_tuple — decrypt an on-disk encrypted HeapTuple.
  *

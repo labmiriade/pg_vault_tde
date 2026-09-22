@@ -1,0 +1,31 @@
+# ci/upgrade-compat.expected — declared upgrade behaviour for this branch.
+#
+# ci/scripts/run-upgrade.sh writes a fixture with the build at the previous
+# release tag, then reads it back with the build from the working tree, and
+# compares what actually happens against these two declarations.
+#
+# The point is not the values: it is that changing them is a deliberate act
+# that shows up in the diff. Both the v1.7.1 AAD change and PSQLE-165 shipped
+# because the whole test suite only ever reads data it wrote in the same run —
+# writer and reader move together, the suite stays green, and what breaks is
+# data already on disk.
+#
+# readable_after_upgrade
+#   yes — every row written by the previous release still decrypts.
+#   no  — it does NOT. The release needs a dump-with-the-old-binary procedure,
+#         because VACUUM FULL cannot help: it rewrites tuples by decrypting
+#         them first, which is the very thing that is broken. This is what
+#         happened in 1.7.1 to out-of-line TOAST written by <= 1.7.0.
+#
+# update_in_place_before_vacuum
+#   yes — rows in the old on-disk format can be UPDATEd as they are.
+#   no  — they cannot, and the release notes must tell users to run
+#         VACUUM FULL (or CLUSTER) on encrypted tables. This is the v5 tuple
+#         layout: v4 rows stay readable but keep a data area the core cannot
+#         walk, so heap_update() still dies on them until they are rewritten.
+#
+# Changing a value here without changing the release notes is the bug this
+# file exists to prevent.
+
+readable_after_upgrade=yes
+update_in_place_before_vacuum=no

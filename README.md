@@ -16,7 +16,7 @@ decrypted after it leaves. Encryption keys are managed by **HashiCorp Vault** /
 **OpenBao** or a **local PKCS#12 wallet** and cached in shared memory with
 automatic rotation.
 
-**Current release: v1.7** — 140 regression tests (52 v1.4 + 20 v1.5 + 38 v1.6 + 30 v1.7), zero compiler warnings on PG 17 + PG 18.
+**Current release: v1.7** — 145 regression tests (52 v1.4 + 20 v1.5 + 38 v1.6 + 35 v1.7), zero compiler warnings on PG 17 + PG 18.
 
 ### Commercial Support
 
@@ -44,8 +44,12 @@ packaged (OS, PG) combinations and what CI exercises on each in the
 
 > **Already running 1.7.0 or earlier?** Do not upgrade to 1.7.1 or later before
 > reading [Upgrading to 1.7.1](#upgrading-to-171). Tables holding out-of-line
-> TOAST values must be dumped *before* the new binary is installed. The break is
-> between 1.7.0 and 1.7.1; upgrading 1.7.1 → 1.7.2 needs nothing.
+> TOAST values must be dumped *before* the new binary is installed.
+>
+> **Upgrading from 1.7.1?** Nothing has to be done before installing 1.7.2, but
+> existing encrypted tables need one `VACUUM FULL` afterwards — see
+> [Upgrading to 1.7.2](#upgrading-to-172). Rows stay readable either way; until
+> they are rewritten, `UPDATE` on some of them can take the backend down.
 
 ### 1. Install
 
@@ -313,7 +317,7 @@ Index Access Method (IAM) — tde_btree                  src/iam/
    │
    ▼
 Crypto Layer — AES-256-GCM (OpenSSL 3.x EVP)           src/crypto/
-   │  [IV(12) | CIPHERTEXT | GCM-TAG(16) | VER(1) | GEN(8)] per tuple
+   │  [attributes, values encrypted | IV(12) | GCM-TAG(16) | VER(1) | GEN(8)]
    │  Per-backend EVP_CIPHER_CTX cached & keyed by (relid, generation):
    │  AES key schedule reused across tuples, only the IV rearmed per call
    │  IV batch generation: 256 IVs per pg_strong_random() call
@@ -330,22 +334,34 @@ HashiCorp Vault / OpenBao (GUC-configurable endpoint)
 
 ### Wire Format (on disk, per tuple)
 
-**v4 format** (default for `encrypted_heap` tables):
+**v5 format** (written by `encrypted_heap` tables; v4 is still read):
 
 ```
 ┌─────────────────────────────────┬───────────────────────────────────────────────────────┐
-│  HeapTupleHeader (t_hoff bytes) │   IV(12) │ Ciphertext │ GCM-Tag(16) | VER(1) │ GEN(8) | 
-│  PLAINTEXT — MVCC fields        │                                                       │
+│  HeapTupleHeader (t_hoff bytes) │  attributes, VALUES encrypted │ IV(12) │ Tag(16) │V│G│
+│  PLAINTEXT — MVCC fields        │  (attribute layout preserved) │                       │
 └─────────────────────────────────┴───────────────────────────────────────────────────────┘
-                                   ←───────────── TDE_V4_OVERHEAD = 37 bytes ─────────────→
+                                                                  ←──── 37 bytes ────→
 ```
 
-v4 overhead: **37 bytes per tuple** (12-byte IV + 16-byte GCM authentication tag +
-1-byte version `0x04` + 8-byte DEK generation counter).
-The IV-first layout keeps the version/generation bytes at the **end** so the blob has no
-byte-stable prefix — this is what structurally disables HOT updates (see
-[Limitations](#limitations-v17)).
-v4 also passes `[database_oid(4) | relid(4) | generation(8)]` as AEAD Additional
+Overhead: **37 bytes per tuple** (12-byte IV + 16-byte GCM authentication tag +
+1-byte version `0x05` + 8-byte DEK generation counter) — the same as v4, so a v5
+tuple is exactly as long as the v4 tuple for the same row.
+
+v5 is **structure preserving**: every attribute keeps its offset and its length,
+and only the bytes of the values are ciphertext. The structural bytes — varlena
+length headers, the external-datum tag, alignment padding — stay in clear,
+because PostgreSQL itself walks the on-disk tuple: `heap_update()` reads the
+indexed attributes straight off the page to decide HOT and index maintenance.
+Under v4 that walk read attribute boundaries out of one opaque blob and crashed
+the backend (PSQLE-165). The cost of v5 is that the **exact byte length of each
+variable-length column** is visible on disk; fixed-length columns leak nothing,
+and the row length and null bitmap were already visible under v4.
+
+v4 tuples are read transparently, but an existing table only moves to v5 when its
+rows are rewritten — `VACUUM FULL` does it.
+
+Both versions pass `[database_oid(4) | relid(4) | generation(8)]` as AEAD Additional
 Authenticated Data (AAD) — zero wire overhead; prevents cross-table ciphertext smuggling.
 
 ---
@@ -900,6 +916,73 @@ newer](#logical-replication-on-postgresql-1711--18x-and-newer) below.
 
 ---
 
+## Upgrading to 1.7.2
+
+1.7.2 changes the on-disk tuple layout (**v5**). Nothing has to be exported
+first — every row written by 1.7.0 or 1.7.1 keeps reading, byte for byte — but
+**each encrypted table needs one `VACUUM FULL` after the upgrade**, and until it
+has had one, `UPDATE` on some of its rows can crash the backend.
+
+### Why
+
+The encrypted region used to be one opaque blob, while the tuple header — which
+stays in plaintext, because MVCC and VACUUM need it — went on declaring that the
+row held `natts` attributes laid out per the table's tuple descriptor. Every core
+path that reads a raw on-disk tuple believes that header, and `heap_update()`
+does it on **every** `UPDATE`: it reads the indexed attributes straight off the
+page to decide whether the update can be HOT and which indexes to maintain.
+
+Past the first variable-length column an attribute's offset is not cached, so
+reaching it means walking the row — and the walk was reading varlena length
+headers out of ciphertext. A four-byte header of random bytes yields a length of
+up to 1 GB, the cursor leaves the page, and the backend dies with SIGSEGV.
+Any index on such a column is enough, `tde_btree` included: what matters is that
+the column is indexed, not which access method indexes it.
+
+v5 keeps the row physically valid — every attribute at its own offset with its
+own length, only the *values* replaced by ciphertext — so that walk is safe. The
+AEAD is unchanged: same cipher, same tag, same AAD, and the same 37 bytes of
+overhead per tuple.
+
+### What to run
+
+Rows written before the upgrade keep the old layout until something rewrites
+them, and no layout can be made walkable after the fact. `VACUUM FULL` (or
+`CLUSTER`) rewrites every row through the extension and migrates the table:
+
+```sql
+-- every encrypted table in the current database
+SELECT format('VACUUM FULL %s;', c.oid::regclass)
+FROM   pg_class c
+JOIN   pg_am    a ON a.oid = c.relam
+WHERE  a.amname = 'encrypted_heap'
+  AND  c.relkind = 'r';
+```
+
+Run the statements it prints. `VACUUM FULL` takes an `ACCESS EXCLUSIVE` lock and
+needs room for a second copy of the table, so treat it as a maintenance window.
+Verified to leave the data byte-identical (`make ci-upgrade`).
+
+Tables created *after* the upgrade are in v5 from the first row and need nothing.
+
+### Also fixed: an all-NULL row made its table unreadable
+
+Independent of the layout change, and present in every release up to 1.7.1: a row
+whose columns are **all** NULL has no user data at all, so its encrypted region is
+the AEAD framing and nothing else. That is a well-formed encoding of a
+zero-length plaintext, and the decrypt path rejected it:
+
+```
+ERROR:  [CRYPTO] Ciphertext too short for AES-256-GCM
+```
+
+One such row is enough to make the whole table fail on any sequential scan from
+that `INSERT` onwards. The row is not corrupt — the ciphertext on disk is fine —
+and 1.7.2 reads it without any migration step. If you have hit this, upgrading is
+the whole fix.
+
+---
+
 ## Compatibility
 
 | Feature | Status | Notes |
@@ -985,7 +1068,7 @@ make ci-all
 PG_VERSION=17 make ci-all
 
 # Individual test stages:
-make ci-regress          # 140 SQL regression tests (vault provider) — tests 1-140 (test 110 deferred)
+make ci-regress          # 145 SQL regression tests (vault provider) — tests 1-140 + 154-158 (test 110 deferred)
 make ci-errorpath        # 13 error-path tests (141-153) — exercises the PG_CATCH handlers
 make ci-matrix           # regress + TAP on the other supported PG majors (17, 19 when published)
 make ci-scan-build       # Clang static analyzer over the sources (compile only, ~1 min)
@@ -998,6 +1081,7 @@ make ci-tap              # 20 TAP test files (starts a real Vault container for 
 make ci-isolation        # 2 isolation specs: DEK rotation under load, relation rewrite under a concurrent reader
 make ci-vault            # Vault integration (Compose-based)
 make ci-openbao          # OpenBao Raft 3-node HA integration (12 tests)
+make ci-upgrade          # Read data written by the previous release tag (upgrade compatibility)
 make ci-bench            # Performance benchmark (encrypted vs plain heap)
 make ci-bench BENCH_ROWS=100000  # with custom row count
 
@@ -1064,6 +1148,11 @@ Test coverage — 153 SQL regression tests (52 v1.4 + 20 v1.5 + 38 v1.6 + 30 v1.
 - Test 138: `ALTER TABLE x SET ACCESS METHOD encrypted_heap` on a **populated** table with genuinely out-of-line TOAST data (~13 KB, high-entropy so PGLZ can't compress it back inline) — verifies an exact byte-for-byte round-trip via `SELECT` (Tests 105/106 only check on-disk bytes, never read the row back) plus post-ALTER `UPDATE`/`DELETE` across all four small/large transitions **(v1.7, PSQLE-135 regression coverage)**
 - Test 139: `ALTER TABLE x SET ACCESS METHOD heap` — reverse direction of Test 138, same coverage **(v1.7, PSQLE-135 regression coverage)**
 - Test 140: `CREATE TABLE AS SELECT` from an `encrypted_heap` table with genuinely out-of-line TOAST data must re-externalize into the **destination's own** TOAST table; verifies the destination survives the (unrelated, from its own point of view) source table being dropped **(v1.7, PSQLE-135 regression coverage)**
+- Test 154: `UPDATE` on a table whose index sits on an attribute **behind a variable-length column** — the statement that segfaulted. `heap_update()` reads the indexed attributes straight off the page; under the v4 layout that walk took a varlena length header out of ciphertext and left the page. Also asserts no HOT update was chosen and that index and sequential scan agree after the indexed column changes **(v1.7.2, PSQLE-165 regression coverage)**
+- Test 155: a row whose columns are **all NULL** round-trips. Its encrypted region is the AEAD framing and nothing else — a well-formed encoding of a zero-length plaintext that used to be rejected, making the row unreadable for good **(v1.7.2)**
+- Test 156: the v5 layout keeps attribute **values** off disk while leaving the tuple structure readable; a plain-heap control proves the search would have found the needle if it were there **(v1.7.2)**
+- Test 157: every on-disk tuple is **physically walkable** with the relation's tuple descriptor — the invariant PSQLE-165 broke, asserted directly via `pageinspect` instead of through its symptom, plus a per-attribute plaintext check. Skips when `pageinspect` is unavailable **(v1.7.2)**
+- Test 158: the indexed column's **position** must not affect correctness — 8 combinations (attnum 1 / behind a varlena / behind a NULL varlena / behind a dropped column, × `tde_btree` and plaintext `btree`). PSQLE-165 hid for four releases because 38 of 38 regression tables put the key on the first column, the one position whose offset is cached and never walked **(v1.7.2)**
 
 Error-path coverage — tests 141-153 (`sql/regression_test_errorpath.sql`, `make ci-errorpath`):
 
@@ -1120,7 +1209,7 @@ Runs the postmaster under Valgrind memcheck with `.valgrind.supp`, over a worklo
 Note what it can and cannot see: the stock server package is not built with `-DUSE_VALGRIND` or `--enable-cassert`, so memcheck cannot see inside `palloc` — a use-after-`pfree` looks like a valid access into a malloc'd arena. It does catch invalid/double `free()` of malloc'd state (libcurl handles on the `vault_transit_request` error path), out-of-bounds access, uninitialised reads, and definite leaks. That limitation is why `ci-errorpath` exists alongside it rather than being replaced by it.
 
 > Test runner notes:
-> - `make ci-regress` (vault provider): 140/140 PASS, with conditional skips for `wal_level` (test 48), `pageinspect` (test 61) and wallet-only assertions (tests 74–80 when `kms_provider=local` is required).
+> - `make ci-regress` (vault provider): 145/145 PASS, with conditional skips for `wal_level` (test 48) and wallet-only assertions (tests 74–80 when `kms_provider=local` is required). `pageinspect` is installed by `ci/scripts/run-regress.sh`, so the storage-level tests (61, 157) run rather than skip — until that line existed they asserted nothing in CI.
 > - `make ci-errorpath` (local provider, **no** `wallet_dev_mode_passphrase`): 13/13 PASS. The absent GUC is load-bearing — with it set, `wallet_lock()` silently re-opens on the next DEK request and every statement succeeds, so the handlers are never entered. Test 141 detects that and fails rather than passing vacuously.
 > - `make ci-wallet` (local provider): tests 73–79 PASS; test 80 SKIPS unless `wallet_passphrase_env` is wired up; tests 81–109 also PASS in wallet mode.
 > - Test 110 (WITH HOLD cursor plaintext spill) is permanently deferred — the executor's tuplestore layer bypasses the TAM write path, so pg_vault_tde cannot intercept it without core modifications. The test is commented out in `regression_test_v16.sql`.
@@ -1428,13 +1517,12 @@ See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
    (heap-only) update — every UPDATE writes new index entries, keeping `tde_btree` indexes
    coherent without a `REINDEX`.
    **How:** `heap_update` decides whether an update is HOT by comparing the indexed columns
-   byte-for-byte between the old and new tuple. Both tuples are encrypted, and the v4 wire
-   format is **IV-first**: it begins with the random GCM IV, which changes on every
-   encryption. The encrypted image therefore always differs, so `heap_update` sees the
+   between the old and the new tuple, on disk. Both images are encrypted under a fresh
+   random GCM IV, so no attribute is byte-stable across an update: `heap_update` sees the
    indexed column as modified and skips the HOT path. The constant `[VERSION | GENERATION]`
-   bytes were moved to the **end** of the blob precisely so they fall outside the comparison
-   window. See [doc/pg_vault_tde.md](doc/pg_vault_tde.md) § Known Limitations for the full
-   analysis (including the v3 bug this resolved).
+   bytes sit at the **end** of the region, outside every attribute, so they cannot create a
+   byte-stable window. See [doc/pg_vault_tde.md](doc/pg_vault_tde.md) § Known Limitations for
+   the full analysis (including the v3 and v4 bugs this resolved).
 
 8. **Parallel index build/rebuild is disabled by design**: the parallel workers that
    PostgreSQL uses to build or rebuild an index run in separate processes that are not

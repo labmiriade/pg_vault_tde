@@ -6,12 +6,14 @@
  * callbacks are overridden; every structural callback (VACUUM, ANALYZE, HOT,
  * CLUSTER, index build, truncate ...) delegates unchanged to heapam.
  *
- * Wire format on disk (per tuple), v4 IV-first trailer:
+ * Wire format on disk (per tuple), v5 structure-preserving:
  *   [HeapTupleHeader (t_hoff bytes, PLAINTEXT - MVCC fields)]
- *   [IV(12) | CIPHERTEXT(N) | GCM TAG(16) | VERSION(1) | GENERATION(8)]
+ *   [attributes at their normal offsets, value bytes encrypted (N bytes)]
+ *   [IV(12) | GCM TAG(16) | VERSION(1) | GENERATION(8)]
  *
- * Overhead vs. plain heap: TDE_V4_OVERHEAD (37) bytes/tuple. IV-first disables
- * HOT on encrypted tables but keeps tde_btree coherent.
+ * Overhead vs. plain heap: TDE_V4_OVERHEAD (37) bytes/tuple, unchanged from
+ * v4.  v4 tuples (whole user-data region as one opaque blob) are still read;
+ * see the comment above tde_encrypt_heap_tuple() for why the layout moved.
  *
  * Copyright (c) 2026 Miriade S.r.l.  
  * Licensed under the PostgreSQL License.
@@ -169,7 +171,8 @@ static HeapTuple tde_prepare_encrypt_tuple(Relation rel, HeapTuple plain, HeapTu
      */
     *toasted_out = toasted;
 
-    enc = tde_encrypt_heap_tuple(toasted, RelationGetRelid(rel));
+    enc = tde_encrypt_heap_tuple(toasted, RelationGetRelid(rel),
+                                 RelationGetDescr(rel));
     enc->t_data->t_infomask &= ~HEAP_HASEXTERNAL;
     enc->t_tableOid = plain->t_tableOid;
     
@@ -193,29 +196,217 @@ static HeapTuple tde_prepare_encrypt_tuple(Relation rel, HeapTuple plain, HeapTu
  * plaintext. This is required for MVCC, HOT, and VACUUM to work correctly.
  * ============================================================ */
 /*
+ * On-disk layout of the user-data region — v5, structure preserving.
+ *
+ * v4 replaced the whole user-data region with one opaque blob:
+ *     [ IV(12) | CIPHERTEXT(N) | TAG(16) | VERSION(1) | GENERATION(8) ]
+ * The header was copied verbatim, so the tuple still advertised natts
+ * attributes laid out per the tuple descriptor while the data area was not
+ * laid out that way at all.  Any core code that deforms an on-disk tuple then
+ * walks ciphertext as if it were a tuple — and heap_update() does exactly
+ * that, reading the indexed attributes straight off the page to decide HOT
+ * and which indexes to maintain.  When the attribute's offset is not cached
+ * (i.e. anything after the first variable-length column) nocachegetattr()
+ * reads a varlena length header out of ciphertext, gets a length of up to
+ * 1 GB, and the cursor leaves the page: SIGSEGV (PSQLE-165).  When it happens
+ * to stay on the page it silently compares garbage instead, and can declare
+ * an updated indexed column unchanged.  Any index on such a column is enough,
+ * including tde_btree — the trigger is the index attribute bitmap, not the
+ * access method.
+ *
+ * v5 keeps the tuple physically valid: every attribute stays at its own
+ * offset with its own length, and only the VALUE bytes are replaced by
+ * ciphertext.  Varlena length headers, the external-datum tag and alignment
+ * padding stay in clear — that is what makes the tuple walkable, and it is
+ * the price of the format: the exact byte length of every variable-length
+ * column becomes visible on disk (the row length and the null bitmap already
+ * were).  Fixed-length columns leak nothing, their length is in the catalog.
+ *
+ *   [ attribute layout, value bytes encrypted (D bytes) ]
+ *   [ IV(12) | TAG(16) | VERSION(1 = 0x05) | GENERATION(8) ]
+ *
+ * D is the plaintext data length, so a v5 tuple is exactly as long as the v4
+ * tuple for the same row (TDE_V4_OVERHEAD over the plaintext region): the
+ * TOAST threshold arithmetic elsewhere in this file is unchanged.
+ *
+ * The AEAD is untouched.  The value bytes are gathered into one buffer, handed
+ * to tde_gcm_encrypt() and scattered back, so ciphertext, tag and AAD are
+ * bit-identical to what v4 produced for the same input; only the framing moved.
+ *
+ * v4 tuples stay readable — the version byte sits at the same offset from the
+ * end in both formats — but they keep their original layout.  An existing
+ * table is only immune once its rows have been rewritten (VACUUM FULL).
+ */
+typedef struct tde_vrange
+{
+    uint32      off;            /* offset into the user-data region */
+    uint32      len;
+} tde_vrange;
+
+/*
+ * tde_value_ranges
+ *
+ * Collect the byte ranges of the user-data region that hold attribute VALUES,
+ * mirroring heap_deform_tuple()'s walk exactly — same alignment rules, same
+ * natts bound, same null bitmap.  Structural bytes (varlena length headers,
+ * the external-datum tag, alignment padding) are deliberately left out: they
+ * stay in clear so that walk keeps working on the encrypted tuple.
+ *
+ * `ranges` must have room for tupdesc->natts entries.  Returns the total
+ * number of value bytes; *end_off receives the offset one past the last
+ * attribute, which the caller checks against the region length.
+ *
+ * ON-DISK CONTRACT — READ BEFORE TOUCHING THIS FUNCTION.
+ *
+ * The ranges are not stored anywhere: they define the order in which the value
+ * bytes are concatenated into the single AEAD message, and the reader has to
+ * reproduce that order exactly or the tag check fails on every v5 tuple already
+ * written.  Which bytes are covered is as much a part of the wire format as the
+ * trailer is, even though nothing about the layout moves.
+ *
+ * That makes the obvious optimisation a breaking change.  Coalescing adjacent
+ * ranges would be correct in isolation — alignment padding that precedes a
+ * FIXED-length attribute is computed arithmetically by att_align_nominal() and
+ * never read, so it could be folded into a neighbouring range, and a row of
+ * only fixed-width columns would collapse to one range, removing the gather and
+ * scatter entirely.  (Padding before a varlena could not: att_align_pointer()
+ * reads that byte and treats a non-zero value as "no padding here".)  But doing
+ * it after v5 ships means old tuples gather in one order and new code in
+ * another.  Same failure mode as the 1.7.1 AAD change — see tde_compute_aad()
+ * in src/crypto/pg_vault_tde_crypto.c.
+ *
+ * Unlike that one, though, the fix is cheap: the physical layout does not move,
+ * only which bytes enter the AEAD, so a v6 that coalesces would read v5 tuples
+ * by dispatching on the trailer's version byte and asking for the v5 ranges.
+ * No rewrite, no VACUUM FULL, nothing for an operator to do.  Which is why this
+ * is written down rather than rushed in: do it when something else is already
+ * bumping the layout, and give it its own version byte when you do.
+ */
+static Size
+tde_value_ranges(HeapTupleHeader td, TupleDesc tupdesc, Size data_len,
+                 tde_vrange *ranges, int *nranges, Size *end_off)
+{
+    int         natts    = HeapTupleHeaderGetNatts(td);
+    bool        hasnulls = ((td->t_infomask & HEAP_HASNULL) != 0);
+    bits8      *bp       = td->t_bits;
+    char       *tp       = (char *) td + td->t_hoff;
+    long        off      = 0;
+    Size        total    = 0;
+    int         n        = 0;
+    int         i;
+
+    if (natts > tupdesc->natts)
+        ereport(ERROR,
+                (errcode(ERRCODE_DATA_CORRUPTED),
+                 errmsg("pg_vault_tde: tuple has %d attributes, descriptor has %d",
+                        natts, tupdesc->natts)));
+
+    for (i = 0; i < natts; i++)
+    {
+        Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+        Size        hdrsz;
+        Size        fullsz;
+
+        if (hasnulls && att_isnull(i, bp))
+            continue;
+
+        if (att->attlen == -1)
+        {
+            /*
+             * att_align_pointer() peeks at the byte under the cursor to decide
+             * whether a short varlena skips the alignment padding.  That byte
+             * is a length header, which v5 keeps in clear, so the decision is
+             * the same on the encrypted and on the plaintext tuple.
+             */
+            if ((Size) off >= data_len)
+                break;
+            off = att_align_pointer(off, att->attalign, -1, tp + off);
+            if ((Size) off >= data_len)
+                break;
+
+            if (VARATT_IS_1B_E(tp + off))
+                hdrsz = VARHDRSZ_EXTERNAL;   /* 1 length byte + 1 tag byte */
+            else if (VARATT_IS_1B(tp + off))
+                hdrsz = VARHDRSZ_SHORT;
+            else
+                hdrsz = VARHDRSZ;
+            fullsz = VARSIZE_ANY(tp + off);
+        }
+        else if (att->attlen > 0)
+        {
+            off = att_align_nominal(off, att->attalign);
+            hdrsz = 0;
+            fullsz = (Size) att->attlen;
+        }
+        else
+        {
+            /*
+             * attlen == -2 (null-terminated cstring): encrypting the bytes
+             * would destroy the terminator the walk needs.  No such type can
+             * be a column of a heap relation, so this is unreachable — fail
+             * closed rather than silently store one attribute in clear.
+             */
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("pg_vault_tde: attribute %d has unsupported length %d",
+                            i + 1, att->attlen)));
+        }
+
+        if (fullsz < hdrsz || (Size) off + fullsz > data_len)
+            ereport(ERROR,
+                    (errcode(ERRCODE_DATA_CORRUPTED),
+                     errmsg("pg_vault_tde: attribute %d runs past the tuple "
+                            "(offset %ld, length %zu, region %zu bytes)",
+                            i + 1, off, fullsz, data_len)));
+
+        if (fullsz > hdrsz)
+        {
+            ranges[n].off = (uint32) (off + hdrsz);
+            ranges[n].len = (uint32) (fullsz - hdrsz);
+            total += ranges[n].len;
+            n++;
+        }
+        off += fullsz;
+    }
+
+    *nranges = n;
+    *end_off = (Size) off;
+    return total;
+}
+
+/*
  * tde_encrypt_heap_tuple
  *
- * Returns a palloc'd HeapTuple whose user-data region is replaced with the
- * v4 wire format produced by tde_gcm_encrypt():
- *   [IV(12) | CIPHERTEXT(N) | TAG(16) | VERSION(1) | GENERATION(8)]
- * Total overhead: TDE_V4_OVERHEAD (37 bytes) per encrypted user-data region.
+ * Returns a palloc'd HeapTuple in the v5 on-disk layout described above.
  *
  * Header bytes [0 .. t_hoff) are copied verbatim (plaintext) because MVCC
  * fields (xmin, xmax, ctid, infomask, null bitmap) must remain readable by
  * heapam without decryption.
  *
+ * tupdesc is the row type of `plain`: it drives the attribute walk, so it must
+ * be the descriptor of the relation the tuple is being written to.
+ *
  * Caller must pfree the returned tuple; OPENSSL_cleanse is NOT required
- * on the returned tuple because it contains only ciphertext.
+ * on the returned tuple because it contains only ciphertext and structure.
  */
 HeapTuple
-tde_encrypt_heap_tuple(HeapTuple plain, Oid relid)
+tde_encrypt_heap_tuple(HeapTuple plain, Oid relid, TupleDesc tupdesc)
 {
     Size        hdr_len   = plain->t_data->t_hoff;
     char       *user_data = (char *) plain->t_data + hdr_len;
     Size        user_len  = plain->t_len - hdr_len;
-    Size        enc_len   = 0;
-    char       *enc_buf;
+    tde_vrange *ranges;
+    int         nranges   = 0;
+    Size        end_off   = 0;
+    Size        val_len;
+    Size        blob_len  = 0;
+    char       *val_buf;
+    char       *blob;
+    char       *dst;
     HeapTuple   enc;
+    Size        pos;
+    int         i;
+
     /*
      * user_len may be 0 for tuples with all-NULL columns (only the null
      * bitmap lives in the header, no column data follows).  AES-256-GCM
@@ -233,28 +424,75 @@ tde_encrypt_heap_tuple(HeapTuple plain, Oid relid)
         HeapTuple copy = heap_copytuple(plain);
         return copy;
     }
-    enc_buf = tde_gcm_encrypt(relid, user_data, user_len, &enc_len);
-    Assert(enc_len == user_len + TDE_V4_OVERHEAD);
-    enc = (HeapTuple) palloc0(HEAPTUPLESIZE + hdr_len + enc_len);
-    enc->t_len      = (uint32) (hdr_len + enc_len);
+
+    ranges = (tde_vrange *) palloc(sizeof(tde_vrange) * (tupdesc->natts + 1));
+    val_len = tde_value_ranges(plain->t_data, tupdesc, user_len,
+                               ranges, &nranges, &end_off);
+
+    /*
+     * heap_fill_tuple() sizes the data region by the very same walk, so the
+     * walk must consume it whole.  If it does not, some plaintext byte is not
+     * covered by any range and would be written to disk in clear: refuse.
+     */
+    if (end_off != user_len)
+    {
+        pfree(ranges);
+        ereport(ERROR,
+                (errcode(ERRCODE_DATA_CORRUPTED),
+                 errmsg("pg_vault_tde: attribute walk covered %zu of %zu data bytes",
+                        end_off, user_len)));
+    }
+
+    /* Gather the value bytes, encrypt them as one AEAD message. */
+    val_buf = (char *) palloc(val_len > 0 ? val_len : 1);
+    for (i = 0, pos = 0; i < nranges; i++)
+    {
+        memcpy(val_buf + pos, user_data + ranges[i].off, ranges[i].len);
+        pos += ranges[i].len;
+    }
+
+    blob = tde_gcm_encrypt(relid, val_buf, val_len, &blob_len);
+    OPENSSL_cleanse(val_buf, val_len);
+    pfree(val_buf);
+    Assert(blob_len == val_len + TDE_V4_OVERHEAD);
+
+    enc = (HeapTuple) palloc0(HEAPTUPLESIZE + hdr_len + user_len + TDE_V4_OVERHEAD);
+    enc->t_len      = (uint32) (hdr_len + user_len + TDE_V4_OVERHEAD);
     enc->t_self     = plain->t_self;
     enc->t_tableOid = plain->t_tableOid;
     enc->t_data     = (HeapTupleHeader) ((char *) enc + HEAPTUPLESIZE);
-    memcpy(enc->t_data, plain->t_data, hdr_len);                 /* header verbatim */
-    memcpy((char *) enc->t_data + hdr_len, enc_buf, enc_len);    /* encrypted payload */
-    pfree(enc_buf);  /* ciphertext - no need to cleanse */
+
+    /* Header and attribute layout verbatim; value bytes overwritten below. */
+    memcpy(enc->t_data, plain->t_data, hdr_len + user_len);
+    dst = (char *) enc->t_data + hdr_len;
+
+    for (i = 0, pos = 0; i < nranges; i++)
+    {
+        memcpy(dst + ranges[i].off, blob + TDE_GCM_IV_LEN + pos, ranges[i].len);
+        pos += ranges[i].len;
+    }
+    pfree(ranges);
+
+    /* Trailer: IV | TAG | VERSION | GENERATION. */
+    memcpy(dst + user_len, blob, TDE_GCM_IV_LEN);
+    memcpy(dst + user_len + TDE_GCM_IV_LEN,
+           blob + TDE_GCM_IV_LEN + val_len,
+           TDE_GCM_TAG_LEN + 1 + TDE_V4_GEN_LEN);
+    dst[user_len + TDE_GCM_IV_LEN + TDE_GCM_TAG_LEN] = (char) TDE_TUPLE_V5_VERSION_BYTE;
+    pfree(blob);  /* ciphertext - no need to cleanse */
 
     /*
      * Clear HEAP_HASEXTERNAL on the encrypted tuple.  From the core's point of
-     * view the encrypted tuple is an opaque blob with no external columns — the
-     * TOAST pointer lives INSIDE the ciphertext, invisible to heap_deform.
-     * Leaving the bit set makes core touch the ciphertext as if it had external
-     * data; in particular ExtractReplicaIdentity() (heap_delete/heap_update) runs
-     * toast_flatten_tuple()/heap_deform_tuple() on the ciphertext and logs a
-     * garbage replica identity, breaking logical UPDATE/DELETE.  TOAST lifecycle
-     * is driven by the TAM itself (per-attribute VARATT scan on the decrypted
-     * tuple, tde_tuple_has_external_slow), not this bit — and VACUUM FULL already
-     * writes encrypted tuples with this bit cleared, so the codebase copes.
+     * view the encrypted tuple has no external columns — the TOAST pointer's
+     * payload is ciphertext, so nothing may dereference it.  Leaving the bit
+     * set makes core touch it as if it were a live pointer; in particular
+     * ExtractReplicaIdentity() (heap_delete/heap_update) runs
+     * toast_flatten_tuple()/heap_deform_tuple() on it and logs a garbage
+     * replica identity, breaking logical UPDATE/DELETE.  TOAST lifecycle is
+     * driven by the TAM itself (per-attribute VARATT scan on the decrypted
+     * tuple, tde_tuple_has_external_slow), not this bit — and VACUUM FULL
+     * already writes encrypted tuples with this bit cleared, so the codebase
+     * copes.
      */
     enc->t_data->t_infomask &= ~HEAP_HASEXTERNAL;
 
@@ -264,7 +502,9 @@ tde_encrypt_heap_tuple(HeapTuple plain, Oid relid)
  * tde_decrypt_heap_tuple
  *
  * Takes an on-disk HeapTuple (header plain, user-data encrypted) and returns
- * a palloc'd HeapTuple with the user-data portion decrypted.
+ * a palloc'd HeapTuple with the user-data portion decrypted.  Both layouts are
+ * accepted: the version byte sits at the same offset from the end in v4 and
+ * v5, so a table written before the v5 upgrade keeps reading.
  * GCM tag verification is performed inside tde_gcm_decrypt; bad tags cause
  * ereport(ERROR) — tampered tuples never return data to the caller.
  *
@@ -274,7 +514,8 @@ tde_encrypt_heap_tuple(HeapTuple plain, Oid relid)
  * Exported (non-static) so the logical decoding output plugin can decrypt
  * WAL-sourced tuples from encrypted_heap relations.
  *
- * tupdesc is required to recompute HEAP_HASEXTERNAL on the returned tuple.
+ * tupdesc is the row type of `enc`.  v5 needs it to walk the attributes; both
+ * versions need it to recompute HEAP_HASEXTERNAL on the returned tuple.
  * tde_encrypt_heap_tuple() deliberately CLEARS that bit on the on-disk
  * (encrypted) representation so core never tries to dereference a TOAST
  * pointer inside ciphertext; the memcpy() below copies that (now-stale)
@@ -301,28 +542,112 @@ tde_decrypt_heap_tuple(HeapTuple enc, Oid relid, TupleDesc tupdesc)
     char       *enc_data  = (char *) enc->t_data + hdr_len;
     Size        enc_len   = enc->t_len - hdr_len;
     Size        pt_len    = enc_len - TDE_V4_OVERHEAD;
+    unsigned char version;
     HeapTuple   plain;
     /* Pass-through mode: stored tuple is plaintext — return a copy. */
     if (!pg_vault_tde_enabled)
         return heap_copytuple(enc);
-    /* Every v4 tuple carries TDE_V4_OVERHEAD bytes; shorter means corrupt. */
+    /* Every tuple carries TDE_V4_OVERHEAD bytes; shorter means corrupt. */
     if (hdr_len > enc->t_len || enc_len < (Size) TDE_V4_OVERHEAD)
         ereport(ERROR,
                 (errcode(ERRCODE_DATA_CORRUPTED),
                  errmsg("pg_vault_tde: encrypted tuple too short (%zu bytes)",
                         enc_len)));
-    /* Allocate once, copy header, then decrypt straight into user-data. */
+    /* Allocate once, copy header, then decrypt into the user-data region. */
     plain = (HeapTuple) palloc0(HEAPTUPLESIZE + hdr_len + pt_len);
     plain->t_data = (HeapTupleHeader) ((char *) plain + HEAPTUPLESIZE);
     memcpy(plain->t_data, enc->t_data, hdr_len);
-    /* GCM auth failure ereports inside; returns false only on non-v4 version byte. */
-    if (!tde_gcm_decrypt(relid, enc_data, enc_len,
-                         (char *) plain->t_data + hdr_len, &pt_len))
+
+    version = (unsigned char) enc_data[enc_len - TDE_V4_GEN_LEN - 1];
+
+    if (version == TDE_TUPLE_V5_VERSION_BYTE)
     {
-        pfree(plain);
-        ereport(ERROR,
-                    (errmsg("pg_vault_tde: decryption failed")));
+        tde_vrange *ranges;
+        int         nranges = 0;
+        Size        end_off = 0;
+        Size        val_len;
+        Size        out_len;
+        char       *blob;
+        char       *val_buf;
+        char       *dst = (char *) plain->t_data + hdr_len;
+        Size        pos;
+        int         i;
+
+        /*
+         * Copy the layout first: the structural bytes are already in clear and
+         * the walk below needs them.  The value bytes land encrypted and are
+         * overwritten in place once the AEAD has verified them.
+         */
+        memcpy(dst, enc_data, pt_len);
+
+        ranges = (tde_vrange *) palloc(sizeof(tde_vrange) * (tupdesc->natts + 1));
+        val_len = tde_value_ranges(plain->t_data, tupdesc, pt_len,
+                                   ranges, &nranges, &end_off);
+        if (end_off != pt_len)
+        {
+            pfree(ranges);
+            pfree(plain);
+            ereport(ERROR,
+                    (errcode(ERRCODE_DATA_CORRUPTED),
+                     errmsg("pg_vault_tde: attribute walk covered %zu of %zu data bytes",
+                            end_off, pt_len)));
+        }
+
+        /*
+         * Rebuild the contiguous AEAD message the crypto layer speaks: the
+         * scattered ciphertext between the IV and the trailer, with the
+         * framing byte set back to the crypto wire version (the 0x05 on disk
+         * versions the tuple LAYOUT, not the cipher, and is outside the tag).
+         */
+        blob = (char *) palloc(val_len + TDE_V4_OVERHEAD);
+        memcpy(blob, enc_data + pt_len, TDE_GCM_IV_LEN);
+        for (i = 0, pos = 0; i < nranges; i++)
+        {
+            memcpy(blob + TDE_GCM_IV_LEN + pos,
+                   enc_data + ranges[i].off, ranges[i].len);
+            pos += ranges[i].len;
+        }
+        memcpy(blob + TDE_GCM_IV_LEN + val_len,
+               enc_data + pt_len + TDE_GCM_IV_LEN,
+               TDE_GCM_TAG_LEN + 1 + TDE_V4_GEN_LEN);
+        blob[TDE_GCM_IV_LEN + val_len + TDE_GCM_TAG_LEN] = (char) TDE_V4_VERSION_BYTE;
+
+        val_buf = (char *) palloc(val_len > 0 ? val_len : 1);
+        out_len = val_len;
+        if (!tde_gcm_decrypt(relid, blob, val_len + TDE_V4_OVERHEAD,
+                             val_buf, &out_len))
+        {
+            pfree(blob);
+            pfree(val_buf);
+            pfree(ranges);
+            pfree(plain);
+            ereport(ERROR,
+                        (errmsg("pg_vault_tde: decryption failed")));
+        }
+        pfree(blob);
+
+        for (i = 0, pos = 0; i < nranges; i++)
+        {
+            memcpy(dst + ranges[i].off, val_buf + pos, ranges[i].len);
+            pos += ranges[i].len;
+        }
+        OPENSSL_cleanse(val_buf, val_len);
+        pfree(val_buf);
+        pfree(ranges);
     }
+    else
+    {
+        /* Legacy v4: the whole user-data region is one opaque blob. */
+        /* GCM auth failure ereports inside; returns false only on a bad version byte. */
+        if (!tde_gcm_decrypt(relid, enc_data, enc_len,
+                             (char *) plain->t_data + hdr_len, &pt_len))
+        {
+            pfree(plain);
+            ereport(ERROR,
+                        (errmsg("pg_vault_tde: decryption failed")));
+        }
+    }
+
     plain->t_len      = (uint32) (hdr_len + pt_len);
     plain->t_self     = enc->t_self;
     plain->t_tableOid = enc->t_tableOid;
@@ -2026,7 +2351,8 @@ pg_vault_tde_relation_copy_for_cluster(Relation OldTable,
                  * get a GCM authentication failure.
                  */
                 enc_new = tde_encrypt_heap_tuple(plain_for_write,
-                                                 RelationGetRelid(OldTable));
+                                                 RelationGetRelid(OldTable),
+                                                 RelationGetDescr(OldTable));
 
                 /*
                  * rewrite_heap_tuple asserts !HeapTupleHasExternal(newTuple):

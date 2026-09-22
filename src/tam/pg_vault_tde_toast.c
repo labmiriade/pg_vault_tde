@@ -282,7 +282,8 @@ Datum pg_vault_tde_toast_save_datum(Relation rel, Datum value,
             
             PG_TRY();
             {
-                chunk_enc = tde_encrypt_heap_tuple(toast_tup, toast_tup->t_tableOid);
+                chunk_enc = tde_encrypt_heap_tuple(toast_tup, toast_tup->t_tableOid,
+                                                   toast_tup_desc);
 
                 /*
                  * Normally heap_insert (logs under RM_HEAP_ID).  With the
