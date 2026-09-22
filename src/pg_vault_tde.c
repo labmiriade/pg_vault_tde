@@ -41,6 +41,7 @@
 #include "src/include/pg_vault_tde_kms.h"
 #include "src/include/pg_vault_tde_tam.h"
 #include "src/include/pg_vault_tde_iam.h"
+#include "src/include/pg_vault_tde_iam_ope.h"
 #include "src/include/pg_vault_tde_crypto.h"
 #include "src/include/pg_vault_tde_hw_accel.h"
 #include "src/include/pg_vault_tde_guc.h"
@@ -160,6 +161,7 @@ tde_backend_cleanup(int code, Datum arg)
     tde_audit(AUDIT_LOG_STOP, NULL, true);
     tde_crypto_ctx_cleanup();
     tde_iam_ctx_cleanup();
+    tde_ope_iam_ctx_cleanup();
     tde_hw_accel_cleanup();
     if (tde_active_kms_provider)
         tde_active_kms_provider->shutdown();
@@ -167,6 +169,7 @@ tde_backend_cleanup(int code, Datum arg)
 
 PG_FUNCTION_INFO_V1(pg_vault_tde_tableam_handler);
 PG_FUNCTION_INFO_V1(pg_vault_tde_iam_handler);
+PG_FUNCTION_INFO_V1(pg_vault_tde_iam_ope_handler);
 
 PGDLLEXPORT Datum
 pg_vault_tde_tableam_handler(PG_FUNCTION_ARGS)
@@ -178,6 +181,12 @@ PGDLLEXPORT Datum
 pg_vault_tde_iam_handler(PG_FUNCTION_ARGS)
 {
     PG_RETURN_POINTER(pg_vault_tde_get_iam_routine());
+}
+
+PGDLLEXPORT Datum
+pg_vault_tde_iam_ope_handler(PG_FUNCTION_ARGS)
+{
+    PG_RETURN_POINTER(pg_vault_tde_get_iam_ope_routine());
 }
 
 #ifndef PG_VAULT_TDE_BUILD_VERSION
@@ -384,7 +393,8 @@ tde_get_tableam_name_for_create(CreateStmt *create_stmt)
  */
 
 static const char *tde_safe_index_ams[] = {
-    "tde_btree", 
+    "tde_btree",
+    "tde_ope_btree",
     NULL
 };
 
@@ -581,7 +591,11 @@ tde_object_access_hook(ObjectAccessType access, Oid classId, Oid objectId,
         return;
 
     amname = get_am_name(relam);
-    if (amname == NULL || (strcmp(amname, "encrypted_heap") != 0 && strcmp(amname, "tde_btree") != 0))
+    if (amname == NULL || (
+			strcmp(amname, "encrypted_heap") != 0 && 
+			strcmp(amname, "tde_btree") != 0 &&
+			strcmp(amname, "tde_ope_btree") != 0
+		))
         return;
 
     /*
@@ -651,10 +665,15 @@ tde_object_access_hook(ObjectAccessType access, Oid classId, Oid objectId,
  * is untouched by this relam poke, so real inserts still route through
  * our AES-256-SIV tde_btree wrappers, not real btree.
  */
+typedef struct TdeSwappedRel
+{
+    Relation idxrel;
+    Oid      real_amoid;
+} TdeSwappedRel;
+
 typedef struct TdeSpeculativeSwapCtx
 {
-    List   *swapped;    /* open Relation* (AccessShareLock) to restore/close */
-    Oid     real_amoid;   /* tde_btree's real AM oid to restore relam to */
+    List   *swapped;    /* list of TdeSwappedRel* */
 } TdeSpeculativeSwapCtx;
 
 static void
@@ -665,10 +684,10 @@ tde_restore_speculative_relam(void *arg)
 
     foreach(lc, ctx->swapped)
     {
-        Relation idxrel = (Relation) lfirst(lc);
+        TdeSwappedRel *sr = (TdeSwappedRel *) lfirst(lc);
 
-        idxrel->rd_rel->relam = ctx->real_amoid;
-        index_close(idxrel, AccessShareLock);
+        sr->idxrel->rd_rel->relam = sr->real_amoid;
+        index_close(sr->idxrel, AccessShareLock);
     }
 }
 
@@ -678,6 +697,7 @@ tde_executor_start_hook(QueryDesc *queryDesc, int eflags)
     List       * volatile swapped = NIL; /* open Relation* whose relam we swapped */
     ModifyTable *mt = NULL;
     volatile Oid tde_btree_amoid = InvalidOid;
+    volatile Oid tde_ope_btree_amoid = InvalidOid;
 
     if (queryDesc->plannedstmt->planTree != NULL &&
         IsA(queryDesc->plannedstmt->planTree, ModifyTable))
@@ -690,8 +710,9 @@ tde_executor_start_hook(QueryDesc *queryDesc, int eflags)
         ListCell *lc_rel;
 
         tde_btree_amoid = get_index_am_oid("tde_btree", true);
+        tde_ope_btree_amoid = get_index_am_oid("tde_ope_btree", true);
 
-        if (OidIsValid(tde_btree_amoid))
+        if (OidIsValid(tde_btree_amoid) || OidIsValid(tde_ope_btree_amoid))
         {
             foreach(lc_rel, mt->resultRelations)
             {
@@ -710,10 +731,14 @@ tde_executor_start_hook(QueryDesc *queryDesc, int eflags)
                     Relation    idxrel = index_open(idxoid, AccessShareLock);
 
                     if (idxrel->rd_index->indisunique &&
-                        idxrel->rd_rel->relam == tde_btree_amoid)
+                        ((OidIsValid(tde_btree_amoid) && idxrel->rd_rel->relam == tde_btree_amoid) ||
+                         (OidIsValid(tde_ope_btree_amoid) && idxrel->rd_rel->relam == tde_ope_btree_amoid)))
                     {
+                        TdeSwappedRel *sr = palloc(sizeof(TdeSwappedRel));
+                        sr->idxrel = idxrel;
+                        sr->real_amoid = idxrel->rd_rel->relam;
                         idxrel->rd_rel->relam = BTREE_AM_OID;
-                        swapped = lappend(swapped, idxrel);
+                        swapped = lappend(swapped, sr);
                     }
                     else
                         index_close(idxrel, AccessShareLock);
@@ -742,12 +767,12 @@ tde_executor_start_hook(QueryDesc *queryDesc, int eflags)
 
         foreach(lc, swapped)
         {
-            Relation idxrel = (Relation) lfirst(lc);
+            TdeSwappedRel *sr = (TdeSwappedRel *) lfirst(lc);
 
-            idxrel->rd_rel->relam = tde_btree_amoid;
-            index_close(idxrel, AccessShareLock);
+            sr->idxrel->rd_rel->relam = sr->real_amoid;
+            index_close(sr->idxrel, AccessShareLock);
         }
-        list_free(swapped);
+        list_free_deep(swapped);
         PG_RE_THROW();
     }
     PG_END_TRY();
@@ -762,7 +787,6 @@ tde_executor_start_hook(QueryDesc *queryDesc, int eflags)
 
         ctx = palloc(sizeof(TdeSpeculativeSwapCtx));
         ctx->swapped = list_copy(swapped);
-        ctx->real_amoid = tde_btree_amoid;
 
         cb = palloc(sizeof(MemoryContextCallback));
         cb->func = tde_restore_speculative_relam;
@@ -1862,6 +1886,7 @@ _PG_init(void)
      * needed by hw_accel_siv_cipher) but before the first CREATE INDEX.
      */
     tde_iam_init();
+    tde_ope_iam_init();
 
     /*
      * Initialize hardware acceleration provider layer.

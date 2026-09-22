@@ -18,7 +18,7 @@ CONTAINER="pg-tde-regress-$$"
 cleanup() { stop_container "$CONTAINER"; }
 trap cleanup EXIT
 
-log_stage "REGRESSION TESTS (52 v1.4 + 20 v1.5 + 38 v1.6 + 30 v1.7 = 140 total)"
+log_stage "REGRESSION TESTS (52 v1.4 + 20 v1.5 + 38 v1.6 + 30 v1.7 + 14 v1.8 = 154 total)"
 
 build_pg_test_image
 
@@ -68,6 +68,7 @@ $RT cp "$REPO_ROOT/sql/regression_test.sql"    "$CONTAINER:/tmp/regression_test.
 $RT cp "$REPO_ROOT/sql/regression_test_v15.sql" "$CONTAINER:/tmp/regression_test_v15.sql"
 $RT cp "$REPO_ROOT/sql/regression_test_v16.sql" "$CONTAINER:/tmp/regression_test_v16.sql"
 $RT cp "$REPO_ROOT/sql/regression_test_v17.sql" "$CONTAINER:/tmp/regression_test_v17.sql"
+$RT cp "$REPO_ROOT/sql/regression_test_v18.sql" "$CONTAINER:/tmp/regression_test_v18.sql"
 
 # ── Phase 1: v1.4 baseline (52 tests) ────────────────────────────────────
 log_info "Running v1.4 regression_test.sql (52 tests) ..."
@@ -81,14 +82,11 @@ fi
 log_ok "v1.4 baseline: ALL 52 TESTS PASSED ($(timer_fmt "$(timer_elapsed "$START")"))"
 
 # ── Version guard ─────────────────────────────────────────────────────────
-# Only pg_vault_tde--1.7.sql is shipped (DATA in the Makefile) and the .control
-# declares default_version = 1.7, so CREATE EXTENSION lands on 1.7 and there is
-# no upgrade chain to walk. This asserts that instead of pretending to walk one.
 #
 LIVE_VERSION=$(container_psql "$CONTAINER" -tAc \
     "SELECT extversion FROM pg_extension WHERE extname='pg_vault_tde';")
-if [ "$LIVE_VERSION" != "1.7" ]; then
-    log_error "REGRESSION: expected pg_vault_tde 1.7, found '${LIVE_VERSION}'"
+if [ "$LIVE_VERSION" != "1.8" ]; then
+    log_error "REGRESSION: expected pg_vault_tde 1.8, found '${LIVE_VERSION}'"
     exit 2
 fi
 log_ok "pg_vault_tde at ${LIVE_VERSION}"
@@ -132,5 +130,19 @@ else
     exit 2
 fi
 
-log_ok "REGRESSION COMPLETE: ALL 140 TESTS PASSED (v1.4 × 52 + v1.5 × 20 + v1.6 × 38 + v1.7 × 30)"
+
+# ── Phase 5: v1.8 (tests 141) ────────────────────────────
+log_info "Running v1.8 regression_test_v18.sql (tests 141-xx) ..."
+START=$(timer_start)
+if container_psql "$CONTAINER" -f /tmp/regression_test_v18.sql; then
+    ELAPSED=$(timer_elapsed "$START")
+    log_ok "REGRESSION v1.8: tests 141 OK ($(timer_fmt "$ELAPSED"))"
+else
+    ELAPSED=$(timer_elapsed "$START")
+    log_error "REGRESSION v1.8 wallet: FAILED after $(timer_fmt "$ELAPSED")"
+    $RT logs "$CONTAINER" --tail 80 2>/dev/null || true
+    exit 2
+fi
+
+log_ok "REGRESSION COMPLETE: ALL 140 TESTS PASSED (v1.4 × 52 + v1.5 × 20 + v1.6 × 38 + v1.7 × 30 + v1.8 x)"
 exit 0

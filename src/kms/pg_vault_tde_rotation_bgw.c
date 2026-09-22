@@ -376,16 +376,18 @@ pg_vault_tde_rotation_bgw_main(Datum main_arg)
         if (get_rel_relkind(args.relid) == RELKIND_INDEX)
         {
             Oid             tde_btree_amoid = get_index_am_oid("tde_btree", true);
+            Oid             tde_ope_btree_amoid = get_index_am_oid("tde_ope_btree", true);
+            Oid             idx_relam = get_rel_relam(args.relid);
             ReindexParams   reindex_params  = {0};
 
-            /* Only tde_btree indexes have a DEK entry — validate before touching shmem. */
-            if (!OidIsValid(tde_btree_amoid) ||
-                get_rel_relam(args.relid) != tde_btree_amoid)
+            /* Only encrypted indexes (tde_btree, tde_ope_btree) have a DEK entry — validate before touching shmem. */
+            if ((!OidIsValid(tde_btree_amoid) || idx_relam != tde_btree_amoid) &&
+                (!OidIsValid(tde_ope_btree_amoid) || idx_relam != tde_ope_btree_amoid))
                 ereport(ERROR,
                         (errcode(ERRCODE_WRONG_OBJECT_TYPE),
-                         errmsg("pg_vault_tde_rotate_online: index %u is not a "
-                                "tde_btree index — only tde_btree indexes "
-                                "have DEK entries", args.relid)));
+                         errmsg("pg_vault_tde_rotate_online: index %u is not an "
+                                "encrypted index — only tde_btree or tde_ope_btree "
+                                "indexes have DEK entries", args.relid)));
 
             pg_vault_tde_catalog_zero_rel_dek(args.relid);
             pg_vault_tde_catalog_update_rel_dek(args.relid);

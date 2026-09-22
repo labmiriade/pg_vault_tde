@@ -59,6 +59,8 @@
 #include "src/include/pg_vault_tde_guc.h"      /* pg_vault_tde_enabled */
 #include "src/include/pg_vault_tde_iam.h"      /* tde_iam_is_tde_btree_index,
                                                   tde_iam_encrypt_index_datum */
+#include "src/include/pg_vault_tde_iam_ope.h"  /* tde_iam_is_ope_btree_index,
+                                                  tde_iam_ope_encrypt_index_datum */
 #include "src/include/pg_vault_tde_toast.h"
 #include "src/include/pg_vault_tde_catalog.h"
 #include <openssl/crypto.h>         /* OPENSSL_cleanse */
@@ -922,6 +924,42 @@ pg_vault_tde_index_build_range_scan(Relation heap_rel,
                             Form_pg_attribute att = TupleDescAttr(index_rel->rd_att, kcol);
                             enc_values[kcol] = tde_iam_encrypt_index_datum(
                                                     index_rel,
+                                                   enc_values[kcol],
+                                                   att->attbyval,
+                                                   att->attlen);
+                        }
+                    }
+                }
+                MemoryContextSwitchTo(oldcxt);
+                callback(index_rel, &itid, enc_values, enc_isnull,
+                         tupleIsAlive, callback_state);
+            }
+            else if (tde_iam_is_ope_btree_index(index_rel))
+            {
+                Datum  enc_values[INDEX_MAX_KEYS];
+                bool   enc_isnull[INDEX_MAX_KEYS];
+                int    nbuildcols = index_info->ii_NumIndexAttrs;
+                int    kcol;
+
+                memcpy(enc_values, values, nbuildcols * sizeof(Datum));
+                memcpy(enc_isnull, isnull, nbuildcols * sizeof(bool));
+
+                for (kcol = 0; kcol < nbuildcols; kcol++)
+                {
+                    if (!enc_isnull[kcol])
+                    {
+                        if (TDE_ope_IS_ENC_OPS_COL(index_rel, kcol))
+                        {
+                            enc_values[kcol] = tde_iam_ope_encrypt_fixed_type_datum(
+                                                   index_rel,
+                                                   enc_values[kcol],
+                                                   index_rel->rd_opcintype[kcol]);
+                        }
+                        else
+                        {
+                            Form_pg_attribute att = TupleDescAttr(index_rel->rd_att, kcol);
+                            enc_values[kcol] = tde_iam_ope_encrypt_index_datum(
+                                                   index_rel,
                                                    enc_values[kcol],
                                                    att->attbyval,
                                                    att->attlen);
@@ -2296,6 +2334,7 @@ int64 pg_vault_tde_reencrypt_table(Oid relid)
     LockTupleMode       lock_mode;
     List               *tde_index_oids = NIL;
     Oid                 tde_btree_amoid;
+    Oid                 tde_ope_btree_amoid;
     int64               tuples_done = 0;
 
     rel = table_open(relid, RowExclusiveLock);
@@ -2333,13 +2372,14 @@ int64 pg_vault_tde_reencrypt_table(Oid relid)
     }
 
     /*
-     * Collect OIDs of tde_btree indexes before releasing the relation.
-     * We must rebuild them because AES-256-SIV key material is DEK-bound:
+     * Collect OIDs of tde_btree and tde_ope_btree indexes before releasing the relation.
+     * We must rebuild them because DEK-bound key material is affected by rotation:
      * after rotation the stored ciphertexts no longer match lookups under
      * the new DEK.  Standard btree (and heap) indexes need no rebuild.
      */
     tde_btree_amoid = get_index_am_oid("tde_btree", true);
-    if (OidIsValid(tde_btree_amoid))
+    tde_ope_btree_amoid = get_index_am_oid("tde_ope_btree", true);
+    if (OidIsValid(tde_btree_amoid) || OidIsValid(tde_ope_btree_amoid))
     {
         List       *idxlist = RelationGetIndexList(rel);
         ListCell   *lc;
@@ -2349,7 +2389,8 @@ int64 pg_vault_tde_reencrypt_table(Oid relid)
             Oid         idxoid = lfirst_oid(lc);
             Relation    idxrel = index_open(idxoid, AccessShareLock);
 
-            if (idxrel->rd_rel->relam == tde_btree_amoid)
+            if ((OidIsValid(tde_btree_amoid) && idxrel->rd_rel->relam == tde_btree_amoid) ||
+                (OidIsValid(tde_ope_btree_amoid) && idxrel->rd_rel->relam == tde_ope_btree_amoid))
                 tde_index_oids = lappend_oid(tde_index_oids, idxoid);
 
             index_close(idxrel, AccessShareLock);

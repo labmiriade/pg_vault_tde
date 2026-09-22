@@ -265,6 +265,7 @@ SELECT email, ssn FROM users WHERE id = 1;
 | Tuple user data | ✅ **Yes** — AES-256-GCM | All column values in `encrypted_heap` tables |
 | HeapTupleHeader | ✗ No | xmin, xmax, ctid, infomask — required for MVCC |
 | Index keys (B-Tree) | ⚠️ Optional — `tde_btree` | AES-256-SIV — equality only; all types encrypted (v1.7); index-only scans not supported |
+| Index keys (B-Tree) | ⚠️ Optional — `tde_ope_btree` | Order Preserving Encryption based in AES-256-ECB — all types encrypted (v1.8); index-only scans and non-equality supported |
 | Index keys (GIN, Hash) | 🔜 v1.8 | GIN for jsonb/arrays; Hash for equality hashing |
 | Index keys (GiST equality) | 🔜 v1.8 | Equality-only GiST (`inet_ops`); range/geometric GiST permanently deferred |
 | Index keys (BRIN bloom) | 🔜 v1.8 | Equality-only block-range pruning via a bloom filter over ciphertext hashes; `minmax` BRIN permanently deferred (needs a spike — see doc/ROADMAP.md) |
@@ -277,7 +278,7 @@ SELECT email, ssn FROM users WHERE id = 1;
 > encrypted. Regular `heap` tables are unaffected.
 
 > **Index access method whitelist**: `CREATE INDEX`/`CREATE UNIQUE INDEX`
-> with any access method other than `tde_btree` (so also `gin`, `gist`,
+> with any access method other than `tde_btree` or `tde_ope_btree` (so also `gin`, `gist`,
 > `hash`, `brin`) against an `encrypted_heap` table is rejected with `ERROR`
 > by default — the indexed column's plaintext value would otherwise sit
 > unencrypted on disk. Set `pg_vault_tde.allow_plaintext_index = on` to allow
@@ -311,6 +312,11 @@ Index Access Method (IAM) — tde_btree                  src/iam/
    │  AES-256-SIV (OpenSSL 3.x EVP_CIPHER_fetch) — deterministic equality
    │  64-byte double-key via PBKDF2-SHA256 from DEK
    │
+Index Access Method (IAM) — tde_ope_btree              src/iam/
+   |  Order Preserving Encryption (OPE)
+   │  AES-256-ECB — stateless, deterministic monotone masking
+   │  128-bit big-endian multi-precision carry arithmetic
+
    ▼
 Crypto Layer — AES-256-GCM (OpenSSL 3.x EVP)           src/crypto/
    │  [IV(12) | CIPHERTEXT | GCM-TAG(16) | VER(1) | GEN(8)] per tuple
@@ -574,14 +580,15 @@ SELECT pg_vault_tde_rotate_online('mytable', 1000);
 SELECT * FROM pg_vault_tde_rotation_status('mytable');
 ```
 
-`rotate_online` accepts both table relations and `tde_btree` index relations:
+`rotate_online` accepts table relations, `tde_btree` or `tde_ope_btree` index relations:
 
 | Target | What happens |
 |--------|-------------|
 | `encrypted_heap` table | Generates a new table DEK, re-encrypts every tuple in-place (`RowExclusiveLock`), then rebuilds any `tde_btree` indexes on the table so their SIV ciphertexts match the new DEK. Standard `btree` indexes on encrypted columns need no rebuild. |
-| `tde_btree` index | Generates a new index DEK, then calls `reindex_index` (`AccessExclusiveLock` on the index only) to rebuild the index with keys encrypted under the new DEK. The parent table's DEK and heap data are untouched. Passing a non-`tde_btree` index raises an error before touching shmem or the catalog. |
+| `tde_btree` index | Generates a new index DEK, then calls `reindex_index` (`AccessExclusiveLock` on the index only) to rebuild the index with keys encrypted under the new DEK. The parent table's DEK and heap data are untouched. |
+| `tde_ope_btree` index | Generates a new index DEK, then calls `reindex_index` (`AccessExclusiveLock` on the index only) to rebuild the index with keys encrypted under the new DEK. The parent table's DEK and heap data are untouched. |
 
-When a table with `tde_btree` indexes is rotated, the index rebuild uses the new table DEK
+When a table with `tde_btree` or `tde_ope_btree` indexes is rotated, the index rebuild uses the new table DEK
 implicitly because the heap rows the scan reads are re-encrypted first; the index keys
 are then produced from the decrypted values and re-encrypted under the (unchanged) index DEK.
 To also rotate the index DEK, call `rotate_online` on the index relation directly afterwards.
@@ -701,7 +708,7 @@ All parameters are `suset` — settable per-database with `ALTER DATABASE SET`.
 | Parameter | Type | Default | Context | Description |
 |---|---|---|---|---|
 | `enabled` | boolean | `on` | suset | Master switch — set `off` to measure TAM overhead without crypto. Settable per-database. |
-| `allow_plaintext_index` | boolean | `off` | suset | When `off` (default), `CREATE INDEX`/`CREATE UNIQUE INDEX` with a non-`tde_btree` access method on an `encrypted_heap` table is rejected with `ERROR`. When `on`, allowed after a `WARNING` — the indexed column's plaintext value is then stored unencrypted on disk. Does not affect `PRIMARY KEY`/`UNIQUE` table constraints (always allowed, always warned — see "What Gets Encrypted" above). |
+| `allow_plaintext_index` | boolean | `off` | suset | When `off` (default), `CREATE INDEX`/`CREATE UNIQUE INDEX` with a non-`tde_btree` and non-`tde_ope_btree` access method on an `encrypted_heap` table is rejected with `ERROR`. When `on`, allowed after a `WARNING` — the indexed column's plaintext value is then stored unencrypted on disk. Does not affect `PRIMARY KEY`/`UNIQUE` table constraints (always allowed, always warned — see "What Gets Encrypted" above). |
 
 ---
 
@@ -774,7 +781,7 @@ log stream without any extension-level configuration.
 | `pg_vault_tde_verify_integrity(regclass)` | record | GCM tag audit scan of all tuples — returns `(total_tuples, failed_tuples)` |
 | `pg_vault_tde_encrypted_size(regclass)` | record | Encryption storage overhead — returns `(total_tuples, encryption_overhead_bytes)` |
 | `pg_vault_tde_reencrypt_table(regclass, int)` | void | Batch re-encrypt with current DEK (locks table); `int` = batch size, default 1000 |
-| `pg_vault_tde_rotate_online(regclass, int)` | void | BGW-based online rotation, no exclusive lock; accepts both `encrypted_heap` tables and `tde_btree` indexes **(v1.5)** |
+| `pg_vault_tde_rotate_online(regclass, int)` | void | BGW-based online rotation, no exclusive lock; accepts both `encrypted_heap` tables, `tde_btree` or `tde_ope_btree` indexes **(v1.5)** |
 | `pg_vault_tde_get_rotation_status(regclass)` | table | Online rotation progress for one relation (status, tuples_done/total, pct_complete, timestamps) **(v1.5)** |
 | `pg_vault_tde_rotation_status` | view | All in-progress/completed rotations across the cluster; readable by `pg_monitor` **(v1.5)** |
 | `pg_vault_tde_check_plaintext_index_keys()` | table | Lists `tde_btree` indexes still using a pre-v1.6 plaintext operator class, with a ready-to-run `REINDEX` suggestion; `pg_monitor`/superuser only |
@@ -801,6 +808,7 @@ log stream without any extension-level configuration.
 |---|---|---|
 | `encrypted_heap` | TABLE | Encrypts all user-data columns of every stored tuple |
 | `tde_btree` | INDEX | AES-256-SIV deterministic encryption for B-Tree index keys |
+| `tde_ope_btree` | INDEX | Order Preserving Encryption using AES-256-ECB deterministic encryption for B-Tree index keys |
 
 ```sql
 -- Table with encrypted heap storage
@@ -808,6 +816,9 @@ CREATE TABLE secrets (id serial, token text) USING encrypted_heap;
 
 -- B-Tree index with deterministic key encryption
 CREATE INDEX ON secrets USING tde_btree (id);
+
+-- B-Tree index with Order Preserving Encryption
+CREATE INDEX ON secrets USING tde_ope_btree (id);
 ```
 
 ---
@@ -923,7 +934,7 @@ newer](#logical-replication-on-postgresql-1711--18x-and-newer) below.
 | Logical replication (non-TOAST) | ✅ Full (v1.2) | `pg_vault_tde_pgoutput` plugin decrypts tuples before streaming. On PG ≥ 17.11 / 18.x the publisher must allow the plugin — see below |
 | TOAST (large values > ≈2 kB) | ✅ Full | Heap-level round-trips functional; per-chunk storage encryption |
 | Logical replication (TOAST columns) | ✅ Full (v1.7) | Custom WAL rmgr (`toast_custom_rmgr`) routes encrypted chunks past the reorder buffer; stitched in `change_cb`. UPDATE/DELETE need `REPLICA IDENTITY FULL` + PK. Same publisher requirement as above |
-| Range scans on TDE indexes | ⚠️ By design | `tde_btree` (GIN/Hash/GiST planned for v1.8, same AES-SIV pattern) — equality only; ranges return empty |
+| Range scans on TDE indexes | ⚠️ By design | `tde_btree` (GIN/Hash/GiST planned for v1.8, same AES-SIV pattern) — equality only; ranges return empty - use `tde_ope_btree` |
 | `CREATE INDEX USING gin/gist/hash/brin/btree` on `encrypted_heap` | ⚠️ `ERROR` by default | Not encrypted AMs; rejected unless `pg_vault_tde.allow_plaintext_index = on` (then allowed with `WARNING`) |
 | Column-level encryption | 🔜 v1.8 | Per-column `ENABLE COLUMN ENCRYPTION` DDL |
 

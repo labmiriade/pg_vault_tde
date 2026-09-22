@@ -6,6 +6,9 @@
 -- Fresh installation at v1.7.  For upgrades from older versions, use the
 -- ALTER EXTENSION UPDATE path (scripts pg_vault_tde--1.0--1.4.sql, etc.).
 
+-- complain if script is sourced in psql, rather than via CREATE EXTENSION
+\echo Use "CREATE EXTENSION pg_vault_tde VERSION '1.7'" to load this file. \quit
+
 -- ============================================================================
 -- Superuser guard
 -- ============================================================================

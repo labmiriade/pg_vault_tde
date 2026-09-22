@@ -53,15 +53,17 @@ OBJS = \
 	src/kms/pg_vault_tde_preload_bgw.o \
 	src/kms/pg_vault_tde_seal.o \
 	src/crypto/pg_vault_tde_crypto.o \
+	src/crypto/pg_vault_tde_crypto_ope.o \
 	src/crypto/pg_vault_tde_hw_accel.o \
 	src/tam/pg_vault_tde_tam.o \
 	src/tam/pg_vault_tde_toast.o \
 	src/iam/pg_vault_tde_iam.o \
+	src/iam/pg_vault_tde_iam_ope.o \
 	src/logical/pg_vault_tde_pgoutput.o \
 	src/logical/pg_vault_tde_rmgr.o
 
 # SQL scripts installed as part of the extension.
-DATA = sql/pg_vault_tde--1.7.sql 
+DATA = sql/pg_vault_tde--1.7.sql sql/pg_vault_tde--1.7--1.8.sql
 
 # pg_regress test targets (filenames without .sql suffix)
 REGRESS = pg_vault_tde_init

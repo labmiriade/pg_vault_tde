@@ -58,7 +58,11 @@ BEGIN
     IF NOT FOUND THEN
         RAISE EXCEPTION 'TEST 2b FAILED: tde_btree AM not found';
     END IF;
-    RAISE NOTICE 'TEST 2 PASSED: both Access Methods registered';
+    PERFORM 1 FROM pg_am WHERE amname = 'tde_ope_btree';
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'TEST 2c FAILED: tde_ope_btree AM not found';
+    END IF;
+    RAISE NOTICE 'TEST 2 PASSED: all Access Methods registered';
 END;
 $$;
 
@@ -271,16 +275,54 @@ DECLARE
     v text;
 BEGIN
     CREATE TABLE tde_idx (id int, secret text) USING encrypted_heap;
-    CREATE INDEX ON tde_idx USING tde_btree (id);
+    CREATE INDEX ix_tde_idx ON tde_idx USING tde_btree (id);
     INSERT INTO tde_idx VALUES (42, 'index_scan_secret');
+	ANALYZE tde_idx;
     -- Force the planner to use the index
     SET enable_seqscan = off;
     SELECT secret INTO v FROM tde_idx WHERE id = 42;
     RESET enable_seqscan;
     IF v IS DISTINCT FROM 'index_scan_secret' THEN
-        RAISE EXCEPTION 'TEST 17 FAILED: index scan returned wrong value "%"', v;
+        RAISE EXCEPTION 'TEST 17a FAILED: (index+insert) tde_btree index scan returned wrong value "%"', v;
     END IF;
-    DROP TABLE tde_idx;
+	DROP INDEX ix_tde_idx;
+
+    CREATE INDEX ix_tde_idx ON tde_idx USING tde_btree (id);
+	ANALYZE tde_idx;
+    -- Force the planner to use the index
+    SET enable_seqscan = off;
+    SELECT secret INTO v FROM tde_idx WHERE id = 42;
+    RESET enable_seqscan;
+    IF v IS DISTINCT FROM 'index_scan_secret' THEN
+        RAISE EXCEPTION 'TEST 17b FAILED: (insert+index) tde_btree index scan returned wrong value "%"', v;
+    END IF;
+	DROP TABLE tde_idx;
+	
+	-- tde_ope_btree
+    CREATE TABLE tde_idx (id int, secret text) USING encrypted_heap;
+    CREATE INDEX ix_tde_idx ON tde_idx USING tde_ope_btree (id);
+    INSERT INTO tde_idx VALUES (42, 'index_scan_secret');
+	ANALYZE tde_idx;
+    -- Force the planner to use the index
+    SET enable_seqscan = off;
+    SELECT secret INTO v FROM tde_idx WHERE id = 42;
+    RESET enable_seqscan;
+    IF v IS DISTINCT FROM 'index_scan_secret' THEN
+        RAISE EXCEPTION 'TEST 17c FAILED: (index+insert) tde_ope_btree index scan returned wrong value "%"', v;
+    END IF;
+	DROP INDEX ix_tde_idx;
+
+    CREATE INDEX ix_tde_idx ON tde_idx USING tde_ope_btree (id);
+	ANALYZE tde_idx;
+    -- Force the planner to use the index
+    SET enable_seqscan = off;
+    SELECT secret INTO v FROM tde_idx WHERE id = 42;
+    RESET enable_seqscan;
+    IF v IS DISTINCT FROM 'index_scan_secret' THEN
+        RAISE EXCEPTION 'TEST 17d FAILED: (insert+index) tde_ope_btree index scan returned wrong value "%"', v;
+    END IF;
+	DROP TABLE tde_idx;
+
     RAISE NOTICE 'TEST 17 PASSED: index scan on encrypted_heap decrypts correctly';
 END;
 $$;
@@ -453,7 +495,7 @@ DECLARE
     v   text;
 BEGIN
     CREATE TABLE tde_bitmap (id int, payload text) USING encrypted_heap;
-    CREATE INDEX ON tde_bitmap USING tde_btree (id);
+    CREATE INDEX ix_tde_bitmap ON tde_bitmap USING tde_btree (id);
     INSERT INTO tde_bitmap SELECT g, 'bitmap_' || g FROM generate_series(1, 200) g;
 
     /*
@@ -466,12 +508,29 @@ BEGIN
 
     SELECT count(*) INTO cnt FROM tde_bitmap WHERE id BETWEEN 50 AND 150;
     IF cnt <> 101 THEN
-        RAISE EXCEPTION 'TEST 23a FAILED: expected 101 rows, got %', cnt;
+        RAISE EXCEPTION 'TEST 23a FAILED: tde_btree expected 101 rows, got %', cnt;
     END IF;
 
     SELECT payload INTO v FROM tde_bitmap WHERE id = 100;
     IF v IS DISTINCT FROM 'bitmap_100' THEN
-        RAISE EXCEPTION 'TEST 23b FAILED: expected "bitmap_100", got "%"', v;
+        RAISE EXCEPTION 'TEST 23b FAILED: tde_btree expected "bitmap_100", got "%"', v;
+    END IF;
+
+	-- tde_ope_btree
+	DROP INDEX ix_tde_bitmap;
+	CREATE INDEX ix_tde_bitmap ON tde_bitmap USING tde_ope_btree (id);
+
+	SET enable_seqscan = off;
+    SET enable_indexscan = off;
+
+    SELECT count(*) INTO cnt FROM tde_bitmap WHERE id BETWEEN 50 AND 150;
+    IF cnt <> 101 THEN
+        RAISE EXCEPTION 'TEST 23c FAILED: tde_ope_btree expected 101 rows, got %', cnt;
+    END IF;
+
+    SELECT payload INTO v FROM tde_bitmap WHERE id = 100;
+    IF v IS DISTINCT FROM 'bitmap_100' THEN
+        RAISE EXCEPTION 'TEST 23d FAILED: tde_ope_btree expected "bitmap_100", got "%"', v;
     END IF;
 
     RESET enable_seqscan;
@@ -677,7 +736,7 @@ BEGIN
     SET enable_seqscan = off;
     SELECT val INTO v FROM tde_reindex WHERE id = 25;
     IF v IS DISTINCT FROM 'val_25' THEN
-        RAISE EXCEPTION 'TEST 28a FAILED: pre-REINDEX index scan got "%"', v;
+        RAISE EXCEPTION 'TEST 28a FAILED: tde_btree pre-REINDEX index scan got "%"', v;
     END IF;
 
     -- Perform REINDEX
@@ -686,7 +745,7 @@ BEGIN
     -- Verify data is still accessible via index after REINDEX
     SELECT val INTO v FROM tde_reindex WHERE id = 25;
     IF v IS DISTINCT FROM 'val_25' THEN
-        RAISE EXCEPTION 'TEST 28b FAILED: post-REINDEX index scan got "%"', v;
+        RAISE EXCEPTION 'TEST 28b FAILED: tde_btree post-REINDEX index scan got "%"', v;
     END IF;
 
     -- Also test REINDEX TABLE
@@ -694,12 +753,41 @@ BEGIN
 
     SELECT val INTO v FROM tde_reindex WHERE id = 50;
     IF v IS DISTINCT FROM 'val_50' THEN
-        RAISE EXCEPTION 'TEST 28c FAILED: post-REINDEX TABLE got "%"', v;
+        RAISE EXCEPTION 'TEST 28c FAILED: tde_btree post-REINDEX TABLE got "%"', v;
+    END IF;
+    RESET enable_seqscan;
+
+	-- tde_ope_btree
+	DROP INDEX tde_reindex_idx;
+	CREATE INDEX tde_reindex_idx ON tde_reindex USING tde_ope_btree(id);
+
+	-- Force an index scan to verify pre-REINDEX state
+    SET enable_seqscan = off;
+    SELECT val INTO v FROM tde_reindex WHERE id = 25;
+    IF v IS DISTINCT FROM 'val_25' THEN
+        RAISE EXCEPTION 'TEST 28d FAILED: tde_ope_btree pre-REINDEX index scan got "%"', v;
+    END IF;
+
+    -- Perform REINDEX
+    REINDEX INDEX tde_reindex_idx;
+
+    -- Verify data is still accessible via index after REINDEX
+    SELECT val INTO v FROM tde_reindex WHERE id = 25;
+    IF v IS DISTINCT FROM 'val_25' THEN
+        RAISE EXCEPTION 'TEST 28e FAILED: tde_ope_btree post-REINDEX index scan got "%"', v;
+    END IF;
+
+    -- Also test REINDEX TABLE
+    REINDEX TABLE tde_reindex;
+
+    SELECT val INTO v FROM tde_reindex WHERE id = 50;
+    IF v IS DISTINCT FROM 'val_50' THEN
+        RAISE EXCEPTION 'TEST 28d FAILED: tde_ope_btree post-REINDEX TABLE got "%"', v;
     END IF;
     RESET enable_seqscan;
 
     DROP TABLE tde_reindex;
-    RAISE NOTICE 'TEST 28 PASSED: REINDEX works on encrypted_heap + tde_btree';
+    RAISE NOTICE 'TEST 28 PASSED: REINDEX works on encrypted_heap + tde_btree / tde_ope_btree';
 END;
 $$;
 
@@ -1526,7 +1614,7 @@ BEGIN
 
     IF v_id IS DISTINCT FROM 42 THEN
         RAISE EXCEPTION
-            'TEST 50 FAILED: index scan returned % (expected 42)', v_id;
+            'TEST 50 FAILED: tde_btree index scan returned % (expected 42)', v_id;
     END IF;
 
     -- Verify count via index
@@ -1535,11 +1623,34 @@ BEGIN
     RESET enable_seqscan;
     IF v_cnt != 1 THEN
         RAISE EXCEPTION
-            'TEST 50 FAILED: count via index should be 1, got %', v_cnt;
+            'TEST 50 FAILED: tde_btree count via index should be 1, got %', v_cnt;
     END IF;
 
+	DROP INDEX tde_btree_idx;
+    -- Build the encrypted B-Tree index (tde_bytea_ops is the default for bytea)
+    CREATE INDEX tde_btree_idx ON tde_btree_test USING tde_ope_btree (tag);
+
+    -- Force index-only path: disable seqscan
+    SET enable_seqscan = off;
+    SELECT id INTO v_id FROM tde_btree_test WHERE tag = 'answer'::bytea;
+    RESET enable_seqscan;
+
+    IF v_id IS DISTINCT FROM 42 THEN
+        RAISE EXCEPTION
+            'TEST 50 FAILED: tde_ope_btree index scan returned % (expected 42)', v_id;
+    END IF;
+
+    -- Verify count via index
+    SET enable_seqscan = off;
+    SELECT count(*) INTO v_cnt FROM tde_btree_test WHERE tag = 'one'::bytea;
+    RESET enable_seqscan;
+    IF v_cnt != 1 THEN
+        RAISE EXCEPTION
+            'TEST 50 FAILED: tde_ope_btree count via index should be 1, got %', v_cnt;
+    END IF;	
+
     DROP TABLE tde_btree_test;
-    RAISE NOTICE 'TEST 50 PASSED: tde_btree CREATE INDEX + equality scan OK';
+    RAISE NOTICE 'TEST 50 PASSED: tde_btree/tde_ope_btree CREATE INDEX + equality scan OK';
 END;
 $$;
 
