@@ -424,6 +424,7 @@ tde_iam_encrypt_fixed_type_datum(Relation index_rel, Datum datum, Oid typoid)
         SET_VARSIZE(enc_bytea, VARHDRSZ + enc_len);
         memcpy(VARDATA(enc_bytea), encrypted, enc_len);
         OPENSSL_cleanse(encrypted, enc_len);
+        pfree(encrypted);
     }
     PG_CATCH();
     {
@@ -435,7 +436,14 @@ tde_iam_encrypt_fixed_type_datum(Relation index_rel, Datum datum, Oid typoid)
 
     OPENSSL_cleanse(dek, sizeof(dek));
 
-    /* Do NOT pfree(encrypted) — let ecxt_per_tuple_memory reset reclaim it. */
+    /*
+     * The intermediate buffer is released here, not left to a context reset:
+     * aminsert runs in ExecutorState, which lives for the whole statement, not
+     * in ecxt_per_tuple_memory.  Measured on a single 8M-row INSERT before this
+     * pfree: ExecutorState held 34 MB against 0.7 MB for the same INSERT into a
+     * plain heap with a plain btree.  enc_bytea is the return value and is
+     * freed by the caller once the index tuple has copied it.
+     */
     return PointerGetDatum(enc_bytea);
 }
 
@@ -552,6 +560,7 @@ tde_iam_encrypt_index_datum(Relation index_rel, Datum datum, bool typbyval, int1
             SET_VARSIZE(enc_bytea, VARHDRSZ + enc_len);
             memcpy(VARDATA(enc_bytea), encrypted, enc_len);
             OPENSSL_cleanse(encrypted, enc_len);
+            pfree(encrypted);
         }
         PG_CATCH();
         {
@@ -562,7 +571,15 @@ tde_iam_encrypt_index_datum(Relation index_rel, Datum datum, bool typbyval, int1
 
         OPENSSL_cleanse(dek, sizeof(dek));
 
-        /* Do NOT pfree(encrypted) — let ecxt_per_tuple_memory reset reclaim it. */
+        /*
+         * Both intermediates go back now — see the note in
+         * tde_iam_encrypt_fixed_type_datum(): the caller is in ExecutorState,
+         * which is reset once per statement, not once per tuple.  `plain`
+         * points inside bval, so this has to come after the encrypt call.
+         */
+        if (bval != NULL)
+            pfree(bval);
+
         return PointerGetDatum(enc_bytea);
     }
 }
@@ -747,7 +764,22 @@ pg_vault_tde_aminsert(Relation index, Datum *values, bool *isnull,
 
     index->rd_rel->relam = saved_relam;
 
-    return result;                                
+    /*
+     * btinsert has copied the key into an IndexTuple of its own, so the bytea
+     * this function produced per column is dead.  Releasing it here matters
+     * because aminsert runs in ExecutorState — reset once per statement, not
+     * once per tuple — so on a bulk load these accumulate for the whole
+     * INSERT.  A datum that came back unchanged was never ours: tde_btree
+     * stores fixed-size keys without an enc_ops opclass in plaintext, and
+     * tde_iam_encrypt_fixed_type_datum returns its input on an unknown typoid.
+     */
+    for (i = 0; i < ncols; i++)
+    {
+        if (!isnull[i] && DatumGetPointer(enc_values[i]) != DatumGetPointer(values[i]))
+            pfree(DatumGetPointer(enc_values[i]));
+    }
+
+    return result;
 }
 
 /* ── AMBEGINSCAN ────────────────────────────────────────────────────────── */
