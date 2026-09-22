@@ -45,6 +45,26 @@ session ends normally.
 
 ## Troubleshooting
 
+### `Ciphertext too short for AES-256-GCM` on a table that used to read fine
+
+A row whose columns are **all** NULL carries no user data, so its encrypted
+region is the AEAD framing and nothing else. Releases up to 1.7.1 rejected that
+as too short, and a single such row made every sequential scan of the table fail
+from the `INSERT` onwards.
+
+The data is not corrupt — the ciphertext on disk is intact. Upgrade to 1.7.2 and
+the rows read normally; no dump, no rewrite, no migration step.
+
+### A backend crashes on `UPDATE` after upgrading to 1.7.2
+
+Rows written before the upgrade keep the old on-disk layout until something
+rewrites them, and on that layout `heap_update()` cannot safely read the indexed
+attributes of a table whose index sits on a column behind a variable-length one.
+
+Run `VACUUM FULL` (or `CLUSTER`) on each `encrypted_heap` table once after
+upgrading — see [Compatibility and Versioning](Compatibility-and-Versioning).
+Tables created after the upgrade are unaffected.
+
 ### "GCM tag mismatch" / decryption / integrity errors
 
 This means the ciphertext, IV, or associated data did not authenticate —

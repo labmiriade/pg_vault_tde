@@ -131,11 +131,19 @@ tde_tuple_looks_encrypted(HeapTuple tup)
 
     data_len = tup->t_len - hdr_len;
     if (data_len < (Size) TDE_V4_OVERHEAD)
-        return false;           /* too short to be a v4 encrypted region */
+        return false;           /* too short to be an encrypted region */
 
-    /* v4 is IV-first: version byte lives in the trailer [.. | TAG | VERSION(1) | GEN(8)] */
+    /*
+     * Both layouts end with the same trailer [.. | TAG | VERSION(1) | GEN(8)],
+     * so the version byte sits at the same offset from the end whether the
+     * region is a v4 blob or a v5 structure-preserving tuple.  Recognising
+     * only one of them here does not produce an error: the tuple is taken for
+     * plaintext and handed to pgoutput as-is, which then reads a varlena
+     * length out of ciphertext ("invalid memory alloc request size" in the
+     * change callback, replication stuck).
+     */
     ver = *((unsigned char *) tup->t_data + tup->t_len - (TDE_V4_GEN_LEN + 1));
-    return (ver == TDE_V4_VERSION_BYTE);
+    return (ver == TDE_V4_VERSION_BYTE || ver == TDE_TUPLE_V5_VERSION_BYTE);
 }
 
 /*

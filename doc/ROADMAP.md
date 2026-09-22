@@ -1,6 +1,6 @@
 # pg_vault_tde Roadmap
 
-> Last updated: 2026-09-19 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 153 regression tests (52 v1.4 + 20 v1.5 + 38 v1.6 + 30 v1.7 + 13 error-path), 20 TAP files / 240 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 2 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
+> Last updated: 2026-09-22 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 153 regression tests (52 v1.4 + 20 v1.5 + 38 v1.6 + 30 v1.7 + 13 error-path), 20 TAP files / 240 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 2 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
 
 ---
 
@@ -72,7 +72,8 @@ the `RELKIND_TOASTVALUE` read-path bypass so real TOAST chunks round-trip correc
 ## v1.7 — TOAST Chunks + KEK Hierarchy + HSM + Audit
 
 > Status: ✅ Completed — patched by v1.7.1 (below)
-> **Delivered**: 137 regression tests at release, 140 with v1.7.1 (target was ~100) —
+> **Delivered**: 137 regression tests at release, 140 with v1.7.1, 145 with v1.7.2
+> (target was ~100) —
 > PG 17 + PG 18; the PG 19 audit moves to that release.
 
 **Theme**: Close the TOAST data-leak gap, formalize the KEK/DEK wrap hierarchy across
@@ -214,6 +215,64 @@ earlier minors have no such GUC and must not carry the line. See README → Comp
 
 ---
 
+## v1.7.2 — Patch: on-disk tuple layout v5 + TOAST threshold crash + hardening
+
+> **158 tests** (145 regression + 13 error-path; tests 154–158 added here) —
+> PG 17 + PG 18, zero compiler warnings.
+
+Carries the TOAST-threshold segfault fix and the correctness hardening summarised in
+the release table, plus the two data-visible defects below. No SQL changes:
+`pg_extension.extversion` stays at `1.7` and `pg_vault_tde_build_version()` is what
+distinguishes the builds.
+
+1. **The on-disk tuple was not physically valid (PSQLE-165).** The encrypted region was
+   one opaque blob, while the header — plaintext, because MVCC and VACUUM need it — kept
+   declaring `natts` attributes laid out per the tuple descriptor. Every core path that
+   deforms a raw on-disk tuple believes that header, and `heap_update()` does it on every
+   `UPDATE`: it reads the indexed attributes off the page to decide HOT and index
+   maintenance. Past the first variable-length column the offset is not cached, so the
+   read walks the row — through ciphertext. A four-byte varlena header of random bytes
+   gives a length of up to 1 GB, the cursor leaves the page, SIGSEGV. Any index on such a
+   column triggers it, `tde_btree` included: the trigger is the index attribute bitmap,
+   not the access method. Measured 6/6 crashes with an index on the third column, 0/6
+   with no index.
+
+   Fixed by **wire format v5**, which keeps the row walkable: every attribute at its own
+   offset with its own length, only the values replaced by ciphertext. The AEAD is
+   untouched — same cipher, tag and AAD, same `TDE_V4_OVERHEAD` (37 bytes) per tuple, so
+   a v5 tuple is exactly as long as the v4 tuple for the same row.
+
+   **Security trade-off, deliberate**: the structural bytes stay in clear, because they
+   are what makes the walk possible. The exact byte length of every variable-length
+   column is therefore visible in the heap file, along with whether the value is
+   compressed or out of line. Fixed-length columns leak nothing (their length is in the
+   catalog), and the row length and null bitmap were already visible under v4. Attribute
+   values are never in clear; regression test 157 reads the raw heap file and asserts it.
+
+   **Needs a rewrite, not an export**: v4 rows keep reading, but keep their old layout,
+   and no layout can be made walkable after the fact — so `UPDATE` on them still crashes
+   until they are rewritten. One `VACUUM FULL` per encrypted table migrates it. Procedure
+   in README → "Upgrading to 1.7.2"; verified byte-identical by `make ci-upgrade`.
+
+2. **An all-NULL row made its table unreadable.** Present in every release up to 1.7.1. A
+   row whose columns are all NULL has no user data, so its encrypted region is the AEAD
+   framing and nothing else — a well-formed encoding of a zero-length plaintext that
+   `tde_gcm_decrypt()` rejected as too short. One such row was enough to make any
+   sequential scan of the table fail from that `INSERT` on. Nothing is lost; 1.7.2 reads
+   those rows with no migration step.
+
+**New CI stage — `make ci-upgrade`.** Every other suite in this repo reads only data it
+wrote in the same run, so writer and reader always move together and a format-level
+breakage leaves the suite green while data on disk becomes unreadable. That is how the
+1.7.1 AAD change shipped. This stage writes a fixture with the build at the most recent
+`v*` tag, reads it back with the working tree, and checks the outcome against the
+declarations in `ci/upgrade-compat.expected`: whether old data is still readable, and
+whether it can be updated in place. Changing either declaration is a deliberate act that
+shows up in the diff — and the two answers are what decide whether a release needs a
+`VACUUM FULL` note or a dump-with-the-old-binary procedure.
+
+---
+
 ## v1.8 — KMIP + Column-Level + GIN/Hash/GiST/BRIN + HA + Dual-Control (Q2 2027)
 
 > Status: 📋 Defined
@@ -228,11 +287,11 @@ regulated-industry features.
 `pg_vault_tde_columns` catalog. `src/tam/pg_vault_tde_column.c`.
 
 **Feasibility (verified against the current TAM architecture, see
-`tam.instructions.md`)**: `encrypted_heap` today encrypts the whole tuple as
-one opaque AES-256-GCM blob (`tde_encrypt_heap_tuple`, wire format v4) —
-there is no per-Datum boundary. Column-level encryption needs the write
-path to operate around `heap_deform_tuple`/`heap_form_tuple` for specific
-attributes instead of the raw tuple bytes:
+`tam.instructions.md`)**: since wire format v5 `encrypted_heap` already walks
+the tuple attribute by attribute and encrypts each value in place
+(`tde_encrypt_heap_tuple` / `tde_value_ranges`), so the per-Datum boundary
+this feature needs now exists — what is missing is the per-column policy and
+the per-column DEK, not the layout. The remaining per-type questions:
 - **Varlena columns** (`text`, `bytea`, `jsonb`, `numeric`, arrays):
   straightforward — store `[IV|ciphertext|GCM-tag]` as the Datum's own
   varlena payload, the same shape already used at the tuple level, just
@@ -375,6 +434,6 @@ These gaps **cannot be closed without modifying PostgreSQL core**.
 | **v1.5** | Per-Table DEK + Online Rotation + AAD | ✅ 2026 | 72 | Per-table catalog, native type ops, wire format v3, rotate_online BGW |
 | **v1.6** | Local Wallet KMS (production-ready) + write-path / catalog bugfix patch | ✅ 2026-07-20 (patched 2026-05-08) | 109 | Wallet unlock/lock, passphrase flexibility, KEK rotation, export/import, Vault→wallet migration; PG_TRY widening; TOAST relid auto-registration; STORAGE EXTERNAL TAM read bypass; all-read-paths TOAST coverage; forensic helpers; tests 73–109 |
 | **v1.7** | Per-database KMS + pg_restore_tde + PGC_SUSET + PKCS#11 + HSM + v1.4 removal | ✅ 2026-06-29 | 137 | All KMS GUCs PGC_SUSET → per-database KMS via `ALTER DATABASE SET`; `pg_restore_tde` full decrypt-and-pipe restore loop; removed v1.4 global-DEK backward compat (`TdeShmemData`, `rotate_key`, `key_generation`, `clear_prev_dek`, `encrypt_test`, `decrypt_test`); PKCS#11/HSM provider with cross-backend KEK-rotation propagation; documentation overhaul |
-| **v1.7.2** | Patch: TOAST threshold crash + correctness hardening | ✅ 2026-09-19 | 153 | Segfault fixed when a value crosses `TOAST_TUPLE_THRESHOLD` only after encryption (gate and TOAST writer now both account for `TDE_V4_OVERHEAD`); assert-enabled startup, unregistered catalog snapshots, lock-less `relation_open`, hint bits without the content lock, uninitialised `VacuumCutoffs`, missing `volatile` across `longjmp`. New CI stages: errorpath, scan-build, ubsan, valgrind, cassert, regress-matrix |
 | **v1.7.1** | Patch: AAD relid resolution + HEAP_HASEXTERNAL on decrypt | ✅ 2026-09-05 | 140 | AEAD tag bound to the effective relid (fixes `ALTER TABLE ... SET ACCESS METHOD` on populated tables); `HEAP_HASEXTERNAL` recomputed on decrypt (fixes CTAS / `INSERT ... SELECT` copying a dangling TOAST pointer); DETAIL/HINT on OID-mismatch decrypt failures; tests 138–140. Breaking for out-of-line TOAST written by ≤ 1.7.0 — dump before upgrading |
+| **v1.7.2** | Patch: tuple layout v5 + TOAST threshold crash + correctness hardening | ✅ 2026-09-28 | 158 | On-disk tuple layout **v5**, structure preserving: the v4 blob left the header describing a data area the core could not walk, so `heap_update()` segfaulted on any table with an index behind a variable-length column (PSQLE-165). An all-NULL row no longer makes its table unreadable. Segfault fixed when a value crosses `TOAST_TUPLE_THRESHOLD` only after encryption (gate and TOAST writer now both account for `TDE_V4_OVERHEAD`); assert-enabled startup, unregistered catalog snapshots, lock-less `relation_open`, hint bits without the content lock, uninitialised `VacuumCutoffs`, missing `volatile` across `longjmp`. New CI stages: errorpath, scan-build, ubsan, valgrind, cassert, regress-matrix, upgrade. **Needs one `VACUUM FULL` per encrypted table after upgrading** — v4 rows stay readable but cannot be updated until rewritten |
 | **v1.8** | KMIP + Column-Level + GIN/Hash/GiST/BRIN + HA + Dual-Control | Q2 2027 | ~130 | KMIP 1.2 client, per-column encryption, GIN/Hash/GiST(equality)/BRIN(bloom) index AMs, streaming replication standby DEK distribution, M-of-N key ceremony, pg_dump/COPY TO plaintext-leak WARNING (carried over from v1.7) |

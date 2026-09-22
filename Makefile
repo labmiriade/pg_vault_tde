@@ -231,6 +231,9 @@ ci-bench:
 	if [ $$rc -eq 7 ]; then echo "ci-bench: avg overhead above threshold (non-fatal WARN, matches run-all.sh)"; exit 0; fi; \
 	exit $$rc
 
+ci-upgrade:
+	@bash ci/scripts/run-upgrade.sh
+
 ci-install-test:
 	@bash ci/scripts/run-install-test.sh --all
 

@@ -396,7 +396,13 @@ tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len,
     Assert(ciphertext != NULL);
     Assert(out_len != NULL);
 
-    if (ciphertext_len <= (Size) TDE_V4_OVERHEAD)
+    /*
+     * TDE_V4_OVERHEAD bytes exactly is the well-formed encoding of a
+     * zero-length plaintext, which is what an all-NULL row produces (the null
+     * bitmap lives in the tuple header, no column data follows).  Rejecting it
+     * made such a row unreadable once written.
+     */
+    if (ciphertext_len < (Size) TDE_V4_OVERHEAD)
         ereport(ERROR,
                 (errmsg("[CRYPTO] Ciphertext too short for AES-256-GCM")));
 

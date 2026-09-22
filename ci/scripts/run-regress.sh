@@ -18,7 +18,7 @@ CONTAINER="pg-tde-regress-$$"
 cleanup() { stop_container "$CONTAINER"; }
 trap cleanup EXIT
 
-log_stage "REGRESSION TESTS (52 v1.4 + 20 v1.5 + 38 v1.6 + 30 v1.7 = 140 total)"
+log_stage "REGRESSION TESTS (52 v1.4 + 20 v1.5 + 38 v1.6 + 35 v1.7 = 145 total)"
 
 build_pg_test_image
 
@@ -62,6 +62,21 @@ if ! container_psql "$CONTAINER" -v ON_ERROR_STOP=1 -c \
     exit 2
 fi
 log_ok "Local wallet initialised"
+
+# pageinspect lets the storage-level tests read raw pages.  Without it they
+# take their SKIP branch and assert nothing: TEST 61 (TOAST chunks encrypted
+# on the page) and TEST 144 (the on-disk tuple is physically walkable) were
+# silent no-ops in CI until this line existed.  Guarded on availability so a
+# base image without contrib still runs the rest of the suite.
+log_info "Installing pageinspect (storage-level assertions) ..."
+container_psql "$CONTAINER" -c \
+    "DO \$\$ BEGIN
+         IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pageinspect') THEN
+             CREATE EXTENSION IF NOT EXISTS pageinspect;
+         ELSE
+             RAISE NOTICE 'pageinspect unavailable — storage-level tests will skip';
+         END IF;
+     END \$\$;"
 
 # Copy fresh regression SQL (in case image is cached with old version)
 $RT cp "$REPO_ROOT/sql/regression_test.sql"    "$CONTAINER:/tmp/regression_test.sql"
@@ -119,12 +134,12 @@ else
     exit 2
 fi
 
-# ── Phase 4: v1.7 wallet tests (tests 111-140) ────────────────────────────
-log_info "Running v1.7 wallet regression_test_v17.sql (tests 111-140) ..."
+# ── Phase 4: v1.7 wallet tests (tests 111-140 + 154-158) ────────────────────────────
+log_info "Running v1.7 wallet regression_test_v17.sql (tests 111-140 + 154-158) ..."
 START=$(timer_start)
 if container_psql "$CONTAINER" -f /tmp/regression_test_v17.sql; then
     ELAPSED=$(timer_elapsed "$START")
-    log_ok "REGRESSION v1.7 wallet: tests 111-140 OK ($(timer_fmt "$ELAPSED"))"
+    log_ok "REGRESSION v1.7 wallet: tests 111-140 + 154-158 OK ($(timer_fmt "$ELAPSED"))"
 else
     ELAPSED=$(timer_elapsed "$START")
     log_error "REGRESSION v1.7 wallet: FAILED after $(timer_fmt "$ELAPSED")"
@@ -132,5 +147,5 @@ else
     exit 2
 fi
 
-log_ok "REGRESSION COMPLETE: ALL 140 TESTS PASSED (v1.4 × 52 + v1.5 × 20 + v1.6 × 38 + v1.7 × 30)"
+log_ok "REGRESSION COMPLETE: ALL 145 TESTS PASSED (v1.4 × 52 + v1.5 × 20 + v1.6 × 38 + v1.7 × 35)"
 exit 0

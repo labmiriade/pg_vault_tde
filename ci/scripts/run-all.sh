@@ -110,7 +110,7 @@ done
 # ---------------------------------------------------------------------------
 # Stage definitions
 # ---------------------------------------------------------------------------
-ALL_STAGES=(regress matrix errorpath checksums tap isolation vault openbao wallet pkcs11 schema scan-build ubsan valgrind cassert install-test bench)
+ALL_STAGES=(regress matrix errorpath checksums tap isolation vault openbao wallet pkcs11 schema upgrade scan-build ubsan valgrind cassert install-test bench)
 
 should_run() {
     local stage="$1"

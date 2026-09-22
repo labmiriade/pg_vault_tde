@@ -16,6 +16,14 @@
 #define TDE_GCM_IV_LEN       12  /* 96-bit IV, NIST recommended for GCM */
 #define TDE_GCM_TAG_LEN      16  /* 128-bit authentication tag */
 #define TDE_V4_VERSION_BYTE  ((unsigned char) 0x04u)
+/*
+ * Heap tuple LAYOUT version, stored in the same framing byte (outside the
+ * GCM tag).  0x04 = whole user-data region is one blob; 0x05 = attributes
+ * keep their on-disk layout and only the value bytes are ciphertext.  The
+ * cipher, the AAD and the tag are identical either way — see
+ * tde_encrypt_heap_tuple() in src/tam/pg_vault_tde_tam.c.
+ */
+#define TDE_TUPLE_V5_VERSION_BYTE ((unsigned char) 0x05u)
 #define TDE_V4_AAD_LEN       16  /* 4 (dboid) + 4 (relid) + 8 (generation) */
 #define TDE_V4_GEN_LEN       8   /* sizeof(uint64): generation counter */
 #define TDE_V4_OVERHEAD      (1 + TDE_V4_GEN_LEN + TDE_GCM_IV_LEN + TDE_GCM_TAG_LEN)

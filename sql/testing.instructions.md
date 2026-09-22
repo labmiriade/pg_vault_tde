@@ -10,14 +10,17 @@
 ALL gates must pass before any change is considered complete:
 
 ```bash
-# Gate 1: Full regression (110 tests: 70 baseline + 20 v1.5 + 38 v1.6 + 2 skip-guarded, vault provider)
+# Gate 1: Full regression (145 tests: 52 v1.4 + 20 v1.5 + 38 v1.6 + 35 v1.7, vault provider)
 make ci-regress
 
-# Gate 1b: Wallet provider regression (110 tests, kms_provider=local)
+# Gate 1b: Wallet provider regression (same suite, kms_provider=local)
 make ci-wallet
 
 # Gate 2: Page checksum compatibility
 make ci-checksums
+
+# Gate 2b: Upgrade compatibility — data written by the previous release tag
+make ci-upgrade
 
 # Gate 3: TAP tests (Perl, with mock Vault)
 make ci-tap
@@ -39,10 +42,21 @@ make ci-all
 
 ## Test Suite Map
 
-`sql/regression_test.sql` contains **70 tests** (52 v1.4 baseline + 18 v1.7
-TAM/TOAST additions in tests 53–70).  The v1.5 and v1.6 supplement files each
-carry their own internal numbering.  All three files together make up the
-**110-test** suite run by `make ci-regress` / `make ci-wallet`.
+Test numbers are **one sequence shared by every file**, not per file.  That is
+why `regression_test_v17.sql` jumps from 140 to 154: 141–153 belong to
+`regression_test_errorpath.sql`.  When you add a test, take the next free number
+across the whole repo, not the next one in the file you are editing.
+
+| File | Range | Run by |
+|---|---|---|
+| `sql/regression_test.sql` | 1–52 | `make ci-regress` / `ci-wallet` |
+| `sql/regression_test_v15.sql` | 53–72 | `make ci-regress` / `ci-wallet` |
+| `sql/regression_test_v16.sql` | 73–110 | `make ci-regress` / `ci-wallet` |
+| `sql/regression_test_v17.sql` | 111–140, 154–158 | `make ci-regress` / `ci-wallet` |
+| `sql/regression_test_errorpath.sql` | 141–153 | `make ci-errorpath` |
+| `sql/regression_test_schema.sql` | own 1–20 | `make ci-schema` |
+
+Test 110 is permanently deferred, so `make ci-regress` reports **145 tests**.
 
 | Test # | Category | What It Validates | File |
 |--------|----------|-------------------|------|
@@ -164,6 +178,29 @@ SELECT * FROM test_dek_b;  -- OK
 5. **DO NOT** rely on specific tuple ordering in sequential scans — heap
    page allocation and HOT chains affect order.
 
+6. **DO NOT** put the indexed column first in every table.  This one is not a
+   style note: it is how PSQLE-165 survived four releases.  An attribute at
+   attnum 1 has its offset cached in `attcacheoff`, so reading it never walks
+   the tuple; an attribute sitting behind a variable-length column can only be
+   reached by walking, and the walk is the code path that touches the encrypted
+   region.  38 of the 38 regression tables put the PRIMARY KEY first, so not one
+   of them ever reached it, and a segfault on every `UPDATE` of such a table
+   went unnoticed with the suite fully green.  When a test involves an index,
+   vary the key's position — test 158 is the parametrized version of this.
+
+7. **DO NOT** write a test that only reads data it wrote in the same run.  The
+   whole suite does this, which is why two format-level breakages shipped: the
+   v1.7.1 AAD change (TOAST written by <= 1.7.0 became unreadable) and
+   PSQLE-165.  Writer and reader move together, so the suite stays green while
+   existing data on disk breaks.
+
+   `make ci-upgrade` is the stage that covers it: it writes a fixture with the
+   build at the most recent `v*` tag, reads it back with the working tree, and
+   compares the outcome against `ci/upgrade-compat.expected`.  Anything that
+   touches the wire format, the AAD, or what the AAD is derived from has to go
+   through it — and if the declared expectations change, the release notes
+   change with them.
+
 ---
 
 ## TAP Test Conventions
@@ -259,12 +296,16 @@ Every regression test MUST have a corresponding expected output file:
 sql/regression_test.sql  →  expected/pg_vault_tde_init.out
 ```
 
-When adding new tests (current numbering in `regression_test.sql` goes up to 70):
+When adding new tests (the next free number across the whole repo is 159):
 1. Run the test manually: `psql -f sql/regression_test.sql > expected/pg_vault_tde_init.out 2>&1`
 2. Review the output for correctness
 3. Commit the `.out` file alongside the `.sql` file
 4. NEVER hand-edit `.out` files — always regenerate
-5. v1.6 tests (73–110) live in `sql/regression_test_v16.sql`; v1.5 tests (53–72)
-   live in `sql/regression_test_v15.sql`. The baseline file `sql/regression_test.sql`
-   now contains tests 1–70: the original 52 v1.4 tests plus tests 53–70 added as
-   v1.7 TAM/TOAST coverage.
+5. See the Test Suite Map above for which file owns which range — the numbering
+   is global, so check every file before picking a number.
+6. Storage-level assertions may use `pageinspect`: `ci/scripts/run-regress.sh`
+   installs it, and tests guard themselves with a `pg_extension` lookup so a
+   standalone run without contrib skips instead of failing.  Note that
+   `tuple_data_split()` and `verify_heapam()` refuse `encrypted_heap`
+   ("only heap AM is supported") — pass the regclass of a twin plain-heap table
+   with the same row type, which is what they use for the tuple descriptor.

@@ -1,10 +1,14 @@
--- regression_test_v17.sql — TDE tests 111-140 for pg_vault_tde v1.7
+-- regression_test_v17.sql — TDE tests 111-140 and 154-158 for pg_vault_tde v1.7
+--
+-- 141-153 are not a gap: they belong to sql/regression_test_errorpath.sql.
+-- Test numbers are one sequence shared by every suite, not per file.
 --
 -- These tests cover the tde_*_enc_ops operator classes introduced in v1.7,
 -- which encrypt fixed-size B-Tree index keys (int4, int8, uuid, date,
 -- timestamptz) using AES-256-SIV with STORAGE bytea.
 --
--- Test 111 additionally requires superuser (pg_read_binary_file).
+-- Tests 111, 156 and 157 additionally require superuser; 157 also needs
+-- pageinspect and skips itself when it is not installed.
 --
 -- Not standalone: `make ci-regress` (ci/scripts/run-regress.sh) sets all of this
 -- up. To run the files by hand, start the server with
@@ -865,11 +869,13 @@ $$;
 -- ================================================================
 -- TEST 128: encrypted_heap intentionally DISABLES HOT updates
 --
--- The v4 IV-first wire format makes heapam see the indexed column as always
--- "changed" (it inspects ciphertext, not plaintext), so no HOT update is
--- chosen. This is deliberate: a HOT decision over ciphertext could skip a
--- tde_btree index update and corrupt it. Assert HOT is off and that a normal
--- UPDATE + REINDEX still leaves the row findable via Index Scan.
+-- heapam decides HOT by comparing the old and the new tuple attribute by
+-- attribute, on disk, i.e. over ciphertext. Every version of a row gets a
+-- fresh IV, so every indexed column always looks "changed" and no HOT update
+-- is chosen. This is deliberate: a HOT decision that came out the other way
+-- would skip a tde_btree index update and corrupt it. Assert HOT is off and
+-- that a normal UPDATE + REINDEX still leaves the row findable via Index Scan.
+-- See also test 154, where the same comparison used to walk off the page.
 -- ================================================================
 DROP TABLE IF EXISTS tde_hot_128;
 CREATE TABLE tde_hot_128 (id int4, val text) USING encrypted_heap;
@@ -1696,12 +1702,397 @@ $$;
 
 
 -- ================================================================
+-- TEST 154: PSQLE-165 — UPDATE with an index on an attribute that
+--           follows a variable-length column
+--
+-- heap_update() reads the indexed attributes straight off the page to decide
+-- HOT and which indexes to maintain.  The on-disk tuple's header is plaintext
+-- and still advertises natts attributes laid out per the tuple descriptor, so
+-- that read walks the encrypted user-data region.  Under the old v4 layout
+-- (one opaque blob) the walk took a varlena length header out of ciphertext,
+-- got a length of up to 1 GB and left the page: SIGSEGV.
+--
+-- The trigger is the index ATTRIBUTE bitmap, not the access method: tde_btree
+-- crashes exactly like a plaintext btree, and a table with no index at all
+-- never crashes.  The v5 layout keeps every attribute at its own offset with
+-- its own length, so the walk is safe.
+--
+-- There is nothing to catch here: before the fix the backend dies and the
+-- whole file stops.  What the assertions below add is the other half of the
+-- bug — the walk that stays on the page silently compares garbage, so an
+-- updated indexed column could be declared unchanged and its index entry
+-- never inserted.
+-- ================================================================
+DO $$
+DECLARE
+    n_rows     bigint;
+    n_updated  bigint;
+    n_hot      bigint;
+    n_idx      bigint;
+    n_seq      bigint;
+BEGIN
+    DROP TABLE IF EXISTS tde_walk_154;
+    -- `key` is attnum 3, behind two varlenas: its offset can never be cached
+    -- in attcacheoff, so every read of it walks the data region by hand.
+    CREATE TABLE tde_walk_154 (pad text, payload text, key int4)
+        USING encrypted_heap;
+    CREATE INDEX tde_walk_idx_154
+        ON tde_walk_154 USING tde_btree (key tde_int4_enc_ops);
+
+    INSERT INTO tde_walk_154
+    SELECT repeat('a', 200), repeat('b', 200), g FROM generate_series(1, 500) g;
+
+    -- This is the statement that segfaulted.
+    UPDATE tde_walk_154 SET pad = pad || 'x';
+
+    SELECT count(*), count(*) FILTER (WHERE pad LIKE '%x')
+      INTO n_rows, n_updated
+      FROM tde_walk_154;
+    IF n_rows <> 500 OR n_updated <> 500 THEN
+        RAISE EXCEPTION
+            'TEST 154 FAILED: % row(s), % updated (expected 500/500)',
+            n_rows, n_updated;
+    END IF;
+
+    -- Now update the INDEXED column: if heap_update() had compared garbage and
+    -- called it unchanged, this would be a HOT update and the index would keep
+    -- pointing at the old key.
+    UPDATE tde_walk_154 SET key = key + 100000 WHERE key = 7;
+    PERFORM pg_stat_force_next_flush();
+
+    SELECT COALESCE(n_tup_hot_upd, 0) INTO n_hot
+      FROM pg_stat_user_tables WHERE relname = 'tde_walk_154';
+    IF n_hot <> 0 THEN
+        RAISE EXCEPTION
+            'TEST 154 FAILED: HOT update chosen on encrypted_heap (n_tup_hot_upd=%) — '
+            'the index entry for the new key was never inserted',
+            n_hot;
+    END IF;
+
+    SET enable_seqscan = off;
+    SELECT count(*) INTO n_idx FROM tde_walk_154 WHERE key = 100007;
+    RESET enable_seqscan;
+
+    SET enable_indexscan = off;
+    SET enable_bitmapscan = off;
+    SELECT count(*) INTO n_seq FROM tde_walk_154 WHERE key = 100007;
+    RESET enable_indexscan;
+    RESET enable_bitmapscan;
+
+    IF n_idx <> 1 OR n_seq <> 1 THEN
+        RAISE EXCEPTION
+            'TEST 154 FAILED: index scan found % row(s), seq scan % (expected 1/1) — '
+            'index out of sync with the heap',
+            n_idx, n_seq;
+    END IF;
+
+    DROP TABLE tde_walk_154;
+    RAISE NOTICE
+        'TEST 154 PASSED: UPDATE with an index behind a varlena no longer walks ciphertext; index stays in sync';
+END;
+$$;
+
+-- ================================================================
+-- TEST 155: a row whose columns are ALL NULL
+--
+-- Such a row has no user data at all — the null bitmap lives in the tuple
+-- header — so the encrypted region is exactly the AEAD framing and nothing
+-- else.  That is a well-formed encoding of a zero-length plaintext; rejecting
+-- it made the row unreadable for good ("Ciphertext too short for AES-256-GCM"
+-- on every subsequent SELECT of the table).
+-- ================================================================
+DO $$
+DECLARE
+    n_all_null bigint;
+    n_rows     bigint;
+BEGIN
+    DROP TABLE IF EXISTS tde_allnull_155;
+    CREATE TABLE tde_allnull_155 (a int4, b text, c timestamptz)
+        USING encrypted_heap;
+
+    INSERT INTO tde_allnull_155 VALUES (1, 'x', now()), (NULL, NULL, NULL);
+
+    SELECT count(*), count(*) FILTER (WHERE a IS NULL AND b IS NULL AND c IS NULL)
+      INTO n_rows, n_all_null
+      FROM tde_allnull_155;
+
+    IF n_rows <> 2 OR n_all_null <> 1 THEN
+        RAISE EXCEPTION
+            'TEST 155 FAILED: % row(s), % all-NULL (expected 2/1)',
+            n_rows, n_all_null;
+    END IF;
+
+    DROP TABLE tde_allnull_155;
+    RAISE NOTICE 'TEST 155 PASSED: an all-NULL row round-trips (zero-length AEAD payload)';
+END;
+$$;
+
+-- ================================================================
+-- TEST 156: the v5 layout keeps the VALUES off disk
+--
+-- v5 leaves the structural bytes of the tuple in clear — varlena length
+-- headers, the external-datum tag, alignment padding — so that heapam can walk
+-- the tuple.  This test is the guard on that boundary: the structure may be
+-- readable, the values may not.  The plain-heap control proves the search
+-- would have found the needle if it were there.
+--
+-- Requires superuser (pg_read_binary_file).
+-- ================================================================
+DO $$
+DECLARE
+    needle    bytea := convert_to('SUPER_SECRET_VALUE_156', 'UTF8');
+    enc_bytes bytea;
+    pln_bytes bytea;
+BEGIN
+    DROP TABLE IF EXISTS tde_forensic_156;
+    DROP TABLE IF EXISTS tde_forensic_ctl_156;
+    CREATE TABLE tde_forensic_156     (tag text, secret text) USING encrypted_heap;
+    CREATE TABLE tde_forensic_ctl_156 (tag text, secret text);
+
+    INSERT INTO tde_forensic_156     VALUES ('row', 'SUPER_SECRET_VALUE_156');
+    INSERT INTO tde_forensic_ctl_156 VALUES ('row', 'SUPER_SECRET_VALUE_156');
+    CHECKPOINT;
+
+    enc_bytes := pg_read_binary_file(pg_relation_filepath('tde_forensic_156'::regclass));
+    pln_bytes := pg_read_binary_file(pg_relation_filepath('tde_forensic_ctl_156'::regclass));
+
+    IF position(needle IN pln_bytes) = 0 THEN
+        RAISE EXCEPTION
+            'TEST 156 INCONCLUSIVE: the needle is not in the PLAIN heap file either — '
+            'the forensic check proves nothing';
+    END IF;
+
+    IF position(needle IN enc_bytes) > 0 THEN
+        RAISE EXCEPTION
+            'TEST 156 FAILED: plaintext value found in the encrypted_heap file — '
+            'the v5 layout is leaving attribute values in clear';
+    END IF;
+
+    DROP TABLE tde_forensic_156;
+    DROP TABLE tde_forensic_ctl_156;
+    RAISE NOTICE
+        'TEST 156 PASSED: v5 keeps tuple structure readable and attribute values encrypted on disk';
+END;
+$$;
+
+-- ================================================================
+-- TEST 157: the on-disk tuple must be physically walkable by the core
+--
+-- This is the invariant PSQLE-165 broke, asserted directly instead of through
+-- its symptom.  The tuple header is plaintext and claims "natts attributes
+-- laid out per the tuple descriptor"; every core path that deforms a raw
+-- on-disk tuple believes it, and heap_update() does exactly that on every
+-- UPDATE to decide HOT and index maintenance.
+--
+-- pageinspect performs the same walk from SQL.  Two things make it usable on
+-- an encrypted_heap table:
+--   * tuple_data_split() and verify_heapam() refuse a non-heap access method
+--     ("only heap AM is supported"), but tuple_data_split() uses the regclass
+--     only for its tuple descriptor — so a twin plain-heap table with the same
+--     row type walks the encrypted bytes perfectly well;
+--   * the 37-byte trailer sits past the last attribute and has to come off
+--     first, otherwise the walk ends with data left over.
+--
+-- Under the old v4 layout this fails with "first byte of varlena attribute is
+-- incorrect for attribute 0" — deterministically, without needing the crash.
+-- Under v5 it walks every tuple and yields one ciphertext value per attribute,
+-- which the second half checks for plaintext: a per-attribute forensic check,
+-- stronger than test 156's search over the whole file.
+--
+-- Requires superuser + pageinspect (installed by ci/scripts/run-regress.sh).
+-- ================================================================
+DO $$
+DECLARE
+    n_pages   int;
+    n_tuples  bigint;
+    n_values  bigint;
+    n_plain   bigint;
+    secret    text := 'WALKABLE_SECRET_157';
+BEGIN
+    PERFORM 1 FROM pg_extension WHERE extname = 'pageinspect';
+    IF NOT FOUND THEN
+        RAISE NOTICE 'TEST 157 SKIPPED: pageinspect not installed; cannot walk '
+                     'raw pages to check the on-disk tuple layout';
+        RETURN;
+    END IF;
+
+    DROP TABLE IF EXISTS tde_walk_157;
+    DROP TABLE IF EXISTS tde_walk_157_twin;
+    CREATE TABLE tde_walk_157      (pad text, payload text, key int4) USING encrypted_heap;
+    CREATE TABLE tde_walk_157_twin (pad text, payload text, key int4);
+
+    INSERT INTO tde_walk_157
+    SELECT secret || repeat('a', 100), repeat('b', 100), g
+      FROM generate_series(1, 20) g;
+    INSERT INTO tde_walk_157 VALUES (NULL, NULL, NULL);          -- no user data at all
+    INSERT INTO tde_walk_157 VALUES ('', repeat('z', 3000), 7);  -- empty + out-of-line
+    CHECKPOINT;
+
+    n_pages := pg_relation_size('tde_walk_157') / 8192;
+
+    SELECT count(*), COALESCE(sum(array_length(s.arr, 1)), 0)
+      INTO n_tuples, n_values
+      FROM generate_series(0, n_pages - 1) AS p(n),
+           LATERAL heap_page_items(get_raw_page('tde_walk_157', p.n)) AS i,
+           -- 37 = TDE_V4_OVERHEAD: IV(12) | TAG(16) | VERSION(1) | GEN(8)
+           LATERAL tuple_data_split('tde_walk_157_twin'::regclass,
+                                    substring(i.t_data FROM 1 FOR length(i.t_data) - 37),
+                                    i.t_infomask, i.t_infomask2, i.t_bits) AS s(arr)
+     WHERE i.t_data IS NOT NULL;
+
+    IF n_tuples <> 22 OR n_values <> 66 THEN
+        RAISE EXCEPTION
+            'TEST 157 FAILED: walked % tuple(s) / % attribute slot(s), expected 22 / 66',
+            n_tuples, n_values;
+    END IF;
+
+    SELECT count(*)
+      INTO n_plain
+      FROM generate_series(0, n_pages - 1) AS p(n),
+           LATERAL heap_page_items(get_raw_page('tde_walk_157', p.n)) AS i,
+           LATERAL tuple_data_split('tde_walk_157_twin'::regclass,
+                                    substring(i.t_data FROM 1 FOR length(i.t_data) - 37),
+                                    i.t_infomask, i.t_infomask2, i.t_bits) AS s(arr),
+           LATERAL unnest(s.arr) AS u(b)
+     WHERE i.t_data IS NOT NULL
+       AND u.b IS NOT NULL
+       AND position(convert_to(secret, 'UTF8') IN u.b) > 0;
+
+    IF n_plain <> 0 THEN
+        RAISE EXCEPTION
+            'TEST 157 FAILED: % attribute value(s) hold plaintext on disk', n_plain;
+    END IF;
+
+    DROP TABLE tde_walk_157;
+    DROP TABLE tde_walk_157_twin;
+    RAISE NOTICE
+        'TEST 157 PASSED: every on-disk tuple walks cleanly with the relation''s tuple descriptor, and no attribute value is plaintext';
+END;
+$$;
+
+-- ================================================================
+-- TEST 158: the indexed column's position must not matter
+--
+-- PSQLE-165 survived every release because 38 of the 38 regression tables put
+-- their PRIMARY KEY on the FIRST column — the one position whose offset lives
+-- in attcacheoff, so heap_update() never has to walk the tuple to read it.
+-- Not one table indexed a column sitting behind a variable-length one, which
+-- is the only shape that reaches the walk.  The bug was invisible by habit,
+-- not by coverage.
+--
+-- This test removes the luck: the same write / update / read cycle over every
+-- position that changes how the attribute offset is resolved, for both index
+-- access methods.  tde_btree crashed exactly like a plaintext btree — the
+-- trigger is the index attribute bitmap, not the access method — so both are
+-- exercised rather than assuming the encrypted one is special.
+--
+-- fillfactor is deliberately low: the new tuple has to FIT on the same page,
+-- otherwise heap_update() never even considers HOT and the assertion below
+-- would pass without meaning anything.
+-- ================================================================
+DO $$
+DECLARE
+    lay     record;
+    am      text;
+    n_hot   bigint;
+    n_idx   bigint;
+    n_seq   bigint;
+    n_old   bigint;
+    n_cases int := 0;
+BEGIN
+    -- The plaintext-btree half of the matrix needs the guard to stand down.
+    SET LOCAL pg_vault_tde.allow_plaintext_index = on;
+
+    FOR lay IN
+        SELECT * FROM (VALUES
+            -- k at attnum 1: offset cached in attcacheoff, no walk
+            ('key_first',     'k int4, pad text, tail text', false),
+            -- k behind a varlena: offset can only be resolved by walking
+            ('after_varlena', 'pad text, k int4, tail text', false),
+            -- same, with a NULL varlena in between (null-bitmap branch)
+            ('after_null',    'pad text, nul text, k int4',  false),
+            -- same, behind a dropped column (kept in the descriptor, always NULL)
+            ('after_dropped', 'junk int8, pad text, k int4', true)
+        ) AS t(label, cols, drop_junk)
+    LOOP
+        FOREACH am IN ARRAY ARRAY['tde_btree', 'btree']
+        LOOP
+            n_cases := n_cases + 1;
+
+            EXECUTE 'DROP TABLE IF EXISTS tde_pos_158';
+            EXECUTE format(
+                'CREATE TABLE tde_pos_158 (%s) USING encrypted_heap WITH (fillfactor = 20)',
+                lay.cols);
+            IF lay.drop_junk THEN
+                EXECUTE 'ALTER TABLE tde_pos_158 DROP COLUMN junk';
+            END IF;
+
+            IF am = 'tde_btree' THEN
+                EXECUTE 'CREATE INDEX tde_pos_idx_158 ON tde_pos_158 '
+                        'USING tde_btree (k tde_int4_enc_ops)';
+            ELSE
+                EXECUTE 'CREATE INDEX tde_pos_idx_158 ON tde_pos_158 USING btree (k)';
+            END IF;
+
+            EXECUTE 'INSERT INTO tde_pos_158 (k, pad) '
+                    'SELECT g, repeat(''a'', 60) FROM generate_series(1, 50) g';
+
+            PERFORM pg_stat_reset_single_table_counters('tde_pos_158'::regclass);
+
+            -- (a) touch only a NON indexed column: this is the statement that
+            --     segfaulted, because the indexed one still has to be read.
+            EXECUTE 'UPDATE tde_pos_158 SET pad = pad || ''x'' WHERE k <= 10';
+
+            -- (b) touch the INDEXED column: if the comparison over the on-disk
+            --     tuple ever came out "unchanged", this is where the index
+            --     would silently stop following the row.
+            EXECUTE 'UPDATE tde_pos_158 SET k = k + 100000 WHERE k = 7';
+            PERFORM pg_stat_force_next_flush();
+
+            SELECT COALESCE(n_tup_hot_upd, 0) INTO n_hot
+              FROM pg_stat_user_tables WHERE relname = 'tde_pos_158';
+            IF n_hot <> 0 THEN
+                RAISE EXCEPTION
+                    'TEST 158 FAILED [% / %]: HOT update chosen (n_tup_hot_upd=%) — '
+                    'the index entry for the new key was never inserted',
+                    lay.label, am, n_hot;
+            END IF;
+
+            SET enable_seqscan = off;
+            EXECUTE 'SELECT count(*) FROM tde_pos_158 WHERE k = 100007' INTO n_idx;
+            EXECUTE 'SELECT count(*) FROM tde_pos_158 WHERE k = 7'      INTO n_old;
+            RESET enable_seqscan;
+
+            SET enable_indexscan = off;
+            SET enable_bitmapscan = off;
+            EXECUTE 'SELECT count(*) FROM tde_pos_158 WHERE k = 100007' INTO n_seq;
+            RESET enable_indexscan;
+            RESET enable_bitmapscan;
+
+            IF n_idx <> 1 OR n_seq <> 1 OR n_old <> 0 THEN
+                RAISE EXCEPTION
+                    'TEST 158 FAILED [% / %]: index scan % row(s), seq scan % row(s), '
+                    'old key still reachable % time(s) (expected 1 / 1 / 0) — '
+                    'index out of sync with the heap',
+                    lay.label, am, n_idx, n_seq, n_old;
+            END IF;
+        END LOOP;
+    END LOOP;
+
+    EXECUTE 'DROP TABLE IF EXISTS tde_pos_158';
+    RAISE NOTICE
+        'TEST 158 PASSED: % layout/access-method combinations — the indexed column''s position does not affect correctness',
+        n_cases;
+END;
+$$;
+
+-- ================================================================
 -- PHASE SUMMARY
 -- ================================================================
 DO $$
 BEGIN
     RAISE NOTICE '============================================================';
-    RAISE NOTICE 'v1.7 Tests 111-140 — COMPLETE';
+    RAISE NOTICE 'v1.7 Tests 111-140 + 154-158 — COMPLETE';
     RAISE NOTICE '   tde_int4_enc_ops + disk forensic check ......test 111';
     RAISE NOTICE '   tde_int8_enc_ops equality lookup ........... test 112';
     RAISE NOTICE '   tde_uuid_enc_ops equality lookup ........... test 113';
@@ -1732,6 +2123,11 @@ BEGIN
     RAISE NOTICE '   ALTER heap->encrypted_heap, real TOAST (PSQLE-135) . test 138';
     RAISE NOTICE '   ALTER encrypted_heap->heap, real TOAST (PSQLE-135) . test 139';
     RAISE NOTICE '   CTAS from encrypted_heap survives source drop (PSQLE-135) test 140';
+    RAISE NOTICE '   UPDATE, index behind a varlena (PSQLE-165) . test 154';
+    RAISE NOTICE '   all-NULL row round-trip .................... test 155';
+    RAISE NOTICE '   v5 layout: structure clear, values not ..... test 156';
+    RAISE NOTICE '   on-disk tuple is walkable (pageinspect) ... test 157';
+    RAISE NOTICE '   indexed-column position matrix ............ test 158';
     RAISE NOTICE '============================================================';
 END;
 $$;

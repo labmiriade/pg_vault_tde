@@ -41,11 +41,12 @@ ci/
 └── scripts/
     ├── lib.sh                   ← Shared utilities (runtime detection, logging)
     ├── run-all.sh               ← Master orchestrator (all stages)
-    ├── run-regress.sh           ← pg_regress (24 tests)
+    ├── run-regress.sh           ← SQL regression suite
     ├── run-checksums.sh         ← Page-checksum compatibility
     ├── run-tap.sh               ← TAP tests with mock Vault
     ├── run-isolation.sh         ← Isolation / concurrency tests
     ├── run-vault.sh             ← Vault integration tests (compose)
+    ├── run-upgrade.sh           ← Upgrade compat vs the previous release tag
     └── run-bench.sh             ← Performance benchmark
 ```
 
@@ -54,11 +55,12 @@ ci/
 | Stage | Script | Container(s) | What It Tests |
 |-------|--------|--------------|---------------|
 | **build** | (embedded) | `pg-test` | Zero-warning compile gate |
-| **regress** | `run-regress.sh` | `pg-test` | 24 SQL regression tests |
+| **regress** | `run-regress.sh` | `pg-test` | SQL regression suite |
 | **checksums** | `run-checksums.sh` | `pg-test` | Page checksum compatibility |
 | **tap** | `run-tap.sh` | `pg-test` | TAP tests (extension load, backup) |
 | **isolation** | `run-isolation.sh` | `pg-test` | MVCC + DEK rotation concurrency |
 | **vault** | `run-vault.sh` | `pg-test` + `vault-mock` | Vault Transit API integration |
+| **upgrade** | `run-upgrade.sh` | `pg-test` + `pg-tde-baseline` | Data written by the previous release tag still reads; declared in `ci/upgrade-compat.expected` |
 | **bench** | `run-bench.sh` | `pg-test` | Performance vs plain heap |
 
 ## Container Runtime
