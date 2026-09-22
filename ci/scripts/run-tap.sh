@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # ci/scripts/run-tap.sh — Run TAP tests inside the pg-test container
 #
-# Runs every tap/*.t file (27 at the time of writing); see the TAP Tests table
+# Runs every tap/*.t file (28 at the time of writing); see the TAP Tests table
 # in doc/pg_vault_tde.md for what each one covers.  A few examples:
 #   - 01_load.t:                   Extension loading and function availability
 #   - 02_backup_local.t:           Backup round-trip, local wallet KMS provider
 #   - 03_backup_vault.t:           Backup round-trip against a real Vault Transit
 #                                  backend; skip_all when VAULT_ADDR is not set
 #   - 18_guc_order_independence.t: KMS GUCs are order- and scope-independent
+#   - 28_dml_memory_scaling.t:     per-row memory that is never released
 #
 # This script:
 #   1. Builds the pg-tde-test image
