@@ -646,9 +646,9 @@ The `tde_btree` access method provides a B-Tree index with deterministic
 | Algorithm | AES-256-SIV (deterministic authenticated encryption) |
 | Key length | 64 bytes (two 32-byte AES keys) |
 | Equality | Preserved (same plaintext → same ciphertext under same DEK) |
-| Ordering | **Not preserved** — range scans return empty results |
-| Use case | Equality predicates only (`=`, `IN`, `ON CONFLICT`) |
-| Column support | Varlena `bytea`/`text`/`numeric` (`tde_*_ops`) and fixed-size `int4`/`int8`/`uuid`/`date`/`timestamptz` (`tde_*_enc_ops`, default since v1.7). All index keys are AES-256-SIV encrypted. |
+| Ordering | **Not preserved** — the planner never uses `tde_btree` for ranges, `ORDER BY`, `min`/`max` or merge joins (sequential scan instead); a forced range is an error |
+| Use case | Equality predicates only (`=`, `IN`, `= ANY`, `ON CONFLICT`) |
+| Column support | Varlena `bytea`/`text` (`tde_*_ops`; since 1.7.2 no index creation path accepts `numeric` or a nondeterministic collation) and fixed-size `int4`/`int8`/`uuid`/`date`/`timestamptz` (`tde_*_enc_ops`, default since v1.7). All index keys are AES-256-SIV encrypted. |
 
 AES-SIV is chosen over AES-GCM for index entries because:
 - It produces a deterministic ciphertext (required for B-Tree comparisons).
@@ -692,9 +692,13 @@ in sorted order.
 
 `pg_vault_tde_amrescan()` encrypts equality scan keys
 (`sk_strategy == BTEqualStrategyNumber`) with AES-SIV before passing them
-to the underlying btree scan. Range keys
-(`sk_strategy != 3`) are passed through unchanged — they will produce
-empty results because AES-SIV does not preserve ordering.
+to the underlying btree scan. A range key (`sk_strategy != 3`) is an error:
+AES-SIV does not preserve ordering, so walking one against the tree would
+return wrong rows. The planner never builds such a scan on its own — a
+`get_relation_info_hook` removes the index's sort order and
+`pg_vault_tde_amcostestimate()` prices non-equality paths out — so only a
+forced plan reaches that error. `amsearcharray` is off: the executor expands
+`IN (…)` / `= ANY (…)` into one scalar lookup per element.
 
 ### Operator Class
 
@@ -717,9 +721,10 @@ CREATE OPERATOR CLASS tde_bytea_ops DEFAULT FOR TYPE bytea USING tde_btree AS
   `tde_uuid_enc_ops`, `tde_date_enc_ops`, `tde_timestamptz_enc_ops`, all in the
   `tde_enc_ops_family` with `STORAGE bytea` and **DEFAULT** for their types. They expose
   only `OPERATOR 3 (=)` — equality is the only meaningful predicate on SIV ciphertext.
-  The legacy non-encrypted classes (`tde_int4_ops`, `tde_int8_ops`, `tde_uuid_ops`,
-  `tde_date_ops`, `tde_timestamptz_ops`) are retained but **not** default; prefer the
-  `enc_ops` classes so index keys are encrypted.
+  The legacy classes (`tde_int4_ops`, `tde_int8_ops`, `tde_uuid_ops`, `tde_date_ops`,
+  `tde_timestamptz_ops`) store their keys **in plaintext** and are retained only for
+  indexes already built on them: since 1.7.2 a new index cannot use them unless
+  `pg_vault_tde.allow_plaintext_index = on`, and 1.8 removes them.
 
 ### Index-Only Scans
 
@@ -732,8 +737,9 @@ All decryption happens in the TAM layer (`decode_slot`) when the heap tuple is
 fetched. The planner is prevented from choosing an index-only scan path on
 `tde_btree` indexes; it always fetches the tuple from the `encrypted_heap` table.
 
-Range scans on `tde_btree` columns return empty results by design — AES-256-SIV
-does not preserve ordering regardless of column type.
+Range scans, `ORDER BY` and `min()`/`max()` are never served from a `tde_btree`
+index — AES-256-SIV does not preserve ordering regardless of column type — and run
+as sequential scans instead.
 
 ### Usage Example
 
@@ -758,7 +764,7 @@ INSERT INTO employees VALUES (2, 'bob',   85000);
 SELECT salary FROM employees WHERE id = 1;       -- uses index
 SELECT id     FROM employees WHERE username = 'alice';  -- uses index
 
--- Range predicates fall back to sequential scan (index returns empty by design)
+-- Range predicates run as a sequential scan: tde_btree answers equality only
 SELECT * FROM employees WHERE id > 1;            -- seq scan, not index scan
 
 -- Index-only scans are not supported and never chosen by the planner;
@@ -1018,7 +1024,7 @@ where the `softhsm2` package is installed; it skips itself otherwise.
 | 3 | **Logical replication of TOAST columns** — ✅ **Resolved in v1.7** via the custom WAL resource manager (enable `pg_vault_tde.toast_custom_rmgr`). UPDATE/DELETE require `REPLICA IDENTITY FULL` + a primary key; `REPLICA IDENTITY DEFAULT` and PK-less tables remain unsupported. See [Logical Decoding and Replication](#logical-decoding-and-replication). | v1.7 ✅ |
 | 4 | **WAL unencrypted** — requires `XLogInsert()` hook unavailable in extension API | Permanently deferred |
 | 5 | **All-or-nothing table encryption** — no per-column granularity | v1.8 |
-| 6 | **Range scans on tde_btree** — `WHERE col > x` returns empty (AES-SIV not order-preserving) | By design, permanent |
+| 6 | **tde_btree answers equality only** — ranges, `ORDER BY`, `min`/`max` run as sequential scans; `numeric` and nondeterministic collations refused (AES-SIV not order-preserving) | By design, permanent |
 | 7 | **BRIN on encrypted columns** — min/max of AES-SIV ciphertexts is meaningless | By design, permanent |
 | 8 | **HOT updates disabled** — `heap_update` reject to use HOT updates because the wire format portion considerd by TupDesc for the comparison between old and new tuple is non-deterministic aka changes at every encryption | By design, permanent |
 | 9 | **`WITH HOLD` cursor plaintext temp file** — a held cursor's result set is materialized into a tuplestore at `COMMIT` and spills to a plain temp file on disk past `work_mem`, bypassing the TAM entirely; no extension hook exists anywhere in the `WITH HOLD` cursor lifecycle to intercept it. See README.md § Limitations item 6. | Permanently deferred |
@@ -1366,17 +1372,17 @@ sequence, gated on the live extension version:
 | `sql/regression_test.sql` | 1–52 | v1.0–v1.4 baseline: crypto, TAM, TOAST, tde_btree |
 | `sql/regression_test_v15.sql` | 53–72 | v1.5: per-table DEK, online rotation, AAD |
 | `sql/regression_test_v16.sql` | 73–109 | v1.6: local wallet KMS |
-| `sql/regression_test_v17.sql` | 111–140, 154–159 | v1.7: `enc_ops` indexes, partition trees, HOT/REINDEX, FK lifecycle, TidRangeScan, on-disk tuple layout |
+| `sql/regression_test_v17.sql` | 111–140, 154–164 | v1.7: `enc_ops` indexes, partition trees, HOT/REINDEX, FK lifecycle, TidRangeScan, on-disk tuple layout |
 | `sql/regression_test_errorpath.sql` | 141–153 | error paths (`make ci-errorpath`) |
 
 Test numbers are one sequence shared by every suite, which is why 141–153 are missing
-from the v1.7 file rather than being a gap. The real gaps are 5–9, 11 and 49 (no
+from the v1.7 file rather than being a gap. The real gaps are 5–11 and 49 (no
 longer exist), 80 (removed in v1.7) and 110 (`WITH HOLD` cursor spill, disabled: a
-permanent limitation), so `make ci-regress` runs **137 tests**. The table below details the v1.0–v1.4 baseline file:
+permanent limitation), so `make ci-regress` runs **141 tests**. The table below details the v1.0–v1.4 baseline file:
 
 | Range | Area |
 |---|---|
-| 1–11 | AES-256-GCM crypto primitives, DEK rotation, tamper detection |
+| 1–4 | Extension, access methods and SQL functions registered; wallet unlock |
 | 12 | TAM INSERT + SELECT basic round-trip |
 | 13 | On-disk plaintext absence (raw file scan) |
 | 14 | TAM UPDATE (ctid preservation, tuple refetch, HOT chains) |
@@ -1391,7 +1397,6 @@ permanent limitation), so `make ci-regress` runs **137 tests**. The table below 
 | 23 | BitmapHeapScan (`scan_bitmap_next_tuple` via forced bitmap scan) |
 | 24 | TABLESAMPLE (`scan_sample_next_tuple` via SYSTEM(100)) |
 | 25–48 | UPSERT, MERGE, TRUNCATE, REINDEX, ALTER, JOINs, CTEs, HW accel, Vault, logical decoding |
-| 49 | Wire format v2 round-trip (version byte + generation counter) **(v1.4)** |
 | 50 | tde_btree CREATE INDEX + equality index scan **(v1.4)** |
 | 51 | health_check() `kms_provider` GUC coherence **(v1.4)** |
 | 52 | tde_btree UNIQUE constraint **(v1.4)** |

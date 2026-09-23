@@ -1,4 +1,4 @@
--- regression_test_v17.sql — TDE tests 111-140 and 154-158 for pg_vault_tde v1.7
+-- regression_test_v17.sql — TDE tests 111-140 and 154-164 for pg_vault_tde v1.7
 --
 -- 141-153 are not a gap: they belong to sql/regression_test_errorpath.sql.
 -- Test numbers are one sequence shared by every suite, not per file.
@@ -31,7 +31,7 @@
 --   psql -f sql/regression_test.sql      (tests 1-52)
 --   psql -f sql/regression_test_v15.sql  (tests 53-72)
 --   psql -f sql/regression_test_v16.sql  (tests 73-110)
---   psql -f sql/regression_test_v17.sql  (tests 111-140)
+--   psql -f sql/regression_test_v17.sql  (tests 111-140, 154-164)
 --
 -- There are no pg_vault_tde--1.x--1.y.sql upgrade scripts. 1.7 is the only
 -- version installed (DATA in the Makefile, default_version in the .control),
@@ -342,9 +342,13 @@ DECLARE
 BEGIN
     DROP TABLE IF EXISTS tde_multikey_117;
     CREATE TABLE tde_multikey_117 (a int4, b text, c int8) USING encrypted_heap;
+    -- v1.5 plaintext-key operator class for c: refused by default since 1.7.2
+    -- (PSQLE-173), still supported for indexes that already use it.
+    SET pg_vault_tde.allow_plaintext_index = on;
     CREATE INDEX tde_multikey_117_idx
         ON tde_multikey_117
         USING tde_btree (a tde_int4_enc_ops, b tde_text_ops, c tde_int8_ops);
+    RESET pg_vault_tde.allow_plaintext_index;
 
     INSERT INTO tde_multikey_117 VALUES (1, 'hello', 100);
     INSERT INTO tde_multikey_117 VALUES (2, 'world', 200);
@@ -2130,12 +2134,446 @@ END;
 $$;
 
 -- ================================================================
+-- TESTS 160-163: tde_btree answers equality only (PSQLE-173)
+--
+-- AES-SIV preserves equality and nothing else.  Up to 1.7.1 the planner
+-- nevertheless used tde_btree for range predicates, ORDER BY ... LIMIT,
+-- min()/max() and merge joins, reading the index in ciphertext order and
+-- returning wrong rows without any error; IN (...) failed with "cache lookup
+-- failed for type <random oid>"; and on numeric even "=" missed rows.
+--
+-- Wrong rows depend on the DEK, so they differ from one database to the
+-- next: every check below compares the index against the same query run
+-- with index scans disabled, never against hand-written values.
+-- ================================================================
+CREATE OR REPLACE FUNCTION pg_temp.tde160_plan_uses(q text, pattern text)
+RETURNS boolean LANGUAGE plpgsql AS $f$
+DECLARE
+    line text;
+BEGIN
+    FOR line IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+        IF position(pattern IN line) > 0 THEN
+            RETURN true;
+        END IF;
+    END LOOP;
+    RETURN false;
+END;
+$f$;
+
+CREATE OR REPLACE FUNCTION pg_temp.tde160_run(q text)
+RETURNS text LANGUAGE plpgsql AS $f$
+DECLARE
+    r text;
+BEGIN
+    EXECUTE q INTO r;
+    RETURN r;
+END;
+$f$;
+
+-- The same query with no index access at all: the reference answer.
+CREATE OR REPLACE FUNCTION pg_temp.tde160_truth(q text)
+RETURNS text LANGUAGE plpgsql
+SET enable_indexscan = off SET enable_bitmapscan = off SET enable_indexonlyscan = off
+AS $f$
+DECLARE
+    r text;
+BEGIN
+    EXECUTE q INTO r;
+    RETURN r;
+END;
+$f$;
+
+DROP TABLE IF EXISTS tde_eq_160;
+CREATE TABLE tde_eq_160 (id int, name text, raw bytea, u uuid, d date) USING encrypted_heap;
+INSERT INTO tde_eq_160
+SELECT g, 'name_' || lpad(g::text, 4, '0'), convert_to('raw_' || g, 'UTF8'),
+       md5(g::text)::uuid, date '2000-01-01' + g
+FROM generate_series(1, 2000) g;
+CREATE INDEX tde_eq_160_id   ON tde_eq_160 USING tde_btree (id);
+CREATE INDEX tde_eq_160_name ON tde_eq_160 USING tde_btree (name);
+CREATE INDEX tde_eq_160_raw  ON tde_eq_160 USING tde_btree (raw);
+CREATE INDEX tde_eq_160_u    ON tde_eq_160 USING tde_btree (u);
+CREATE INDEX tde_eq_160_d    ON tde_eq_160 USING tde_btree (d);
+ANALYZE tde_eq_160;
+
+-- ================================================================
+-- TEST 160: ordering, min()/max(), ranges and merge joins never use tde_btree
+-- ================================================================
+DO $$
+DECLARE
+    q     text;
+    got   text;
+    want  text;
+BEGIN
+    FOREACH q IN ARRAY ARRAY[
+        'SELECT max(name) FROM tde_eq_160',
+        -- bytea ordering through the index, without min(bytea): that aggregate
+        -- only exists from PostgreSQL 18.
+        'SELECT string_agg(encode(raw, ''escape''), '','' ORDER BY raw) FROM (SELECT raw FROM tde_eq_160 ORDER BY raw LIMIT 5) s',
+        'SELECT max(d)::text FROM tde_eq_160',
+        'SELECT string_agg(name, '','' ORDER BY name) FROM (SELECT name FROM tde_eq_160 ORDER BY name LIMIT 5) s',
+        'SELECT string_agg(id::text, '','' ORDER BY id) FROM (SELECT id FROM tde_eq_160 ORDER BY id DESC LIMIT 5) s',
+        'SELECT count(*)::text FROM tde_eq_160 WHERE name > ''name_1990''',
+        'SELECT count(*)::text FROM tde_eq_160 WHERE raw < convert_to(''raw_2'', ''UTF8'')',
+        'SELECT count(*)::text FROM tde_eq_160 WHERE name LIKE ''name_19%''',
+        'SELECT count(*)::text FROM tde_eq_160 WHERE d BETWEEN date ''2000-01-10'' AND date ''2000-01-20'''
+    ]
+    LOOP
+        IF pg_temp.tde160_plan_uses(q, 'tde_eq_160_') THEN
+            RAISE EXCEPTION 'TEST 160 FAILED: the plan reads a tde_btree index for: %', q;
+        END IF;
+        got  := pg_temp.tde160_run(q);
+        want := pg_temp.tde160_truth(q);
+        IF got IS DISTINCT FROM want THEN
+            RAISE EXCEPTION 'TEST 160 FAILED: % returned %, a sequential scan returns %', q, got, want;
+        END IF;
+    END LOOP;
+
+    -- A merge join must sort its inputs itself, never take tde_btree order.
+    PERFORM set_config('enable_hashjoin', 'off', true);
+    PERFORM set_config('enable_nestloop', 'off', true);
+    q := 'SELECT count(*)::text FROM tde_eq_160 a JOIN tde_eq_160 b ON a.name = b.name';
+    got := pg_temp.tde160_run(q);
+    PERFORM set_config('enable_hashjoin', 'on', true);
+    PERFORM set_config('enable_nestloop', 'on', true);
+    IF got IS DISTINCT FROM '2000' THEN
+        RAISE EXCEPTION 'TEST 160 FAILED: merge join on name returned % rows, expected 2000', got;
+    END IF;
+
+    RAISE NOTICE 'TEST 160 PASSED: ordering, min/max, ranges and merge joins never read tde_btree and match a sequential scan';
+END;
+$$;
+
+-- ================================================================
+-- TEST 161: =, IN and = ANY use tde_btree and lose nothing
+-- ================================================================
+DO $$
+DECLARE
+    q      text;
+    got    text;
+    want   text;
+    col    text;
+BEGIN
+    FOREACH q IN ARRAY ARRAY[
+        'SELECT count(*)::text FROM tde_eq_160 WHERE name = ''name_1500''',
+        'SELECT count(*)::text FROM tde_eq_160 WHERE name IN (''name_0005'', ''name_1500'', ''name_9999'')',
+        'SELECT count(*)::text FROM tde_eq_160 WHERE id IN (5, 1500, 99999)',
+        'SELECT count(*)::text FROM tde_eq_160 WHERE raw = ANY (ARRAY[convert_to(''raw_5'', ''UTF8''), convert_to(''raw_1500'', ''UTF8'')])',
+        'SELECT count(*)::text FROM tde_eq_160 WHERE u = ANY (ARRAY[md5(''5'')::uuid, md5(''1500'')::uuid])',
+        'SELECT count(*)::text FROM tde_eq_160 WHERE d IN (date ''2000-01-06'', date ''2004-02-09'')'
+    ]
+    LOOP
+        IF NOT pg_temp.tde160_plan_uses(q, 'tde_eq_160_') THEN
+            RAISE EXCEPTION 'TEST 161 FAILED: the plan does not use the tde_btree index for: %', q;
+        END IF;
+        got  := pg_temp.tde160_run(q);
+        want := pg_temp.tde160_truth(q);
+        IF got IS DISTINCT FROM want THEN
+            RAISE EXCEPTION 'TEST 161 FAILED: % returned %, a sequential scan returns %', q, got, want;
+        END IF;
+    END LOOP;
+
+    -- Look every value up through the index: a nested loop anti join forced
+    -- onto one index probe per row.  Any miss is a value the tree lost.
+    PERFORM set_config('enable_seqscan', 'off', true);
+    PERFORM set_config('enable_bitmapscan', 'off', true);
+    PERFORM set_config('enable_mergejoin', 'off', true);
+    PERFORM set_config('enable_hashjoin', 'off', true);
+    FOREACH col IN ARRAY ARRAY['id', 'name', 'raw', 'u', 'd'] LOOP
+        q := format('SELECT count(*)::text FROM tde_eq_160 o WHERE NOT EXISTS '
+                    '(SELECT 1 FROM tde_eq_160 i WHERE i.%1$I = o.%1$I)', col);
+        got := pg_temp.tde160_run(q);
+        IF got IS DISTINCT FROM '0' THEN
+            RAISE EXCEPTION 'TEST 161 FAILED: % of 2000 values of % are not found through the index', got, col;
+        END IF;
+    END LOOP;
+    PERFORM set_config('enable_seqscan', 'on', true);
+    PERFORM set_config('enable_bitmapscan', 'on', true);
+    PERFORM set_config('enable_mergejoin', 'on', true);
+    PERFORM set_config('enable_hashjoin', 'on', true);
+
+    RAISE NOTICE 'TEST 161 PASSED: =, IN and = ANY use tde_btree, and every one of 2000 values is found through it';
+END;
+$$;
+
+-- ================================================================
+-- TEST 162: a range forced onto tde_btree fails; it never returns rows
+--
+-- With sequential and bitmap scans disabled the planner may still pick the
+-- index: pg_vault_tde_amrescan() must then refuse the range key.  Which of
+-- the two happens depends on the major's costing of disabled paths, so both
+-- are accepted — a wrong count is not.
+-- ================================================================
+DO $$
+DECLARE
+    got   text;
+    want  text := pg_temp.tde160_truth('SELECT count(*)::text FROM tde_eq_160 WHERE name > ''name_1990''');
+    first text := pg_temp.tde160_truth('SELECT string_agg(name, '','' ORDER BY name) FROM (SELECT name FROM tde_eq_160 ORDER BY name LIMIT 3) s');
+BEGIN
+    PERFORM set_config('enable_seqscan', 'off', true);
+    PERFORM set_config('enable_bitmapscan', 'off', true);
+    BEGIN
+        got := pg_temp.tde160_run('SELECT count(*)::text FROM tde_eq_160 WHERE name > ''name_1990''');
+        IF got IS DISTINCT FROM want THEN
+            RAISE EXCEPTION 'TEST 162 FAILED: forced range returned % rows, expected % or an error', got, want;
+        END IF;
+    EXCEPTION WHEN feature_not_supported THEN
+        NULL;   /* refused by amrescan: the intended outcome */
+    END;
+
+    -- Ordering cannot be forced at all: the index offers no sort order.
+    PERFORM set_config('enable_sort', 'off', true);
+    got := pg_temp.tde160_run('SELECT string_agg(name, '','' ORDER BY name) FROM (SELECT name FROM tde_eq_160 ORDER BY name LIMIT 3) s');
+    PERFORM set_config('enable_sort', 'on', true);
+    PERFORM set_config('enable_seqscan', 'on', true);
+    PERFORM set_config('enable_bitmapscan', 'on', true);
+    IF got IS DISTINCT FROM first THEN
+        RAISE EXCEPTION 'TEST 162 FAILED: forced ORDER BY returned %, expected %', got, first;
+    END IF;
+
+    RAISE NOTICE 'TEST 162 PASSED: a forced range is refused or answered correctly, and ordering cannot be forced onto tde_btree';
+END;
+$$;
+
+-- ================================================================
+-- TEST 163: no path creates a tde_btree index it cannot serve
+--
+-- numeric: numeric_cmp over ciphertext is no ordering, and 1.5 = 1.50
+-- encrypt differently — equality misses rows.  Nondeterministic collation:
+-- AES-SIV only matches identical bytes.  Both matter beyond queries: UNIQUE
+-- and EXCLUDE checks read the index directly, without the planner, and let
+-- duplicates in (measured before the fix: 1164 and 1332 exact duplicates of
+-- 2000 accepted).  v1.5 operator classes: plaintext keys, allowed only with
+-- pg_vault_tde.allow_plaintext_index.
+--
+-- The check runs at OAT_POST_CREATE, which every creation path reaches —
+-- CREATE INDEX, CREATE TABLE ... EXCLUDE, ALTER TABLE ... ADD CONSTRAINT,
+-- the rebuild behind ALTER COLUMN ... TYPE — and REINDEX, including
+-- CONCURRENTLY, is left alone: it rebuilds what already exists.
+-- ================================================================
+DROP TABLE IF EXISTS tde_eq_163;
+CREATE TABLE tde_eq_163 (id int, amount numeric, txt text, name text) USING encrypted_heap;
+INSERT INTO tde_eq_163 SELECT g, g * 1.25, (g * 1.25)::text, 'Name_' || g
+FROM generate_series(1, 2000) g;
+
+DO $$
+DECLARE
+    has_icu  boolean := true;
+BEGIN
+    BEGIN
+        CREATE INDEX tde_eq_163_amount ON tde_eq_163 USING tde_btree (amount);
+        RAISE EXCEPTION 'TEST 163 FAILED: CREATE INDEX accepted a numeric column';
+    EXCEPTION WHEN feature_not_supported THEN NULL;
+    END;
+
+    BEGIN
+        CREATE INDEX tde_eq_163_amount_expr ON tde_eq_163 USING tde_btree ((amount + 0));
+        RAISE EXCEPTION 'TEST 163 FAILED: CREATE INDEX accepted a numeric expression';
+    EXCEPTION WHEN feature_not_supported THEN NULL;
+    END;
+
+    BEGIN
+        CREATE TABLE tde_eq_163_ex (id int, amount numeric,
+                                    EXCLUDE USING tde_btree (amount WITH =)) USING encrypted_heap;
+        RAISE EXCEPTION 'TEST 163 FAILED: CREATE TABLE accepted a numeric EXCLUDE constraint';
+    EXCEPTION WHEN feature_not_supported THEN NULL;
+    END;
+
+    BEGIN
+        ALTER TABLE tde_eq_163 ADD CONSTRAINT tde_eq_163_amount_excl
+            EXCLUDE USING tde_btree (amount WITH =);
+        RAISE EXCEPTION 'TEST 163 FAILED: ALTER TABLE accepted a numeric EXCLUDE constraint';
+    EXCEPTION WHEN feature_not_supported THEN NULL;
+    END;
+
+    -- A UNIQUE text index would become a numeric one: the ALTER must fail and
+    -- leave the column as it was.
+    CREATE UNIQUE INDEX tde_eq_163_txt ON tde_eq_163 USING tde_btree (txt);
+    BEGIN
+        ALTER TABLE tde_eq_163 ALTER COLUMN txt TYPE numeric USING txt::numeric;
+        RAISE EXCEPTION 'TEST 163 FAILED: ALTER COLUMN TYPE rebuilt a tde_btree index on numeric';
+    EXCEPTION WHEN feature_not_supported THEN NULL;
+    END;
+    IF (SELECT atttypid FROM pg_attribute
+        WHERE attrelid = 'tde_eq_163'::regclass AND attname = 'txt') <> 'text'::regtype THEN
+        RAISE EXCEPTION 'TEST 163 FAILED: the refused ALTER changed the column type';
+    END IF;
+
+    BEGIN
+        CREATE INDEX tde_eq_163_legacy ON tde_eq_163 USING tde_btree (id tde_int4_ops);
+        RAISE EXCEPTION 'TEST 163 FAILED: CREATE INDEX accepted a plaintext-key operator class';
+    EXCEPTION WHEN feature_not_supported THEN NULL;
+    END;
+
+    BEGIN
+        CREATE COLLATION tde_ci_163 (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+    EXCEPTION WHEN OTHERS THEN
+        has_icu := false;
+    END;
+
+    IF has_icu THEN
+        BEGIN
+            CREATE INDEX tde_eq_163_ci ON tde_eq_163 USING tde_btree (name COLLATE tde_ci_163);
+            RAISE EXCEPTION 'TEST 163 FAILED: CREATE INDEX accepted a nondeterministic collation';
+        EXCEPTION WHEN feature_not_supported THEN NULL;
+        END;
+
+        CREATE INDEX tde_eq_163_name ON tde_eq_163 USING tde_btree (name);
+        BEGIN
+            ALTER TABLE tde_eq_163 ALTER COLUMN name TYPE text COLLATE tde_ci_163;
+            RAISE EXCEPTION 'TEST 163 FAILED: ALTER COLUMN TYPE rebuilt a tde_btree index on a nondeterministic collation';
+        EXCEPTION WHEN feature_not_supported THEN NULL;
+        END;
+        DROP COLLATION tde_ci_163;
+    ELSE
+        RAISE NOTICE 'TEST 163: ICU unavailable, nondeterministic collation checks skipped';
+    END IF;
+
+    -- The plaintext-key class, allowed on request: existing indexes of that
+    -- kind must keep working through REINDEX (checked below, CONCURRENTLY too).
+    SET pg_vault_tde.allow_plaintext_index = on;
+    CREATE INDEX tde_eq_163_legacy ON tde_eq_163 USING tde_btree (id tde_int4_ops);
+    RESET pg_vault_tde.allow_plaintext_index;
+    REINDEX INDEX tde_eq_163_legacy;
+END;
+$$;
+
+-- CONCURRENTLY cannot run inside a DO block.  The copy it builds reaches the
+-- post-create hook as a non-internal creation; it must not be refused.
+REINDEX INDEX CONCURRENTLY tde_eq_163_legacy;
+REINDEX TABLE CONCURRENTLY tde_eq_163;
+
+DO $$
+DECLARE
+    n bigint;
+BEGIN
+    SELECT count(*) INTO n FROM tde_eq_163 WHERE id = 1234;
+    IF n <> 1 THEN
+        RAISE EXCEPTION 'TEST 163 FAILED: lookup through the reindexed legacy index returned % rows', n;
+    END IF;
+
+    -- Nothing that reached the catalog is an index tde_btree cannot serve.
+    SELECT count(*) INTO n
+    FROM pg_index ix
+    JOIN pg_class ic ON ic.oid = ix.indexrelid
+    JOIN pg_am am ON am.oid = ic.relam AND am.amname = 'tde_btree'
+    CROSS JOIN LATERAL unnest(ix.indclass::oid[], ix.indcollation::oid[]) AS k(opc, coll)
+    JOIN pg_opclass opc ON opc.oid = k.opc
+    LEFT JOIN pg_collation c ON c.oid = k.coll
+    WHERE ix.indrelid = 'tde_eq_163'::regclass
+      AND (opc.opcintype = 'numeric'::regtype OR c.collisdeterministic IS FALSE);
+    IF n <> 0 THEN
+        RAISE EXCEPTION 'TEST 163 FAILED: % tde_btree index column(s) on numeric or a nondeterministic collation exist', n;
+    END IF;
+
+    DROP TABLE tde_eq_163;
+    RAISE NOTICE 'TEST 163 PASSED: no creation path builds a tde_btree index on numeric, a nondeterministic collation or a plaintext-key class; REINDEX, CONCURRENTLY too, keeps working';
+END;
+$$;
+
+-- ================================================================
+-- TEST 164: shapes that could still lead the planner onto tde_btree
+--
+-- Ranges the planner derives itself (LIKE, ^@ and regex prefixes under
+-- collation "C"), > ANY, row comparisons, window functions, DISTINCT with
+-- ORDER BY, the second column of a multi-column index (skip scan on
+-- PostgreSQL 18), range joins, IS NULL, and ORDER BY / max() across
+-- partitions.  Each must return what a sequential scan returns.
+-- ================================================================
+DROP TABLE IF EXISTS tde_eq_164;
+CREATE TABLE tde_eq_164 (id int, name text, cname text COLLATE "C", raw bytea) USING encrypted_heap;
+INSERT INTO tde_eq_164
+SELECT g, 'name_' || lpad(g::text, 4, '0'), 'name_' || lpad(g::text, 4, '0'),
+       convert_to('raw_' || g, 'UTF8')
+FROM generate_series(1, 2000) g;
+INSERT INTO tde_eq_164 VALUES (NULL, NULL, NULL, NULL), (NULL, NULL, NULL, NULL);
+CREATE INDEX tde_eq_164_name   ON tde_eq_164 USING tde_btree (name);
+CREATE INDEX tde_eq_164_cname  ON tde_eq_164 USING tde_btree (cname);
+CREATE INDEX tde_eq_164_multi  ON tde_eq_164 USING tde_btree (name, raw);
+CREATE INDEX tde_eq_164_idname ON tde_eq_164 USING tde_btree (id, name);
+ANALYZE tde_eq_164;
+
+DROP TABLE IF EXISTS tde_eq_164p;
+CREATE TABLE tde_eq_164p (id int, name text) PARTITION BY RANGE (id) USING encrypted_heap;
+CREATE TABLE tde_eq_164p1 PARTITION OF tde_eq_164p FOR VALUES FROM (1)    TO (1001) USING encrypted_heap;
+CREATE TABLE tde_eq_164p2 PARTITION OF tde_eq_164p FOR VALUES FROM (1001) TO (2001) USING encrypted_heap;
+INSERT INTO tde_eq_164p SELECT g, 'name_' || lpad(g::text, 4, '0') FROM generate_series(1, 2000) g;
+CREATE INDEX tde_eq_164p_name ON tde_eq_164p USING tde_btree (name);
+ANALYZE tde_eq_164p;
+
+DO $$
+DECLARE
+    q     text;
+    got   text;
+    want  text;
+BEGIN
+    FOREACH q IN ARRAY ARRAY[
+        'SELECT count(*)::text FROM tde_eq_164 WHERE cname LIKE ''name_19%''',
+        'SELECT count(*)::text FROM tde_eq_164 WHERE cname ^@ ''name_19''',
+        'SELECT count(*)::text FROM tde_eq_164 WHERE cname ~ ''^name_19''',
+        'SELECT count(*)::text FROM tde_eq_164 WHERE name > ANY (ARRAY[''name_1990''])',
+        'SELECT count(*)::text FROM tde_eq_164 WHERE (name, raw) > (''name_1990'', ''''::bytea)',
+        'SELECT string_agg(name, '','') FROM (SELECT name, row_number() OVER (ORDER BY name) rn FROM tde_eq_164) s WHERE rn <= 3',
+        'SELECT string_agg(name, '','') FROM (SELECT DISTINCT name FROM tde_eq_164 WHERE name IS NOT NULL ORDER BY name LIMIT 3) s',
+        'SELECT string_agg(name, '','') FROM (SELECT name FROM tde_eq_164p ORDER BY name LIMIT 3) s',
+        'SELECT max(name) FROM tde_eq_164p'
+    ]
+    LOOP
+        -- Both tables carry tde_btree indexes only, and partition indexes are
+        -- named after the partition (tde_eq_164p1_name_idx): any index node
+        -- in the plan is a tde_btree one.
+        IF pg_temp.tde160_plan_uses(q, 'Index') THEN
+            RAISE EXCEPTION 'TEST 164 FAILED: the plan reads a tde_btree index for: %', q;
+        END IF;
+        got  := pg_temp.tde160_run(q);
+        want := pg_temp.tde160_truth(q);
+        IF got IS DISTINCT FROM want THEN
+            RAISE EXCEPTION 'TEST 164 FAILED: % returned %, a sequential scan returns %', q, got, want;
+        END IF;
+    END LOOP;
+
+    -- These may use the index — they are equality or NULL searches — and
+    -- must still be right.
+    FOREACH q IN ARRAY ARRAY[
+        'SELECT count(*)::text FROM tde_eq_164 WHERE name IS NULL',
+        'SELECT count(*)::text FROM tde_eq_164 WHERE raw = convert_to(''raw_1500'', ''UTF8'')',
+        'SELECT count(*)::text FROM tde_eq_164 WHERE id = 5 AND name > ''name_0001'''
+    ]
+    LOOP
+        got  := pg_temp.tde160_run(q);
+        want := pg_temp.tde160_truth(q);
+        IF got IS DISTINCT FROM want THEN
+            RAISE EXCEPTION 'TEST 164 FAILED: % returned %, a sequential scan returns %', q, got, want;
+        END IF;
+    END LOOP;
+
+    -- A range join: the inner side must not probe tde_btree with the range.
+    PERFORM set_config('enable_hashjoin', 'off', true);
+    PERFORM set_config('enable_mergejoin', 'off', true);
+    q := 'SELECT count(*)::text FROM tde_eq_164 a JOIN tde_eq_164 b ON b.name > a.name WHERE a.id IN (1998, 1999)';
+    got := pg_temp.tde160_run(q);
+    PERFORM set_config('enable_hashjoin', 'on', true);
+    PERFORM set_config('enable_mergejoin', 'on', true);
+    want := pg_temp.tde160_truth(q);
+    IF got IS DISTINCT FROM want THEN
+        RAISE EXCEPTION 'TEST 164 FAILED: range join returned %, expected %', got, want;
+    END IF;
+
+    DROP TABLE tde_eq_164;
+    DROP TABLE tde_eq_164p;
+    RAISE NOTICE 'TEST 164 PASSED: derived ranges, > ANY, row comparisons, windows, DISTINCT, skip scan, range joins and partitions all match a sequential scan';
+END;
+$$;
+
+DROP TABLE tde_eq_160;
+
+-- ================================================================
 -- PHASE SUMMARY
 -- ================================================================
 DO $$
 BEGIN
     RAISE NOTICE '============================================================';
-    RAISE NOTICE 'v1.7 Tests 111-140 + 154-159 — COMPLETE';
+    RAISE NOTICE 'v1.7 Tests 111-140 + 154-164 — COMPLETE';
     RAISE NOTICE '   tde_int4_enc_ops + disk forensic check ......test 111';
     RAISE NOTICE '   tde_int8_enc_ops equality lookup ........... test 112';
     RAISE NOTICE '   tde_uuid_enc_ops equality lookup ........... test 113';
@@ -2172,6 +2610,11 @@ BEGIN
     RAISE NOTICE '   on-disk tuple is walkable (pageinspect) ... test 157';
     RAISE NOTICE '   indexed-column position matrix ............ test 158';
     RAISE NOTICE '   rmgr id 161 registered as pg_vault_tde .... test 159';
+    RAISE NOTICE '   tde_btree: no order/range use ............. test 160';
+    RAISE NOTICE '   tde_btree: =, IN, = ANY complete .......... test 161';
+    RAISE NOTICE '   tde_btree: forced range refused ........... test 162';
+    RAISE NOTICE '   tde_btree: unservable indexes ............. test 163';
+    RAISE NOTICE '   tde_btree: planner edge cases ............. test 164';
     RAISE NOTICE '============================================================';
 END;
 $$;

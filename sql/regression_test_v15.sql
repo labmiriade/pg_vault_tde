@@ -29,7 +29,7 @@
 --   psql -f sql/regression_test.sql      (tests 1-52)
 --   psql -f sql/regression_test_v15.sql  (tests 53-72)
 --   psql -f sql/regression_test_v16.sql  (tests 73-110)
---   psql -f sql/regression_test_v17.sql  (tests 111-140)
+--   psql -f sql/regression_test_v17.sql  (tests 111-140, 154-164)
 --
 -- There are no pg_vault_tde--1.x--1.y.sql upgrade scripts. 1.7 is the only
 -- version installed (DATA in the Makefile, default_version in the .control),
@@ -521,8 +521,12 @@ DECLARE
     result_val  text;
 BEGIN
     CREATE TABLE tde_btree_int4_test (id int4, label text) USING encrypted_heap;
+    -- v1.5 plaintext-key operator class: refused by default since 1.7.2
+    -- (PSQLE-173), still supported for indexes that already use it.
+    SET pg_vault_tde.allow_plaintext_index = on;
     CREATE INDEX tde_btree_int4_idx
         ON tde_btree_int4_test USING tde_btree (id tde_int4_ops);
+    RESET pg_vault_tde.allow_plaintext_index;
 
     INSERT INTO tde_btree_int4_test VALUES (100, 'hundred'),
                                            (200, 'two_hundred'),
@@ -554,8 +558,12 @@ DECLARE
     result_id  int;
 BEGIN
     CREATE TABLE tde_btree_uuid_test (id int, token uuid) USING encrypted_heap;
+    -- v1.5 plaintext-key operator class: refused by default since 1.7.2
+    -- (PSQLE-173), still supported for indexes that already use it.
+    SET pg_vault_tde.allow_plaintext_index = on;
     CREATE INDEX tde_btree_uuid_idx
         ON tde_btree_uuid_test USING tde_btree (token tde_uuid_ops);
+    RESET pg_vault_tde.allow_plaintext_index;
 
     INSERT INTO tde_btree_uuid_test VALUES
         (1, '550e8400-e29b-41d4-a716-446655440000'::uuid),

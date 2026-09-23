@@ -10,7 +10,7 @@
 ALL gates must pass before any change is considered complete:
 
 ```bash
-# Gate 1: Full regression (137 tests: 45 v1.4 + 20 v1.5 + 36 v1.6 + 36 v1.7, vault provider)
+# Gate 1: Full regression (141 tests: 44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7, vault provider)
 make ci-regress
 
 # Gate 1b: Wallet provider regression (same suite, kms_provider=local)
@@ -52,13 +52,13 @@ across the whole repo, not the next one in the file you are editing.
 | `sql/regression_test.sql` | 1–52 | `make ci-regress` / `ci-wallet` |
 | `sql/regression_test_v15.sql` | 53–72 | `make ci-regress` / `ci-wallet` |
 | `sql/regression_test_v16.sql` | 73–110 | `make ci-regress` / `ci-wallet` |
-| `sql/regression_test_v17.sql` | 111–140, 154–159 | `make ci-regress` / `ci-wallet` |
+| `sql/regression_test_v17.sql` | 111–140, 154–164 | `make ci-regress` / `ci-wallet` |
 | `sql/regression_test_errorpath.sql` | 141–153 | `make ci-errorpath` |
 | `sql/regression_test_schema.sql` | own 1–20 | `make ci-schema` |
 
-The ranges have gaps, so count tests, not numbers: 5–9, 11 and 49 no longer exist, 80
+The ranges have gaps, so count tests, not numbers: 5–11 and 49 no longer exist, 80
 was removed in v1.7, and 110 is commented out (the `WITH HOLD` cursor spill is a
-permanent limitation). `make ci-regress` therefore runs **137 tests**: 45 + 20 + 36 + 36.
+permanent limitation). `make ci-regress` therefore runs **141 tests**: 44 + 20 + 36 + 41.
 To find the next free number, ask the files rather than this page (the error-path
 file uses a `-- ---- TEST n` header):
 
@@ -68,7 +68,7 @@ grep -hoE '^-- (---- )?TEST [0-9]+' sql/regression_test*.sql | grep -oE '[0-9]+'
 
 | Test # | Category | What It Validates | File |
 |--------|----------|-------------------|------|
-| 1–4, 10 | Registration | extension loaded, access methods and SQL functions registered, wallet unlock, backup status | `regression_test.sql` |
+| 1–4 | Registration | extension loaded, access methods and SQL functions registered, wallet unlock | `regression_test.sql` |
 | 12 | TAM INSERT+SELECT | Basic round-trip on `encrypted_heap` table | `regression_test.sql` |
 | 13 | On-disk absence | Raw file scan confirms no plaintext on disk | `regression_test.sql` |
 | 14 | TAM UPDATE | ctid preservation, tuple refetch, HOT chains | `regression_test.sql` |
@@ -303,7 +303,8 @@ Every regression test MUST have a corresponding expected output file:
 sql/regression_test.sql  →  expected/pg_vault_tde_init.out
 ```
 
-When adding new tests (the next free number across the whole repo is 159):
+When adding new tests (take the next free number from the files — see the command
+under the Test Suite Map, never from this page):
 1. Run the test manually: `psql -f sql/regression_test.sql > expected/pg_vault_tde_init.out 2>&1`
 2. Review the output for correctness
 3. Commit the `.out` file alongside the `.sql` file

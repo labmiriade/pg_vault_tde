@@ -21,7 +21,7 @@
 --   psql -f sql/regression_test.sql      (tests 1-52)
 --   psql -f sql/regression_test_v15.sql  (tests 53-72)
 --   psql -f sql/regression_test_v16.sql  (tests 73-110)
---   psql -f sql/regression_test_v17.sql  (tests 111-140)
+--   psql -f sql/regression_test_v17.sql  (tests 111-140, 154-164)
 --
 -- There are no pg_vault_tde--1.x--1.y.sql upgrade scripts. 1.7 is the only
 -- version installed (DATA in the Makefile, default_version in the .control),
@@ -90,36 +90,6 @@ DO $$
 BEGIN
     PERFORM pg_vault_tde_wallet_unlock('tde_regression_pass_2026');
     RAISE NOTICE 'TEST 4 PASSED: wallet unlocked';
-END;
-$$;
-
-
--- ================================================================
--- TEST 10: Backup status function works
--- ================================================================
-DO $$
-DECLARE
-    status text;
-BEGIN
-    status := 'backup encryption active';
-    IF status IS NULL OR position('backup encryption active' IN status) = 0 THEN
-        RAISE EXCEPTION 'TEST 10 FAILED: unexpected backup status: %', status;
-    END IF;
-    RAISE NOTICE 'TEST 10 PASSED: backup status = %', status;
-END;
-$$;
-
-
--- ================================================================
--- SUMMARY
--- ================================================================
-DO $$
-BEGIN
-    RAISE NOTICE '================================================';
-    RAISE NOTICE 'CRYPTO PRIMITIVE TESTS: 3 passed (tests 1, 2, 3), 6 removed (5,6,7,9,11,49 — relied on global DEK which was removed)';
-    RAISE NOTICE '  PASSED : 1, 2, 3, 4, 10';
-    RAISE NOTICE '  REMOVED: 5, 6, 7, 8, 9, 11, 49 — encrypt_test/decrypt_test/rotate_key/key_generation (global DEK removed)';
-    RAISE NOTICE '================================================';
 END;
 $$;
 
@@ -1622,8 +1592,8 @@ $$;
 DO $$
 BEGIN
     RAISE NOTICE '====================================================';
-    RAISE NOTICE 'TESTS SUMMARY: 45 tests — pg_vault_tde v1.4 (numbered 1-52, with gaps)';
-    RAISE NOTICE '   Registration, wallet ........ tests  1-4, 10';
+    RAISE NOTICE 'TESTS SUMMARY: 44 tests — pg_vault_tde v1.4 (numbered 1-52, with gaps)';
+    RAISE NOTICE '   Registration, wallet ........ tests  1-4';
     RAISE NOTICE '   TAM basic I/O ............... tests 12-14';
     RAISE NOTICE '   DELETE, NULL, index scan .... tests 15-17';
     RAISE NOTICE '   COPY, multi-col, DEK isol. .. tests 18-20';
@@ -1642,6 +1612,7 @@ BEGIN
     RAISE NOTICE '   v1.2: logical decoding ...... test  48';
     RAISE NOTICE '   v1.4: tde_btree ............. tests 50-52';
     RAISE NOTICE '   REMOVED: 5-9, 11, 49 — legacy global-DEK tests, dropped together in 2026-06';
+    RAISE NOTICE '   REMOVED: 10 — pg_vault_tde_backup_status(), removed in 2026-05';
     RAISE NOTICE '====================================================';
 END;
 $$;

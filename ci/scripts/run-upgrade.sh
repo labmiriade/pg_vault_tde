@@ -130,6 +130,8 @@ SELECT md5(string_agg(x, '|' ORDER BY x)) FROM (
     UNION ALL
     SELECT 'n:' || coalesce(a::text,'-') || ':' || coalesce(b,'-')
                 || ':' || coalesce(c::text,'-')             AS x FROM up_nulls
+    UNION ALL
+    SELECT 'm:' || id || ':' || amount                      AS x FROM up_numeric
 ) s;
 SQL
 
@@ -168,6 +170,13 @@ CREATE TABLE up_nulls (a int4, b text, c timestamptz) USING encrypted_heap;
 INSERT INTO up_nulls VALUES (1, 'x', '2026-01-01 00:00:00+00'),
                             (2, NULL, NULL),
                             (NULL, 'y', NULL);
+
+-- A tde_btree index the current build no longer lets anyone create
+-- (PSQLE-173): numeric, whose operator class cannot find equal values.  Kept
+-- to prove the current build hides it from the planner and still rebuilds it.
+CREATE TABLE up_numeric (id int4, amount numeric) USING encrypted_heap;
+INSERT INTO up_numeric SELECT g, g * 1.25 FROM generate_series(1, 200) g;
+CREATE INDEX up_numeric_amount ON up_numeric USING tde_btree (amount);
 
 CHECKPOINT;
 SQL
@@ -250,7 +259,7 @@ fi
 # ── Gate C: the documented remedy has to work ────────────────────────────
 log_info "Gate C — VACUUM FULL must migrate the rows without altering them ..."
 container_psql "$CONTAINER" -v ON_ERROR_STOP=1 -q -c \
-    "VACUUM FULL up_plain, up_late_key, up_toast, up_nulls;" \
+    "VACUUM FULL up_plain, up_late_key, up_toast, up_nulls, up_numeric;" \
     || { log_error "GATE C: VACUUM FULL failed on baseline data"; exit 2; }
 
 MIGRATED="$(container_psql "$CONTAINER" -tAc "$FINGERPRINT" 2>/dev/null | tr -d '[:space:]')"
@@ -268,6 +277,54 @@ if [[ -n "$POST_ERR" ]]; then
     exit 2
 fi
 log_ok "GATE C: rows update normally once rewritten"
+
+# ── Probe D: an index the current build refuses to create ────────────────
+# up_numeric_amount was built by the baseline; this build refuses numeric
+# tde_btree indexes because equality through them misses rows.  One that
+# already exists must be left out of every plan — VACUUM FULL above has just
+# rebuilt it, which must also still work — and the query must be right.
+# 2.5 equals the stored 2.50 with a different scale: the value such an index
+# misses.
+log_info "Probe D — a numeric tde_btree index written by $BASELINE must be ignored by the planner ..."
+PLAN="$(container_psql "$CONTAINER" -tAc \
+    "EXPLAIN (COSTS OFF) SELECT count(*) FROM up_numeric WHERE amount = 2.5" 2>&1 || true)"
+if grep -q "up_numeric_amount" <<< "$PLAN"; then
+    log_error "PROBE D: the planner uses a numeric tde_btree index:"
+    log_error "        $(echo "$PLAN" | tr '\n' ' ')"
+    exit 2
+fi
+N="$(container_psql "$CONTAINER" -tAc \
+    "SELECT count(*) FROM up_numeric WHERE amount = 2.5" 2>&1 | tr -d '[:space:]' || true)"
+if [[ "$N" != "1" ]]; then
+    log_error "PROBE D: equality on a column with a numeric tde_btree index returned '$N', expected 1"
+    exit 2
+fi
+log_ok "PROBE D: the baseline's numeric tde_btree index is ignored by the planner; equality is correct"
+
+# The query README -> "Upgrading to 1.7.2" gives users to find such indexes.
+# It must find this one: a detection query that finds nothing looks the same
+# as a database with nothing to find.  Keep the two copies identical.
+read -r -d '' FIND_UNSERVABLE <<'SQL' || true
+SELECT DISTINCT ix.indexrelid::regclass AS index_name,
+       ix.indrelid::regclass   AS table_name,
+       ix.indisunique,
+       con.conname             AS constraint_name
+FROM pg_index ix
+JOIN pg_class ic ON ic.oid = ix.indexrelid
+JOIN pg_am    am ON am.oid = ic.relam AND am.amname = 'tde_btree'
+CROSS JOIN LATERAL unnest(ix.indclass::oid[], ix.indcollation::oid[]) AS k(opc, coll)
+JOIN pg_opclass opc ON opc.oid = k.opc
+LEFT JOIN pg_collation  c   ON c.oid = k.coll
+LEFT JOIN pg_constraint con ON con.conindid = ix.indexrelid
+WHERE opc.opcintype = 'numeric'::regtype OR c.collisdeterministic IS FALSE
+ORDER BY 1;
+SQL
+FOUND="$(container_psql "$CONTAINER" -tA -F '|' -c "$FIND_UNSERVABLE" 2>&1 | cut -d'|' -f1 | tr '\n' ' ' | sed 's/ *$//')"
+if [[ "$FOUND" != "up_numeric_amount" ]]; then
+    log_error "PROBE D: the README detection query found '$FOUND', expected 'up_numeric_amount'"
+    exit 2
+fi
+log_ok "PROBE D: the README detection query finds it"
 
 log_ok "UPGRADE COMPATIBILITY: data written by $BASELINE reads under $(cat "$REPO_ROOT/VERSION"); behaviour matches ci/upgrade-compat.expected"
 exit 0

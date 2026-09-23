@@ -16,7 +16,7 @@ decrypted after it leaves. Encryption keys are managed by **HashiCorp Vault** /
 **OpenBao** or a **local PKCS#12 wallet** and cached in shared memory with
 automatic rotation.
 
-**Current release: v1.7** — 137 regression tests (45 v1.4 + 20 v1.5 + 36 v1.6 + 36 v1.7), zero compiler warnings on PG 17 + PG 18.
+**Current release: v1.7** — 141 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7), zero compiler warnings on PG 17 + PG 18.
 
 ### Commercial Support
 
@@ -737,7 +737,7 @@ All parameters are `suset` — settable per-database with `ALTER DATABASE SET`.
 | Parameter | Type | Default | Context | Description |
 |---|---|---|---|---|
 | `enabled` | boolean | `on` | suset | Master switch — set `off` to measure TAM overhead without crypto. Settable per-database. |
-| `allow_plaintext_index` | boolean | `off` | suset | When `off` (default), `CREATE INDEX`/`CREATE UNIQUE INDEX` with a non-`tde_btree` access method on an `encrypted_heap` table is rejected with `ERROR`. When `on`, allowed after a `WARNING` — the indexed column's plaintext value is then stored unencrypted on disk. Does not affect `PRIMARY KEY`/`UNIQUE` table constraints (always allowed, always warned — see "What Gets Encrypted" above). |
+| `allow_plaintext_index` | boolean | `off` | suset | When `off` (default), `CREATE INDEX`/`CREATE UNIQUE INDEX` with a non-`tde_btree` access method on an `encrypted_heap` table is rejected with `ERROR`. When `on`, allowed after a `WARNING` — the indexed column's plaintext value is then stored unencrypted on disk. Governs the v1.5 `tde_btree` operator classes that keep keys in plaintext (`tde_int4_ops`, `tde_int8_ops`, `tde_uuid_ops`, `tde_date_ops`, `tde_timestamptz_ops`) the same way since 1.7.2 — which is also what restoring a dump that names one needs. Does not affect `PRIMARY KEY`/`UNIQUE` table constraints (always allowed, always warned — see "What Gets Encrypted" above). |
 
 ---
 
@@ -813,7 +813,7 @@ log stream without any extension-level configuration.
 | `pg_vault_tde_rotate_online(regclass, int)` | void | BGW-based online rotation, no exclusive lock; accepts both `encrypted_heap` tables and `tde_btree` indexes **(v1.5)** |
 | `pg_vault_tde_get_rotation_status(regclass)` | table | Online rotation progress for one relation (status, tuples_done/total, pct_complete, timestamps) **(v1.5)** |
 | `pg_vault_tde_rotation_status` | view | All in-progress/completed rotations across the cluster; readable by `pg_monitor` **(v1.5)** |
-| `pg_vault_tde_check_plaintext_index_keys()` | table | Lists `tde_btree` indexes still using a pre-v1.6 plaintext operator class, with a ready-to-run `REINDEX` suggestion; `pg_monitor`/superuser only |
+| `pg_vault_tde_check_plaintext_index_keys()` | table | Meant to list `tde_btree` indexes on a plaintext-key operator class. **Known defect: returns no rows in 1.7.x**, and its `REINDEX` suggestion would not change the operator class. Use the query in [Upgrading to 1.7.2](#upgrading-to-172) instead; replaced in 1.8. `pg_monitor`/superuser only |
 | `pg_vault_tde_wallet_init(text)` | void | Create local wallet and generate KEK **(v1.5)** |
 | `pg_vault_tde_wallet_change_passphrase(text, text)` | void | Re-protect wallet with new passphrase and automatically rotate the KEK (`local` provider only); no separate `rotate_kek()` needed **(v1.6)** |
 | `pg_vault_tde_wallet_status()` | composite | Wallet existence, open state, algorithm, last opened, file perms (5 cols) **(v1.6)** |
@@ -1048,6 +1048,72 @@ Nothing on disk changes — shared memory is rebuilt at every start. Update only
 monitoring that matches the old name in `pg_stat_activity.wait_event` or in
 `pg_shmem_allocations.name`.
 
+### `tde_btree` answers equality only
+
+Up to 1.7.1 the planner used `tde_btree` indexes for range predicates, `ORDER BY`,
+`min()`/`max()` and merge joins, reading them in ciphertext order: on `text`, `bytea` and
+`numeric` columns those queries returned wrong rows without any error. `IN (…)` failed
+with `cache lookup failed for type …`, and on `numeric` even `=` missed rows. 1.7.2
+enforces the one question AES-SIV can answer — see [Limitation 2](#limitations-v17).
+Nothing on disk changes. What you may notice:
+
+- **Queries that range-filter or sort an indexed column run as sequential scans.** They
+  are correct now, and may be slower than the wrong answer was.
+- **`IN (…)` and `= ANY (…)` work**, through bitmap index scans.
+- **`numeric` and nondeterministic-collation `tde_btree` indexes can no longer be
+  created**, by any path: `CREATE INDEX`, an `EXCLUDE` constraint, or the rebuild behind
+  `ALTER COLUMN … TYPE` — so changing a column to `numeric` now fails while it has a
+  `tde_btree` index; drop the index first. Existing ones are ignored by the planner, so
+  queries are right, but **a `UNIQUE` or `EXCLUDE` constraint on one is not enforced**:
+  the check reads the index directly, misses equal values and lets duplicates in. Find
+  them and drop them:
+
+  ```sql
+  SELECT DISTINCT ix.indexrelid::regclass AS index_name,
+         ix.indrelid::regclass   AS table_name,
+         ix.indisunique,
+         con.conname             AS constraint_name
+  FROM pg_index ix
+  JOIN pg_class ic ON ic.oid = ix.indexrelid
+  JOIN pg_am    am ON am.oid = ic.relam AND am.amname = 'tde_btree'
+  CROSS JOIN LATERAL unnest(ix.indclass::oid[], ix.indcollation::oid[]) AS k(opc, coll)
+  JOIN pg_opclass opc ON opc.oid = k.opc
+  LEFT JOIN pg_collation  c   ON c.oid = k.coll
+  LEFT JOIN pg_constraint con ON con.conindid = ix.indexrelid
+  WHERE opc.opcintype = 'numeric'::regtype OR c.collisdeterministic IS FALSE
+  ORDER BY 1;
+  ```
+
+  `REINDEX`, `CONCURRENTLY` included, still rebuilds them. A restore of a dump containing
+  one reports an error for that index and restores everything else.
+- **The v1.5 operator classes that keep keys in plaintext** — `tde_int4_ops`,
+  `tde_int8_ops`, `tde_uuid_ops`, `tde_date_ops`, `tde_timestamptz_ops` — are refused for
+  new indexes unless `pg_vault_tde.allow_plaintext_index = on`, which a restore of a dump
+  that names one also needs. Indexes already built on them keep working. This lists them,
+  each with the statements that rebuild it on the encrypted default:
+
+  ```sql
+  SELECT ix.indexrelid::regclass AS index_name,
+         ix.indrelid::regclass   AS table_name,
+         regexp_replace(
+           regexp_replace(pg_get_indexdef(ix.indexrelid),
+                          ' tde_(int4|int8|uuid|date|timestamptz)_ops\M', '', 'g'),
+           '^CREATE (UNIQUE )?INDEX (\S+) ON ', 'CREATE \1INDEX CONCURRENTLY \2_enc ON ')
+           || ';  DROP INDEX CONCURRENTLY ' || ix.indexrelid::regclass || ';' AS migrate
+  FROM pg_index ix
+  WHERE EXISTS (
+      SELECT 1 FROM pg_opclass opc
+      WHERE opc.oid = ANY (ix.indclass::oid[])
+        AND opc.opcmethod = (SELECT oid FROM pg_am WHERE amname = 'tde_btree')
+        AND opc.opcname IN ('tde_int4_ops', 'tde_int8_ops', 'tde_uuid_ops',
+                            'tde_date_ops', 'tde_timestamptz_ops'))
+  ORDER BY 1;
+  ```
+
+  Run the `migrate` statements one at a time: `CREATE INDEX CONCURRENTLY` cannot run in a
+  transaction block. `pg_vault_tde_check_plaintext_index_keys()` would be the obvious tool,
+  and returns no rows in 1.7.x — a known defect, replaced in 1.8.
+
 ---
 
 ## Compatibility
@@ -1073,7 +1139,7 @@ monitoring that matches the old name in `pg_stat_activity.wait_event` or in
 | Logical replication (non-TOAST) | ✅ Full (v1.2) | `pg_vault_tde_pgoutput` plugin decrypts tuples before streaming. On PG ≥ 17.11 / 18.x the publisher must allow the plugin — see below |
 | TOAST (large values > ≈2 kB) | ✅ Full | Heap-level round-trips functional; per-chunk storage encryption |
 | Logical replication (TOAST columns) | ✅ Full (v1.7) | Custom WAL rmgr (`toast_custom_rmgr`) routes encrypted chunks past the reorder buffer; stitched in `change_cb`. UPDATE/DELETE need `REPLICA IDENTITY FULL` + PK. Same publisher requirement as above |
-| Range scans / ordering / `IN` on TDE indexes | ❌ Known defects | `tde_btree` is meant for equality only (AES-SIV preserves equality, not order). Ranges, `ORDER BY` and `min`/`max` return wrong rows on `text`/`bytea`/`numeric`; `IN`/`= ANY` fail on every type; `numeric` misses rows even on `=` — see [Limitation 2](#limitations-v17) |
+| Range scans / ordering on TDE indexes | ⚠️ Equality only (by design) | `tde_btree` serves `=`, `IN`, `= ANY`; ranges, `ORDER BY`, `min`/`max` and merge joins run as sequential scans. `numeric` and nondeterministic-collation columns cannot be indexed with it — see [Limitation 2](#limitations-v17) |
 | `CREATE INDEX USING gin/gist/hash/brin/btree` on `encrypted_heap` | ⚠️ `ERROR` by default | Not encrypted AMs; rejected unless `pg_vault_tde.allow_plaintext_index = on` (then allowed with `WARNING`) |
 | Column-level encryption | 🔜 v1.8 | Per-column `ENABLE COLUMN ENCRYPTION` DDL |
 
@@ -1135,7 +1201,7 @@ make ci-all
 PG_VERSION=17 make ci-all
 
 # Individual test stages:
-make ci-regress          # 137 SQL regression tests (vault provider) — numbered 1-140 + 154-159, with gaps
+make ci-regress          # 141 SQL regression tests (vault provider) — numbered 1-140 + 154-164, with gaps
 make ci-errorpath        # 13 error-path tests (141-153) — exercises the PG_CATCH handlers
 make ci-matrix           # regress + TAP on the other supported PG majors (17, 19 when published)
 make ci-scan-build       # Clang static analyzer over the sources (compile only, ~1 min)
@@ -1156,8 +1222,8 @@ make ci-bench BENCH_ROWS=100000  # with custom row count
 make ci-clean            # Remove test containers and images
 ```
 
-Test coverage — 150 SQL regression tests (45 v1.4 + 20 v1.5 + 36 v1.6 + 36 v1.7 + 13 error-path), plus 306 assertions across 28 TAP files. Numbers are one sequence shared by every file and have gaps: 5-9, 11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
-- Tests 1-4, 10: extension loaded, access methods and SQL functions registered, wallet unlock, backup status function
+Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 306 assertions across 28 TAP files. Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
+- Tests 1-4: extension loaded, access methods and SQL functions registered, wallet unlock
 - Tests 12-14: TAM INSERT/SELECT/UPDATE end-to-end
 - Test 15: DELETE
 - Test 16: All-NULL rows (zero-length user data)
@@ -1220,6 +1286,11 @@ Test coverage — 150 SQL regression tests (45 v1.4 + 20 v1.5 + 36 v1.6 + 36 v1.
 - Test 157: every on-disk tuple is **physically walkable** with the relation's tuple descriptor — the invariant PSQLE-165 broke, asserted directly via `pageinspect` instead of through its symptom, plus a per-attribute plaintext check. Skips when `pageinspect` is unavailable **(v1.7.2)**
 - Test 158: the indexed column's **position** must not affect correctness — 8 combinations (attnum 1 / behind a varlena / behind a NULL varlena / behind a dropped column, × `tde_btree` and plaintext `btree`). PSQLE-165 hid for four releases because 38 of 38 regression tables put the key on the first column, the one position whose offset is cached and never walked **(v1.7.2)**
 - Test 159: `pg_get_wal_resource_managers()` reports id **161** as `pg_vault_tde` — the id reserved on the PostgreSQL *Custom WAL Resource Managers* wiki. Fails on any change to `TDE_RMGR_ID`, which would make the previous release's WAL unreplayable; `tap/19` pins the same id in the WAL records and the startup log **(v1.7.2, PSQLE-172)**
+- Test 160: ordering, `min()`/`max()`, ranges, `LIKE` prefixes and merge joins never read a `tde_btree` index and return what a sequential scan returns **(v1.7.2, PSQLE-173)**
+- Test 161: `=`, `IN (…)` and `= ANY (…)` use the index, and every one of 2,000 values of five types is found through it **(v1.7.2, PSQLE-173)**
+- Test 162: a range forced onto `tde_btree` is refused, never answered with wrong rows; ordering cannot be forced onto it at all **(v1.7.2, PSQLE-173)**
+- Test 163: no creation path — `CREATE INDEX`, `EXCLUDE` in `CREATE TABLE` or `ALTER TABLE`, the rebuild behind `ALTER COLUMN … TYPE` — builds a `tde_btree` index on `numeric`, a nondeterministic collation or a plaintext-key operator class; `REINDEX`, `CONCURRENTLY` included, keeps working (before the fix, `UNIQUE` and `EXCLUDE` on such an index let 1164 and 1332 exact duplicates of 2,000 in) **(v1.7.2, PSQLE-173)**
+- Test 164: shapes that could still lead the planner onto `tde_btree` — ranges it derives from `LIKE`, `^@` and regex prefixes under collation `C`, `> ANY`, row comparisons, window functions, `DISTINCT … ORDER BY`, skip scan, range joins, `IS NULL`, `ORDER BY`/`max()` across partitions — all match a sequential scan **(v1.7.2, PSQLE-173)**
 
 Error-path coverage — tests 141-153 (`sql/regression_test_errorpath.sql`, `make ci-errorpath`):
 
@@ -1553,21 +1624,14 @@ run against 1.7.2.
   `uuid`) and enforce uniqueness of a sensitive column with
   `CREATE UNIQUE INDEX … USING tde_btree`. A violation of that index reports the key in
   `DETAIL` as ciphertext, not as the value.
-- **Use `tde_btree` for single-value equality lookups only, and know its known defects**
-  ([Limitation 2](#limitations-v17)):
-  - `int4`, `int8`, `uuid`, `date`, `timestamptz`, and `text`/`bytea` with a deterministic
-    collation: `col = value` is correct.
-  - **`IN (…)` and `= ANY (…)` fail** on every `tde_btree` index
-    (`cache lookup failed for type …`).
-  - **`numeric`: do not index with `tde_btree`.** Even `=` misses rows (555 of 2,000 values
-    in one test).
-  - **`text` with a nondeterministic collation**: `=` through the index misses rows.
-  - `text`, `bytea`, `numeric`: range predicates, `ORDER BY … LIMIT`, `min()`/`max()` and
-    merge joins use the index and return **wrong rows, or fail with
-    `mergejoin input data is out of order`**, with default planner settings.
-
-  Where a query must do any of these on an indexed column, `SET enable_indexscan = off`
-  and `SET enable_bitmapscan = off` for it.
+- **Use `tde_btree` for equality lookups: `=`, `IN (…)`, `= ANY (…)`.** AES-SIV preserves
+  equality and nothing else, so the planner uses a `tde_btree` index for those and nothing
+  more ([Limitation 2](#limitations-v17)). Range predicates, `ORDER BY`, `min()`/`max()` and
+  merge joins run as sequential scans: correct, not index-assisted — plan for that on
+  columns you sort or range-filter. Two kinds of column cannot carry a `tde_btree` index
+  at all — no `CREATE INDEX`, `EXCLUDE` constraint or `ALTER COLUMN … TYPE` will build
+  one: **`numeric`** (correct support is planned for 1.8) and **`text` with a
+  nondeterministic collation**.
 - **Every index costs on every `UPDATE`.** HOT updates are off
   ([Limitation 7](#limitations-v17)), so each `UPDATE` adds an entry to every index on the
   table, whether or not its columns changed. Keep indexes to what queries need, and don't
@@ -1697,25 +1761,19 @@ See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
    with AES-256-SIV, identical to varlena types. **Index-only scans are not supported**
    (by design, for security — see `doc/pg_vault_tde.md` § Index-Only Scans).
 
-2. **Range scans and ordering on TDE indexes** (equality-only by design; **wrong results on
-   `text`, `bytea` and `numeric` — known defect**): The `tde_btree` AM uses AES-256-SIV,
-   which preserves equality but not order. For `int4`, `int8`, `uuid`, `date` and
-   `timestamptz` the default operator classes declare equality only, so range predicates,
-   `ORDER BY` and `min()`/`max()` never use the index and are answered correctly by a
-   sequential scan. For `text`, `bytea` and `numeric` the default operator classes
-   (`tde_text_ops`, `tde_bytea_ops`, `tde_numeric_ops`) also declare `<` `<=` `>=` `>`,
-   applied to the **ciphertext**: with default planner settings PostgreSQL uses the index
-   for range predicates, `ORDER BY … LIMIT` and `min()`/`max()`, and returns wrong rows
-   without an error — on 2,000 rows, `max()` returned a value from the middle of the table,
-   and a range meant to match 8 rows matched 416; a merge join fails with
-   `mergejoin input data is out of order`. Three further defects of the same family:
-   `IN (…)` / `= ANY (…)` fail on **every** `tde_btree` index with
-   `cache lookup failed for type …`; on `numeric` even `=` misses rows, because the
-   comparator is `numeric_cmp` applied to ciphertext (555 of 2,000 values in one test);
-   and on `text` with a nondeterministic collation `=` misses rows, because AES-SIV can
-   only match identical bytes. Until these are fixed: do not index `numeric` with
-   `tde_btree`, use it for single-value `=` lookups only, and for any other query on an
-   indexed column `SET enable_indexscan = off` and `SET enable_bitmapscan = off` first.
+2. **TDE indexes answer equality only** (by design): `tde_btree` encrypts keys with
+   AES-256-SIV, which preserves equality but not order. The planner uses a `tde_btree`
+   index for `=`, `IN (…)` and `= ANY (…)` only; range predicates, `ORDER BY`,
+   `min()`/`max()` and merge joins never read it and run as correct sequential scans, and
+   a plan forced onto it for a range fails with
+   `tde_btree index "…" supports only equality lookups` rather than return rows.
+   No path builds a `tde_btree` index on a `numeric` column — equal values such as 1.5
+   and 1.50 do not encrypt alike, and the numeric operator class cannot order encrypted
+   keys; correct support is planned for 1.8 — and columns with a nondeterministic
+   collation, since AES-SIV only matches identical bytes. Up to 1.7.1 all of these were
+   silent defects: wrong rows on ranges, ordering and `min`/`max` for `text`, `bytea` and
+   `numeric`, `cache lookup failed for type …` on `IN`, missed rows on `numeric`
+   equality — see [Upgrading to 1.7.2](#upgrading-to-172).
 
 3. **Logical replication of TOAST columns** (✅ resolved in v1.7): Enable
    `pg_vault_tde.toast_custom_rmgr` (PGC_POSTMASTER, default off) to publish
