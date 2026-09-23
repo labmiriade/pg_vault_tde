@@ -15,9 +15,10 @@
 #
 # Two server configurations are needed, so the stage starts the server twice:
 #
-#   Phase 1  wallet_dev_mode_passphrase SET     — the standard regression suite,
-#                                                 which expects every backend to
-#                                                 be able to self-unlock
+#   Phase 1  wallet_dev_mode_passphrase SET     — the four regression files,
+#                                                 in run-regress.sh order; they
+#                                                 expect every backend to be
+#                                                 able to self-unlock
 #   Phase 2  wallet_dev_mode_passphrase UNSET   — the error-path suite, which
 #                                                 needs wallet_lock() to stick
 #
@@ -114,20 +115,28 @@ assert_log_clean() {   # $1 = phase label
 
 RC=0
 
-# ── Phase 1: standard regression suite ───────────────────────────────────
+# ── Phase 1: regression suite ────────────────────────────────────────────
+# The four files share cluster state, so they run in order and the first
+# failure stops the phase.  The exit status matters as much as the output: a
+# backend killed by an assertion prints no "FAILED" line at all.
 log_info "Phase 1: regression suite, dev passphrase SET ..."
 start_server "pg_vault_tde.wallet_dev_mode_passphrase = '$REGRESS_PASS'"
 q -v ON_ERROR_STOP=1 -c "CREATE EXTENSION pg_vault_tde;" >/dev/null 2>&1
 q -v ON_ERROR_STOP=1 -c "SELECT pg_vault_tde_wallet_init('$REGRESS_PASS');" >/dev/null 2>&1
-$RT cp "$REPO_ROOT/sql/regression_test.sql" "$CONTAINER:/tmp/regression_test.sql"
 
 START=$(timer_start)
-if q -f /tmp/regression_test.sql 2>&1 | grep -qE "TEST [0-9]+ FAILED|FATAL"; then
-    log_error "CASSERT: regression suite reported failures under assertions"
-    RC=13
-else
-    log_ok "Phase 1 passed ($(timer_fmt "$(timer_elapsed "$START")"))"
-fi
+for f in regression_test regression_test_v15 regression_test_v16 regression_test_v17; do
+    $RT cp "$REPO_ROOT/sql/$f.sql" "$CONTAINER:/tmp/$f.sql"
+    OUT=$(q -v ON_ERROR_STOP=1 -f "/tmp/$f.sql" 2>&1)
+    if [ $? -ne 0 ] || grep -qE "TEST [0-9]+[a-z]? FAILED|FATAL" <<<"$OUT"; then
+        log_error "CASSERT: $f.sql failed under assertions"
+        tail -30 <<<"$OUT"
+        RC=13
+        break
+    fi
+    log_ok "  $f.sql: $(grep -cE 'TEST [0-9]+[a-z]? PASSED' <<<"$OUT") passed"
+done
+[ "$RC" -eq 0 ] && log_ok "Phase 1 passed ($(timer_fmt "$(timer_elapsed "$START")"))"
 assert_log_clean "phase 1 (regression suite)" || RC=13
 stop_server
 

@@ -21,7 +21,7 @@
 --   psql -f sql/regression_test.sql      (tests 1-52)
 --   psql -f sql/regression_test_v15.sql  (tests 53-72)
 --   psql -f sql/regression_test_v16.sql  (tests 73-110)
---   psql -f sql/regression_test_v17.sql  (tests 111-140)
+--   psql -f sql/regression_test_v17.sql  (tests 111-140, 154-164)
 --
 -- There are no pg_vault_tde--1.x--1.y.sql upgrade scripts. 1.7 is the only
 -- version installed (DATA in the Makefile, default_version in the .control),
@@ -106,20 +106,6 @@ BEGIN
         RAISE EXCEPTION 'TEST 10 FAILED: unexpected backup status: %', status;
     END IF;
     RAISE NOTICE 'TEST 10 PASSED: backup status = %', status;
-END;
-$$;
-
-
--- ================================================================
--- SUMMARY
--- ================================================================
-DO $$
-BEGIN
-    RAISE NOTICE '================================================';
-    RAISE NOTICE 'CRYPTO PRIMITIVE TESTS: 3 passed (tests 1, 2, 3), 6 removed (5,6,7,9,11,49 — relied on global DEK which was removed)';
-    RAISE NOTICE '  PASSED : 1, 2, 3, 4, 10';
-    RAISE NOTICE '  REMOVED: 5, 6, 7, 8, 9, 11, 49 — encrypt_test/decrypt_test/rotate_key/key_generation (global DEK removed)';
-    RAISE NOTICE '================================================';
 END;
 $$;
 

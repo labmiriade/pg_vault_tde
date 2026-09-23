@@ -1,4 +1,4 @@
--- regression_test_v17.sql — TDE tests 111-140 and 154-158 for pg_vault_tde v1.7
+-- regression_test_v17.sql — TDE tests 111-140 and 154-164 for pg_vault_tde v1.7
 --
 -- 141-153 are not a gap: they belong to sql/regression_test_errorpath.sql.
 -- Test numbers are one sequence shared by every suite, not per file.
@@ -31,7 +31,7 @@
 --   psql -f sql/regression_test.sql      (tests 1-52)
 --   psql -f sql/regression_test_v15.sql  (tests 53-72)
 --   psql -f sql/regression_test_v16.sql  (tests 73-110)
---   psql -f sql/regression_test_v17.sql  (tests 111-140)
+--   psql -f sql/regression_test_v17.sql  (tests 111-140, 154-164)
 --
 -- There are no pg_vault_tde--1.x--1.y.sql upgrade scripts. 1.7 is the only
 -- version installed (DATA in the Makefile, default_version in the .control),
