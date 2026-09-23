@@ -33,10 +33,10 @@ Two distinct shmem objects, two distinct (both correct) tranche strategies:
 # 1. TdeRelDekMap HTAB — DEK cache (named tranche) — in pg_vault_tde_catalog.c
 shmem_request_hook (pg_vault_tde_catalog_shmem_request):
   ├── RequestAddinShmemSpace(hash_estimate_size(capacity, sizeof(TdeRelDekMap)))
-  └── RequestNamedLWLockTranche("TdeRelDekMap", 1)   ← named-tranche request OK here
+  └── RequestNamedLWLockTranche("pg_vault_tde_rel_dek_map", 1)   ← named-tranche request OK here
 shmem_startup_hook (pg_vault_tde_catalog_shmem_init):
-  ├── rel_dek_lock = &GetNamedLWLockTranche("TdeRelDekMap")[0].lock
-  └── ShmemInitHash("TdeRelDekMap", capacity, capacity, &info, HASH_ELEM | HASH_BLOBS)
+  ├── rel_dek_lock = &GetNamedLWLockTranche("pg_vault_tde_rel_dek_map")[0].lock
+  └── ShmemInitHash("pg_vault_tde_rel_dek_map", capacity, capacity, &info, HASH_ELEM | HASH_BLOBS)
 
 # 2. pg_vault_tde_kms_cache — Vault token (dynamic tranche) — in pg_vault_tde_kms.c
 shmem_request_hook:
@@ -450,7 +450,7 @@ the very first `wrap_dek` call after `wallet_init`.  Always use `PKCS12_DEFAULT_
  * Each encrypted relation has its own DEK entry, stored as the value type of
  * the TdeRelDekMap HTAB (ShmemInitHash, HASH_BLOBS) keyed by (dbid, relid).
  * There is NO per-entry lock — a single file-scope `rel_dek_lock` (named
- * tranche "TdeRelDekMap") guards the whole table.
+ * tranche "pg_vault_tde_rel_dek_map") guards the whole table.
  */
 typedef struct TdeRelDekMapKey {
     Oid          dbid;                   /* always MyDatabaseId */

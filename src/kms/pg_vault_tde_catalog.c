@@ -9,8 +9,8 @@
  * This module manages the TdeRelDekMap shared-memory hash table (an HTAB
  * created with ShmemInitHash, keyed by (dbid, relid)) and provides the
  * pg_vault_tde_kms_get_rel_dek() accessor used by all TAM encrypt/decrypt
- * paths in v1.5+.  A single LWLock from the "TdeRelDekMap" named tranche
- * guards the whole table.
+ * paths in v1.5+.  A single LWLock from the named tranche
+ * TDE_REL_DEK_MAP_NAME guards the whole table.
  *
  * HOT PATH:
  * ---------
@@ -75,6 +75,22 @@
 static HTAB     *rel_dek_map    = NULL;
 static LWLock   *rel_dek_lock   = NULL;
 
+/*
+ * Name of both the shmem HTAB and its LWLock tranche.
+ *
+ * Both are cluster-wide namespaces shared with every other preloaded
+ * extension, and neither reports a clash: GetNamedLWLockTranche() returns the
+ * first tranche with a matching name, so two extensions would silently share
+ * one lock; ShmemInitHash() finds the name already in ShmemIndex and attaches
+ * to the EXISTING table with HASH_ATTACH, so the second would read the first's
+ * memory through its own struct layout.  Hence the extension prefix, matching
+ * pg_vault_tde_kms_cache and pg_vault_tde_pkcs11_shared.  One constant, so
+ * request and lookup cannot drift apart ("requested tranche is not
+ * registered").  The C type keeps its TdeRelDekMap name: types do not leave
+ * this shared object.
+ */
+#define TDE_REL_DEK_MAP_NAME    "pg_vault_tde_rel_dek_map"
+
 /* Warn once per backend that the cache is full; see tde_rel_dek_cache_store. */
 static bool      cache_full_warned = false;
 
@@ -138,7 +154,7 @@ pg_vault_tde_catalog_shmem_request(void)
         capacity = TDE_REL_DEK_CACHE_DEFAULT;
 
     RequestAddinShmemSpace(tde_rel_dek_cache_size(capacity));
-    RequestNamedLWLockTranche("TdeRelDekMap", 1);  /* Lock outside of the map */
+    RequestNamedLWLockTranche(TDE_REL_DEK_MAP_NAME, 1);  /* Lock outside of the map */
 }
 
 bool tde_catalog_cache_entry(Oid relid, TdeRelDekMap* out_entry)
@@ -176,13 +192,13 @@ pg_vault_tde_catalog_shmem_init(void)
     if(capacity < 64)
         capacity = TDE_REL_DEK_CACHE_DEFAULT;
 
-    rel_dek_lock = &GetNamedLWLockTranche("TdeRelDekMap")[0].lock;
+    rel_dek_lock = &GetNamedLWLockTranche(TDE_REL_DEK_MAP_NAME)[0].lock;
 
     MemSet(&info, 0, sizeof(info));
     info.keysize = sizeof(TdeRelDekMapKey);
     info.entrysize = sizeof(TdeRelDekMap);
 
-    rel_dek_map = ShmemInitHash("TdeRelDekMap",
+    rel_dek_map = ShmemInitHash(TDE_REL_DEK_MAP_NAME,
                                 capacity, 
                                 capacity, 
                                 &info, 

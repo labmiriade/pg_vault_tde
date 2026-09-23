@@ -860,8 +860,12 @@ BEGIN
     END IF;
 
     DROP TABLE tde_part_127;
-    RAISE WARNING 'TEST 127: mixed encrypted/plain partition tree stores plaintext in the plain '
-                  'leaf';
+    -- A pass is reported as PASSED like every other test.  It used to be a
+    -- WARNING, to make the leak loud; but the limitation is documented in
+    -- README, not here, and a WARNING in a green run reads as a failure and
+    -- breaks counting tests by their PASSED lines.  What makes this test a
+    -- tripwire is the RAISE EXCEPTION above, which fires if the leak goes away.
+    RAISE NOTICE 'TEST 127 PASSED: plain leaf of a mixed tree still stores plaintext, as documented; the encrypted leaf does not';
 END;
 $$;
 
@@ -885,7 +889,7 @@ CREATE INDEX tde_hot_idx_128
 INSERT INTO tde_hot_128 VALUES (1, 'before_update');
 
 -- Only the non-indexed column changes.  On a plain heap this would be a HOT
--- update; on encrypted_heap the IV-first format forces a non-HOT update.
+-- update; on encrypted_heap a fresh IV per row version forces a non-HOT update.
 UPDATE tde_hot_128 SET val = 'after_update' WHERE id = 1;
 
 -- Flush backend stats so the HOT-update counter is visible below.
@@ -897,7 +901,7 @@ DECLARE
     n_found    bigint;
     result_val text;
 BEGIN
-    -- HOT must be disabled on encrypted_heap: the IV-first wire format makes
+    -- HOT must be disabled on encrypted_heap: a fresh IV per row version makes
     -- the indexed column always look modified to heapam, so no heap-only
     -- tuple is produced.
     SELECT n_tup_hot_upd INTO n_hot
@@ -925,7 +929,7 @@ BEGIN
 
     DROP TABLE tde_hot_128;
     RAISE NOTICE
-        'TEST 128 PASSED: encrypted_heap disables HOT (IV-first); non-HOT UPDATE + REINDEX keeps row findable';
+        'TEST 128 PASSED: encrypted_heap disables HOT (fresh IV per version); non-HOT UPDATE + REINDEX keeps row findable';
 END;
 $$;
 
@@ -2087,12 +2091,51 @@ END;
 $$;
 
 -- ================================================================
+-- TEST 159: the custom WAL resource manager is pg_vault_tde, under id 161
+--
+-- 161 is the id reserved for pg_vault_tde on the PostgreSQL "Custom WAL
+-- Resource Managers" wiki (PSQLE-172; up to 1.7.1 it was 128,
+-- RM_EXPERIMENTAL_ID).  The id is written into every WAL record the custom
+-- rmgr produces, so changing it makes the previous release's WAL
+-- unreplayable.  This must therefore fail on any change to TDE_RMGR_ID, and
+-- the change then needs an upgrade note.  Registration is unconditional in
+-- _PG_init, so the check holds whatever pg_vault_tde.toast_custom_rmgr says.
+--
+-- tap/19_crash_recovery_rmgr.t pins the same id in the WAL records and in the
+-- startup log; this is the SQL-level half, and it runs on every supported
+-- major through ci-matrix.  It is also the query README gives operators to
+-- check a node before and after preloading pg_vault_tde.
+-- ================================================================
+DO $$
+DECLARE
+    holder text;
+    actual int;
+BEGIN
+    SELECT rm_name INTO holder
+    FROM pg_get_wal_resource_managers()
+    WHERE rm_id = 161;
+
+    IF holder IS DISTINCT FROM 'pg_vault_tde' THEN
+        SELECT rm_id INTO actual
+        FROM pg_get_wal_resource_managers()
+        WHERE rm_name = 'pg_vault_tde';
+
+        RAISE EXCEPTION 'TEST 159 FAILED: id 161 is %, and pg_vault_tde is registered under %',
+            coalesce(format('taken by "%s"', holder), 'unused'),
+            coalesce(actual::text, 'no id at all (not in shared_preload_libraries?)');
+    END IF;
+
+    RAISE NOTICE 'TEST 159 PASSED: WAL resource manager id 161 is registered as pg_vault_tde';
+END;
+$$;
+
+-- ================================================================
 -- PHASE SUMMARY
 -- ================================================================
 DO $$
 BEGIN
     RAISE NOTICE '============================================================';
-    RAISE NOTICE 'v1.7 Tests 111-140 + 154-158 — COMPLETE';
+    RAISE NOTICE 'v1.7 Tests 111-140 + 154-159 — COMPLETE';
     RAISE NOTICE '   tde_int4_enc_ops + disk forensic check ......test 111';
     RAISE NOTICE '   tde_int8_enc_ops equality lookup ........... test 112';
     RAISE NOTICE '   tde_uuid_enc_ops equality lookup ........... test 113';
@@ -2110,7 +2153,7 @@ BEGIN
     RAISE NOTICE '   ATTACH pre-existing encrypted table ........ test 125';
     RAISE NOTICE '   DETACH keeps leaf readable ................. test 126';
     RAISE NOTICE '   MIXED tree limitation (doc) ................ test 127';
-    RAISE NOTICE '   HOT disabled on encrypted_heap (IV-first) .. test 128';
+    RAISE NOTICE '   HOT disabled on encrypted_heap (fresh IV) .. test 128';
     RAISE NOTICE '   FK encrypted parent + encrypted child ...... test 129';
     RAISE NOTICE '   FK encrypted parent + plain child .......... test 130';
     RAISE NOTICE '   FK plain parent + encrypted child .......... test 131';
@@ -2128,6 +2171,7 @@ BEGIN
     RAISE NOTICE '   v5 layout: structure clear, values not ..... test 156';
     RAISE NOTICE '   on-disk tuple is walkable (pageinspect) ... test 157';
     RAISE NOTICE '   indexed-column position matrix ............ test 158';
+    RAISE NOTICE '   rmgr id 161 registered as pg_vault_tde .... test 159';
     RAISE NOTICE '============================================================';
 END;
 $$;
