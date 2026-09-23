@@ -18,7 +18,7 @@ CONTAINER="pg-tde-regress-$$"
 cleanup() { stop_container "$CONTAINER"; }
 trap cleanup EXIT
 
-log_stage "REGRESSION TESTS (52 v1.4 + 20 v1.5 + 38 v1.6 + 35 v1.7 = 145 total)"
+log_stage "REGRESSION TESTS (45 v1.4 + 20 v1.5 + 36 v1.6 + 36 v1.7 = 137 total)"
 
 build_pg_test_image
 
@@ -84,8 +84,8 @@ $RT cp "$REPO_ROOT/sql/regression_test_v15.sql" "$CONTAINER:/tmp/regression_test
 $RT cp "$REPO_ROOT/sql/regression_test_v16.sql" "$CONTAINER:/tmp/regression_test_v16.sql"
 $RT cp "$REPO_ROOT/sql/regression_test_v17.sql" "$CONTAINER:/tmp/regression_test_v17.sql"
 
-# ── Phase 1: v1.4 baseline (52 tests) ────────────────────────────────────
-log_info "Running v1.4 regression_test.sql (52 tests) ..."
+# ── Phase 1: v1.4 baseline (45 tests, numbered 1-52) ────────────────────────────────────
+log_info "Running v1.4 regression_test.sql (45 tests) ..."
 START=$(timer_start)
 if ! container_psql "$CONTAINER" -f /tmp/regression_test.sql; then
     ELAPSED=$(timer_elapsed "$START")
@@ -93,7 +93,7 @@ if ! container_psql "$CONTAINER" -f /tmp/regression_test.sql; then
     $RT logs "$CONTAINER" --tail 50 2>/dev/null || true
     exit 2
 fi
-log_ok "v1.4 baseline: ALL 52 TESTS PASSED ($(timer_fmt "$(timer_elapsed "$START")"))"
+log_ok "v1.4 baseline: ALL 45 TESTS PASSED ($(timer_fmt "$(timer_elapsed "$START")"))"
 
 # ── Version guard ─────────────────────────────────────────────────────────
 # Only pg_vault_tde--1.7.sql is shipped (DATA in the Makefile) and the .control
@@ -134,12 +134,12 @@ else
     exit 2
 fi
 
-# ── Phase 4: v1.7 wallet tests (tests 111-140 + 154-158) ────────────────────────────
-log_info "Running v1.7 wallet regression_test_v17.sql (tests 111-140 + 154-158) ..."
+# ── Phase 4: v1.7 wallet tests (tests 111-140 + 154-159) ────────────────────────────
+log_info "Running v1.7 wallet regression_test_v17.sql (tests 111-140 + 154-159) ..."
 START=$(timer_start)
 if container_psql "$CONTAINER" -f /tmp/regression_test_v17.sql; then
     ELAPSED=$(timer_elapsed "$START")
-    log_ok "REGRESSION v1.7 wallet: tests 111-140 + 154-158 OK ($(timer_fmt "$ELAPSED"))"
+    log_ok "REGRESSION v1.7 wallet: tests 111-140 + 154-159 OK ($(timer_fmt "$ELAPSED"))"
 else
     ELAPSED=$(timer_elapsed "$START")
     log_error "REGRESSION v1.7 wallet: FAILED after $(timer_fmt "$ELAPSED")"
@@ -147,5 +147,5 @@ else
     exit 2
 fi
 
-log_ok "REGRESSION COMPLETE: ALL 145 TESTS PASSED (v1.4 × 52 + v1.5 × 20 + v1.6 × 38 + v1.7 × 35)"
+log_ok "REGRESSION COMPLETE: ALL 137 TESTS PASSED (v1.4 × 45 + v1.5 × 20 + v1.6 × 36 + v1.7 × 36)"
 exit 0

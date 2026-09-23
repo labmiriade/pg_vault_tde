@@ -32,9 +32,22 @@
 # inline, no TOAST chunks are written, and the custom rmgr is never reached.
 # The test asserts a non-empty TOAST relation so it cannot pass vacuously.
 #
-# Both branches of toast.c:354 are covered: custom rmgr on (tde_toast_wal_insert
-# -> RM_TDE) and off (heap_insert -> RM_HEAP).  The second is the control: if
+# Both branches of the pg_vault_tde_toast_custom_rmgr test in
+# pg_vault_tde_toast.c are covered: custom rmgr on (tde_toast_wal_insert ->
+# TDE_RMGR_ID) and off (heap_insert -> RM_HEAP).  The second is the control: if
 # only the first fails, the bug is in our rmgr, not in the encryption.
+#
+# THE RESOURCE MANAGER ID
+#
+# Each case also pins the id itself, twice, because the two checks see
+# different things.  The startup LOG line proves the rmgr was *registered*
+# under 161, and must appear with the GUC off too: registration is
+# unconditional.  pg_waldump proves the WAL *records* carry 161.  pg_waldump is
+# a frontend binary that cannot load the extension, so it has no way to learn
+# the name and prints the id as "custom161"; that is what --rmgr filters on.
+# With the GUC off the same filter must match nothing, which is the fact behind
+# README -> "Upgrading to 1.7.2": no record is ever written under the id unless
+# the feature is on.
 use strict;
 use warnings;
 use Test::More;
@@ -44,6 +57,12 @@ use PostgreSQL::Test::Utils;
 END { system('/bin/sh', '-c', 'rm -rf /var/lib/pg_vault_tde/*') }
 
 my $ROWS = 200;
+
+# The id reserved for pg_vault_tde on the PostgreSQL "Custom WAL Resource
+# Managers" wiki.  Hardcoded on purpose, not read back from the build: changing
+# TDE_RMGR_ID makes WAL written by the previous release unreplayable, so a
+# change must fail here and be made deliberately, with an upgrade note.
+my $RMGR_ID = 161;
 
 # Incompressible payload: md5 hex strings concatenated.  ~12 kB per row, well
 # past TOAST_TUPLE_THRESHOLD, and PGLZ cannot shrink it back inline.  Takes the
@@ -89,9 +108,15 @@ sub run_case
     # TOAST traffic we care about.
     $node->safe_psql('postgres', 'CHECKPOINT');
 
+    my $start_lsn = $node->safe_psql('postgres',
+        'SELECT pg_current_wal_insert_lsn()');
+
     $node->safe_psql('postgres',
         "INSERT INTO rmgr_t SELECT g, " . payload('g') .
         " FROM generate_series(1, $ROWS) g");
+
+    my $end_lsn = $node->safe_psql('postgres',
+        'SELECT pg_current_wal_insert_lsn()');
 
     # Guard against a vacuous run: if the payload stayed inline there are no
     # TOAST chunks, the custom rmgr was never reached, and replaying proves
@@ -101,6 +126,38 @@ sub run_case
         FROM pg_class WHERE oid = 'rmgr_t'::regclass});
     cmp_ok($toast_bytes, '>', 8192,
         "[$label] payload really went out of line ($toast_bytes bytes of TOAST)");
+
+    # --- the resource manager id -----------------------------------------
+    # Registration is unconditional, so this holds with the GUC off as well.
+    ok($node->log_contains(
+           qr/registered custom resource manager "pg_vault_tde" with ID $RMGR_ID\b/),
+        "[$label] startup LOG registers pg_vault_tde with ID $RMGR_ID");
+
+    my ($stdout, $stderr);
+    my $ran = IPC::Run::run [
+        'pg_waldump',
+        '--path'  => $node->data_dir,
+        '--start' => $start_lsn,
+        '--end'   => $end_lsn,
+        '--rmgr'  => sprintf('custom%03d', $RMGR_ID),
+      ],
+      '>' => \$stdout,
+      '2>' => \$stderr;
+    ok($ran, "[$label] pg_waldump --rmgr=custom$RMGR_ID runs");
+    is($stderr, '', "[$label] pg_waldump reports no error");
+
+    my $records = grep { /^rmgr: custom$RMGR_ID\s/ } split /\n/, $stdout;
+    if ($custom_rmgr eq 'on')
+    {
+        # One or more chunks per row, every one of them through our rmgr.
+        cmp_ok($records, '>=', $ROWS,
+            "[$label] $records TOAST chunk records carry rmgr id $RMGR_ID");
+    }
+    else
+    {
+        is($records, 0,
+            "[$label] no WAL record carries rmgr id $RMGR_ID with the GUC off");
+    }
 
     my $before = $node->safe_psql('postgres',
         "SELECT count(*) || ':' || md5(string_agg(big, '' ORDER BY id)) FROM rmgr_t");

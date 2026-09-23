@@ -15,16 +15,27 @@
  * We do NOT hardcode an ENGINE; the default provider handles this, meaning
  * the code benefits from AES-NI on modern x86/ARM without any extra work.
  *
- * Ciphertext wire format (v4 IV-first trailer):
+ * AEAD blob produced by this module, IV first:
  *   [ IV(12) ][ CIPHERTEXT(plaintext_len) ][ GCM TAG(16) ][ VERSION(1) ][ GEN(8) ]
+ *
+ * That is what callers storing the blob whole see: index keys, TOAST chunks and
+ * backup blocks.  A heap tuple does NOT look like this on disk.  The v5 layout
+ * re-frames the blob — ciphertext scattered back into each attribute's own
+ * position, IV moved into the trailer — so the tuple stays walkable by core.
+ * Read the layout comment above tde_value_ranges() in pg_vault_tde_tam.c before
+ * reasoning about on-disk tuple bytes from here.
  *
  * A 12-byte (96-bit) IV is the NIST-recommended size for GCM.
  * We generate it via PostgreSQL's pg_strong_random() which is /dev/urandom
- * backed on Linux \u2014 we do NOT use OpenSSL's RAND_bytes to stay within the
+ * backed on Linux - we do NOT use OpenSSL's RAND_bytes to stay within the
  * PostgreSQL memory/resource model.
  *
- * IV-first so the blob differs from byte 0 every time: heap_update never sees
- * a constant prefix, so HOT is never wrongly chosen and tde_btree stays coherent.
+ * The fresh IV per row version is what keeps HOT off: heap_update compares
+ * indexed columns byte by byte over ciphertext, so an indexed column always
+ * looks changed, no HOT update is chosen, and tde_btree stays coherent.  Under
+ * v4 the argument was "IV first, so the blob differs from byte 0"; in v5 the
+ * leading bytes are structural and in clear, and it is the value bytes that
+ * differ.  Same conclusion, different mechanism.
  */
 #include "postgres.h"
 #include "miscadmin.h"          /* MyDatabaseId — needed for AAD binding */

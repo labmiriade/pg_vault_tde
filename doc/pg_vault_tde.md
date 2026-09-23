@@ -181,7 +181,7 @@ typedef struct TdeRelDekMap {
   corruption — covered by `tap/21_cache_key_cross_db.t`.
 - `TDE_DEK_LEN` is defined **only** in `src/include/pg_vault_tde_kms.h`.
 - The HTAB lives in `src/kms/pg_vault_tde_catalog.c`, created with
-  `ShmemInitHash("TdeRelDekMap", capacity, capacity, &info, HASH_ELEM | HASH_BLOBS)`
+  `ShmemInitHash("pg_vault_tde_rel_dek_map", capacity, capacity, &info, HASH_ELEM | HASH_BLOBS)`
   where `capacity = pg_vault_tde.max_encrypted_relations`. The segment is sized
   with `hash_estimate_size(capacity, sizeof(TdeRelDekMap))`.  `HASH_BLOBS`
   means the key is hashed as raw bytes, so `tde_rel_dek_key()` zeroes the
@@ -189,8 +189,8 @@ typedef struct TdeRelDekMap {
   cluster-wide: with encrypted tables in several databases, budget for the sum.
 - There is **no per-entry lock**. A single `LWLock` (file-scope `rel_dek_lock`)
   from a **named** tranche guards the whole table:
-  `RequestNamedLWLockTranche("TdeRelDekMap", 1)` in the `shmem_request_hook`,
-  then `&GetNamedLWLockTranche("TdeRelDekMap")[0].lock` in the
+  `RequestNamedLWLockTranche("pg_vault_tde_rel_dek_map", 1)` in the `shmem_request_hook`,
+  then `&GetNamedLWLockTranche("pg_vault_tde_rel_dek_map")[0].lock` in the
   `shmem_startup_hook`. The lock is taken `LW_SHARED` for lookups and
   `LW_EXCLUSIVE` for insert/evict/rotate.
 - A second, fixed-size shmem struct (`pg_vault_tde_kms_cache`, in
@@ -804,7 +804,9 @@ The lever that does exist is a **custom WAL resource manager**, gated by the GUC
 `pg_vault_tde` in `shared_preload_libraries`). When enabled:
 
 1. **Write path** — `tde_toast_wal_insert()` (a faithful clone of `heap_insert`)
-   logs encrypted TOAST chunks under `TDE_RMGR_ID` instead of `RM_HEAP_ID`. The
+   logs encrypted TOAST chunks under `TDE_RMGR_ID` (161, registered for
+   pg_vault_tde on the PostgreSQL *Custom WAL Resource Managers* wiki) instead of
+   `RM_HEAP_ID`. The
    WAL record is byte-identical to heap's except for the resource manager id, so
    crash recovery is unaffected (`rm_redo` delegates to `heap_redo`).
 2. **Decode** — routing the chunks to our `rm_decode` keeps them out of the
@@ -868,9 +870,6 @@ they follow from the tuple being an opaque ciphertext blob to the core.
   full snapshot and then aborts *without being streamed* leaves its captured
   chunks in memory until the decoding process exits (there is no output-plugin
   hook for non-streamed aborts; it is a slow, per-abort leak, not per-row).
-- **Resource manager id** — the experimental id `RM_EXPERIMENTAL_ID` (128) is
-  used for now; a stable custom rmid will be reserved and registered on the
-  PostgreSQL community wiki before GA.
 
 This ciphertext-as-opaque-blob conflict — every place the core reads a single
 column (e.g. replica identity) sees ciphertext — is the motivation for the
@@ -1290,15 +1289,15 @@ _PG_init()
   │       │       └── RequestAddinShmemSpace(sizeof(pg_vault_tde_kms_cache))
   │       └── pg_vault_tde_catalog_shmem_request()
   │               ├── RequestAddinShmemSpace(tde_rel_dek_cache_size(capacity))
-  │               └── RequestNamedLWLockTranche("TdeRelDekMap", 1)
+  │               └── RequestNamedLWLockTranche("pg_vault_tde_rel_dek_map", 1)
   ├── install shmem_startup_hook  → pg_vault_tde_shmem_startup()
   │       ├── pg_vault_tde_kms_shmem_init()       (Vault-token cache)
   │       │       ├── ShmemInitStruct("pg_vault_tde_kms_cache", ..., &found)
   │       │       └── if !found: LWLockNewTrancheId() + LWLockInitialize()
   │       │                      ← dynamic tranche; requires shmem to be up!
   │       ├── pg_vault_tde_catalog_shmem_init()   (per-relation DEK cache)
-  │       │       ├── ShmemInitHash("TdeRelDekMap", capacity, capacity, ...)
-  │       │       └── rel_dek_lock = &GetNamedLWLockTranche("TdeRelDekMap")[0].lock
+  │       │       ├── ShmemInitHash("pg_vault_tde_rel_dek_map", capacity, capacity, ...)
+  │       │       └── rel_dek_lock = &GetNamedLWLockTranche("pg_vault_tde_rel_dek_map")[0].lock
   │       └── tde_shmem_started = true; tde_active_kms_provider->init()
   ├── pg_vault_tde_tam_init()
   │       └── memcpy(&tde_methods, GetHeapamTableAmRoutine(), sizeof(TableAmRoutine))
@@ -1320,9 +1319,9 @@ shmem structs use two different (both correct) tranche strategies:
   in `shmem_request_hook`; `LWLockNewTrancheId()` + `LWLockInitialize()` in the
   `shmem_startup_hook` `!found` branch.
 - **`TdeRelDekMap`** (named tranche): `RequestAddinShmemSpace()` **and**
-  `RequestNamedLWLockTranche("TdeRelDekMap", 1)` in `shmem_request_hook`
+  `RequestNamedLWLockTranche("pg_vault_tde_rel_dek_map", 1)` in `shmem_request_hook`
   (named-tranche *requests* are allowed there — only `LWLockNewTrancheId()` is
-  not), then `GetNamedLWLockTranche("TdeRelDekMap")` in `shmem_startup_hook`
+  not), then `GetNamedLWLockTranche("pg_vault_tde_rel_dek_map")` in `shmem_startup_hook`
   (the HTAB and its lock are created by `ShmemInitHash` / picked up from the
   tranche; no `LWLockInitialize()` needed for a named-tranche lock).
 
@@ -1367,12 +1366,13 @@ sequence, gated on the live extension version:
 | `sql/regression_test.sql` | 1–52 | v1.0–v1.4 baseline: crypto, TAM, TOAST, tde_btree |
 | `sql/regression_test_v15.sql` | 53–72 | v1.5: per-table DEK, online rotation, AAD |
 | `sql/regression_test_v16.sql` | 73–109 | v1.6: local wallet KMS |
-| `sql/regression_test_v17.sql` | 111–140, 154–158 | v1.7: `enc_ops` indexes, partition trees, HOT/REINDEX, FK lifecycle, TidRangeScan, on-disk tuple layout |
+| `sql/regression_test_v17.sql` | 111–140, 154–159 | v1.7: `enc_ops` indexes, partition trees, HOT/REINDEX, FK lifecycle, TidRangeScan, on-disk tuple layout |
 | `sql/regression_test_errorpath.sql` | 141–153 | error paths (`make ci-errorpath`) |
 
 Test numbers are one sequence shared by every suite, which is why 141–153 are missing
-from the v1.7 file rather than being a gap. Test 110 (`WITH HOLD` cursor spill) is
-permanently deferred, so `make ci-regress` runs **145 tests**. The table below details the v1.0–v1.4 baseline file:
+from the v1.7 file rather than being a gap. The real gaps are 5–9, 11 and 49 (no
+longer exist), 80 (removed in v1.7) and 110 (`WITH HOLD` cursor spill, disabled: a
+permanent limitation), so `make ci-regress` runs **137 tests**. The table below details the v1.0–v1.4 baseline file:
 
 | Range | Area |
 |---|---|

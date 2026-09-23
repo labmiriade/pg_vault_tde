@@ -2572,7 +2572,7 @@ END;
 $$;
 
 
-/* (currently commentend because it's not planned to be resolved)
+/* (currently commented out because it's not planned to be resolved)
 -- ================================================================
 -- TEST 110: WITH HOLD CURSOR PLAINTEXT SPILL ON DISK 
 --
@@ -2646,7 +2646,7 @@ ALTER SYSTEM RESET work_mem;*/
 DO $$
 BEGIN
     RAISE NOTICE '============================================================';
-    RAISE NOTICE 'v1.6 Tests 73-110 — COMPLETE';
+    RAISE NOTICE 'v1.6 Tests 73-109 — COMPLETE';
     RAISE NOTICE '   v1.6 function registration .......... test 73';
     RAISE NOTICE '   wallet_unlock KEK-cache regression .. test 74  *';
     RAISE NOTICE '   wallet_lock evicts DEKs ............. test 75  *';
@@ -2683,7 +2683,6 @@ BEGIN
     RAISE NOTICE '   Online rotation round-trip .......... test 107';
     RAISE NOTICE '   CREATE TABLE AS ..................... test 108';
     RAISE NOTICE '   VACUUM FULL + STORAGE EXTERNAL ...... test 109';
-    RAISE NOTICE '   WITH HOLD cursor no plaintext spill . test 110';
 
     RAISE NOTICE '';
     RAISE NOTICE '   *   = requires kms_provider=local (make ci-wallet)';

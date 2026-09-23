@@ -10,7 +10,7 @@
 ALL gates must pass before any change is considered complete:
 
 ```bash
-# Gate 1: Full regression (145 tests: 52 v1.4 + 20 v1.5 + 38 v1.6 + 35 v1.7, vault provider)
+# Gate 1: Full regression (137 tests: 45 v1.4 + 20 v1.5 + 36 v1.6 + 36 v1.7, vault provider)
 make ci-regress
 
 # Gate 1b: Wallet provider regression (same suite, kms_provider=local)
@@ -52,15 +52,23 @@ across the whole repo, not the next one in the file you are editing.
 | `sql/regression_test.sql` | 1–52 | `make ci-regress` / `ci-wallet` |
 | `sql/regression_test_v15.sql` | 53–72 | `make ci-regress` / `ci-wallet` |
 | `sql/regression_test_v16.sql` | 73–110 | `make ci-regress` / `ci-wallet` |
-| `sql/regression_test_v17.sql` | 111–140, 154–158 | `make ci-regress` / `ci-wallet` |
+| `sql/regression_test_v17.sql` | 111–140, 154–159 | `make ci-regress` / `ci-wallet` |
 | `sql/regression_test_errorpath.sql` | 141–153 | `make ci-errorpath` |
 | `sql/regression_test_schema.sql` | own 1–20 | `make ci-schema` |
 
-Test 110 is permanently deferred, so `make ci-regress` reports **145 tests**.
+The ranges have gaps, so count tests, not numbers: 5–9, 11 and 49 no longer exist, 80
+was removed in v1.7, and 110 is commented out (the `WITH HOLD` cursor spill is a
+permanent limitation). `make ci-regress` therefore runs **137 tests**: 45 + 20 + 36 + 36.
+To find the next free number, ask the files rather than this page (the error-path
+file uses a `-- ---- TEST n` header):
+
+```bash
+grep -hoE '^-- (---- )?TEST [0-9]+' sql/regression_test*.sql | grep -oE '[0-9]+' | sort -n | tail -1
+```
 
 | Test # | Category | What It Validates | File |
 |--------|----------|-------------------|------|
-| 1–11 | Crypto primitives | GCM encrypt/decrypt, IV uniqueness, tamper detection, rotation | `regression_test.sql` |
+| 1–4, 10 | Registration | extension loaded, access methods and SQL functions registered, wallet unlock, backup status | `regression_test.sql` |
 | 12 | TAM INSERT+SELECT | Basic round-trip on `encrypted_heap` table | `regression_test.sql` |
 | 13 | On-disk absence | Raw file scan confirms no plaintext on disk | `regression_test.sql` |
 | 14 | TAM UPDATE | ctid preservation, tuple refetch, HOT chains | `regression_test.sql` |
@@ -69,7 +77,7 @@ Test 110 is permanently deferred, so `make ci-regress` reports **145 tests**.
 | 17 | Index scan | `index_fetch_tuple` + `rd_tableam` impersonation | `regression_test.sql` |
 | 18 | COPY/bulk | `multi_insert` path via `COPY FROM` | `regression_test.sql` |
 | 19 | Multi-column | int, text, bool, numeric, timestamptz types | `regression_test.sql` |
-| 20 | Key rotation | DEK-A rows rejected after rotating to DEK-B | `regression_test.sql` |
+| 20 | Per-table DEK isolation | two tables independently readable | `regression_test.sql` |
 | 21 | ANALYZE | Statistics computed on decrypted data | `regression_test.sql` |
 | 22 | SELECT FOR UPDATE | `tuple_lock` path | `regression_test.sql` |
 | 23 | BitmapHeapScan | `scan_bitmap_next_tuple` via forced bitmap scan | `regression_test.sql` |
@@ -79,7 +87,6 @@ Test 110 is permanently deferred, so `make ci-regress` reports **145 tests**.
 | 45–46 | BGW token renewal, multi_insert batch | v1.3 coverage | `regression_test.sql` |
 | 47 | `health_check()` state transitions | Uses `dek_available` only | `regression_test.sql` |
 | 48 | Logical decoding (skipped if `wal_level != logical`) | v1.2 | `regression_test.sql` |
-| 49 | Wire format v2 round-trip | v1.4 | `regression_test.sql` |
 | 50 | `tde_btree` CREATE INDEX + equality | v1.4 | `regression_test.sql` |
 | 51 | `health_check.kms_provider` GUC coherence | Replaces v1.4 `wrapped_dek_perms` test | `regression_test.sql` |
 | 52 | `tde_btree` UNIQUE constraint | v1.4 | `regression_test.sql` |
@@ -97,7 +104,7 @@ Test 110 is permanently deferred, so `make ci-regress` reports **145 tests**.
 | 69 | UPDATE large↔large / large↔small | `old_has_external` branch in `tuple_update`; UPDATE large→large, large→small, small→large | `regression_test.sql` |
 | 70 | `toast_am` GUC | `pg_vault_tde_toast_am` returns correct AM OID based on `toast_encryption` GUC; TOAST table AM matches expectation | `regression_test.sql` |
 | 53–72 | Per-table DEK catalog, TOAST large-value, DEK isolation, tde_btree native ops, wire format v3 AAD, online rotation BGW | v1.5 coverage | `regression_test_v15.sql` |
-| 73–110 | Wallet init/unlock/lock, wallet passphrase, rotate_kek, bundle export/import, TOAST storage paths (EXTERNAL/EXTENDED), VACUUM FULL + TOAST, CLUSTER, all seven read paths with TOAST, ANALYZE, multi_insert, UPDATE old_has_external, ALTER TABLE AM switch, online rotation, CREATE TABLE AS, WITH HOLD cursor plaintext spill | v1.6 coverage | `regression_test_v16.sql` |
+| 73–109 | Wallet init/unlock/lock, wallet passphrase, rotate_kek, TOAST storage paths (EXTERNAL/EXTENDED), VACUUM FULL + TOAST, CLUSTER, all seven read paths with TOAST, ANALYZE, multi_insert, UPDATE old_has_external, ALTER TABLE AM switch, online rotation, CREATE TABLE AS (80 removed in v1.7, 110 disabled) | v1.6 coverage | `regression_test_v16.sql` |
 
 > **Skip semantics under `make ci-regress` (vault provider):**
 > Test 48 SKIP if `wal_level != logical`; Test 61 (v15) SKIP if the `pageinspect`

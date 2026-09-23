@@ -16,7 +16,7 @@ decrypted after it leaves. Encryption keys are managed by **HashiCorp Vault** /
 **OpenBao** or a **local PKCS#12 wallet** and cached in shared memory with
 automatic rotation.
 
-**Current release: v1.7** — 145 regression tests (52 v1.4 + 20 v1.5 + 38 v1.6 + 35 v1.7), zero compiler warnings on PG 17 + PG 18.
+**Current release: v1.7** — 137 regression tests (45 v1.4 + 20 v1.5 + 36 v1.6 + 36 v1.7), zero compiler warnings on PG 17 + PG 18.
 
 ### Commercial Support
 
@@ -109,6 +109,22 @@ Add to `postgresql.conf`:
 ```
 shared_preload_libraries = 'pg_vault_tde'
 ```
+
+> **Check the WAL resource manager id first.** pg_vault_tde registers a custom WAL
+> resource manager under id **161**, reserved for it on the PostgreSQL *Custom WAL
+> Resource Managers* wiki. Extensions that follow the registry never use it, but an
+> unregistered one — typically in-house or proprietary — can. On every node that
+> will load pg_vault_tde or replay its WAL (primary, standbys, PITR restore hosts),
+> this must return **no rows** before you add it:
+>
+> ```sql
+> SELECT rm_id, rm_name FROM pg_get_wal_resource_managers()
+> WHERE rm_id = 161 OR rm_name = 'pg_vault_tde';
+> ```
+>
+> If it returns one, the server will refuse to start once pg_vault_tde is preloaded
+> (`failed to register custom resource manager "pg_vault_tde" with ID 161`). After the
+> restart the same query must return exactly `161 | pg_vault_tde`. Any role can run it.
 
 Restart PostgreSQL and create the extension in your database:
 
@@ -259,6 +275,10 @@ VALUES ('alice@example.com', '123-45-6789', '1990-01-15');
 -- Data is transparently decrypted on read
 SELECT email, ssn FROM users WHERE id = 1;
 ```
+
+Before going to production, read [Running pg_vault_tde in Production](#running-pg_vault_tde-in-production):
+primary keys, partitions, statistics, temporary files and backups all have ways of
+putting plaintext on disk.
 
 ---
 
@@ -530,7 +550,7 @@ and timeout are all configurable via GUC parameters registered at startup
 ### DEK Cache (Shared Memory)
 
 Since v1.7 the cache is a shared-memory hash table (`HTAB`), not a fixed array.
-A single `LWLock` from the `"TdeRelDekMap"` named tranche guards the whole table
+A single `LWLock` from the `"pg_vault_tde_rel_dek_map"` named tranche guards the whole table
 (no per-entry lock).
 
 ```
@@ -786,7 +806,7 @@ log stream without any extension-level configuration.
 
 | Function | Returns | Description |
 |---|---|---|
-| `pg_vault_tde_health_check()` | composite | Status (5 columns: version, enabled, kms_provider, enc_ops_available, checked_at) |
+| `pg_vault_tde_health_check()` | composite | Status (6 columns: version, build_version, enabled, kms_provider, enc_ops_available, checked_at) |
 | `pg_vault_tde_verify_integrity(regclass)` | record | GCM tag audit scan of all tuples — returns `(total_tuples, failed_tuples)` |
 | `pg_vault_tde_encrypted_size(regclass)` | record | Encryption storage overhead — returns `(total_tuples, encryption_overhead_bytes)` |
 | `pg_vault_tde_reencrypt_table(regclass, int)` | void | Batch re-encrypt with current DEK (locks table); `int` = batch size, default 1000 |
@@ -981,6 +1001,53 @@ that `INSERT` onwards. The row is not corrupt — the ciphertext on disk is fine
 and 1.7.2 reads it without any migration step. If you have hit this, upgrading is
 the whole fix.
 
+### Custom WAL resource manager id: 128 → 161
+
+1.7.2 moves the custom WAL resource manager from `RM_EXPERIMENTAL_ID` (128) — the
+id upstream reserves for experimentation, and so the one every prototype uses — to
+**161**, registered for pg_vault_tde on the PostgreSQL *Custom WAL Resource
+Managers* wiki. That is what keeps pg_vault_tde from colliding with another
+extension loaded in the same cluster.
+
+**If `pg_vault_tde.toast_custom_rmgr` is off — the default — there is nothing to
+do.** No WAL record is ever written under the extension's id, so none carries 128.
+
+**If it is on**, WAL written by 1.7.1 carries id 128, which 1.7.2 no longer knows:
+replaying it fails with `resource manager with ID 128 not registered`, which is
+fatal in the startup process. WAL carries the number, not the name, so this is not
+something a restart can work around. Before switching binaries:
+
+- stop the primary with a **clean** shutdown (`pg_ctl stop -m fast` or `smart`,
+  never `immediate`), so nothing is left to replay on the next start;
+- let every **physical standby** replay up to that shutdown checkpoint, then stop
+  and upgrade it together with the primary. **No rolling upgrade**: a 1.7.2 standby
+  cannot replay a 1.7.1 primary's records, and a 1.7.1 standby cannot replay a
+  1.7.2 primary's;
+- drain every **logical replication slot** that decodes TOAST through the custom
+  resource manager;
+- take a **new base backup** after the upgrade if you keep a WAL archive for PITR.
+  Recovering into the pre-upgrade window needs the 1.7.1 binaries.
+
+**Whatever the GUC says, check the id before upgrading.** 1.7.1 claimed 128, so a
+cluster running it alongside an extension that uses 161 worked; with 1.7.2 the same
+cluster will not start. Run the check in [2. Configure PostgreSQL](#2-configure-postgresql)
+on every node first — it must return only pg_vault_tde's own row, under 128 while
+1.7.1 is still running, and nothing else.
+
+### Renamed shared-memory objects
+
+The DEK cache's shared hash table and its LWLock tranche were both called
+`TdeRelDekMap`. Both names live in cluster-wide namespaces shared with every other
+preloaded extension, and PostgreSQL reports a clash in neither: a second extension
+using the same name would silently share the lock, or attach to the existing hash
+table and read it through its own layout. In 1.7.2 both are
+**`pg_vault_tde_rel_dek_map`**, prefixed like the extension's other shared-memory
+objects.
+
+Nothing on disk changes — shared memory is rebuilt at every start. Update only
+monitoring that matches the old name in `pg_stat_activity.wait_event` or in
+`pg_shmem_allocations.name`.
+
 ---
 
 ## Compatibility
@@ -996,7 +1063,7 @@ the whole fix.
 | INSERT / COPY | ✅ Full | `tuple_insert` + `multi_insert` override |
 | UPDATE | ✅ Full | `tuple_update` override + ctid preservation |
 | DELETE | ✅ Full | No-op (heapam header-only delete, no column data touched) |
-| HOT chains | ✅ Full | Header plaintext → HOT chain pointers preserved |
+| HOT updates | ❌ Disabled by design | A fresh IV per row version makes every indexed column look changed, so `heap_update` never chooses HOT; every `UPDATE` writes all indexes. See [Limitation 7](#limitations-v17) and [Running in Production](#running-pg_vault_tde-in-production) |
 | VACUUM | ✅ Full | Inherited from heapam (dead-tuple header only) |
 | CTAS   | ✅ Full | Per-table DEK registration before SELECT is executed |
 | `pg_dump` (plain) | ⚠️ Dump is plaintext | pg_dump reads via scan_getnextslot → decrypted. Use `pg_dump_tde` to re-encrypt the output. |
@@ -1006,7 +1073,7 @@ the whole fix.
 | Logical replication (non-TOAST) | ✅ Full (v1.2) | `pg_vault_tde_pgoutput` plugin decrypts tuples before streaming. On PG ≥ 17.11 / 18.x the publisher must allow the plugin — see below |
 | TOAST (large values > ≈2 kB) | ✅ Full | Heap-level round-trips functional; per-chunk storage encryption |
 | Logical replication (TOAST columns) | ✅ Full (v1.7) | Custom WAL rmgr (`toast_custom_rmgr`) routes encrypted chunks past the reorder buffer; stitched in `change_cb`. UPDATE/DELETE need `REPLICA IDENTITY FULL` + PK. Same publisher requirement as above |
-| Range scans on TDE indexes | ⚠️ By design | `tde_btree` (GIN/Hash/GiST planned for v1.8, same AES-SIV pattern) — equality only; ranges return empty |
+| Range scans / ordering / `IN` on TDE indexes | ❌ Known defects | `tde_btree` is meant for equality only (AES-SIV preserves equality, not order). Ranges, `ORDER BY` and `min`/`max` return wrong rows on `text`/`bytea`/`numeric`; `IN`/`= ANY` fail on every type; `numeric` misses rows even on `=` — see [Limitation 2](#limitations-v17) |
 | `CREATE INDEX USING gin/gist/hash/brin/btree` on `encrypted_heap` | ⚠️ `ERROR` by default | Not encrypted AMs; rejected unless `pg_vault_tde.allow_plaintext_index = on` (then allowed with `WARNING`) |
 | Column-level encryption | 🔜 v1.8 | Per-column `ENABLE COLUMN ENCRYPTION` DDL |
 
@@ -1068,7 +1135,7 @@ make ci-all
 PG_VERSION=17 make ci-all
 
 # Individual test stages:
-make ci-regress          # 145 SQL regression tests (vault provider) — tests 1-140 + 154-158 (test 110 deferred)
+make ci-regress          # 137 SQL regression tests (vault provider) — numbered 1-140 + 154-159, with gaps
 make ci-errorpath        # 13 error-path tests (141-153) — exercises the PG_CATCH handlers
 make ci-matrix           # regress + TAP on the other supported PG majors (17, 19 when published)
 make ci-scan-build       # Clang static analyzer over the sources (compile only, ~1 min)
@@ -1077,7 +1144,7 @@ make ci-valgrind         # Valgrind memcheck over the full TDE workload (slow: 1
 make ci-cassert          # PostgreSQL built --enable-cassert -DUSE_VALGRIND (builds PG from source)
 make ci-wallet           # SQL regression tests (local wallet provider)
 make ci-checksums        # regression tests + page checksum compatibility
-make ci-tap              # 20 TAP test files (starts a real Vault container for the Vault-dependent ones)
+make ci-tap              # 28 TAP test files (starts a real Vault container for the Vault-dependent ones)
 make ci-isolation        # 2 isolation specs: DEK rotation under load, relation rewrite under a concurrent reader
 make ci-vault            # Vault integration (Compose-based)
 make ci-openbao          # OpenBao Raft 3-node HA integration (12 tests)
@@ -1089,21 +1156,20 @@ make ci-bench BENCH_ROWS=100000  # with custom row count
 make ci-clean            # Remove test containers and images
 ```
 
-Test coverage — 153 SQL regression tests (52 v1.4 + 20 v1.5 + 38 v1.6 + 30 v1.7 + 13 error-path), plus 240 assertions across 20 TAP files:
-- Tests 1-11: AES-256-GCM crypto primitives, DEK rotation, tamper detection
+Test coverage — 150 SQL regression tests (45 v1.4 + 20 v1.5 + 36 v1.6 + 36 v1.7 + 13 error-path), plus 306 assertions across 28 TAP files. Numbers are one sequence shared by every file and have gaps: 5-9, 11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
+- Tests 1-4, 10: extension loaded, access methods and SQL functions registered, wallet unlock, backup status function
 - Tests 12-14: TAM INSERT/SELECT/UPDATE end-to-end
 - Test 15: DELETE
 - Test 16: All-NULL rows (zero-length user data)
 - Test 17: Index scan (`index_fetch_tuple` path)
 - Test 18: COPY/bulk insert (`multi_insert` path)
 - Test 19: Multi-column table (int, text, bool, numeric, timestamptz)
-- Test 20: Key rotation isolation (DEK-A rows rejected by DEK-B)
+- Test 20: Per-table DEK isolation (two tables independently readable)
 - Test 21: ANALYZE produces correct statistics on decrypted data
 - Test 22: SELECT FOR UPDATE (`tuple_lock` path)
 - Test 23: BitmapHeapScan (`scan_bitmap_next_tuple` path)
 - Test 24: TABLESAMPLE (`scan_sample_next_tuple` path)
 - Tests 25-48: UPSERT, MERGE, TRUNCATE, REINDEX, ALTER, JOINs, CTEs, HW accel, Vault, logical decoding
-- Test 49: Wire format v2 round-trip (version byte + generation counter) **(v1.4)**
 - Test 50: tde_btree CREATE INDEX + equality index scan **(v1.4)**
 - Test 51: health_check() `kms_provider` column coherence with GUC **(v1.6 realignment)**
 - Test 52: tde_btree UNIQUE constraint **(v1.4)**
@@ -1153,6 +1219,7 @@ Test coverage — 153 SQL regression tests (52 v1.4 + 20 v1.5 + 38 v1.6 + 30 v1.
 - Test 156: the v5 layout keeps attribute **values** off disk while leaving the tuple structure readable; a plain-heap control proves the search would have found the needle if it were there **(v1.7.2)**
 - Test 157: every on-disk tuple is **physically walkable** with the relation's tuple descriptor — the invariant PSQLE-165 broke, asserted directly via `pageinspect` instead of through its symptom, plus a per-attribute plaintext check. Skips when `pageinspect` is unavailable **(v1.7.2)**
 - Test 158: the indexed column's **position** must not affect correctness — 8 combinations (attnum 1 / behind a varlena / behind a NULL varlena / behind a dropped column, × `tde_btree` and plaintext `btree`). PSQLE-165 hid for four releases because 38 of 38 regression tables put the key on the first column, the one position whose offset is cached and never walked **(v1.7.2)**
+- Test 159: `pg_get_wal_resource_managers()` reports id **161** as `pg_vault_tde` — the id reserved on the PostgreSQL *Custom WAL Resource Managers* wiki. Fails on any change to `TDE_RMGR_ID`, which would make the previous release's WAL unreplayable; `tap/19` pins the same id in the WAL records and the startup log **(v1.7.2, PSQLE-172)**
 
 Error-path coverage — tests 141-153 (`sql/regression_test_errorpath.sql`, `make ci-errorpath`):
 
@@ -1442,6 +1509,160 @@ or `-i` (for `pg_restore_tde`) are mandatory. Neither piping nor reading from `s
 6. Executing `pg_dump` still produces a plain-text backup
 ---
 
+## Running pg_vault_tde in Production
+
+A checklist for setting up and administering a cluster that keeps data in
+`encrypted_heap`. Each item links to the section with the detail; the queries were
+run against 1.7.2.
+
+### Before the first encrypted table
+
+- **Check the WAL resource manager id** on every node that will load pg_vault_tde or
+  replay its WAL — see [2. Configure PostgreSQL](#2-configure-postgresql).
+- **Pick a real KMS.** Vault/OpenBao, PKCS#11 or the local wallet — see
+  [KMS Provider Selection](#kms-provider-selection). `pg_vault_tde.dev_mode` and
+  `wallet_dev_mode_passphrase` are for tests: the extension logs a WARNING on every use.
+- **Size the DEK cache.** `pg_vault_tde.max_encrypted_relations` (default 1024, restart
+  required) is one budget for the whole cluster. Every encrypted table, every partition
+  *and* its partitioned parent, and every `tde_btree` index takes an entry. Past the
+  budget nothing fails, but each access to an uncached relation goes back to the KMS —
+  and the budget is also the cap on how many plaintext DEKs sit in shared memory. Count
+  in every database, sum, add headroom:
+
+  ```sql
+  SELECT count(*) FROM pg_vault_tde_catalog;
+  ```
+
+- **Warm the cache after a restart** with `pg_vault_tde.preload_keys = on` if
+  first-query latency matters — it needs a KMS that opens without an interactive unlock
+  (see [GUC Parameters](#guc-parameters)).
+- **Put temporary files on encrypted storage.** Any query that spills past `work_mem` —
+  a sort, a hash, a `WITH HOLD` cursor — writes rows that are already decrypted to a
+  temporary file, and no extension hook can intercept it
+  ([Limitation 6](#limitations-v17)). Point `temp_tablespaces` at an encrypted
+  filesystem, and set `log_temp_files` to see how much spills.
+- **Treat the server log as sensitive.** Statement text is logged with its literals: with
+  `log_statement = 'mod'` or `'all'`, and by default for every statement that fails
+  (`log_min_error_statement = error`).
+
+### Designing encrypted tables
+
+- **Keep sensitive values out of `PRIMARY KEY` and `UNIQUE` constraints.** PostgreSQL
+  backs them with a native btree, so the key column is stored **in plaintext** in that
+  index; pg_vault_tde warns when you create one. Use a surrogate primary key (`bigserial`,
+  `uuid`) and enforce uniqueness of a sensitive column with
+  `CREATE UNIQUE INDEX … USING tde_btree`. A violation of that index reports the key in
+  `DETAIL` as ciphertext, not as the value.
+- **Use `tde_btree` for single-value equality lookups only, and know its known defects**
+  ([Limitation 2](#limitations-v17)):
+  - `int4`, `int8`, `uuid`, `date`, `timestamptz`, and `text`/`bytea` with a deterministic
+    collation: `col = value` is correct.
+  - **`IN (…)` and `= ANY (…)` fail** on every `tde_btree` index
+    (`cache lookup failed for type …`).
+  - **`numeric`: do not index with `tde_btree`.** Even `=` misses rows (555 of 2,000 values
+    in one test).
+  - **`text` with a nondeterministic collation**: `=` through the index misses rows.
+  - `text`, `bytea`, `numeric`: range predicates, `ORDER BY … LIMIT`, `min()`/`max()` and
+    merge joins use the index and return **wrong rows, or fail with
+    `mergejoin input data is out of order`**, with default planner settings.
+
+  Where a query must do any of these on an indexed column, `SET enable_indexscan = off`
+  and `SET enable_bitmapscan = off` for it.
+- **Every index costs on every `UPDATE`.** HOT updates are off
+  ([Limitation 7](#limitations-v17)), so each `UPDATE` adds an entry to every index on the
+  table, whether or not its columns changed. Keep indexes to what queries need, and don't
+  lower `fillfactor` to make room for HOT: there is none to make room for.
+- **Encrypt every partition.** Encryption is per leaf. A `heap` partition under an
+  `encrypted_heap` parent stores its rows in plaintext without any error (regression
+  test 127 asserts it). Find them:
+
+  ```sql
+  SELECT p.relid::regclass AS unencrypted_leaf, parent.oid::regclass AS encrypted_parent
+  FROM pg_class parent
+  JOIN pg_am pa ON pa.oid = parent.relam AND pa.amname = 'encrypted_heap'
+  CROSS JOIN LATERAL pg_partition_tree(parent.oid) p
+  JOIN pg_class c ON c.oid = p.relid
+  LEFT JOIN pg_am a ON a.oid = c.relam
+  WHERE parent.relkind = 'p' AND p.isleaf
+    AND a.amname IS DISTINCT FROM 'encrypted_heap';
+  ```
+
+- **Keep sensitive columns out of `pg_statistic`.** `ANALYZE` computes statistics on the
+  decrypted values, so most-common values and histogram bounds land in `pg_statistic` in
+  plaintext, on disk. `ALTER TABLE t ALTER COLUMN c SET STATISTICS 0` stops that — but only
+  for future runs: a row `ANALYZE` already wrote stays. Set it right after `CREATE TABLE`,
+  before data and autovacuum's first analyze arrive. The planner then has no statistics
+  for that column. See `doc/pg_vault_tde.md` → Security Considerations.
+- **Logical replication** needs `REPLICA IDENTITY FULL` plus a primary key for
+  `UPDATE`/`DELETE`, and `pg_vault_tde.toast_custom_rmgr = on` for TOAST columns
+  ([Limitation 3](#limitations-v17)). The stream leaves the publisher **decrypted**: use
+  TLS on the subscription connection and `encrypted_heap` on the subscriber.
+
+### Routine administration
+
+- **Vacuum more, table by table.** Every `UPDATE` leaves a dead heap tuple and a dead
+  entry in every index, and autovacuum's defaults assume HOT absorbs much of that. Lower
+  the thresholds on update-heavy encrypted tables; start from something like:
+
+  ```sql
+  ALTER TABLE orders SET (autovacuum_vacuum_scale_factor  = 0.02,
+                          autovacuum_analyze_scale_factor = 0.02);
+  ```
+
+- **Measure bloat without `pgstattuple`.** `pgstattuple()` and `pgstattuple_approx()`
+  reject `encrypted_heap` ("only heap AM is supported"), and `pgstatindex()` rejects
+  `tde_btree` ("is not a btree index"). Watch the statistics views and the size trend
+  instead; `n_tup_hot_upd` is always 0 here, by design:
+
+  ```sql
+  SELECT s.relid::regclass AS table_name, s.n_live_tup, s.n_dead_tup,
+         s.n_tup_upd, s.n_tup_hot_upd, s.last_autovacuum, s.autovacuum_count
+  FROM pg_stat_user_tables s
+  JOIN pg_class c ON c.oid = s.relid
+  JOIN pg_am    a ON a.oid = c.relam
+  WHERE a.amname = 'encrypted_heap'
+  ORDER BY s.n_dead_tup DESC;
+
+  SELECT i.indexrelid::regclass AS index_name, i.indrelid::regclass AS table_name,
+         pg_size_pretty(pg_relation_size(i.indexrelid)) AS index_size
+  FROM pg_index i
+  JOIN pg_class ic ON ic.oid = i.indexrelid
+  JOIN pg_am    a  ON a.oid  = ic.relam
+  WHERE a.amname = 'tde_btree'
+  ORDER BY pg_relation_size(i.indexrelid) DESC;
+  ```
+
+- **Rebuild bloated indexes online** with `REINDEX INDEX CONCURRENTLY`. It works on
+  `tde_btree` but never in parallel ([Limitation 8](#limitations-v17)), so it takes longer
+  than on a plain btree. btree's bottom-up deletion already removes most dead versions
+  for updates that don't touch the key; what vacuum cannot give back is pages that have
+  split. `tde_btree` indexes also never deduplicate, so on low-cardinality keys they are
+  larger than a plain btree even right after a rebuild.
+- **Rotate keys on a schedule** — see [Key Rotation](#key-rotation). Online rotations are
+  tracked in the `pg_vault_tde_rotation_status` view, readable by `pg_monitor`.
+- **Check integrity off-peak.** `pg_vault_tde_verify_integrity('t')` verifies the GCM
+  tag of every tuple — a full scan.
+- **Check health.** `pg_vault_tde_health_check()`, `pg_vault_tde_hw_accel_info()` (is
+  AES-NI in use?), and `pg_vault_tde_vault_status()` or `pg_vault_tde_wallet_status()`
+  for the KMS — see [SQL Functions](#sql-functions).
+
+### Backups, standbys and upgrades
+
+- **Don't rely on plain `pg_dump`**: it writes decrypted rows. Use `pg_dump_tde` and
+  `pg_basebackup_tde` — see [Encrypted Backups](#encrypted-backups).
+- **Back up the key material separately.** A base backup carries the wrapped DEKs, never
+  the KEK. With the local provider the wallet lives outside `PGDATA`, at
+  `/var/lib/pg_vault_tde/<db_oid>/wallet.p12`, and `DROP DATABASE` deletes it. Back up the
+  wallet file and its passphrase on their own schedule: without them, every dump of that
+  database is undecryptable.
+- **Standbys** need pg_vault_tde preloaded, the id check above, and access to the KEK —
+  a copy of the wallet, or the same Vault or HSM.
+- **Upgrades**: follow the notes for each release. [Upgrading to 1.7.2](#upgrading-to-172)
+  needs one `VACUUM FULL` per encrypted table and, with `toast_custom_rmgr` on, every
+  node stopped cleanly and upgraded together.
+
+---
+
 ## Performance
 
 ### Overhead vs Plain Heap
@@ -1476,9 +1697,25 @@ See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
    with AES-256-SIV, identical to varlena types. **Index-only scans are not supported**
    (by design, for security — see `doc/pg_vault_tde.md` § Index-Only Scans).
 
-2. **Range scans on TDE indexes** (by design — permanent): The `tde_btree` AM uses
-   AES-256-SIV (equality-preserving, NOT order-preserving). `WHERE col > 'x'` on a
-   `tde_btree` index returns empty results. Use sequential scans for range predicates.
+2. **Range scans and ordering on TDE indexes** (equality-only by design; **wrong results on
+   `text`, `bytea` and `numeric` — known defect**): The `tde_btree` AM uses AES-256-SIV,
+   which preserves equality but not order. For `int4`, `int8`, `uuid`, `date` and
+   `timestamptz` the default operator classes declare equality only, so range predicates,
+   `ORDER BY` and `min()`/`max()` never use the index and are answered correctly by a
+   sequential scan. For `text`, `bytea` and `numeric` the default operator classes
+   (`tde_text_ops`, `tde_bytea_ops`, `tde_numeric_ops`) also declare `<` `<=` `>=` `>`,
+   applied to the **ciphertext**: with default planner settings PostgreSQL uses the index
+   for range predicates, `ORDER BY … LIMIT` and `min()`/`max()`, and returns wrong rows
+   without an error — on 2,000 rows, `max()` returned a value from the middle of the table,
+   and a range meant to match 8 rows matched 416; a merge join fails with
+   `mergejoin input data is out of order`. Three further defects of the same family:
+   `IN (…)` / `= ANY (…)` fail on **every** `tde_btree` index with
+   `cache lookup failed for type …`; on `numeric` even `=` misses rows, because the
+   comparator is `numeric_cmp` applied to ciphertext (555 of 2,000 values in one test);
+   and on `text` with a nondeterministic collation `=` misses rows, because AES-SIV can
+   only match identical bytes. Until these are fixed: do not index `numeric` with
+   `tde_btree`, use it for single-value `=` lookups only, and for any other query on an
+   indexed column `SET enable_indexscan = off` and `SET enable_bitmapscan = off` first.
 
 3. **Logical replication of TOAST columns** (✅ resolved in v1.7): Enable
    `pg_vault_tde.toast_custom_rmgr` (PGC_POSTMASTER, default off) to publish
@@ -1523,6 +1760,9 @@ See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
    bytes sit at the **end** of the region, outside every attribute, so they cannot create a
    byte-stable window. See [doc/pg_vault_tde.md](doc/pg_vault_tde.md) § Known Limitations for
    the full analysis (including the v3 and v4 bugs this resolved).
+   **Operational cost:** every `UPDATE` writes every index and leaves dead entries in all
+   of them — vacuum, bloat monitoring and `REINDEX CONCURRENTLY` are covered in
+   [Running pg_vault_tde in Production](#running-pg_vault_tde-in-production).
 
 8. **Parallel index build/rebuild is disabled by design**: the parallel workers that
    PostgreSQL uses to build or rebuild an index run in separate processes that are not

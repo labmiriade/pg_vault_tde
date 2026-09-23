@@ -2,7 +2,7 @@
 # ci/scripts/run-all.sh — Master orchestrator for the local CI pipeline
 #
 # Runs all test stages in sequence:
-#   1. regress     — 140-test SQL regression suite (52 v1.4 + 20 v1.5 + 38 v1.6 + 30 v1.7)
+#   1. regress     — 137-test SQL regression suite (45 v1.4 + 20 v1.5 + 36 v1.6 + 36 v1.7)
 #   1b. matrix      — regress + tap on the other supported PG majors
 #   1c. errorpath  — 13-test error-path suite: the PG_CATCH handlers (141-153)
 #   2. checksums   — Page checksum compatibility
@@ -10,7 +10,7 @@
 #   4. isolation   — Concurrency/MVCC isolation specs
 #   5. vault       — Vault mock integration (via Compose)
 #   6. openbao     — OpenBao 3-node Raft integration (AppRole, KEK, BGW)
-#   7. wallet      — Local wallet full regression (kms_provider=local, tests 74-80)
+#   7. wallet      — Local wallet full regression (kms_provider=local, tests 73-109)
 #   8. schema      — Multi-database and multi-schema isolation (SCHEMA-1..20)
 #   9. scan-build  — Clang static analyzer over the sources (compile only)
 #  10. ubsan       — Extension built with -fsanitize=undefined

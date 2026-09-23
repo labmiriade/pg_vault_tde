@@ -1622,11 +1622,11 @@ $$;
 DO $$
 BEGIN
     RAISE NOTICE '====================================================';
-    RAISE NOTICE 'TESTS SUMMARY: 46 passed, 6 skipped (LEGACY) — pg_vault_tde v1.4';
-    RAISE NOTICE '   Crypto primitives ........... tests  1-11  (5 skipped: 5,6,7,9,11)';
+    RAISE NOTICE 'TESTS SUMMARY: 45 tests — pg_vault_tde v1.4 (numbered 1-52, with gaps)';
+    RAISE NOTICE '   Registration, wallet ........ tests  1-4, 10';
     RAISE NOTICE '   TAM basic I/O ............... tests 12-14';
     RAISE NOTICE '   DELETE, NULL, index scan .... tests 15-17';
-    RAISE NOTICE '   COPY, multi-col, rotation ... tests 18-20';
+    RAISE NOTICE '   COPY, multi-col, DEK isol. .. tests 18-20';
     RAISE NOTICE '   ANALYZE, FOR UPDATE ......... tests 21-22';
     RAISE NOTICE '   BitmapHeapScan, TABLESAMPLE . tests 23-24';
     RAISE NOTICE '   UPSERT, MERGE ............... tests 25-26';
@@ -1640,8 +1640,8 @@ BEGIN
     RAISE NOTICE '   v1.1: HW accel info, round  . tests 42-43';
     RAISE NOTICE '   v1.3: health_check, batch ... tests 44-47';
     RAISE NOTICE '   v1.2: logical decoding ...... test  48';
-    RAISE NOTICE '   v1.4: wire fmt v2 (SKIP 49), tde_btree  tests 50-52';
-    RAISE NOTICE '   SKIPPED (LEGACY): 5,6,7,9,11,49 — encrypt_test/decrypt_test use global DEK';
+    RAISE NOTICE '   v1.4: tde_btree ............. tests 50-52';
+    RAISE NOTICE '   REMOVED: 5-9, 11, 49 — legacy global-DEK tests, dropped together in 2026-06';
     RAISE NOTICE '====================================================';
 END;
 $$;
