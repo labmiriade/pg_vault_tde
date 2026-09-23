@@ -18,7 +18,7 @@ CONTAINER="pg-tde-regress-$$"
 cleanup() { stop_container "$CONTAINER"; }
 trap cleanup EXIT
 
-log_stage "REGRESSION TESTS (45 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 = 142 total)"
+log_stage "REGRESSION TESTS (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 = 141 total)"
 
 build_pg_test_image
 
@@ -84,8 +84,8 @@ $RT cp "$REPO_ROOT/sql/regression_test_v15.sql" "$CONTAINER:/tmp/regression_test
 $RT cp "$REPO_ROOT/sql/regression_test_v16.sql" "$CONTAINER:/tmp/regression_test_v16.sql"
 $RT cp "$REPO_ROOT/sql/regression_test_v17.sql" "$CONTAINER:/tmp/regression_test_v17.sql"
 
-# ── Phase 1: v1.4 baseline (45 tests, numbered 1-52) ────────────────────────────────────
-log_info "Running v1.4 regression_test.sql (45 tests) ..."
+# ── Phase 1: v1.4 baseline (44 tests, numbered 1-52) ────────────────────────────────────
+log_info "Running v1.4 regression_test.sql (44 tests) ..."
 START=$(timer_start)
 if ! container_psql "$CONTAINER" -f /tmp/regression_test.sql; then
     ELAPSED=$(timer_elapsed "$START")
@@ -93,7 +93,7 @@ if ! container_psql "$CONTAINER" -f /tmp/regression_test.sql; then
     $RT logs "$CONTAINER" --tail 50 2>/dev/null || true
     exit 2
 fi
-log_ok "v1.4 baseline: ALL 45 TESTS PASSED ($(timer_fmt "$(timer_elapsed "$START")"))"
+log_ok "v1.4 baseline: ALL 44 TESTS PASSED ($(timer_fmt "$(timer_elapsed "$START")"))"
 
 # ── Version guard ─────────────────────────────────────────────────────────
 # Only pg_vault_tde--1.7.sql is shipped (DATA in the Makefile) and the .control
@@ -147,5 +147,5 @@ else
     exit 2
 fi
 
-log_ok "REGRESSION COMPLETE: ALL 142 TESTS PASSED (v1.4 × 45 + v1.5 × 20 + v1.6 × 36 + v1.7 × 41)"
+log_ok "REGRESSION COMPLETE: ALL 141 TESTS PASSED (v1.4 × 44 + v1.5 × 20 + v1.6 × 36 + v1.7 × 41)"
 exit 0

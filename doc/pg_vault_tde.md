@@ -1376,13 +1376,13 @@ sequence, gated on the live extension version:
 | `sql/regression_test_errorpath.sql` | 141–153 | error paths (`make ci-errorpath`) |
 
 Test numbers are one sequence shared by every suite, which is why 141–153 are missing
-from the v1.7 file rather than being a gap. The real gaps are 5–9, 11 and 49 (no
+from the v1.7 file rather than being a gap. The real gaps are 5–11 and 49 (no
 longer exist), 80 (removed in v1.7) and 110 (`WITH HOLD` cursor spill, disabled: a
-permanent limitation), so `make ci-regress` runs **142 tests**. The table below details the v1.0–v1.4 baseline file:
+permanent limitation), so `make ci-regress` runs **141 tests**. The table below details the v1.0–v1.4 baseline file:
 
 | Range | Area |
 |---|---|
-| 1–11 | AES-256-GCM crypto primitives, DEK rotation, tamper detection |
+| 1–4 | Extension, access methods and SQL functions registered; wallet unlock |
 | 12 | TAM INSERT + SELECT basic round-trip |
 | 13 | On-disk plaintext absence (raw file scan) |
 | 14 | TAM UPDATE (ctid preservation, tuple refetch, HOT chains) |
@@ -1397,7 +1397,6 @@ permanent limitation), so `make ci-regress` runs **142 tests**. The table below 
 | 23 | BitmapHeapScan (`scan_bitmap_next_tuple` via forced bitmap scan) |
 | 24 | TABLESAMPLE (`scan_sample_next_tuple` via SYSTEM(100)) |
 | 25–48 | UPSERT, MERGE, TRUNCATE, REINDEX, ALTER, JOINs, CTEs, HW accel, Vault, logical decoding |
-| 49 | Wire format v2 round-trip (version byte + generation counter) **(v1.4)** |
 | 50 | tde_btree CREATE INDEX + equality index scan **(v1.4)** |
 | 51 | health_check() `kms_provider` GUC coherence **(v1.4)** |
 | 52 | tde_btree UNIQUE constraint **(v1.4)** |

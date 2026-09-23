@@ -2,7 +2,7 @@
 # ci/scripts/run-all.sh — Master orchestrator for the local CI pipeline
 #
 # Runs all test stages in sequence:
-#   1. regress     — 142-test SQL regression suite (45 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7)
+#   1. regress     — 141-test SQL regression suite (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7)
 #   1b. matrix      — regress + tap on the other supported PG majors
 #   1c. errorpath  — 13-test error-path suite: the PG_CATCH handlers (141-153)
 #   2. checksums   — Page checksum compatibility

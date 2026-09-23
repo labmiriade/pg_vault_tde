@@ -16,7 +16,7 @@ decrypted after it leaves. Encryption keys are managed by **HashiCorp Vault** /
 **OpenBao** or a **local PKCS#12 wallet** and cached in shared memory with
 automatic rotation.
 
-**Current release: v1.7** — 142 regression tests (45 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7), zero compiler warnings on PG 17 + PG 18.
+**Current release: v1.7** — 141 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7), zero compiler warnings on PG 17 + PG 18.
 
 ### Commercial Support
 
@@ -1201,7 +1201,7 @@ make ci-all
 PG_VERSION=17 make ci-all
 
 # Individual test stages:
-make ci-regress          # 142 SQL regression tests (vault provider) — numbered 1-140 + 154-164, with gaps
+make ci-regress          # 141 SQL regression tests (vault provider) — numbered 1-140 + 154-164, with gaps
 make ci-errorpath        # 13 error-path tests (141-153) — exercises the PG_CATCH handlers
 make ci-matrix           # regress + TAP on the other supported PG majors (17, 19 when published)
 make ci-scan-build       # Clang static analyzer over the sources (compile only, ~1 min)
@@ -1222,8 +1222,8 @@ make ci-bench BENCH_ROWS=100000  # with custom row count
 make ci-clean            # Remove test containers and images
 ```
 
-Test coverage — 155 SQL regression tests (45 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 306 assertions across 28 TAP files. Numbers are one sequence shared by every file and have gaps: 5-9, 11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
-- Tests 1-4, 10: extension loaded, access methods and SQL functions registered, wallet unlock, backup status function
+Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 306 assertions across 28 TAP files. Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
+- Tests 1-4: extension loaded, access methods and SQL functions registered, wallet unlock
 - Tests 12-14: TAM INSERT/SELECT/UPDATE end-to-end
 - Test 15: DELETE
 - Test 16: All-NULL rows (zero-length user data)

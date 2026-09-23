@@ -1,6 +1,6 @@
 # pg_vault_tde Roadmap
 
-> Last updated: 2026-09-23 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 155 regression tests (45 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 28 TAP files / 306 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 2 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
+> Last updated: 2026-09-23 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 28 TAP files / 306 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 2 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
 
 ---
 
@@ -73,7 +73,7 @@ the `RELKIND_TOASTVALUE` read-path bypass so real TOAST chunks round-trip correc
 
 > Status: ✅ Completed — patched by v1.7.1 (below)
 > **Delivered**: tests numbered up to 137 at release, 140 with v1.7.1, 164 with v1.7.2
-> (155 of them present and run in 1.7.2 — the numbering has gaps)
+> (154 of them present and run in 1.7.2 — the numbering has gaps)
 > (target was ~100) —
 > PG 17 + PG 18; the PG 19 audit moves to that release.
 
@@ -218,7 +218,7 @@ earlier minors have no such GUC and must not carry the line. See README → Comp
 
 ## v1.7.2 — Patch: on-disk tuple layout v5 + TOAST threshold crash + hardening
 
-> **155 tests** (142 regression + 13 error-path; tests 154–164 added here) —
+> **154 tests** (141 regression + 13 error-path; tests 154–164 added here) —
 > PG 17 + PG 18, zero compiler warnings.
 
 Carries the TOAST-threshold segfault fix and the correctness hardening summarised in

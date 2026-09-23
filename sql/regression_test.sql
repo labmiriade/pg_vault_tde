@@ -95,22 +95,6 @@ $$;
 
 
 -- ================================================================
--- TEST 10: Backup status function works
--- ================================================================
-DO $$
-DECLARE
-    status text;
-BEGIN
-    status := 'backup encryption active';
-    IF status IS NULL OR position('backup encryption active' IN status) = 0 THEN
-        RAISE EXCEPTION 'TEST 10 FAILED: unexpected backup status: %', status;
-    END IF;
-    RAISE NOTICE 'TEST 10 PASSED: backup status = %', status;
-END;
-$$;
-
-
--- ================================================================
 -- TEST 12: TAM end-to-end — INSERT + SELECT via encrypted_heap
 --
 -- Creates a table USING encrypted_heap, inserts a row with a known
@@ -1608,8 +1592,8 @@ $$;
 DO $$
 BEGIN
     RAISE NOTICE '====================================================';
-    RAISE NOTICE 'TESTS SUMMARY: 45 tests — pg_vault_tde v1.4 (numbered 1-52, with gaps)';
-    RAISE NOTICE '   Registration, wallet ........ tests  1-4, 10';
+    RAISE NOTICE 'TESTS SUMMARY: 44 tests — pg_vault_tde v1.4 (numbered 1-52, with gaps)';
+    RAISE NOTICE '   Registration, wallet ........ tests  1-4';
     RAISE NOTICE '   TAM basic I/O ............... tests 12-14';
     RAISE NOTICE '   DELETE, NULL, index scan .... tests 15-17';
     RAISE NOTICE '   COPY, multi-col, DEK isol. .. tests 18-20';
@@ -1628,6 +1612,7 @@ BEGIN
     RAISE NOTICE '   v1.2: logical decoding ...... test  48';
     RAISE NOTICE '   v1.4: tde_btree ............. tests 50-52';
     RAISE NOTICE '   REMOVED: 5-9, 11, 49 — legacy global-DEK tests, dropped together in 2026-06';
+    RAISE NOTICE '   REMOVED: 10 — pg_vault_tde_backup_status(), removed in 2026-05';
     RAISE NOTICE '====================================================';
 END;
 $$;
