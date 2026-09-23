@@ -37,6 +37,7 @@
 #include "catalog/pg_am_d.h"     /* BTREE_AM_OID */
 #include "parser/parsetree.h"    /* rt_fetch */
 #endif
+#include "optimizer/plancat.h"   /* get_relation_info_hook */
 
 #include "src/include/pg_vault_tde_kms.h"
 #include "src/include/pg_vault_tde_tam.h"
@@ -138,6 +139,15 @@ static shmem_request_hook_type    prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type    prev_shmem_startup_hook = NULL;
 static ProcessUtility_hook_type   prev_process_utility_hook = NULL;
 static object_access_hook_type    prev_object_access_hook = NULL;
+static get_relation_info_hook_type prev_get_relation_info_hook = NULL;
+
+/*
+ * True while a REINDEX runs in this backend.  REINDEX CONCURRENTLY rebuilds an
+ * existing index by creating a copy, which tde_object_access_hook sees as an
+ * ordinary index creation (is_internal is false there); the new-index policy
+ * must not refuse routine maintenance of indexes that already exist.
+ */
+static bool tde_reindex_in_progress = false;
 #if PG_VERSION_NUM < 180000
 static ExecutorStart_hook_type    prev_executor_start_hook = NULL;
 #endif
@@ -585,6 +595,22 @@ tde_object_access_hook(ObjectAccessType access, Oid classId, Oid objectId,
         return;
 
     /*
+     * tde_btree answers equality only: refuse, whatever created it, an index
+     * that could not (numeric, nondeterministic collation) or that would store
+     * plaintext keys.  Here and not in the ProcessUtility hook, because EXCLUDE
+     * constraints, ALTER COLUMN ... TYPE rebuilds and ALTER TABLE ... ADD
+     * CONSTRAINT all create indexes without passing through it — and UNIQUE
+     * and EXCLUDE enforcement uses the index directly, planner or not.
+     */
+    if (relkind == RELKIND_INDEX && strcmp(amname, "tde_btree") == 0 &&
+        !tde_reindex_in_progress)
+    {
+        ObjectAccessPostCreate *pc = (ObjectAccessPostCreate *) arg;
+
+        tde_iam_check_new_index(objectId, pc != NULL && pc->is_internal);
+    }
+
+    /*
      * Register a fresh per-table DEK now, while we are still inside the
      * CREATE command and before any row is inserted.  catalog_register_rel
      * is idempotent: if the entry already exists it returns immediately
@@ -773,7 +799,41 @@ tde_executor_start_hook(QueryDesc *queryDesc, int eflags)
         list_free(swapped);
     }
 }
-#endif                          /* PG_VERSION_NUM < 180000 */
+#endif                          /*
+ * Hand a utility statement to the next hook in the chain, or to core.  A
+ * REINDEX runs with tde_reindex_in_progress set; the PG_TRY lives here rather
+ * than in tde_process_utility_hook so that none of that function's locals sit
+ * across a setjmp.
+ */
+static void
+tde_next_process_utility(PlannedStmt *pstmt, const char *queryString,
+                         bool readOnlyTree, ProcessUtilityContext context,
+                         ParamListInfo params, QueryEnvironment *queryEnv,
+                         DestReceiver *dest, QueryCompletion *qc,
+                         bool is_reindex)
+{
+    bool        save_reindex_in_progress = tde_reindex_in_progress;
+
+    if (is_reindex)
+        tde_reindex_in_progress = true;
+
+    PG_TRY();
+    {
+        if (prev_process_utility_hook)
+            prev_process_utility_hook(pstmt, queryString, readOnlyTree,
+                                      context, params, queryEnv, dest, qc);
+        else
+            standard_ProcessUtility(pstmt, queryString, readOnlyTree,
+                                    context, params, queryEnv, dest, qc);
+    }
+    PG_FINALLY();
+    {
+        tde_reindex_in_progress = save_reindex_in_progress;
+    }
+    PG_END_TRY();
+}
+
+/* PG_VERSION_NUM < 180000 */
 
 static void
 tde_process_utility_hook(PlannedStmt *pstmt,
@@ -1018,12 +1078,9 @@ tde_process_utility_hook(PlannedStmt *pstmt,
     }
 
     /* Run the actual DDL statement through the hook chain */
-    if (prev_process_utility_hook)
-        prev_process_utility_hook(pstmt, queryString, readOnlyTree,
-                                  context, params, queryEnv, dest, qc);
-    else
-        standard_ProcessUtility(pstmt, queryString, readOnlyTree,
-                                context, params, queryEnv, dest, qc);
+    tde_next_process_utility(pstmt, queryString, readOnlyTree,
+                             context, params, queryEnv, dest, qc,
+                             IsA(parsetree, ReindexStmt));
 
     /*
      * Post-processing for ALTER TABLE ADD CONSTRAINT ... {PRIMARY KEY|UNIQUE}
@@ -1378,6 +1435,20 @@ pg_vault_tde_shmem_startup(void)
  * do NOT call any shmem functions here; shared memory is not yet allocated
  * at this point.
  */
+/*
+ * tde_get_relation_info_hook — let earlier hooks shape the relation first,
+ * then enforce tde_btree's equality-only contract on what they left.
+ */
+static void
+tde_get_relation_info_hook(PlannerInfo *root, Oid relationObjectId,
+                           bool inhparent, RelOptInfo *rel)
+{
+    if (prev_get_relation_info_hook)
+        prev_get_relation_info_hook(root, relationObjectId, inhparent, rel);
+
+    tde_iam_get_relation_info(root, relationObjectId, inhparent, rel);
+}
+
 void
 _PG_init(void)
 {
@@ -1834,6 +1905,14 @@ _PG_init(void)
      */
     prev_object_access_hook = object_access_hook;
     object_access_hook = tde_object_access_hook;
+
+    /*
+     * Planner hook: tde_btree answers equality only, so take the sort order
+     * away from its indexes and drop the ones that cannot answer equality —
+     * see tde_iam_get_relation_info().
+     */
+    prev_get_relation_info_hook = get_relation_info_hook;
+    get_relation_info_hook = tde_get_relation_info_hook;
 
     audit_hook_ptr = tde_audit_handler;
     tde_audit(AUDIT_LOG_START, NULL, true);

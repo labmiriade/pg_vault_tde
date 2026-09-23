@@ -1,6 +1,6 @@
 # pg_vault_tde Roadmap
 
-> Last updated: 2026-09-23 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 150 regression tests (45 v1.4 + 20 v1.5 + 36 v1.6 + 36 v1.7 + 13 error-path), 28 TAP files / 306 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 2 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
+> Last updated: 2026-09-23 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 155 regression tests (45 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 28 TAP files / 306 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 2 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
 
 ---
 
@@ -72,8 +72,8 @@ the `RELKIND_TOASTVALUE` read-path bypass so real TOAST chunks round-trip correc
 ## v1.7 — TOAST Chunks + KEK Hierarchy + HSM + Audit
 
 > Status: ✅ Completed — patched by v1.7.1 (below)
-> **Delivered**: tests numbered up to 137 at release, 140 with v1.7.1, 159 with v1.7.2
-> (150 of them present and run in 1.7.2 — the numbering has gaps)
+> **Delivered**: tests numbered up to 137 at release, 140 with v1.7.1, 164 with v1.7.2
+> (155 of them present and run in 1.7.2 — the numbering has gaps)
 > (target was ~100) —
 > PG 17 + PG 18; the PG 19 audit moves to that release.
 
@@ -218,7 +218,7 @@ earlier minors have no such GUC and must not carry the line. See README → Comp
 
 ## v1.7.2 — Patch: on-disk tuple layout v5 + TOAST threshold crash + hardening
 
-> **150 tests** (137 regression + 13 error-path; tests 154–159 added here) —
+> **155 tests** (142 regression + 13 error-path; tests 154–164 added here) —
 > PG 17 + PG 18, zero compiler warnings.
 
 Carries the TOAST-threshold segfault fix and the correctness hardening summarised in
@@ -276,6 +276,24 @@ distinguishes the builds.
    `ShmemInitHash()` attaches to an existing table of the same name. Now
    `pg_vault_tde_rel_dek_map`. Nothing on disk; only monitoring that matches the old name
    in `pg_stat_activity.wait_event` or `pg_shmem_allocations.name` is affected.
+
+5. **`tde_btree` answers equality only (PSQLE-173).** AES-SIV preserves equality and
+   nothing else, yet the planner used `tde_btree` for ranges, `ORDER BY`, `min`/`max` and
+   merge joins — the `text`/`bytea`/`numeric` operator classes declare `<` `<=` `>=` `>` —
+   and returned wrong rows in ciphertext order; `IN (…)` failed with `cache lookup failed
+   for type …` on every `tde_btree` index; on `numeric` even `=` missed rows. Enforced in C,
+   with no catalog change: `amsearcharray = false` (IN expands to scalar lookups), a
+   `get_relation_info_hook` that removes the index's sort order and drops `numeric` and
+   nondeterministic-collation indexes from the planner's view, a prohibitive
+   `amcostestimate` for non-equality paths, and an error in `amrescan` for a range key a
+   forced plan still delivers. Every index creation — `CREATE INDEX`, `EXCLUDE`
+   constraints, the rebuild behind `ALTER COLUMN … TYPE` — is checked at `OAT_POST_CREATE`
+   and refuses `numeric`, nondeterministic collations and, unless `allow_plaintext_index`,
+   the v1.5 plaintext-key operator classes; that matters beyond queries, because `UNIQUE`
+   and `EXCLUDE` checks read the index directly (1164 and 1332 exact duplicates of 2,000
+   accepted before the fix). `REINDEX`, `CONCURRENTLY` included, is exempt. Removing those
+   classes and correct `numeric` support need a catalog change and are planned for 1.8.
+   Tests 160–164; `ci-upgrade` Probe D covers an index the baseline built.
 
 **New CI stage — `make ci-upgrade`.** Every other suite in this repo reads only data it
 wrote in the same run, so writer and reader always move together and a format-level
@@ -451,5 +469,5 @@ These gaps **cannot be closed without modifying PostgreSQL core**.
 | **v1.6** | Local Wallet KMS (production-ready) + write-path / catalog bugfix patch | ✅ 2026-07-20 (patched 2026-05-08) | 109 | Wallet unlock/lock, passphrase flexibility, KEK rotation, export/import, Vault→wallet migration; PG_TRY widening; TOAST relid auto-registration; STORAGE EXTERNAL TAM read bypass; all-read-paths TOAST coverage; forensic helpers; tests 73–109 |
 | **v1.7** | Per-database KMS + pg_restore_tde + PGC_SUSET + PKCS#11 + HSM + v1.4 removal | ✅ 2026-06-29 | 137 | All KMS GUCs PGC_SUSET → per-database KMS via `ALTER DATABASE SET`; `pg_restore_tde` full decrypt-and-pipe restore loop; removed v1.4 global-DEK backward compat (`TdeShmemData`, `rotate_key`, `key_generation`, `clear_prev_dek`, `encrypt_test`, `decrypt_test`); PKCS#11/HSM provider with cross-backend KEK-rotation propagation; documentation overhaul |
 | **v1.7.1** | Patch: AAD relid resolution + HEAP_HASEXTERNAL on decrypt | ✅ 2026-09-05 | 140 | AEAD tag bound to the effective relid (fixes `ALTER TABLE ... SET ACCESS METHOD` on populated tables); `HEAP_HASEXTERNAL` recomputed on decrypt (fixes CTAS / `INSERT ... SELECT` copying a dangling TOAST pointer); DETAIL/HINT on OID-mismatch decrypt failures; tests 138–140. Breaking for out-of-line TOAST written by ≤ 1.7.0 — dump before upgrading |
-| **v1.7.2** | Patch: tuple layout v5 + TOAST threshold crash + correctness hardening | ✅ 2026-09-28 | 159 | On-disk tuple layout **v5**, structure preserving: the v4 blob left the header describing a data area the core could not walk, so `heap_update()` segfaulted on any table with an index behind a variable-length column (PSQLE-165). An all-NULL row no longer makes its table unreadable. Segfault fixed when a value crosses `TOAST_TUPLE_THRESHOLD` only after encryption (gate and TOAST writer now both account for `TDE_V4_OVERHEAD`); assert-enabled startup, unregistered catalog snapshots, lock-less `relation_open`, hint bits without the content lock, uninitialised `VacuumCutoffs`, missing `volatile` across `longjmp`. New CI stages: errorpath, scan-build, ubsan, valgrind, cassert, regress-matrix, upgrade. **Needs one `VACUUM FULL` per encrypted table after upgrading** — v4 rows stay readable but cannot be updated until rewritten |
+| **v1.7.2** | Patch: tuple layout v5 + TOAST threshold crash + correctness hardening | ✅ 2026-09-28 | 164 | On-disk tuple layout **v5**, structure preserving: the v4 blob left the header describing a data area the core could not walk, so `heap_update()` segfaulted on any table with an index behind a variable-length column (PSQLE-165). An all-NULL row no longer makes its table unreadable. Segfault fixed when a value crosses `TOAST_TUPLE_THRESHOLD` only after encryption (gate and TOAST writer now both account for `TDE_V4_OVERHEAD`); assert-enabled startup, unregistered catalog snapshots, lock-less `relation_open`, hint bits without the content lock, uninitialised `VacuumCutoffs`, missing `volatile` across `longjmp`. New CI stages: errorpath, scan-build, ubsan, valgrind, cassert, regress-matrix, upgrade. **Needs one `VACUUM FULL` per encrypted table after upgrading** — v4 rows stay readable but cannot be updated until rewritten |
 | **v1.8** | KMIP + Column-Level + GIN/Hash/GiST/BRIN + HA + Dual-Control | Q2 2027 | ~130 | KMIP 1.2 client, per-column encryption, GIN/Hash/GiST(equality)/BRIN(bloom) index AMs, streaming replication standby DEK distribution, M-of-N key ceremony, pg_dump/COPY TO plaintext-leak WARNING (carried over from v1.7) |

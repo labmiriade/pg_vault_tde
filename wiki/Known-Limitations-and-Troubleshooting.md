@@ -4,7 +4,7 @@
 
 | # | Limitation | Status |
 |---|---|---|
-| 1 | **Range scans on `tde_btree`** — `WHERE col > x` returns empty results (AES-SIV is not order-preserving) | By design, permanent |
+| 1 | **`tde_btree` answers equality only** — ranges, `ORDER BY` and `min`/`max` never use it and run as sequential scans; `numeric` and nondeterministic collations cannot be indexed (AES-SIV is not order-preserving) | By design, permanent; `numeric` support planned (v1.8) |
 | 2 | **HOT updates disabled** — every `UPDATE` on an `encrypted_heap` table maintains indexes explicitly, never using a HOT update | By design, permanent (see [Encrypted Tables and Indexes](Encrypted-Tables-and-Indexes)) |
 | 3 | **Parallel index build/rebuild disabled** — `CREATE INDEX`/`REINDEX` on `tde_btree` always runs single-process | By design, permanent |
 | 4 | **All-or-nothing table encryption** — every column in an `encrypted_heap` table is encrypted; no per-column opt-out | Planned: per-column `ENABLE COLUMN ENCRYPTION` DDL (v1.8) |

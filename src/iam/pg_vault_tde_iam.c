@@ -17,10 +17,11 @@
  * equality semantics (equal plaintexts → equal ciphertexts), which is
  * sufficient for B-Tree equality lookups.
  *
- * KNOWN LIMITATION: Range scans (>, <, BETWEEN) on TDE-encrypted indexed
- * columns are NOT supported and will return empty results.  Users requiring
- * range queries must either accept unencrypted indexes (SQL ACL protection
- * only) or restructure their queries.  This trade-off is inherent to
+ * CONSEQUENCE: tde_btree answers equality (=, IN, = ANY) and nothing else.
+ * Range predicates, ORDER BY, min()/max() and merge joins are never served
+ * from it — they run as sequential scans and stay correct — and a plan forced
+ * onto it for a range fails with an error rather than return wrong rows.  See
+ * "PLANNER: EQUALITY ONLY" below.  This trade-off is inherent to
  * deterministic encryption, not specific to this implementation.
  *
  * AES-SIV is available in OpenSSL 3.x via EVP_aes_256_siv().  It provides:
@@ -40,7 +41,10 @@
 #include "utils/syscache.h"     /* SearchSysCache1, ReleaseSysCache, CLAOID */
 #include "utils/uuid.h"         /* DatumGetUUIDP, pg_uuid_t */
 #include "catalog/pg_opclass.h" /* Form_pg_opclass */
+#include "catalog/pg_index.h"   /* Anum_pg_index_indclass */
 #include "catalog/pg_am_d.h"    /* BTREE_AM_OID */
+#include "nodes/pathnodes.h"    /* IndexOptInfo, IndexPath, IndexClause */
+#include "utils/lsyscache.h"    /* get_op_opfamily_strategy, get_collation_isdeterministic */
 #include "storage/lwlock.h"
 #include <openssl/evp.h>
 #include <openssl/crypto.h>
@@ -69,6 +73,7 @@
 #include "src/include/pg_vault_tde_catalog.h"
 #include "src/include/pg_vault_tde_iam.h"
 #include "src/include/pg_vault_tde_hw_accel.h"
+#include "src/include/pg_vault_tde_guc.h"   /* pg_vault_tde_allow_plaintext_index */
 
 /* AES-SIV produces a 16-byte synthetic IV prepended to ciphertext. */
 #define TDE_SIV_OVERHEAD 16
@@ -903,14 +908,39 @@ pg_vault_tde_amrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
     Assert(saved_btree_methods_valid);
 
     /*
-     * Encrypt equality scan keys (strategy == BTEqualStrategyNumber = 3)
-     * so they match the encrypted values stored in the index.
+     * tde_btree answers equality only.  AES-SIV preserves equality and
+     * nothing else, so a range key walked against the ciphertext order
+     * returns wrong rows without any error.  The planner never builds such a
+     * scan on its own — pg_vault_tde_amcostestimate() prices it out and
+     * tde_iam_get_relation_info() strips the index of its sort order — so a
+     * key reaching this point means the plan was forced.  Fail it here,
+     * before anything is encrypted, rather than return wrong rows.
      *
-     * Range scan keys (strategy != 3) are passed through unchanged.
-     * They will produce incorrect or empty results because AES-SIV
-     * encrypted values do not preserve ordering — this is the documented
-     * v1.4 limitation of tde_btree.
+     * An array key cannot reach us either: amsearcharray is off, so the
+     * executor expands IN / = ANY into one scalar rescan per element.  If one
+     * ever does, encrypting it as a scalar would hand btree an array header
+     * made of ciphertext.
      */
+    for (i = 0; keys != NULL && i < nkeys; i++)
+    {
+        if ((keys[i].sk_flags & SK_ISNULL) != 0)
+            continue;           /* IS NULL / IS NOT NULL: no value compared */
+
+        if ((keys[i].sk_flags & SK_SEARCHARRAY) != 0)
+            elog(ERROR, "tde_btree received an array scan key although amsearcharray is off");
+
+        if (keys[i].sk_strategy != BTEqualStrategyNumber)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("pg_vault_tde: tde_btree index \"%s\" supports only equality lookups",
+                            RelationGetRelationName(scan->indexRelation)),
+                     errdetail("Index keys are encrypted with AES-SIV, which preserves equality "
+                               "but not order: a range comparison through this index would "
+                               "return wrong rows."),
+                     errhint("The planner avoids tde_btree for such conditions unless the plan "
+                             "is forced; check enable_seqscan and enable_bitmapscan.")));
+    }
+
     /*
      * Release what the previous rescan built, before btrescan() overwrites the
      * pointers with this round's keys and they become unreachable.
@@ -1021,6 +1051,284 @@ pg_vault_tde_amvalidate(Oid opclassoid)
     return saved_btree_methods.amvalidate(opclassoid);
 }
 
+/* ── PLANNER: EQUALITY ONLY ──────────────────────────────────────────────── */
+
+/*
+ * What the planner may ask of a tde_btree index, and why nothing else.
+ *
+ * AES-SIV maps equal plaintexts to equal ciphertexts and preserves nothing
+ * else, so an equality lookup is the only question the tree can answer.
+ * The v1.5 operator classes tde_text_ops, tde_bytea_ops and tde_numeric_ops
+ * nevertheless declare < <= >= > as well, and the planner believed them:
+ * range predicates, ORDER BY ... LIMIT, min()/max() and merge joins read the
+ * index in ciphertext order and returned wrong rows without any error.  The
+ * operator classes cannot be amended in place (ALTER OPERATOR FAMILY ... DROP
+ * OPERATOR is refused while the class exists), so the rule is enforced here,
+ * where the planner meets the index:
+ *
+ *   - tde_iam_get_relation_info() takes the sort order away from every
+ *     tde_btree index, which removes ORDER BY, min()/max() and merge-join
+ *     uses, and drops the indexes that cannot even answer equality;
+ *   - pg_vault_tde_amcostestimate() prices out any path whose index clauses
+ *     are not all equality, so range predicates go to a sequential scan;
+ *   - pg_vault_tde_amrescan() fails a range key that reaches it anyway,
+ *     which only a forced plan can do.
+ *
+ * AM-level amcanorder = false would be the obvious lever and is not an
+ * option: PrepareSortSupportFromIndexRel() rejects a non-amcanorder index
+ * during the btree-impersonated build (see pg_vault_tde_ambuild()).
+ */
+
+/* Added to both cost figures of a path that tde_btree must not serve. */
+#define TDE_IAM_NON_EQUALITY_COST   1.0e10
+
+/*
+ * v1.5 operator classes for fixed-size types.  Their keys are stored in
+ * plaintext (tde_iam_encrypt_index_datum() cannot widen a fixed-length key),
+ * and v1.7 replaced them with the tde_*_enc_ops defaults.  Kept only so that
+ * indexes built on them keep working; new indexes may not use them.
+ */
+static const char *const tde_iam_legacy_opclasses[] = {
+    "tde_int4_ops", "tde_int8_ops", "tde_uuid_ops",
+    "tde_date_ops", "tde_timestamptz_ops"
+};
+
+/*
+ * tde_iam_path_is_equality_only — would this index path ask the tree
+ * anything but "which entries equal these values"?
+ */
+static bool
+tde_iam_path_is_equality_only(IndexPath *path)
+{
+    ListCell   *lc;
+
+    /* No ordered use.  tde_iam_get_relation_info() already prevents it. */
+    if (path->path.pathkeys != NIL || path->indexorderbys != NIL)
+        return false;
+
+    foreach(lc, path->indexclauses)
+    {
+        IndexClause *iclause = lfirst_node(IndexClause, lc);
+        Oid          opfamily = path->indexinfo->opfamily[iclause->indexcol];
+        ListCell    *lc2;
+
+        foreach(lc2, iclause->indexquals)
+        {
+            Node   *clause = (Node *) lfirst_node(RestrictInfo, lc2)->clause;
+            Oid     opno;
+
+            if (IsA(clause, NullTest))
+                continue;
+            else if (IsA(clause, OpExpr))
+                opno = ((OpExpr *) clause)->opno;
+            else if (IsA(clause, ScalarArrayOpExpr))
+                opno = ((ScalarArrayOpExpr *) clause)->opno;
+            else
+                return false;   /* RowCompareExpr, or anything unforeseen */
+
+            if (get_op_opfamily_strategy(opno, opfamily) != BTEqualStrategyNumber)
+                return false;
+        }
+    }
+
+    return true;
+}
+
+/*
+ * pg_vault_tde_amcostestimate — btree's estimate, plus a prohibitive cost
+ * for any path that is not equality-only.  Pricing rather than removing the
+ * path keeps the planner's search intact: a sequential scan always exists,
+ * and it wins.
+ */
+static void
+pg_vault_tde_amcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
+                            Cost *indexStartupCost, Cost *indexTotalCost,
+                            Selectivity *indexSelectivity, double *indexCorrelation,
+                            double *indexPages)
+{
+    saved_btree_methods.amcostestimate(root, path, loop_count,
+                                       indexStartupCost, indexTotalCost,
+                                       indexSelectivity, indexCorrelation,
+                                       indexPages);
+
+    if (!tde_iam_path_is_equality_only(path))
+    {
+        *indexStartupCost += TDE_IAM_NON_EQUALITY_COST;
+        *indexTotalCost   += TDE_IAM_NON_EQUALITY_COST;
+    }
+}
+
+/*
+ * tde_iam_index_cannot_answer_equality — index columns on which even an
+ * equality lookup through the tree misses rows.
+ *
+ *   numeric: tde_numeric_ops compares with numeric_cmp, applied to the
+ *     ciphertext bytes as if they were a numeric; that is not an ordering,
+ *     and the descent misses keys.  Equal values can also differ in bytes
+ *     (1.5 and 1.50), which AES-SIV then keeps apart.
+ *   nondeterministic collation: equality under the collation is not byte
+ *     equality, and AES-SIV can only match identical bytes.
+ */
+static bool
+tde_iam_index_cannot_answer_equality(IndexOptInfo *info)
+{
+    int         i;
+
+    for (i = 0; i < info->nkeycolumns; i++)
+    {
+        Oid     collid = info->indexcollations[i];
+
+        if (info->opcintype[i] == NUMERICOID)
+            return true;
+        if (OidIsValid(collid) && !get_collation_isdeterministic(collid))
+            return true;
+    }
+    return false;
+}
+
+/*
+ * tde_iam_get_relation_info — called from the get_relation_info_hook
+ * (pg_vault_tde.c) for every relation the planner considers.
+ */
+void
+tde_iam_get_relation_info(PlannerInfo *root, Oid relationObjectId,
+                          bool inhparent, RelOptInfo *rel)
+{
+    ListCell   *lc;
+
+    foreach(lc, rel->indexlist)
+    {
+        IndexOptInfo *info = lfirst_node(IndexOptInfo, lc);
+
+        if (info->amcostestimate != pg_vault_tde_amcostestimate)
+            continue;           /* not a tde_btree index */
+
+        /*
+         * An index that misses rows on equality is not offered to the
+         * planner at all: the query runs as a sequential scan and is correct.
+         * Writes still maintain it, and uniqueness and ON CONFLICT inference
+         * read the index list from the relcache, not from here.
+         */
+        if (tde_iam_index_cannot_answer_equality(info))
+        {
+            rel->indexlist = foreach_delete_current(rel->indexlist, lc);
+            continue;
+        }
+
+        /*
+         * No sort order: no ORDER BY, min()/max() or merge-join input.
+         * sortopfamily is the one field the planner reads to decide whether
+         * an index is ordered (build_index_pathkeys, and the min/max probe
+         * in get_actual_variable_range).  reverse_sort and nulls_first must
+         * stay: btcostestimate() reads reverse_sort[0] unconditionally for
+         * the correlation estimate, and a NULL there is a segfault.
+         */
+        info->sortopfamily = NULL;
+    }
+}
+
+/*
+ * tde_iam_check_new_index — refuse a tde_btree index that cannot answer
+ * equality, or that would store its keys in plaintext.
+ *
+ * Called from the object_access_hook at OAT_POST_CREATE, which every index
+ * creation reaches: CREATE INDEX, the EXCLUDE constraints of CREATE TABLE and
+ * ALTER TABLE ... ADD CONSTRAINT, the rebuild ALTER COLUMN ... TYPE performs,
+ * pg_restore.  A check in the ProcessUtility hook sees only the first of
+ * those, and the others matter most: UNIQUE and EXCLUDE enforcement reads the
+ * index directly, without the planner, so an index that misses equal values
+ * silently lets duplicates in.  REINDEX is exempted by the caller: it
+ * rebuilds what already exists.
+ *
+ * `is_internal` is ObjectAccessPostCreate's flag, true for the rebuild of an
+ * existing index (ALTER COLUMN ... TYPE): the plaintext-key classes are then
+ * let through, as they only carry over an index someone already built.
+ */
+void
+tde_iam_check_new_index(Oid indexOid, bool is_internal)
+{
+    Relation    index = index_open(indexOid, NoLock);
+    Oid         heapOid = index->rd_index->indrelid;
+    oidvector  *indclass;
+    int         i;
+
+    indclass = (oidvector *) DatumGetPointer(
+        SysCacheGetAttrNotNull(INDEXRELID, index->rd_indextuple, Anum_pg_index_indclass));
+
+    for (i = 0; i < IndexRelationGetNumberOfKeyAttributes(index); i++)
+    {
+        AttrNumber  attnum = index->rd_index->indkey.values[i];
+        const char *column = attnum != 0 ? get_attname(heapOid, attnum, false) : "expression";
+        Oid         collid = index->rd_indcollation[i];
+        HeapTuple   opctup;
+        const char *opcname;
+        int         j;
+
+        if (index->rd_opcintype[i] == NUMERICOID)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("pg_vault_tde: tde_btree cannot index numeric column \"%s\"",
+                            column),
+                     errdetail("Equal numeric values do not always encrypt to equal index "
+                               "keys (1.5 and 1.50 are equal), and the numeric operator class "
+                               "cannot order encrypted keys: lookups, UNIQUE and EXCLUDE "
+                               "checks through such an index miss equal values."),
+                     errhint("Leave the column unindexed, or drop the tde_btree index before "
+                             "changing the column to numeric. Correct numeric support is "
+                             "planned for pg_vault_tde 1.8.")));
+
+        if (OidIsValid(collid) && !get_collation_isdeterministic(collid))
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("pg_vault_tde: tde_btree cannot index column \"%s\" with "
+                            "nondeterministic collation \"%s\"",
+                            column, get_collation_name(collid)),
+                     errdetail("Encrypted index keys can only match byte-identical values, so "
+                               "equality under this collation — and UNIQUE or EXCLUDE checks "
+                               "relying on it — would miss equal values."),
+                     errhint("Index the column with a deterministic collation.")));
+
+        if (is_internal)
+            continue;
+
+        opctup = SearchSysCache1(CLAOID, ObjectIdGetDatum(indclass->values[i]));
+        if (!HeapTupleIsValid(opctup))
+            elog(ERROR, "cache lookup failed for operator class %u", indclass->values[i]);
+        opcname = pstrdup(NameStr(((Form_pg_opclass) GETSTRUCT(opctup))->opcname));
+        ReleaseSysCache(opctup);
+
+        /*
+         * A plaintext-key operator class is the same exposure as a plaintext
+         * index access method, so it follows the same rule: refused, unless
+         * pg_vault_tde.allow_plaintext_index is on — which is also what lets
+         * a dump that names one (pg_dump writes non-default classes out) be
+         * restored.
+         */
+        for (j = 0; j < (int) lengthof(tde_iam_legacy_opclasses); j++)
+        {
+            if (strcmp(opcname, tde_iam_legacy_opclasses[j]) != 0)
+                continue;
+
+            ereport(pg_vault_tde_allow_plaintext_index ? WARNING : ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("pg_vault_tde: operator class \"%s\" stores index keys in "
+                            "plaintext", opcname),
+                     errdetail("It is a v1.5 operator class, kept only so that indexes "
+                               "already built on it keep working."),
+                     pg_vault_tde_allow_plaintext_index
+                     ? errhint("Allowed because pg_vault_tde.allow_plaintext_index is on. "
+                               "Omit the operator class to use the encrypted default, "
+                               "%.*s_enc_ops.", (int) (strlen(opcname) - 4), opcname)
+                     : errhint("Omit the operator class to use the encrypted default, "
+                               "%.*s_enc_ops, or set pg_vault_tde.allow_plaintext_index = on "
+                               "to allow it with a WARNING.",
+                               (int) (strlen(opcname) - 4), opcname)));
+        }
+    }
+
+    index_close(index, NoLock);
+}
+
 /* ── INIT + HANDLER ─────────────────────────────────────────────────────── */
 
 /*
@@ -1091,6 +1399,22 @@ tde_iam_init(void)
      * keeps every scan/sort call inside the (correctly impersonated) leader.
      */
     tde_btree_methods.amcanbuildparallel = false;
+
+    /*
+     * IN (...) / = ANY (...): let the executor expand the array into one
+     * scalar rescan per element.  With amsearcharray on, btree receives a
+     * single SK_SEARCHARRAY key whose argument is the array itself, and
+     * pg_vault_tde_amrescan() has no way to encrypt the elements in place.
+     * The planner then uses bitmap index scans for such clauses.
+     */
+    tde_btree_methods.amsearcharray = false;
+
+    /*
+     * Price out every path that would compare anything but equality — see
+     * pg_vault_tde_amcostestimate().  The function pointer also identifies
+     * tde_btree indexes to the planner hook, tde_iam_get_relation_info().
+     */
+    tde_btree_methods.amcostestimate = pg_vault_tde_amcostestimate;
 
     /*
      * Allow STORAGE type ≠ opcintype for tde_*_enc_ops operator classes.

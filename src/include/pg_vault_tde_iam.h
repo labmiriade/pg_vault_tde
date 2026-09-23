@@ -11,6 +11,7 @@
 #include "access/amapi.h"
 #include "catalog/pg_type_d.h"   /* INT4OID, INT8OID, DATEOID, TIMESTAMPTZOID, UUIDOID */
 #include "utils/uuid.h"          /* DatumGetUUIDP, pg_uuid_t */
+#include "nodes/pathnodes.h"     /* PlannerInfo, RelOptInfo */
 
 /*
  * AES-256-SIV key encryption for B-Tree index entries.
@@ -57,6 +58,23 @@ extern bool tde_iam_is_tde_btree_index(Relation index_rel);
  * the index tuple has been formed (i.e., after btbuildCallback returns).
  */
 Datum tde_iam_encrypt_index_datum(Relation index_rel, Datum datum, bool typbyval, int16 typlen);
+
+/*
+ * tde_btree answers equality only — see "PLANNER: EQUALITY ONLY" in
+ * pg_vault_tde_iam.c.
+ *
+ * tde_iam_get_relation_info: body of the get_relation_info_hook installed by
+ * _PG_init.  Strips the sort order from every tde_btree index and drops the
+ * ones that cannot answer equality (numeric, nondeterministic collations).
+ *
+ * tde_iam_check_new_index: called from the object_access_hook at
+ * OAT_POST_CREATE for every new tde_btree index, whatever created it;
+ * refuses numeric, nondeterministic collations, and — unless `is_internal`
+ * or pg_vault_tde.allow_plaintext_index — the v1.5 plaintext-key classes.
+ */
+extern void tde_iam_get_relation_info(PlannerInfo *root, Oid relationObjectId,
+                                      bool inhparent, RelOptInfo *rel);
+extern void tde_iam_check_new_index(Oid indexOid, bool is_internal);
 
 /* Exported registration function for CREATE ACCESS METHOD */
 const IndexAmRoutine *pg_vault_tde_get_iam_routine(void);
