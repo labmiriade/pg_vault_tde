@@ -29,8 +29,8 @@
 ## How Has This Been Tested?
 
 <!--
-  Which suites did you run, on which PostgreSQL major, with which KMS provider?
-  e.g. `make ci-regress` on PG 18 with the local wallet; `make ci-vault` on PG 17.
+  Paste the PIPELINE SUMMARY table printed at the end of `make ci-all`.
+  Add anything you tested by hand beyond it (another PG major, a real Vault or HSM).
 -->
 
 ## Checklist
@@ -38,7 +38,7 @@
 ### Always
 
 - [ ] The code builds with **zero compiler warnings** on the PostgreSQL majors it targets (17 and 18).
-- [ ] `make ci-regress` passes.
+- [ ] `make ci-all` passes (its `matrix` stage covers PG 17) and its PIPELINE SUMMARY is pasted above; only `bench` and `openbao` may show WARN.
 - [ ] I have added or updated tests covering the change, and they fail without it.
 - [ ] I have read [CONTRIBUTING.md](CONTRIBUTING.md) and agree my contribution is licensed under the [PostgreSQL License](LICENSE).
 - [ ] My commits have a clear message explaining *why*, not only *what*.
