@@ -1424,7 +1424,7 @@ Starts PostgreSQL with `initdb -k` (`--data-checksums`). Verifies that:
 
 ### TAP Tests (`tap/`)
 
-29 files, run together by `make ci-tap` (which also starts the Vault container
+30 files, run together by `make ci-tap` (which also starts the Vault container
 the Vault-dependent files need; they `skip_all` when `VAULT_ADDR` is unset).
 
 | File | Coverage |
@@ -1458,6 +1458,7 @@ the Vault-dependent files need; they `skip_all` when `VAULT_ADDR` is unset).
 | `tap/27_preload_providers.t` | The warm-up works with the KEK outside the server: Vault/OpenBao and PKCS#11 (each half skips when its backend is absent) |
 | `tap/28_dml_memory_scaling.t` | Per-row memory is released on every DML path: a second session samples `pg_log_backend_memory_contexts()` mid-statement and compares `encrypted_heap` with a plain heap under the same workload — the only stage that sees a lifetime bug |
 | `tap/29_rotate_online_concurrent_access.t` | A table read or written while `pg_vault_tde_rotate_online()` runs stays readable after the rotation, after a second rotation and after a restart; a row lock on `pg_vault_tde_catalog` holds the worker inside the window (PSQLE-184). Runs once per available provider: local, Vault (`VAULT_ADDR`), PKCS#11 (SoftHSM2) |
+| `tap/30_rotate_kek_local_atomicity.t` | A local-wallet KEK rotation that rolls back, fails later in its statement, or dies in a crash leaves every table readable; so do a session that unlocked the wallet before another session rotated the KEK, and a `CREATE TABLE` that waited on an aborted rotation — each checked right after and after a restart (PSQLE-185) |
 
 #### `tap/19_crash_recovery_rmgr.t`
 
