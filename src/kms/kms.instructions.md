@@ -306,6 +306,9 @@ Rules, each paid for by a lost database in 1.7.1:
    with an older cached `kek[0]` is safe because versions are never removed.
 5. **Rotation needs the passphrase from a source**, not a cached ring: the file
    is re-encrypted under it.
+6. **Everything local is wrapped under a KEK the file holds.**  Nothing derives a
+   KEK from the passphrase: `migrate_vault_to_wallet()` did, and every table it
+   migrated was lost (PSQLE-188).  It now opens the wallet and uses `kek[0]`.
 
 Pruning old versions is not implemented (1.8); `LOCAL_KEK_MAX_VERSIONS` caps the
 ring.  `pg_dump_tde_kms_local.c` has its own reader with the same rules, so a

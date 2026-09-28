@@ -335,6 +335,17 @@ distinguishes the builds.
    so dumps taken before a rotation restore again. Vault and PKCS#11 already versioned
    their keys. `tap/30_rotate_kek_local_atomicity.t`.
 
+9. **`migrate_vault_to_wallet()` made every migrated table unreadable (PSQLE-188).** It
+   wrapped the DEKs under a KEK derived from its passphrase argument
+   (`local_derive_kek_from_pass()`), while the wallet `wallet_init()` creates — which
+   the migration requires — holds a random one; it accepted any passphrase, evicted the
+   DEK cache, and left the database on the Vault provider, which cannot unwrap the new
+   wrapping. Now it opens the wallet with the passphrase (a wrong one is refused before
+   anything changes), wraps under the wallet's current KEK, leaves the cache alone (the
+   DEKs themselves do not change), and switches the database to `kms_provider = 'local'`
+   in the session and through a database-level setting. The derivation helper is gone.
+   `tap/31_migrate_vault_to_wallet.t`, with a real-Vault half.
+
 **New CI stage — `make ci-upgrade`.** Every other suite in this repo reads only data it
 wrote in the same run, so writer and reader always move together and a format-level
 breakage leaves the suite green while data on disk becomes unreadable. That is how the

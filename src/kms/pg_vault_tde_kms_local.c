@@ -79,14 +79,6 @@
 #define LOCAL_WRAP_OVERHEAD     8   /* RFC 3394 AES-WRAP overhead in bytes */
 #define LOCAL_WRAPPED_DEK_LEN   (TDE_DEK_LEN + LOCAL_WRAP_OVERHEAD)  /* 40 bytes */
 
-/*
- * PBKDF2 iteration count for KEK derivation from passphrase.
- *
- * NIST SP 800-132 (2023) minimum for HMAC-SHA-256: 210 000.  We use
- * 600 000 to provide a comfortable safety margin against brute-force.
- * Increasing this value requires wallet re-initialisation.
- */
-#define LOCAL_PBKDF2_ITERS      600000
 
 /* -------------------------------------------------------------------------
  * KEK versions (PSQLE-185)
@@ -357,8 +349,6 @@ static bool local_unwrap_dek_with_kek(const unsigned char *wrapped,
                                       int wrapped_len,
                                       unsigned char *dek_out, int *dek_len,
                                       const unsigned char *kek);
-static bool local_derive_kek_from_pass(const char *passphrase,
-                                       unsigned char *kek_out);
 #define TDE_DEFAULT_WALLET_FMT "/var/lib/pg_vault_tde/%u/wallet.p12"
 
 static const char *local_get_wallet_path(void);
@@ -728,43 +718,6 @@ local_unwrap_dek_with_ring(const unsigned char *wrapped, int wrapped_len,
                                       ring->kek[i]))
             return true;
     return false;
-}
-
-/* -------------------------------------------------------------------------
- * local_derive_kek_from_pass — derive a KEK from a passphrase WITHOUT
- * touching the wallet file or verifying any MAC.
- *
- * Mirrors exactly the PBKDF2 derivation performed inside local_open_wallet()
- * (same fixed salt "pg_vault_tde_kek_v1", same iteration count, same MD).
- *
- * This is used during passphrase rotation: between the old MAC (still on
- * disk) and the new MAC (about to be written), we need to derive the NEW
- * KEK from the NEW passphrase to re-wrap DEKs.  Calling local_open_wallet()
- * with the new passphrase would fail PKCS12_verify_mac() because the file
- * is still authenticated under the OLD passphrase.
- *
- * kek_out must point to a TDE_DEK_LEN-byte buffer.
- * Caller MUST OPENSSL_cleanse(kek_out, TDE_DEK_LEN) after use.
- * -------------------------------------------------------------------------*/
-static bool
-local_derive_kek_from_pass(const char *passphrase, unsigned char *kek_out)
-{
-    Assert(passphrase != NULL);
-    Assert(kek_out != NULL);
-
-    if (PKCS5_PBKDF2_HMAC(passphrase, -1,
-                          (const unsigned char *) "pg_vault_tde_kek_v1",
-                          19,                                 /* salt length */
-                          LOCAL_PBKDF2_ITERS,
-                          EVP_sha256(),
-                          TDE_DEK_LEN, kek_out) != 1)
-    {
-        ereport(WARNING,
-                errmsg("pg_vault_tde: PBKDF2 KEK derivation failed: %s",
-                       ERR_reason_error_string(ERR_get_error())));
-        return false;
-    }
-    return true;
 }
 
 /* -------------------------------------------------------------------------
@@ -2190,14 +2143,21 @@ pg_vault_tde_wallet_lock_sql(PG_FUNCTION_ARGS)
 /* -------------------------------------------------------------------------
  * pg_vault_tde_migrate_vault_to_wallet — re-wrap all Vault DEKs under local wallet
  *
- * For each row in pg_vault_tde_catalog with kms_provider='vault':
+ * new_passphrase must open the wallet pg_vault_tde_wallet_init() created; its
+ * current KEK is the key everything is wrapped under.  For each row in
+ * pg_vault_tde_catalog with kms_provider='vault':
  *   1. Unwrap the DEK using the Vault provider.
- *   2. Re-wrap using the local wallet with new_passphrase.
+ *   2. Re-wrap it under the wallet's current KEK.
  *   3. UPDATE the catalog row with the new wrapped_dek and kms_provider='local'.
  *
- * After all rows are migrated, sets tde_active_kms_provider to the local
- * provider.  The Vault provider is NOT shut down (may still be referenced by
- * GUC settings until the server is restarted with kms_provider=local).
+ * Then the database switches to the local provider — this session at once,
+ * new sessions through a database-level setting — since the Vault provider
+ * cannot unwrap what was just written.  The plaintext DEKs do not change, so
+ * the shmem cache is left alone: every session keeps reading the tables it
+ * has cached, including those connected before the migration.
+ *
+ * Until PSQLE-188 the DEKs were wrapped under a KEK derived from the
+ * passphrase, which the wallet does not hold, so no migrated table read again.
  * -------------------------------------------------------------------------*/
 
 PGDLLEXPORT Datum
@@ -2262,16 +2222,26 @@ pg_vault_tde_migrate_vault_to_wallet_sql(PG_FUNCTION_ARGS)
     }
 
     /*
-     * Derive the local KEK from new_pass once before the scan loop.
-     * This avoids per-row PBKDF2 overhead that local_wrap_dek_with_pass
-     * would incur inside the loop.
+     * The wallet's own current KEK, once, before the scan loop.  Opening the
+     * file is also what proves new_pass is the wallet's passphrase: the MAC
+     * check fails otherwise, and nothing has been touched yet.
      */
-    if (!local_derive_kek_from_pass(new_pass, new_kek))
     {
-        OPENSSL_cleanse(new_pass, strlen(new_pass));
-        pfree(new_pass);
-        ereport(ERROR,
-                errmsg("pg_vault_tde: migrate_vault_to_wallet: could not derive KEK from passphrase"));
+        LocalKekRing *ring = local_ring_new(CurrentMemoryContext);
+
+        if (!local_open_wallet_ring(wallet_path, new_pass, ring))
+        {
+            local_ring_free(ring);
+            OPENSSL_cleanse(new_pass, strlen(new_pass));
+            pfree(new_pass);
+            ereport(ERROR,
+                    errcode(ERRCODE_INVALID_PASSWORD),
+                    errmsg("pg_vault_tde: migrate_vault_to_wallet: the passphrase "
+                           "does not open the local wallet at \"%s\"", wallet_path),
+                    errhint("Pass the passphrase given to pg_vault_tde_wallet_init()."));
+        }
+        memcpy(new_kek, ring->kek[0], TDE_DEK_LEN);
+        local_ring_free(ring);
     }
 
     ext_ns = get_extension_schema(get_extension_oid(pg_vault_tde_extension_name, true));
@@ -2414,7 +2384,27 @@ pg_vault_tde_migrate_vault_to_wallet_sql(PG_FUNCTION_ARGS)
     CatalogCloseIndexes(indstate);
     table_close(catalog_rel, ShareRowExclusiveLock);
 
-    pg_vault_tde_catalog_evict_db();
+    /*
+     * No pg_vault_tde_catalog_evict_db(): the DEKs are the same, only their
+     * wrapping moved, and evicting would send every session back to the
+     * Vault provider, which cannot unwrap the new wrapping.
+     *
+     * Switch this database to the local provider — this session now, and
+     * the ones that connect later through the database-level setting, the
+     * same mechanism local_set_wallet() uses for wallet_path.
+     */
+    {
+        VariableSetStmt *setstmt;
+
+        SetConfigOption("pg_vault_tde.kms_provider", "local",
+                        PGC_SUSET, PGC_S_SESSION);
+
+        setstmt        = makeNode(VariableSetStmt);
+        setstmt->kind  = VAR_SET_CURRENT;
+        setstmt->name  = "pg_vault_tde.kms_provider";
+        setstmt->args  = NIL;
+        AlterSetting(MyDatabaseId, InvalidOid, setstmt);
+    }
 
     {
         LocalWalletState *st = local_state();
@@ -2430,6 +2420,12 @@ pg_vault_tde_migrate_vault_to_wallet_sql(PG_FUNCTION_ARGS)
     ereport(LOG,
             errmsg("pg_vault_tde: vault-to-wallet migration complete; "
                    "%d entries migrated", migrated));
+    ereport(NOTICE,
+            errmsg("pg_vault_tde: this database now uses the local wallet "
+                   "(kms_provider = 'local')"),
+            errdetail("Sessions connected before the migration keep the Vault "
+                      "provider until they reconnect; they still read the "
+                      "tables whose keys are cached."));
 
     PG_RETURN_VOID();
 }

@@ -42,7 +42,7 @@
 #define SEAL_LABEL_LEN    63            /* NUL-padded */
 #define SEAL_HMAC_SALT    "tde-seal-hmac-v1"
 #define SEAL_HMAC_LEN     32            /* HMAC-SHA256 */
-#define SEAL_PBKDF2_ITERS 600000        /* match LOCAL_PBKDF2_ITERS */
+#define SEAL_PBKDF2_ITERS 600000        /* NIST SP 800-132 minimum is 210000 */
 
 /*
  * Derive the 32-byte HMAC key from the seal passphrase (PBKDF2-SHA256).

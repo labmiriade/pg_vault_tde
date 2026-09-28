@@ -839,7 +839,7 @@ log stream without any extension-level configuration.
 | `pg_vault_tde_seal_keys(text, text, text)` | void | Write an HMAC-SHA256-signed bundle of **all** wrapped DEKs (every provider) to a file, to accompany a physical backup (`pg_basebackup`); the KEK is never included **(v1.7)** |
 | `pg_vault_tde_seal_keys_bytea(text, text)` | bytea | Same signed bundle as `pg_vault_tde_seal_keys()`, returned as `bytea` instead of written server-side — used by `pg_basebackup_tde` to store the bundle on the client host **(v1.7)** |
 | `pg_vault_tde_unseal_keys(text, text)` | void | Verify (HMAC) and re-import a bundle written by `pg_vault_tde_seal_keys()`; rejects a tampered file or wrong passphrase before writing anything **(v1.7)** |
-| `pg_vault_tde_migrate_vault_to_wallet(text)` | void | Online Vault→local wallet migration **(v1.6)** |
+| `pg_vault_tde_migrate_vault_to_wallet(text)` | void | Online Vault→local wallet migration: pass the passphrase of the wallet created with `wallet_init()`; re-wraps every Vault DEK under the wallet's KEK and switches the database to the `local` provider. Broken before 1.7.2 — see [Upgrading to 1.7.2](#migrate_vault_to_wallet-before-172) **(v1.6)** |
 | `pg_vault_tde_vault_status()` | table | Vault provider diagnostics — `(configured, auth_method, reachable)` |
 | `pg_vault_tde_refresh_token()` | boolean | Manually renew the current Vault token lease |
 | `pg_vault_tde_hw_accel_info()` | record | OpenSSL provider/cipher diagnostics — `(openssl_version, configured_provider, provider_loaded, gcm_cipher, siv_cipher, aes_ni_available)` |
@@ -1160,6 +1160,23 @@ What to know:
   unlock again after another session rotates the KEK or changes the passphrase.
 - **If a rotation on 1.7.1 did not commit and your tables stopped reading,** restore
   the wallet file from before that rotation: the catalog is still wrapped under it.
+
+### `migrate_vault_to_wallet()` before 1.7.2
+
+Up to 1.7.1, `pg_vault_tde_migrate_vault_to_wallet()` wrapped every DEK under a key
+derived from its passphrase argument instead of the KEK held by the wallet it was told
+to use, accepted any passphrase, and left the database on the Vault provider. Every
+migrated table became unreadable, and the Vault-wrapped copy of each DEK had been
+overwritten in `pg_vault_tde_catalog` (PSQLE-188).
+
+1.7.2 opens the wallet with the passphrase — a wrong one is refused before anything
+changes — wraps under the wallet's current KEK, keeps the cached keys so sessions keep
+reading, and switches the database to `kms_provider = 'local'`. Sessions connected
+before the migration keep the Vault provider until they reconnect.
+
+**If you ran it on 1.7.1:** the tables it migrated can only come back from a backup
+taken before the migration — of the database, or of `pg_vault_tde_catalog` while the
+Vault Transit key still exists.
 
 ### `rotate_online()` with concurrent access
 
