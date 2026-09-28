@@ -625,6 +625,12 @@ implicitly because the heap rows the scan reads are re-encrypted first; the inde
 are then produced from the decrypted values and re-encrypted under the (unchanged) index DEK.
 To also rotate the index DEK, call `rotate_online` on the index relation directly afterwards.
 
+> **Logical replication:** a rotation reaches subscribers as one `UPDATE` per row, and a
+> logical slot must decode past it before the publisher restarts or the same table is
+> rotated again — the previous DEK lives only in shared memory until then. A slot that
+> falls behind that point stops with `pg_vault_tde: decryption failed`, and so does every
+> other slot of the database. Check `confirmed_flush_lsn` in `pg_replication_slots`.
+
 **KEK rotation** (re-wraps all per-table DEKs under a new KEK — tuple data untouched):
 
 ```sql

@@ -747,6 +747,17 @@ src/include/
 
 ### 10.1 Memory Ownership of Decrypted Tuples
 
+> **Superseded — the plugin does the opposite.** Swapping in a decrypted copy
+> crashed the walsender intermittently under streaming: the reorder buffer frees
+> the change later, outside the callback's memory context, and the swapped-in
+> tuple was already gone. `tde_maybe_decrypt()` decrypts into a temporary tuple
+> and copies the plaintext back into the reorder buffer's own buffer, and
+> `tde_toast_stitch()` does the same for TOAST. Since PSQLE-186 the change
+> callbacks also put the original `t_len` back once pgoutput has serialized the
+> row: the reorder buffer sizes a change from it when it frees it.
+
+*Original analysis:*
+
 The `change->data.tp.newtuple` and `.oldtuple` are allocated by the
 ReorderBuffer in its own memory context. When we replace them with decrypted
 copies, we must:
@@ -755,6 +766,25 @@ copies, we must:
 3. The ReorderBuffer will free our replacement tuple when it cleans up the change
 
 ### 10.2 TOAST Handling
+
+> **Superseded in v1.7 — kept as the record of the original analysis.** It
+> assumed TOAST chunks stored unencrypted in a plain `heap` table; that is no
+> longer the design. What shipped:
+>
+> - TOAST chunks are **encrypted**, each one with the parent relation's DEK.
+> - The suspicion at the end of this section was right: `ReorderBufferToastReplace()`
+>   deforms the still-encrypted main tuple before any output-plugin callback runs,
+>   and there is no earlier hook.
+> - The way around it is a **custom WAL resource manager** (id 161, reserved on the
+>   PostgreSQL wiki; GUC `pg_vault_tde.toast_custom_rmgr`, `PGC_POSTMASTER`, off by
+>   default). Encrypted chunks are WAL-logged under it, `rm_decode` captures them
+>   away from the reorder buffer's `toast_hash`, and the change callback stitches
+>   them back into the decrypted tuple (`tde_toast_stitch()`).
+>
+> Current design, requirements and limits: `doc/pg_vault_tde.md` → *Logical
+> Decoding and Replication*.
+
+*Original analysis (pre-v1.7):*
 
 The ReorderBuffer **reassembles TOAST values** before calling `change_cb`.
 This means:
@@ -797,12 +827,41 @@ plugin level.
 
 ### 10.3 DEK Security in WAL Sender
 
+> **Still accurate**, with one precision: there is no pool of EVP contexts, each
+> process caches one GCM encrypt, one GCM decrypt and one SIV context.  The WAL
+> sender reads DEKs from the same shared cache as every backend, so it follows the
+> same rotation rules — see 10.4.
+
 - The WAL sender has shared memory access → can read the DEK
 - `OPENSSL_cleanse` is called on all DEK copies (existing pattern)
 - The `on_proc_exit(tde_backend_cleanup, ...)` handler fires on WAL sender exit
 - EVP contexts are per-process → the WAL sender gets its own pool
 
 ### 10.4 Key Rotation During Logical Decoding
+
+> **Corrected — measured on 1.7.2 (2026-09-28).** Decryption does not try keys in
+> turn: every ciphertext carries its generation, and the key of that generation is
+> looked up (`pg_vault_tde_kms_get_rel_dek_for_gen()`).  Only two exist at any
+> time: the current one, in the catalog, and the previous one, **in shared memory
+> only**.  What that means for a logical slot:
+>
+> - **A rotation is decoded as one UPDATE per row** (with `REPLICA IDENTITY FULL`,
+>   old and new tuple each): a slot 10 rows behind showed 13 changes before a
+>   rotation and 25 after.
+> - **WAL written under the previous generation decodes only while that key is in
+>   shared memory** — the rotation's own UPDATEs included, since their old tuple
+>   is under it.  After a publisher restart, or after a second rotation, a slot
+>   that has not decoded that WAL yet fails with `pg_vault_tde: decryption failed`
+>   at the same LSN on every retry: it is stuck.
+> - **It stops every slot of the database**, not only the ones publishing the
+>   table: the plugin decrypts before pgoutput filters changes by publication.
+>
+> Until previous keys are persisted (the key ring planned for 1.8): after a
+> rotation, let every logical slot confirm past it (`confirmed_flush_lsn` beyond
+> the rotation's commit) before restarting the publisher or rotating the same
+> table again.
+
+*Original analysis:*
 
 If a key rotation happens while the WAL sender is streaming:
 - Old tuples in the WAL still use the old DEK
@@ -812,6 +871,17 @@ If a key rotation happens while the WAL sender is streaming:
 - This is safe for logical decoding
 
 ### 10.5 Replica Identity Interaction
+
+> **Corrected.** Decrypting both tuples is necessary, not sufficient.  With
+> `REPLICA IDENTITY DEFAULT` the core extracts the key columns from the
+> still-encrypted tuple before any plugin callback runs, so the subscriber gets a
+> garbage key and silently updates or deletes the wrong row.  UPDATE and DELETE
+> need `REPLICA IDENTITY FULL` plus a primary key; a DEFAULT key tuple is not in
+> our wire format and the plugin passes it through untouched
+> (`tde_tuple_looks_encrypted()`).  See `doc/pg_vault_tde.md` → *Logical Decoding
+> and Replication*.
+
+*Original analysis:*
 
 For `UPDATE` and `DELETE`, PostgreSQL logs the **old tuple** (or replica identity
 columns) in the WAL. For `encrypted_heap` tables:

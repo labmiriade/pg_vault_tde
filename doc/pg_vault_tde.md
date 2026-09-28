@@ -879,6 +879,14 @@ they follow from the tuple being an opaque ciphertext blob to the core.
 - **Reorder-buffer coupling** — the stitch path mirrors internal contracts of
   `ReorderBufferToastReplace` (buffer copy-back, memory context) that are not a
   stable public API.
+- **Slots behind a key rotation** — a rotation is decoded as one UPDATE per row,
+  and WAL written under the previous DEK generation decodes only while that key is
+  still in shared memory (the catalog keeps the current one only).  A slot that has
+  not decoded it when the publisher restarts, or when the same table is rotated
+  again, fails with `pg_vault_tde: decryption failed` at the same LSN on every
+  retry — every slot of the database, since the plugin decrypts before pgoutput
+  filters by publication.  Let slots confirm past a rotation first; persisting
+  previous keys is the 1.8 key ring.
 - **Aborted-transaction capture** — a TOAST-writing transaction that reaches a
   full snapshot and then aborts *without being streamed* leaves its captured
   chunks in memory until the decoding process exits (there is no output-plugin

@@ -47,6 +47,12 @@ carries the generation of the key that wrote it:
    released, so the writers waiting on it resume with the new key. If the
    rotation fails, the outgoing DEK stays current.
 
+> **Logical replication:** a rotation reaches subscribers as one `UPDATE`
+> per row, and every logical slot of the database must decode past it before
+> the publisher restarts or the same table is rotated again: until then the
+> previous DEK exists only in shared memory. A slot left behind stops with
+> `pg_vault_tde: decryption failed`.
+
 > Up to 1.7.1 a rotation of a table that was being read or written could
 > make it unreadable after the next restart. See *`rotate_online()` with
 > concurrent access* in the README before restarting to install 1.7.2.
