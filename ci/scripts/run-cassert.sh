@@ -13,7 +13,8 @@
 # error aborts the transaction, the memory context is deleted moments later,
 # and aset.c never notices.
 #
-# Two server configurations are needed, so the stage starts the server twice:
+# Two server configurations are needed, so the stage starts the server twice,
+# and then runs the TAP files, which start their own:
 #
 #   Phase 1  wallet_dev_mode_passphrase SET     — the four regression files,
 #                                                 in run-regress.sh order; they
@@ -21,6 +22,9 @@
 #                                                 able to self-unlock
 #   Phase 2  wallet_dev_mode_passphrase UNSET   — the error-path suite, which
 #                                                 needs wallet_lock() to stick
+#   Phase 3  the tap/ files                      — each starts its own nodes on
+#                                                 this server build; the ones
+#                                                 that need Vault skip
 #
 # Exit code: 0 clean, 13 on assertion failure or suite failure.
 #
@@ -162,10 +166,39 @@ fi
 assert_log_clean "phase 2 (error-path suite)" || RC=13
 stop_server
 
+# ── Phase 3: TAP files ───────────────────────────────────────────────────
+# The TAP scenarios reach paths no SQL file does — a rotation worker that
+# fails, a restart between two statements, a second session in a window — and
+# before this phase none of them ran with Assert() on.  A failed rotation
+# crashed the worker on this build for as long as that went unnoticed.
+# Each node logs to /test/log; an Assert kills the backend, which the test may
+# or may not notice, so the logs are checked as well as the exit status.
+log_info "Phase 3: TAP files ..."
+$RT exec -u root "$CONTAINER" bash -c 'mkdir -p /test/tap && chown -R postgres /test'
+$RT cp "$REPO_ROOT/tap/." "$CONTAINER:/test/tap/"
+TAP_OUT=$(mktemp)
+START=$(timer_start)
+if ! cx bash -c '
+    export PERL5LIB=/usr/local/pgsql/lib/pgxs/src/test/perl
+    export PG_REGRESS=/usr/local/pgsql/lib/pgxs/src/test/regress/pg_regress
+    cd /test && prove --failures tap/*.t' > "$TAP_OUT" 2>&1; then
+    log_error "CASSERT: TAP files failed under assertions"
+    grep -E "^tap/|Failed|Wstat|not ok" "$TAP_OUT" | tail -30
+    RC=13
+else
+    log_ok "Phase 3 passed ($(timer_fmt "$(timer_elapsed "$START")")): $(grep -E '^Files=' "$TAP_OUT")"
+fi
+rm -f "$TAP_OUT"
+if cx bash -c 'grep -lE "TRAP: failed Assert|FailedAssertion|could not find block containing chunk|detected write past chunk end" /test/log/*.log' 2>/dev/null; then
+    log_error "CASSERT: assertion failure in a TAP node (logs listed above)"
+    cx bash -c 'grep -hE -A12 "TRAP: failed Assert|FailedAssertion" /test/log/*.log' | head -40
+    RC=13
+fi
+
 if [ "$RC" -ne 0 ]; then
     log_error "CASSERT: FAILED"
     exit "$RC"
 fi
 
-log_ok "CASSERT: both suites clean on an assert-enabled server"
+log_ok "CASSERT: SQL suites and TAP files clean on an assert-enabled server"
 exit 0

@@ -18,6 +18,9 @@
 #   9  Multi-type data round-trip under Vault-provided DEK (50 rows)
 #  10  Node bao-2 connectivity: bao-2 API returns 200 health (follower up)
 #  11  Node bao-3 connectivity: bao-3 API returns 200 health (follower up)
+#  12  rotate_online() with a reader and a writer in the rotation window, then
+#      a second rotation: every tag verifies, contents intact (PSQLE-184)
+#  13  the same table after a restart of pg-bao (new AppRole login)
 #
 # Exit code: 0 on success, 5 on failure.
 #
@@ -297,6 +300,76 @@ bao_api_ok 10 "OpenBao bao-2 sealed=false (Raft follower)" "$BAO_PORT_2" "/v1/sy
 
 # Test 11: bao-3 follower is up and unsealed (standby → standbyok=true)
 bao_api_ok 11 "OpenBao bao-3 sealed=false (Raft follower)" "$BAO_PORT_3" "/v1/sys/health?standbyok=true"
+
+# Tests 12-13: rotate_online() with concurrent access, against OpenBao.
+# The same scenario as tap/29, driven with psql: a row lock on the catalog row
+# holds the rotation worker between zero_rel_dek() and update_rel_dek() while
+# a reader and a writer touch the table.  Up to 1.7.1 that left rows under a
+# key that existed only in shared memory.
+# set -e is on: a failing statement must fail its test, not end the stage.
+bq() { $RT exec -u postgres pg-tde-bao psql -U postgres -At -v ON_ERROR_STOP=1 "$@" 2>/dev/null || true; }
+bao_rotation_status() {
+    local s
+    for _ in $(seq 1 150); do
+        s=$(bq -c "SELECT status FROM pg_vault_tde_rotation_progress
+                   WHERE relid = 'bao_rot'::regclass::oid")
+        case "$s" in complete|failed) echo "$s"; return ;; esac
+        sleep 0.2
+    done
+    echo "timeout"
+}
+bao_rot_check() {   # prints total|failed|differences, empty if a read fails
+    bq -c "SELECT (SELECT total_tuples || '|' || failed_tuples
+                   FROM pg_vault_tde_verify_integrity('bao_rot')) || '|' ||
+                  (SELECT count(*) FROM (
+                      (SELECT * FROM bao_rot EXCEPT ALL SELECT * FROM bao_rot_truth)
+                      UNION ALL
+                      (SELECT * FROM bao_rot_truth EXCEPT ALL SELECT * FROM bao_rot)) d)"
+}
+
+log_info "Test 12: rotate_online() with a reader and a writer in the window ..."
+bq -c "CREATE TABLE bao_rot (id int, val text) USING encrypted_heap;
+       INSERT INTO bao_rot SELECT g, 'row_' || g FROM generate_series(1, 1000) g;
+       CREATE TABLE bao_rot_truth AS SELECT * FROM bao_rot;
+       INSERT INTO bao_rot_truth SELECT g, 'win_' || g FROM generate_series(1001, 1005) g;
+       SELECT count(*) FROM bao_rot;" >/dev/null
+( bq -c "BEGIN;
+         SELECT 1 FROM pg_vault_tde_catalog WHERE relid = 'bao_rot'::regclass::oid FOR UPDATE;
+         SELECT pg_sleep(5);
+         COMMIT;" >/dev/null ) &
+blocker=$!
+sleep 1
+bq -c "SET client_min_messages = warning; SELECT pg_vault_tde_rotate_online('bao_rot')" >/dev/null
+sleep 1
+held=$(bq -c "SELECT count(*) FROM pg_stat_activity
+              WHERE backend_type = 'pg_vault_tde rotation' AND wait_event_type = 'Lock'")
+bq -c "SELECT count(*) FROM bao_rot" >/dev/null
+( bq -c "INSERT INTO bao_rot SELECT g, 'win_' || g FROM generate_series(1001, 1005) g" >/dev/null ) &
+writer=$!
+wait "$blocker" "$writer" || true
+rot1=$(bao_rotation_status)
+bq -c "DELETE FROM pg_vault_tde_rotation_progress WHERE relid = 'bao_rot'::regclass::oid" >/dev/null
+bq -c "SET client_min_messages = warning; SELECT pg_vault_tde_rotate_online('bao_rot')" >/dev/null
+rot2=$(bao_rotation_status)
+check=$(bao_rot_check)
+if [[ "$held" == "1" && "$rot1" == "complete" && "$rot2" == "complete" && "$check" == "1005|0|0" ]]; then
+    pass "Test 12: rotation with concurrent access keeps every row readable"
+else
+    fail "Test 12: worker held=$held rotation1=$rot1 rotation2=$rot2 total|failed|diff=${check:-read failed}"
+fi
+
+log_info "Test 13: the rotated table after a restart of pg-bao ..."
+$RT restart pg-tde-bao >/dev/null 2>&1 || true
+for _ in $(seq 1 60); do
+    $RT exec pg-tde-bao pg_isready -U postgres >/dev/null 2>&1 && break
+    sleep 2
+done
+check=$(bao_rot_check)
+if [[ "$check" == "1005|0|0" ]]; then
+    pass "Test 13: every row still reads after a restart"
+else
+    fail "Test 13: total|failed|diff=${check:-read failed}"
+fi
 
 # ---------------------------------------------------------------------------
 # Summary

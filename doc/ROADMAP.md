@@ -1,6 +1,6 @@
 # pg_vault_tde Roadmap
 
-> Last updated: 2026-09-23 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 28 TAP files / 306 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 2 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
+> Last updated: 2026-09-28 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 29 TAP files / 423 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 2 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
 
 ---
 
@@ -294,6 +294,33 @@ distinguishes the builds.
    accepted before the fix). `REINDEX`, `CONCURRENTLY` included, is exempt. Removing those
    classes and correct `numeric` support need a catalog change and are planned for 1.8.
    Tests 160–164; `ci-upgrade` Probe D covers an index the baseline built.
+
+6. **`rotate_online()` lost tables accessed during the rotation (PSQLE-184).** The
+   rotation demoted the shared-memory DEK and rewrote the catalog in one transaction, but
+   any backend touching the table in between — a `SELECT` was enough — reloaded the cache
+   from the catalog its snapshot saw and put the outgoing DEK back as current. The worker
+   then re-encrypted the table with it, and that key survived only in shared memory:
+   rows broke at once or at the next restart (all 1,000 of 1,000 after one `SELECT`).
+   Writers committed during the rotation hit the same hole directly. Now the worker takes
+   `ShareRowExclusiveLock` on the heap before its snapshot (reads continue, writes and a
+   second rotation wait), encrypts with keys held in its own memory, nothing installs a
+   current key while the entry is marked `rotating`, and a transaction callback moves the
+   cache to the new key at commit — before the locks are released — or back at abort.
+   DEK and generation are now always read together. `tap/29_rotate_online_concurrent_access.t`.
+   Found testing the fix on a `--enable-cassert` server: any failed rotation crashed the
+   worker, because its `PG_CATCH` called `CopyErrorData()` while still in `ErrorContext`
+   (on a release build the copy was read after `FlushErrorState()` had freed it).
+
+7. **Logical decoding drifted the reorder buffer's memory accounting (PSQLE-186).** The
+   output plugin decrypts each change, and stitches its TOAST values, in place — the
+   copy-back is deliberate — and left the shorter `t_len` behind. The reorder buffer
+   sizes a change from `t_len` when it queues it and again when it frees it, so every
+   decoded encrypted row left its encryption overhead (about 37 bytes) in `rb->size`
+   until the walsender restarted; past `logical_decoding_work_mem` every transaction was
+   spilled or streamed. On an assert-enabled build the walsender died on
+   `Assert(txn->size == 0)`. The change callbacks now put the original lengths back once
+   pgoutput has serialized the row. Found when `ci-cassert` began running the TAP files
+   (`tap/12_logical_repl_toast.t`).
 
 **New CI stage — `make ci-upgrade`.** Every other suite in this repo reads only data it
 wrote in the same run, so writer and reader always move together and a format-level

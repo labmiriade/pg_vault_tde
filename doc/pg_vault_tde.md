@@ -613,18 +613,25 @@ toggling this on any database with existing `encrypted_heap` data.
 
 ### Generation-Epoch Rotation
 
-Key rotation is now **per-relation** via `pg_vault_tde_rotate_online(relname, batch_size)`.
-For each encrypted relation `pg_vault_tde_catalog_zero_rel_dek()`:
-1. Acquires `LW_EXCLUSIVE` on the single `rel_dek_lock` guarding the HTAB and
-   looks the entry up with `hash_search(HASH_FIND)`.
-2. Promotes the current DEK to `prev_dek` then `OPENSSL_cleanse`s `dek[32]` for the rotation window.
-3. Increments the per-relation `generation` counter.
-4. Sets `dek_valid = false` (triggers a catalog read + KMS unwrap on next access).
-5. Releases lock.
+Key rotation is **per-relation** via `pg_vault_tde_rotate_online(relname, batch_size)`.
+The rotation worker runs one transaction:
+1. Takes `ShareRowExclusiveLock` on the heap — writers and a second rotation wait,
+   `SELECT` continues — and only then its snapshot, so rows committed by the writers it
+   waited for are re-encrypted too.
+2. `pg_vault_tde_catalog_zero_rel_dek()` moves the current DEK to `prev_dek`, wipes
+   `dek[32]`, sets `dek_valid = false` and `rotating = true`, and keeps the outgoing
+   key in the worker's own memory. `generation` stays the outgoing key's.
+3. `pg_vault_tde_catalog_update_rel_dek()` writes DEK N+1 to the catalog row and hands
+   it to the worker's memory, never to the shared cache.
+4. `pg_vault_tde_reencrypt_table()` rewrites every row with DEK N+1.
+5. A transaction callback moves the cache entry to DEK N+1 at commit (before the locks
+   are released) or back to DEK N at abort, and clears `rotating`.
 
-Each backend detects the mismatch lazily on the next encrypt/decrypt call for that
-relation. Old-generation rows can still be read via `prev_dek` during the rotation
-window; after `pg_vault_tde_reencrypt_table()` completes the window closes.
+While `rotating` is set nobody installs a current key: every other session encrypts and
+decrypts with the outgoing DEK, which is what its snapshot of the catalog shows. Every
+ciphertext carries its generation, so decryption asks for the key of that generation
+(`pg_vault_tde_kms_get_rel_dek_for_gen()`), and encryption reads DEK and generation in
+one call (`pg_vault_tde_kms_get_rel_dek_gen()`).
 
 - **Bounded staleness**: At most one LWLock pair per encrypt/decrypt call.
 - **No signals**: Generation mismatch is detected lazily; no SIGUSR1/SIGHUP needed.
@@ -872,6 +879,14 @@ they follow from the tuple being an opaque ciphertext blob to the core.
 - **Reorder-buffer coupling** — the stitch path mirrors internal contracts of
   `ReorderBufferToastReplace` (buffer copy-back, memory context) that are not a
   stable public API.
+- **Slots behind a key rotation** — a rotation is decoded as one UPDATE per row,
+  and WAL written under the previous DEK generation decodes only while that key is
+  still in shared memory (the catalog keeps the current one only).  A slot that has
+  not decoded it when the publisher restarts, or when the same table is rotated
+  again, fails with `pg_vault_tde: decryption failed` at the same LSN on every
+  retry — every slot of the database, since the plugin decrypts before pgoutput
+  filters by publication.  Let slots confirm past a rotation first; persisting
+  previous keys is the 1.8 key ring.
 - **Aborted-transaction capture** — a TOAST-writing transaction that reaches a
   full snapshot and then aborts *without being streamed* leaves its captured
   chunks in memory until the decoding process exits (there is no output-plugin
@@ -1071,8 +1086,8 @@ region, outside every attribute, so they cannot create a byte-stable window.
 
 2. **Row re-encryption after rotation** (ticket #2) — ✅ **Resolved**  
    `pg_vault_tde_rotate_online(relname, batch_size)` promotes the current DEK to
-   `prev_dek` and bumps the per-relation generation; old-generation rows stay readable
-   via `prev_dek` during the rotation window. `pg_vault_tde_reencrypt_table(regclass
+   `prev_dek` and moves the relation to the next generation; old-generation rows stay
+   readable via `prev_dek` (see Generation-Epoch Rotation). `pg_vault_tde_reencrypt_table(regclass
    [, batch_size])` (implemented in `src/tam/pg_vault_tde_tam.c`) then rewrites every
    row to the new generation in batches, closing the window. A rotation background
    worker (`src/kms/pg_vault_tde_rotation_bgw.c`) can drive this automatically.
@@ -1409,7 +1424,7 @@ Starts PostgreSQL with `initdb -k` (`--data-checksums`). Verifies that:
 
 ### TAP Tests (`tap/`)
 
-18 files, run together by `make ci-tap` (which also starts the Vault container
+29 files, run together by `make ci-tap` (which also starts the Vault container
 the Vault-dependent files need; they `skip_all` when `VAULT_ADDR` is unset).
 
 | File | Coverage |
@@ -1441,6 +1456,8 @@ the Vault-dependent files need; they `skip_all` when `VAULT_ADDR` is unset).
 | `tap/25_cache_full_degrades.t` | `max_encrypted_relations` is honoured, and relations past it keep reading and writing |
 | `tap/26_preload_keys.t` | The startup warm-up loads a database's DEKs when it asks, skips the databases that did not, keeps their keys apart, and honours `preload_max_failures` |
 | `tap/27_preload_providers.t` | The warm-up works with the KEK outside the server: Vault/OpenBao and PKCS#11 (each half skips when its backend is absent) |
+| `tap/28_dml_memory_scaling.t` | Per-row memory is released on every DML path: a second session samples `pg_log_backend_memory_contexts()` mid-statement and compares `encrypted_heap` with a plain heap under the same workload — the only stage that sees a lifetime bug |
+| `tap/29_rotate_online_concurrent_access.t` | A table read or written while `pg_vault_tde_rotate_online()` runs stays readable after the rotation, after a second rotation and after a restart; a row lock on `pg_vault_tde_catalog` holds the worker inside the window (PSQLE-184). Runs once per available provider: local, Vault (`VAULT_ADDR`), PKCS#11 (SoftHSM2) |
 
 #### `tap/19_crash_recovery_rmgr.t`
 

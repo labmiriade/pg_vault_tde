@@ -73,9 +73,13 @@ typedef struct TdeRelDekMapKey
  * same catalog read.  Nothing else may advance it — see the comment in
  * pg_vault_tde_catalog_zero_rel_dek(), which deliberately does not.
  *
- * While dek_valid is false (the rotation window) readers must ignore this
- * field and ask the catalog instead; that is what
- * pg_vault_tde_catalog_get_rel_generation() does.
+ * ROTATION: while rotating is true an online rotation owns the entry.  dek[]
+ * is invalid, prev_dek[] holds the outgoing key and generation is ITS
+ * generation — the one every transaction but the rotation's own still sees
+ * in the catalog.  Nothing may install a key as current meanwhile: the
+ * rotating worker encrypts with the key it generated (held in its own memory,
+ * never here), and the entry only moves to the new key when that transaction
+ * commits, from its commit callback.  See pg_vault_tde_catalog_zero_rel_dek().
  */
 typedef struct TdeRelDekMap
 {
@@ -85,6 +89,7 @@ typedef struct TdeRelDekMap
     uint64       generation;            /* epoch of dek[]; see INVARIANT above */
     bool         dek_valid;             /* true iff dek[] holds a live key */
     bool         prev_dek_valid;        /* true iff prev_dek[] is populated */
+    bool         rotating;              /* an online rotation owns the entry */
 } TdeRelDekMap;
 
 /*
@@ -94,7 +99,6 @@ typedef struct TdeRelDekMap
  */
 void pg_vault_tde_catalog_shmem_request(void);
 void pg_vault_tde_catalog_shmem_init(void);
-bool tde_catalog_cache_entry(Oid relid, TdeRelDekMap* out_entry);
 Oid resolve_effective_relid(Oid relid);
 
 /*
@@ -118,12 +122,23 @@ bool pg_vault_tde_kms_get_rel_dek(Oid relid,
                                    unsigned char *dek_out, int dek_len);
 
 /*
- * pg_vault_tde_kms_get_rel_prev_dek:
- *   Fill prev_dek_out with the previous DEK for the given relation
- *   (populated during online rotation).  Returns false if none exists.
+ * pg_vault_tde_kms_get_rel_dek_gen:
+ *   The key to ENCRYPT with, and its generation, read together.  A DEK and a
+ *   generation fetched by two separate calls can straddle a rotation and tag
+ *   a ciphertext with a generation its key does not have.
+ *
+ * pg_vault_tde_kms_get_rel_dek_for_gen:
+ *   The key that DECRYPTS data tagged with generation gen: the current DEK,
+ *   the previous one, or — for the rotating worker only — the key it is
+ *   rotating to.  Returns false when no key for gen is available.
+ *
+ * Both follow pg_vault_tde_kms_get_rel_dek() on a cache miss, and the same
+ * CALLER RESPONSIBILITY applies.
  */
-bool pg_vault_tde_kms_get_rel_prev_dek(Oid relid,
-                                        unsigned char *prev_dek_out, int dek_len);
+bool pg_vault_tde_kms_get_rel_dek_gen(Oid relid, unsigned char *dek_out,
+                                      int dek_len, uint64 *gen_out);
+bool pg_vault_tde_kms_get_rel_dek_for_gen(Oid relid, uint64 gen,
+                                          unsigned char *dek_out, int dek_len);
 
 /*
  * pg_vault_tde_catalog_register_rel:
@@ -139,8 +154,8 @@ void pg_vault_tde_catalog_register_rel(Oid relid);
  *   Called by the online rotation BGW to replace the wrapped DEK of an
  *   existing catalog entry.  Generates a fresh DEK, wraps it, and performs
  *   a CatalogTupleUpdate on the existing row.  The caller must have already
- *   zeroed the shmem cache entry (pg_vault_tde_catalog_zero_rel_dek) so that
- *   concurrent readers re-fetch the new key from the catalog.
+ *   opened the rotation with pg_vault_tde_catalog_zero_rel_dek(); the new key
+ *   is handed to that rotation, never to the shared cache.
  *   Raises ERROR if no catalog entry exists for relid.
  */
 void pg_vault_tde_catalog_update_rel_dek(Oid relid);
@@ -197,23 +212,20 @@ long pg_vault_tde_catalog_cache_entries(void);
 
 /*
  * pg_vault_tde_catalog_zero_rel_dek:
- *   Demote the relation's current DEK into prev_dek[] and invalidate dek[],
- *   opening the rotation window.  Recovers the outgoing DEK through
+ *   Open an online rotation of relid in the current transaction: demote the
+ *   current DEK into prev_dek[], mark the entry rotating, and keep the
+ *   outgoing key in this backend.  Recovers the outgoing DEK through
  *   pg_vault_tde_kms_get_rel_dek() first, so it works on a cold cache; call it
  *   BEFORE pg_vault_tde_catalog_update_rel_dek() overwrites the catalog row,
  *   which is the last place that DEK still exists.  ereports on failure — a
  *   rotation that cannot preserve the outgoing DEK must not proceed.
+ *
+ *   The caller must hold a lock that keeps writers out of the relation
+ *   (ShareLock on the heap) and take its scan snapshot after acquiring it.
+ *   The rotation ends with the transaction: on commit the entry moves to the
+ *   new key, on abort back to the outgoing one.
  */
 void pg_vault_tde_catalog_zero_rel_dek(Oid relid);
-
-/*
- * pg_vault_tde_catalog_get_rel_generation:
- *   Return the current rotation epoch for relid from the shmem cache.
- *   Returns 1 for the first (unrotated) generation, higher values after
- *   key rotations.  Returns 0 for InvalidOid (backup path, v2 wire format).
- *   Safe to call from any backend; acquires LW_SHARED briefly.
- */
-uint64 pg_vault_tde_catalog_get_rel_generation(Oid relid);
 
 bool pg_vault_tde_catalog_rewrap_all(void);
 

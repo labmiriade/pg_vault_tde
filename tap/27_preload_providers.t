@@ -35,7 +35,8 @@ my ($module) = grep { $_ && -e $_ } (
 plan skip_all => 'neither VAULT_ADDR nor SoftHSM2 available'
     unless $vault_addr || $module;
 
-plan tests => ($vault_addr ? 3 : 0) + ($module ? 3 : 0);
+# Each half reports its 3 results whether it runs or skips.
+plan tests => 6;
 
 # Create NREL tables, restart, and return the log written after the restart.
 sub preload_and_capture

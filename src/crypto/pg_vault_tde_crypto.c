@@ -237,7 +237,7 @@ tde_compute_aad(Oid relid, uint64 generation, unsigned char aad[TDE_V4_AAD_LEN])
  */
 
 static char* 
-tde_gcm_encrypt_core(const unsigned char* dek, int dek_len, Oid relid,
+tde_gcm_encrypt_core(const unsigned char* dek, int dek_len, uint64 gen, Oid relid,
                                  const char* plaintext, Size plaintext_len, Size *out_len)
 {
     EVP_CIPHER_CTX* ctx;
@@ -250,7 +250,6 @@ tde_gcm_encrypt_core(const unsigned char* dek, int dek_len, Oid relid,
     int             olen = 0;
     int             flen = 0;
     Size            total;
-    uint64          gen;
 
     Assert(plaintext != NULL);
     Assert(out_len != NULL);
@@ -270,7 +269,6 @@ tde_gcm_encrypt_core(const unsigned char* dek, int dek_len, Oid relid,
 
     version_ptr[0] = TDE_V4_VERSION_BYTE;
 
-    gen = pg_vault_tde_catalog_get_rel_generation(relid);
     memcpy(gen_ptr, &gen, TDE_V4_GEN_LEN);
 
 
@@ -346,17 +344,19 @@ tde_gcm_encrypt(Oid relid, const char *plaintext, Size plaintext_len, Size *out_
 {
 
     unsigned char   dek[TDE_DEK_LEN];
+    uint64          gen;
     char*           encrypted;
     Size            enc_len;
 
     Assert(plaintext != NULL);
     Assert(out_len != NULL);
 
-    if (!pg_vault_tde_kms_get_rel_dek(relid, (unsigned char *) dek, TDE_DEK_LEN))
+    /* One call: a DEK and a generation read apart can straddle a rotation. */
+    if (!pg_vault_tde_kms_get_rel_dek_gen(relid, dek, TDE_DEK_LEN, &gen))
         ereport(ERROR,
                 (errmsg("[CRYPTO] DEK unavailable for relid=%u; cannot encrypt data", relid)));
 
-    if(!(encrypted = tde_gcm_encrypt_core(dek, TDE_DEK_LEN, relid, 
+    if(!(encrypted = tde_gcm_encrypt_core(dek, TDE_DEK_LEN, gen, relid, 
                             plaintext, plaintext_len, &enc_len)))
     {
         OPENSSL_cleanse(dek, TDE_DEK_LEN);
@@ -402,7 +402,6 @@ tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len,
                         flen = 0;
     int                 auth_ok;
     uint64              stored_gen;
-    uint64              current_gen;
 
     Assert(ciphertext != NULL);
     Assert(out_len != NULL);
@@ -428,49 +427,11 @@ tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len,
     if ((unsigned char) version_ptr[0] != TDE_V4_VERSION_BYTE)
         return false;
 
-    {
+    memcpy(&stored_gen, gen_ptr, TDE_V4_GEN_LEN);
 
-        TdeRelDekMap cache_entry;
-        Oid dek_relid = resolve_effective_relid(relid);
-        bool    found = false;
-
-        memcpy(&stored_gen, gen_ptr, TDE_V4_GEN_LEN);
-
-        if(!tde_catalog_cache_entry(dek_relid, &cache_entry))
-        {   
-            current_gen = pg_vault_tde_catalog_get_rel_generation(dek_relid);
-                
-            if(stored_gen == current_gen)
-            {
-                found = pg_vault_tde_kms_get_rel_dek(dek_relid, (unsigned char *) dek, TDE_DEK_LEN);
-            } 
-            else if(stored_gen == current_gen - 1)
-            {
-                found = pg_vault_tde_kms_get_rel_prev_dek(dek_relid, (unsigned char *) dek, TDE_DEK_LEN);
-            }
-        }
-        else
-        {
-            current_gen = cache_entry.generation;
-
-            if(stored_gen == current_gen && cache_entry.dek_valid)
-            {
-                memcpy(dek, cache_entry.dek, TDE_DEK_LEN);
-                found = true;
-            }
-            else if(stored_gen == current_gen - 1 && cache_entry.prev_dek_valid)
-            {
-                memcpy(dek, cache_entry.prev_dek, TDE_DEK_LEN);
-                found = true;
-            }
-        }
-
-        OPENSSL_cleanse(&cache_entry, sizeof(TdeRelDekMap));
-
-        if(!found)
-            return false;
-
-    }
+    if (!pg_vault_tde_kms_get_rel_dek_for_gen(relid, stored_gen,
+                                              (unsigned char *) dek, TDE_DEK_LEN))
+        return false;
 
     /* Cache key is stored_gen: the generation of the DEK loaded above. */
     if (!tde_crypto_ctx_init())

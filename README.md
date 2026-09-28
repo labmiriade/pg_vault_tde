@@ -46,8 +46,11 @@ packaged (OS, PG) combinations and what CI exercises on each in the
 > reading [Upgrading to 1.7.1](#upgrading-to-171). Tables holding out-of-line
 > TOAST values must be dumped *before* the new binary is installed.
 >
-> **Upgrading from 1.7.1?** Nothing has to be done before installing 1.7.2, but
-> existing encrypted tables need one `VACUUM FULL` afterwards — see
+> **Upgrading from 1.7.1?** If `pg_vault_tde_rotate_online()` has run since the
+> last restart on a table that was being read or written, copy that table out
+> *before* restarting — see [`rotate_online()` with concurrent access](#rotate_online-with-concurrent-access).
+> Otherwise nothing has to be done before installing 1.7.2, but existing
+> encrypted tables need one `VACUUM FULL` afterwards — see
 > [Upgrading to 1.7.2](#upgrading-to-172). Rows stay readable either way; until
 > they are rewritten, `UPDATE` on some of them can take the backend down.
 
@@ -602,7 +605,7 @@ DEK access via `pg_vault_tde_kms_get_rel_dek(relid)`:
 
 ### Key Rotation
 
-**Per-table DEK rotation** (re-encrypts all tuples with a new DEK, no exclusive lock):
+**Per-table DEK rotation** (re-encrypts all tuples with a new DEK; reads continue, writes wait until it finishes):
 
 ```sql
 SELECT pg_vault_tde_rotate_online('mytable', 1000);
@@ -614,13 +617,19 @@ SELECT * FROM pg_vault_tde_rotation_status('mytable');
 
 | Target | What happens |
 |--------|-------------|
-| `encrypted_heap` table | Generates a new table DEK, re-encrypts every tuple in-place (`RowExclusiveLock`), then rebuilds any `tde_btree` indexes on the table so their SIV ciphertexts match the new DEK. Standard `btree` indexes on encrypted columns need no rebuild. |
-| `tde_btree` index | Generates a new index DEK, then calls `reindex_index` (`AccessExclusiveLock` on the index only) to rebuild the index with keys encrypted under the new DEK. The parent table's DEK and heap data are untouched. Passing a non-`tde_btree` index raises an error before touching shmem or the catalog. |
+| `encrypted_heap` table | Generates a new table DEK, re-encrypts every tuple in-place in one transaction (`ShareRowExclusiveLock` on the table: `SELECT` continues, writes and a second rotation wait), then rebuilds any `tde_btree` indexes on the table so their SIV ciphertexts match the new DEK. Standard `btree` indexes on encrypted columns need no rebuild. |
+| `tde_btree` index | Generates a new index DEK, then calls `reindex_index` (`AccessExclusiveLock` on the index, `ShareRowExclusiveLock` on its table) to rebuild the index with keys encrypted under the new DEK. The parent table's DEK and heap data are untouched. Passing a non-`tde_btree` index raises an error before touching shmem or the catalog. |
 
 When a table with `tde_btree` indexes is rotated, the index rebuild uses the new table DEK
 implicitly because the heap rows the scan reads are re-encrypted first; the index keys
 are then produced from the decrypted values and re-encrypted under the (unchanged) index DEK.
 To also rotate the index DEK, call `rotate_online` on the index relation directly afterwards.
+
+> **Logical replication:** a rotation reaches subscribers as one `UPDATE` per row, and a
+> logical slot must decode past it before the publisher restarts or the same table is
+> rotated again — the previous DEK lives only in shared memory until then. A slot that
+> falls behind that point stops with `pg_vault_tde: decryption failed`, and so does every
+> other slot of the database. Check `confirmed_flush_lsn` in `pg_replication_slots`.
 
 **KEK rotation** (re-wraps all per-table DEKs under a new KEK — tuple data untouched):
 
@@ -810,7 +819,7 @@ log stream without any extension-level configuration.
 | `pg_vault_tde_verify_integrity(regclass)` | record | GCM tag audit scan of all tuples — returns `(total_tuples, failed_tuples)` |
 | `pg_vault_tde_encrypted_size(regclass)` | record | Encryption storage overhead — returns `(total_tuples, encryption_overhead_bytes)` |
 | `pg_vault_tde_reencrypt_table(regclass, int)` | void | Batch re-encrypt with current DEK (locks table); `int` = batch size, default 1000 |
-| `pg_vault_tde_rotate_online(regclass, int)` | void | BGW-based online rotation, no exclusive lock; accepts both `encrypted_heap` tables and `tde_btree` indexes **(v1.5)** |
+| `pg_vault_tde_rotate_online(regclass, int)` | void | BGW-based online rotation: reads continue, writes wait until it commits; accepts both `encrypted_heap` tables and `tde_btree` indexes **(v1.5)** |
 | `pg_vault_tde_get_rotation_status(regclass)` | table | Online rotation progress for one relation (status, tuples_done/total, pct_complete, timestamps) **(v1.5)** |
 | `pg_vault_tde_rotation_status` | view | All in-progress/completed rotations across the cluster; readable by `pg_monitor` **(v1.5)** |
 | `pg_vault_tde_check_plaintext_index_keys()` | table | Meant to list `tde_btree` indexes on a plaintext-key operator class. **Known defect: returns no rows in 1.7.x**, and its `REINDEX` suggestion would not change the operator class. Use the query in [Upgrading to 1.7.2](#upgrading-to-172) instead; replaced in 1.8. `pg_monitor`/superuser only |
@@ -1116,6 +1125,24 @@ Nothing on disk changes. What you may notice:
 
 ---
 
+### `rotate_online()` with concurrent access
+
+Up to 1.7.1, a `pg_vault_tde_rotate_online()` that ran while its table was read or
+written could leave rows encrypted under a key that existed only in shared memory: some
+became unreadable at once, the rest at the next restart. A single `SELECT` during the
+rotation was enough to lose the whole table at the restart, and
+`pg_vault_tde_verify_integrity()` reports nothing wrong until then (PSQLE-184).
+
+**Before the restart that installs 1.7.2:** if `rotate_online()` has run since the last
+restart on a table that was being read or written, copy that table while the server is
+still up (`CREATE TABLE … AS SELECT …` or `pg_dump`). The restart discards the only copy
+of the key; after it, only a backup brings the rows back.
+
+What changes in 1.7.2: `SELECT` keeps working during a rotation, while `INSERT`,
+`UPDATE`, `DELETE`, `COPY` and a second rotation of the same table wait for it to
+commit. The whole table is re-encrypted in one transaction, so on a large table treat a
+rotation as a window with no writes.
+
 ## Compatibility
 
 | Feature | Status | Notes |
@@ -1207,10 +1234,10 @@ make ci-matrix           # regress + TAP on the other supported PG majors (17, 1
 make ci-scan-build       # Clang static analyzer over the sources (compile only, ~1 min)
 make ci-ubsan            # Extension built with -fsanitize=undefined
 make ci-valgrind         # Valgrind memcheck over the full TDE workload (slow: 10-50x)
-make ci-cassert          # PostgreSQL built --enable-cassert -DUSE_VALGRIND (builds PG from source)
+make ci-cassert          # SQL suites + TAP files on PostgreSQL built --enable-cassert -DUSE_VALGRIND (builds PG from source)
 make ci-wallet           # SQL regression tests (local wallet provider)
 make ci-checksums        # regression tests + page checksum compatibility
-make ci-tap              # 28 TAP test files (starts a real Vault container for the Vault-dependent ones)
+make ci-tap              # 29 TAP test files (starts a real Vault container for the Vault-dependent ones)
 make ci-isolation        # 2 isolation specs: DEK rotation under load, relation rewrite under a concurrent reader
 make ci-vault            # Vault integration (Compose-based)
 make ci-openbao          # OpenBao Raft 3-node HA integration (12 tests)
@@ -1222,7 +1249,7 @@ make ci-bench BENCH_ROWS=100000  # with custom row count
 make ci-clean            # Remove test containers and images
 ```
 
-Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 306 assertions across 28 TAP files. Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
+Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 423 assertions across 29 TAP files. Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
 - Tests 1-4: extension loaded, access methods and SQL functions registered, wallet unlock
 - Tests 12-14: TAM INSERT/SELECT/UPDATE end-to-end
 - Test 15: DELETE
@@ -1317,7 +1344,7 @@ Deep-checking stages — four tools, four different bug classes. `run-all.sh --s
 | `ci-valgrind` | memory ownership: invalid/double `free()` of malloc'd state, out-of-bounds, uninitialised reads | 10-50x runtime |
 | `ci-cassert` | `Assert()` calls that run nowhere else, plus `MEMORY_CONTEXT_CHECKING` — the only stage that catches a double `pfree()` of a palloc chunk | builds PostgreSQL from source |
 
-`ci-cassert` is the one worth the wall-clock. `--enable-cassert` executes the `Assert()` calls this codebase is full of — none of which run in any packaged build — and turns on `MEMORY_CONTEXT_CHECKING`, which poisons freed chunks and validates the header on every `pfree()`. A double free in a `PG_CATCH` handler becomes a loud failure instead of a silent no-op that the aborting transaction covers up moments later. Neither flag exists in a PGDG or Debian package, which is why the image builds the server from source.
+`ci-cassert` is the one worth the wall-clock. `--enable-cassert` executes the `Assert()` calls this codebase is full of — none of which run in any packaged build — and turns on `MEMORY_CONTEXT_CHECKING`, which poisons freed chunks and validates the header on every `pfree()`. A double free in a `PG_CATCH` handler becomes a loud failure instead of a silent no-op that the aborting transaction covers up moments later. Neither flag exists in a PGDG or Debian package, which is why the image builds the server from source. The stage runs the four regression files, the error-path suite and the `tap/` files (the Vault ones skip): the TAP scenarios reach paths no SQL file does — a failed rotation, a restart between two statements — and a failed rotation crashed the worker on this build until the TAP files ran here.
 
 `ci-ubsan` uses the `TDE_SANITIZE` Makefile knob (`make TDE_SANITIZE=undefined`), which instruments only our objects — the server binary stays stock, so no PostgreSQL rebuild is needed.
 

@@ -17,7 +17,7 @@
  * AES-256-SIV key encryption for B-Tree index entries.
  * Callers MUST OPENSSL_cleanse + pfree the returned buffers after use.
  */
-char *tde_iam_encrypt_key(Oid idx_oid, const char* dek, int dek_len,
+char *tde_iam_encrypt_key(Oid idx_oid, const char* dek, int dek_len, uint64 gen,
                           const char *plaintext, Size plaintext_len, Size *out_len);
 
 /*

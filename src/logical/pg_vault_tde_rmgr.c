@@ -485,7 +485,8 @@ tde_toast_stitch(Relation relation, ReorderBufferChange *change,
          *
          * DO NOT remove the copy-back in favour of a pointer swap: it is the fix
          * for an intermittent walsender crash under streaming (multiple TOAST
-         * txns in a burst).  See doc/logical_decoding_research.md.
+         * txns in a burst).  See doc/logical_decoding_research.md.  The
+         * output plugin puts the original t_len back after pgoutput has run.
          */
         MemoryContextSwitchTo(oldcxt);
         tmphtup = heap_form_tuple(desc, attrs, isnull);

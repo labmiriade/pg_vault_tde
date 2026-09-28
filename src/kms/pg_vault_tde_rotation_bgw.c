@@ -42,6 +42,7 @@
 #include "miscadmin.h"
 #include "postmaster/bgworker.h"
 #include "storage/ipc.h"
+#include "storage/lmgr.h"          /* LockRelationOid */
 #include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "tcop/tcopprot.h"           /* die */
@@ -357,14 +358,20 @@ pg_vault_tde_rotation_bgw_main(Datum main_arg)
      * (pg_vault_tde_tuple_update), which decrypts the old row, re-encrypts
      * it with the current DEK, and writes a new heap version. 
      *
-     * RowExclusiveLock is compatible with concurrent reads, inserts, updates,
-     * and deletes — only DDL (AccessExclusiveLock) will wait.
+     * Reads go on while it runs; writes wait.  ShareRowExclusiveLock on the
+     * heap keeps out every writer (INSERT/UPDATE/DELETE/COPY take
+     * RowExclusiveLock) and any second rotation of the same table, and lets
+     * SELECT through.  A write that ran during the rotation would be
+     * encrypted with the outgoing key and left out of the re-encryption,
+     * with nothing on disk to decrypt it after a restart (PSQLE-184).
      *
      * --------------------------------------------------------------------- */
     {
+        bool    is_index;
+        Oid     heap_relid;
+
         SetCurrentStatementStartTimestamp();
         StartTransactionCommand();
-        PushActiveSnapshot(GetTransactionSnapshot());
 
         if (get_rel_name(args.relid) == NULL)
             ereport(ERROR,
@@ -373,10 +380,10 @@ pg_vault_tde_rotation_bgw_main(Datum main_arg)
                             "pg_vault_tde_rotate_online()",
                             args.relid)));
 
-        if (get_rel_relkind(args.relid) == RELKIND_INDEX)
+        is_index = (get_rel_relkind(args.relid) == RELKIND_INDEX);
+        if (is_index)
         {
-            Oid             tde_btree_amoid = get_index_am_oid("tde_btree", true);
-            ReindexParams   reindex_params  = {0};
+            Oid tde_btree_amoid = get_index_am_oid("tde_btree", true);
 
             /* Only tde_btree indexes have a DEK entry — validate before touching shmem. */
             if (!OidIsValid(tde_btree_amoid) ||
@@ -386,6 +393,20 @@ pg_vault_tde_rotation_bgw_main(Datum main_arg)
                          errmsg("pg_vault_tde_rotate_online: index %u is not a "
                                 "tde_btree index — only tde_btree indexes "
                                 "have DEK entries", args.relid)));
+        }
+        heap_relid = is_index ? IndexGetRelation(args.relid, false) : args.relid;
+
+        /*
+         * The snapshot is taken AFTER the lock: the lock waits for the writers
+         * already in flight, and a snapshot taken before it would not see the
+         * rows they commit, which then stay under the outgoing key.
+         */
+        LockRelationOid(heap_relid, ShareRowExclusiveLock);
+        PushActiveSnapshot(GetTransactionSnapshot());
+
+        if (is_index)
+        {
+            ReindexParams   reindex_params  = {0};
 
             pg_vault_tde_catalog_zero_rel_dek(args.relid);
             pg_vault_tde_catalog_update_rel_dek(args.relid);
@@ -399,8 +420,8 @@ pg_vault_tde_rotation_bgw_main(Datum main_arg)
         {
             pg_vault_tde_catalog_zero_rel_dek(args.relid);
             pg_vault_tde_catalog_update_rel_dek(args.relid);
-            /* CommandCounterIncrement makes the new catalog row visible to kms_get_rel_dek's
-             * slow path — without it, reencrypt_table re-encrypts with the old DEK. */
+            /* The re-encryption takes its keys from the rotation, not the catalog;
+             * the increment only makes the new row visible to the rest of it. */
             CommandCounterIncrement();
 
             tuples_done = pg_vault_tde_reencrypt_table(args.relid);
@@ -428,7 +449,16 @@ pg_vault_tde_rotation_bgw_main(Datum main_arg)
     } /* end PG_TRY body */
     PG_CATCH();
     {
-        ErrorData *edata = CopyErrorData();
+        ErrorData *edata;
+
+        /*
+         * The longjmp leaves CurrentMemoryContext in ErrorContext, which
+         * CopyErrorData() refuses (an Assert on a cassert build) and which
+         * FlushErrorState() empties right after; the transaction's contexts
+         * go with the abort.  The copy has to outlive both.
+         */
+        MemoryContextSwitchTo(TopMemoryContext);
+        edata = CopyErrorData();
 
         FlushErrorState();
         AbortCurrentTransaction();
