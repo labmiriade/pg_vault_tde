@@ -30,21 +30,26 @@ SELECT * FROM pg_vault_tde_rotation_status;   -- view, readable by pg_monitor
 
 | Target | What happens |
 |---|---|
-| `encrypted_heap` table | Generates a new table DEK, re-encrypts every tuple in place (`RowExclusiveLock`), then rebuilds any `tde_btree` indexes on the table so their AES-SIV ciphertexts match the new DEK. Plain `btree` indexes on encrypted columns need no rebuild. |
-| `tde_btree` index | Generates a new **index** DEK, then rebuilds the index (`AccessExclusiveLock` on the index only, not the table) with keys encrypted under the new DEK. The parent table's DEK and heap data are untouched. Passing a non-`tde_btree` index raises an error before touching shared memory or the catalog. |
+| `encrypted_heap` table | Generates a new table DEK, re-encrypts every tuple in place in one transaction (`ShareRowExclusiveLock` on the table: `SELECT` continues, writes wait), then rebuilds any `tde_btree` indexes on the table so their AES-SIV ciphertexts match the new DEK. Plain `btree` indexes on encrypted columns need no rebuild. |
+| `tde_btree` index | Generates a new **index** DEK, then rebuilds the index (`AccessExclusiveLock` on the index, `ShareRowExclusiveLock` on its table) with keys encrypted under the new DEK. The parent table's DEK and heap data are untouched. Passing a non-`tde_btree` index raises an error before touching shared memory or the catalog. |
 
-Mechanically, rotation works by **generation epoch**, not a blocking
-in-place key swap:
+Mechanically, rotation works by **generation epoch**. Every ciphertext
+carries the generation of the key that wrote it:
 
-1. The current DEK is promoted to `prev_dek` and the shared-memory copy of
-   the live DEK is wiped; the per-relation generation counter is
-   incremented.
-2. Each backend detects the generation mismatch lazily, on its next
-   encrypt/decrypt call for that relation — no signal or broadcast is
-   needed.
-3. Rows still encrypted under the previous generation remain readable via
-   `prev_dek` throughout the rotation window.
-4. Once `rotate_online` finishes re-encrypting every row, the window closes.
+1. The rotation locks the table against writes (`SELECT` continues), then
+   takes its snapshot, so every row committed before it started is included.
+2. The current DEK moves to `prev_dek`, and the new DEK stays in the
+   rotation worker's own memory. The worker re-encrypts every row with it,
+   in one transaction.
+3. Every other session keeps reading with the outgoing DEK, which is what
+   the catalog shows them until the rotation commits.
+4. At commit the shared cache switches to the new DEK before the lock is
+   released, so the writers waiting on it resume with the new key. If the
+   rotation fails, the outgoing DEK stays current.
+
+> Up to 1.7.1 a rotation of a table that was being read or written could
+> make it unreadable after the next restart. See *`rotate_online()` with
+> concurrent access* in the README before restarting to install 1.7.2.
 
 If a table has `tde_btree` indexes, rotating the table implicitly produces
 correct index entries under the new table DEK (the index rebuild reads the

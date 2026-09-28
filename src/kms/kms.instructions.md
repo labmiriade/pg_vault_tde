@@ -464,6 +464,7 @@ typedef struct TdeRelDekMap {
     uint64       generation;             /* rotation epoch for this relation */
     bool         dek_valid;              /* true iff dek[] holds a live key */
     bool         prev_dek_valid;         /* true iff prev_dek[] is populated */
+    bool         rotating;               /* an online rotation owns the entry */
 } TdeRelDekMap;
 ```
 
@@ -503,15 +504,15 @@ fourteen call sites can.
 memory rolls back with nothing.  Two rules keep them from diverging:
 
 1. **Write it only alongside the DEK it describes.**  `tde_rel_dek_cache_store()`
-   sets `dek[]` and `generation` from the same catalog read — including the
-   refill branch that reopens a rotation window.  Nothing else advances it.
-   In particular `pg_vault_tde_catalog_zero_rel_dek()` deliberately does *not*
-   bump it: that bump is `pg_vault_tde_catalog_update_rel_dek()`'s job, and it
-   is transactional.
-2. **Read it only while `dek_valid` is true.**  An entry with `dek_valid = false`
-   is mid-rotation, the one window where shared memory and the catalog can
-   disagree; `pg_vault_tde_catalog_get_rel_generation()` reads through to the
-   catalog there.
+   sets `dek[]` and `generation` from the same catalog read.  The only other
+   writers are a rotation's `pg_vault_tde_catalog_zero_rel_dek()`, which keeps
+   the *outgoing* key's generation, and its commit/abort callback.  The bump to
+   N+1 is `pg_vault_tde_catalog_update_rel_dek()`'s job, and it is
+   transactional.
+2. **Read DEK and generation in one call.**  `pg_vault_tde_kms_get_rel_dek_gen()`
+   to encrypt, `pg_vault_tde_kms_get_rel_dek_for_gen()` to decrypt the
+   generation a ciphertext carries.  Two calls can straddle a rotation and tag
+   a ciphertext with a generation its key does not have.
 
 Breaking either rule reproduces the PSQLE-158 failure: an aborted rotation
 strands shared memory at N+1 while the catalog is back at N, rows written
@@ -519,6 +520,33 @@ afterwards are tagged N+1 but encrypted under DEK N, and the next rotation
 moves to N+2 where the oldest rows match neither `generation` nor
 `generation - 1` — they stop decrypting.  Regression:
 `tap/23_rotation_generation_drift.t`.
+
+### An online rotation owns its cache entry
+
+`pg_vault_tde_rotate_online()` demotes the shared entry and rewrites the
+catalog row in the worker's transaction, which nobody else sees until it
+commits.  Up to 1.7.1 any backend touching the table in between — a `SELECT`
+was enough — reloaded the cache from the catalog *its* snapshot showed and put
+the outgoing DEK back as current; the worker then re-encrypted the whole table
+with it, and that key existed only in shared memory.  All 1,000 rows of 1,000
+were gone at the next restart (PSQLE-184).  The rules now:
+
+1. **The worker locks writers out first.**  `ShareRowExclusiveLock` on the
+   heap, then the snapshot — in that order, or the rows of the writers it
+   waited for are left out of the re-encryption.
+2. **The worker's keys never enter shared memory.**  `TdeRotationState` in
+   `pg_vault_tde_catalog.c` holds the outgoing and the new DEK; both accessors
+   answer the worker from it before looking at the cache.
+3. **Nothing installs a current key while `rotating` is set.**
+   `tde_rel_dek_cache_store()` returns without storing; everyone else gets the
+   outgoing key from `prev_dek[]` under the entry's unchanged `generation`.
+4. **The switch happens in `tde_rotation_xact_callback()`.**  `XACT_EVENT_COMMIT`
+   runs after the commit is visible and before locks are released, so the
+   queued writers wake up to the new key; `XACT_EVENT_ABORT` restores the old
+   one.  The callback must not raise an error.
+
+Regression: `tap/29_rotate_online_concurrent_access.t` (a row lock on
+`pg_vault_tde_catalog` holds the worker inside the window).
 
 ### Evicting many entries is per-database
 

@@ -3,14 +3,17 @@
 
 use strict;
 use warnings;
-use Test::More tests => 9;
+use Test::More;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use IPC::Run qw(run);
 END { system('/bin/sh', '-c', 'rm -rf /var/lib/pg_vault_tde/*') }
 
+# Plan after the check: planning twice dies, which is what a missing VAULT_ADDR
+# used to produce instead of a skip.
 my $vault_addr = $ENV{VAULT_ADDR}
     or plan skip_all => 'VAULT_ADDR not set — skipping Vault integration test';
+plan tests => 9;
 
 my $node = PostgreSQL::Test::Cluster->new('test_cluster');
 $node->init;

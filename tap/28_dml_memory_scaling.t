@@ -267,7 +267,11 @@ my @workloads = (
             "CREATE TABLE $t (k int4, pad text)" . amend($m),
             "INSERT INTO $t SELECT g, 'xxxxxxxxxxxxxxxxxxxx' FROM generate_series(1,$R) g",
         ) },
-        run   => sub { my $t = shift; "SELECT sum(length(pad)) FROM $t;" } },
+        # repeat() only makes each row slower, on both sides alike: a plain
+        # scan of $R short rows could end before the first sample landed.
+        # Its allocations go to the per-tuple ExprContext, not to the
+        # ExecutorState being measured.
+        run   => sub { my $t = shift; "SELECT sum(length(repeat(pad, 50))) FROM $t;" } },
 
     {   name  => 'Nested loop, one index rescan per outer row',
         setup => sub { my ($t, $m) = @_; (

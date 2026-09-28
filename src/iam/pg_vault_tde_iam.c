@@ -128,13 +128,14 @@ tde_iam_ctx_cleanup(void)
  * message.  enc: 1 = encrypt, 0 = decrypt.  Raises ERROR on failure.
  *
  * On (idx_oid, generation) change the SIV key is re-derived from `dek` and the
- * cipher + key installed; otherwise only the cached key is re-armed.
+ * cipher + key installed; otherwise only the cached key is re-armed.  gen must
+ * be the generation OF dek, read with it (pg_vault_tde_kms_get_rel_dek_gen):
+ * the cached key is looked up by it.
  */
 static EVP_CIPHER_CTX *
 tde_iam_ctx_prepare(TdeCipherSlot *slot, Oid idx_oid,
-                    const unsigned char *dek, int dek_len, int enc)
+                    const unsigned char *dek, int dek_len, uint64 gen, int enc)
 {
-    uint64 gen = pg_vault_tde_catalog_get_rel_generation(idx_oid);
 
     /* Allocate once per backend in TopMemoryContext (survives per-tuple resets). */
     if (slot->ctx == NULL)
@@ -216,7 +217,7 @@ tde_iam_ctx_prepare(TdeCipherSlot *slot, Oid idx_oid,
  * Side effects: reads DEK from shared-memory KMS cache under shared LWLock.
  */
 char *
-tde_iam_encrypt_key(Oid idx_oid, const char* dek, int dek_len,
+tde_iam_encrypt_key(Oid idx_oid, const char* dek, int dek_len, uint64 gen,
                     const char *plaintext, Size plaintext_len, Size *out_len)
 {
     EVP_CIPHER_CTX *ctx;
@@ -228,7 +229,7 @@ tde_iam_encrypt_key(Oid idx_oid, const char* dek, int dek_len,
     Assert(out_len != NULL);
 
     out_buf = (char *) palloc0(plaintext_len + TDE_SIV_OVERHEAD);
-    ctx = tde_iam_ctx_prepare(&idx_enc, idx_oid, (const unsigned char *) dek, dek_len, 1);
+    ctx = tde_iam_ctx_prepare(&idx_enc, idx_oid, (const unsigned char *) dek, dek_len, gen, 1);
 
     /*
      * AES-256-SIV: no IV (synthetic IV derived internally).  The 16-byte SIV
@@ -476,6 +477,7 @@ tde_iam_encrypt_fixed_type_datum(Relation index_rel, Datum datum, Oid typoid)
     bytea  *enc_bytea  = NULL;
 
     unsigned char dek[TDE_DEK_LEN];
+    uint64        gen;
 
     plain_len = tde_iam_serialize_fixed_type(datum, typoid, plain_buf);
 
@@ -487,7 +489,7 @@ tde_iam_encrypt_fixed_type_datum(Relation index_rel, Datum datum, Oid typoid)
         return datum;
     }
 
-    if(!pg_vault_tde_kms_get_rel_dek(RelationGetRelid(index_rel), dek, sizeof(dek)))
+    if(!pg_vault_tde_kms_get_rel_dek_gen(RelationGetRelid(index_rel), dek, sizeof(dek), &gen))
     {
         ereport(ERROR, 
                 (errmsg("[IAM] tde_iam_encrypt_fixed_type_datum: "
@@ -501,7 +503,7 @@ tde_iam_encrypt_fixed_type_datum(Relation index_rel, Datum datum, Oid typoid)
     PG_TRY();
     {
         encrypted = tde_iam_encrypt_key(RelationGetRelid(index_rel),
-                                        (const char *) dek, sizeof(dek),
+                                        (const char *) dek, sizeof(dek), gen,
                                         (const char *) plain_buf, plain_len, &enc_len);
         OPENSSL_cleanse(plain_buf, sizeof(plain_buf));
 
@@ -605,6 +607,7 @@ tde_iam_encrypt_index_datum(Relation index_rel, Datum datum, bool typbyval, int1
         char       *encrypted;
         bytea      *enc_bytea  = NULL;
         unsigned char dek[TDE_DEK_LEN];
+        uint64        gen;
 
         if (typlen == -1)
         {
@@ -625,7 +628,7 @@ tde_iam_encrypt_index_datum(Relation index_rel, Datum datum, bool typbyval, int1
             plen  = strlen(plain) + 1;   /* include null terminator */
         }   
 
-        if(!pg_vault_tde_kms_get_rel_dek(RelationGetRelid(index_rel), dek, sizeof(dek)))
+        if(!pg_vault_tde_kms_get_rel_dek_gen(RelationGetRelid(index_rel), dek, sizeof(dek), &gen))
         {
             ereport(ERROR, 
                     errmsg("[IAM] tde_iam_encrypt_index_datum: "
@@ -638,7 +641,7 @@ tde_iam_encrypt_index_datum(Relation index_rel, Datum datum, bool typbyval, int1
         PG_TRY();
         {
             encrypted = tde_iam_encrypt_key(RelationGetRelid(index_rel),
-                                            (const char *) dek, sizeof(dek),
+                                            (const char *) dek, sizeof(dek), gen,
                                             plain, plen, &enc_len);
 
             enc_bytea = (bytea *) palloc(VARHDRSZ + enc_len);

@@ -24,6 +24,11 @@
 #                      memcheck sees one big malloc'd arena and a use-after-
 #                      pfree looks like a perfectly valid access.
 #
+# --enable-tap-tests installs PostgreSQL's TAP modules (PostgreSQL::Test::*)
+# and needs IPC::Run: the tap/ files run here too, because the rotation worker's
+# error path — and anything else only a TAP scenario reaches — gets no Assert()
+# coverage from the SQL suites.  softhsm2 lets the PKCS#11 halves run.
+#
 # -O1 rather than -O2: assertions plus valgrind annotations are already the
 # slow path, and -O1 keeps stack frames and variable names readable in the
 # reports.  -fno-omit-frame-pointer for the same reason.
@@ -43,6 +48,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libreadline-dev zlib1g-dev libssl-dev libicu-dev libxml2-dev \
         libcurl4-openssl-dev \
         valgrind gdb procps \
+        libipc-run-perl softhsm2 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/src
@@ -57,12 +63,17 @@ RUN ./configure \
         --with-openssl \
         --with-libxml \
         --with-icu \
+        --enable-tap-tests \
         CFLAGS="-DUSE_VALGRIND -O1 -g -fno-omit-frame-pointer" \
     && make -j"$(nproc)" world-bin \
     && make install-world-bin \
     && cd / && rm -rf /usr/src/postgresql-${PG_VERSION}*
 
 # The stock postgres image ships this user; debian:bookworm does not.
+# The client binaries built against this server (pg_dump_tde and friends) carry
+# no rpath to /usr/local/pgsql/lib, where libpq.so.5 lives.
+RUN echo "${PG_PREFIX}/lib" > /etc/ld.so.conf.d/pgsql.conf && ldconfig
+
 RUN useradd -m -s /bin/bash postgres \
     && mkdir -p "${PGDATA}" /var/lib/pg_vault_tde /tmp/valgrind /etc/pg_vault_tde \
     && chown -R postgres:postgres "${PGDATA}" /var/lib/pg_vault_tde /tmp/valgrind \

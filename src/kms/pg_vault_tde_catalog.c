@@ -41,6 +41,7 @@
 #include "fmgr.h"
 #include "access/relation.h"
 #include "access/table.h"
+#include "access/xact.h"        /* RegisterXactCallback */
 #include "miscadmin.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
@@ -93,6 +94,35 @@ static LWLock   *rel_dek_lock   = NULL;
 
 /* Warn once per backend that the cache is full; see tde_rel_dek_cache_store. */
 static bool      cache_full_warned = false;
+
+/*
+ * The online rotation this backend is running, if any — only ever the rotation
+ * worker.  Both keys live here, in process memory.  The new DEK belongs to a
+ * transaction that has not committed, so no other backend may see it; the
+ * outgoing one must not depend on a shared entry that an eviction can drop.
+ * Opened by pg_vault_tde_catalog_zero_rel_dek(), given its new key by
+ * pg_vault_tde_catalog_update_rel_dek(), closed by tde_rotation_xact_callback()
+ * when the transaction ends.
+ */
+typedef struct TdeRotationState
+{
+    bool          active;
+    Oid           relid;                    /* effective relid */
+    unsigned char old_dek[TDE_DEK_LEN];
+    uint64        old_gen;
+    unsigned char new_dek[TDE_DEK_LEN];
+    uint64        new_gen;
+    bool          new_valid;                /* set once the catalog row is written */
+} TdeRotationState;
+
+static TdeRotationState tde_rotation;
+static bool             tde_rotation_callback_registered = false;
+
+static bool
+tde_rotation_owns(Oid effective_relid)
+{
+    return tde_rotation.active && tde_rotation.relid == effective_relid;
+}
 
 /* -------------------------------------------------------------------------
  * tde_rel_dek_key — build the shmem cache key for a relation
@@ -155,29 +185,6 @@ pg_vault_tde_catalog_shmem_request(void)
 
     RequestAddinShmemSpace(tde_rel_dek_cache_size(capacity));
     RequestNamedLWLockTranche(TDE_REL_DEK_MAP_NAME, 1);  /* Lock outside of the map */
-}
-
-bool tde_catalog_cache_entry(Oid relid, TdeRelDekMap* out_entry)
-{
-    TdeRelDekMap    *e = NULL;
-    TdeRelDekMapKey  search_key;
-
-    if (!rel_dek_map)
-        return false;
-
-    tde_rel_dek_key(&search_key, relid);
-
-    LWLockAcquire(rel_dek_lock, LW_SHARED);
-
-    e = (TdeRelDekMap*) hash_search(rel_dek_map, &search_key, HASH_FIND, NULL);
-    if(e && e->dek_valid)
-        memcpy(out_entry, e, sizeof(TdeRelDekMap));
-    else 
-        e = NULL;  
-         
-    LWLockRelease(rel_dek_lock);
-
-    return e != NULL ? true : false;
 }
 
 /* -------------------------------------------------------------------------
@@ -490,6 +497,20 @@ tde_rel_dek_cache_store(Oid relid,
         return false;
     }
 
+    /*
+     * An online rotation owns this entry until its transaction ends.  The
+     * catalog row the caller just read is the one its snapshot sees — the
+     * outgoing key, for every transaction but the rotation's own — and
+     * installing it as current is what let the rotation worker re-encrypt a
+     * whole table with the key it was retiring (PSQLE-184).  The caller already
+     * holds the key it asked for; only the memoisation is skipped.
+     */
+    if(found && stored_slot->rotating)
+    {
+        LWLockRelease(rel_dek_lock);
+        return false;
+    }
+
     if(found && stored_slot->dek_valid)
     {
         LWLockRelease(rel_dek_lock);
@@ -498,7 +519,7 @@ tde_rel_dek_cache_store(Oid relid,
     else if(found && !stored_slot->dek_valid && stored_slot->prev_dek_valid)
     {
         /*
-         * Refilling the rotation window: prev_dek[] stays, dek[] comes back.
+         * An entry that lost dek[] but kept prev_dek[]: prev_dek[] stays, dek[] comes back.
          * generation moves with dek[] — see the invariant on the struct.
          * Leaving it behind is what let a failed rotation strand the entry a
          * generation ahead of the catalog.
@@ -515,6 +536,7 @@ tde_rel_dek_cache_store(Oid relid,
     if(!found)
     {
         stored_slot->prev_dek_valid = false;
+        stored_slot->rotating       = false;
         MemSet(stored_slot->prev_dek, 0, TDE_DEK_LEN);
     }
 
@@ -527,14 +549,101 @@ tde_rel_dek_cache_store(Oid relid,
 }
 
 /* -------------------------------------------------------------------------
- * pg_vault_tde_kms_get_rel_dek — hot-path DEK accessor (v1.5+)
+ * tde_rel_dek_load — the slow path: catalog read + KMS unwrap + memoise
  *
- * Resolves effective OID, checks shmem cache (fast path), on miss fetches
- * from pg_vault_tde_catalog + KMS unwrap, stores via tde_rel_dek_cache_store.
+ * Returns the key and generation the catalog shows this backend, which for a
+ * relation mid-rotation is the outgoing key until the rotation commits, and
+ * the new one right after — the catalog snapshot is never older than the
+ * statement's.  tde_rel_dek_cache_store() declines to memoise mid-rotation.
+ * -------------------------------------------------------------------------*/
+static bool
+tde_rel_dek_load(Oid effective_relid, unsigned char *dek_out, uint64 *gen_out)
+{
+    TdeCatalogRow row;
+    unsigned char dek_temp[TDE_DEK_LEN];
+    bool          unwrap_ok;
+    const TdeKmsProvider *kms;
+
+    /* Guard: catalog absent on fresh install before CREATE EXTENSION. */
+    if (!tde_catalog_read_row(effective_relid, &row))
+    {
+        ereport(WARNING,
+                errmsg("pg_vault_tde: catalog absent — "
+                       "no DEK available for relid=%u", effective_relid));
+        return false;
+    }
+
+    if (!row.found)
+    {
+        ereport(WARNING,
+                errmsg("pg_vault_tde: no catalog entry for relid=%u",
+                       effective_relid));
+        return false;
+    }
+
+    if (row.wrapped_len == 0 || row.generation == 0)
+    {
+        ereport(WARNING,
+                errmsg("pg_vault_tde: wrapped_dek IS NULL for relid=%u",
+                       effective_relid));
+        return false;
+    }
+
+    if (row.wrapped_len > (int) sizeof(row.wrapped_dek))
+    {
+        ereport(WARNING,
+                errmsg("pg_vault_tde: wrapped_dek too large (%d bytes) "
+                       "for relid=%u", row.wrapped_len, effective_relid));
+        return false;
+    }
+
+    kms = tde_kms_provider();
+
+    if (!kms || !kms->unwrap_dek)
+    {
+        ereport(WARNING,
+                errmsg("pg_vault_tde: no active KMS provider for "
+                       "unwrap_dek (relid=%u)", effective_relid));
+        return false;
+    }
+
+    {
+        int dek_temp_len = TDE_DEK_LEN;
+        unwrap_ok = kms->unwrap_dek(
+                        row.wrapped_dek, row.wrapped_len, dek_temp, &dek_temp_len);
+    }
+
+    OPENSSL_cleanse(row.wrapped_dek, sizeof(row.wrapped_dek));
+
+    if (!unwrap_ok)
+    {
+        OPENSSL_cleanse(dek_temp, TDE_DEK_LEN);
+        tde_audit(ACCESS_DENIED, psprintf("%u", effective_relid), false);
+        return false;
+    }
+
+    tde_audit(KMS_DEK_ACCESS, psprintf("%u", effective_relid), true);
+
+    memcpy(dek_out, dek_temp, TDE_DEK_LEN);
+    *gen_out = row.generation;
+
+    /* Store the DEK for next calls */
+    tde_rel_dek_cache_store(effective_relid, dek_temp, row.generation);
+    
+    OPENSSL_cleanse(dek_temp, TDE_DEK_LEN);
+    return true;
+}
+
+/* -------------------------------------------------------------------------
+ * pg_vault_tde_kms_get_rel_dek_gen — hot-path DEK accessor (v1.5+)
+ *
+ * The key to encrypt with and its generation, read together.  Resolves the
+ * effective OID, checks the shmem cache (fast path), on a miss fetches from
+ * pg_vault_tde_catalog + KMS unwrap and stores via tde_rel_dek_cache_store.
  * -------------------------------------------------------------------------*/
 bool
-pg_vault_tde_kms_get_rel_dek(Oid relid,
-                               unsigned char *dek_out, int dek_len)
+pg_vault_tde_kms_get_rel_dek_gen(Oid relid, unsigned char *dek_out,
+                                 int dek_len, uint64 *gen_out)
 {
     bool             found = false;
     Oid              effective_relid;
@@ -543,8 +652,26 @@ pg_vault_tde_kms_get_rel_dek(Oid relid,
 
     Assert(dek_out != NULL);
     Assert(dek_len == TDE_DEK_LEN);
+    Assert(gen_out != NULL);
 
     effective_relid = resolve_effective_relid(relid);
+
+    /* The rotating worker writes with the key it is rotating to. */
+    if (tde_rotation_owns(effective_relid))
+    {
+        if (tde_rotation.new_valid)
+        {
+            memcpy(dek_out, tde_rotation.new_dek, TDE_DEK_LEN);
+            *gen_out = tde_rotation.new_gen;
+        }
+        else
+        {
+            memcpy(dek_out, tde_rotation.old_dek, TDE_DEK_LEN);
+            *gen_out = tde_rotation.old_gen;
+        }
+        return true;
+    }
+
     tde_rel_dek_key(&search_key, effective_relid);
 
     /* ---- Fast path: LW_SHARED cache lookup ---- */
@@ -557,123 +684,107 @@ pg_vault_tde_kms_get_rel_dek(Oid relid,
     if (e && e->dek_valid)
     {
         memcpy(dek_out, e->dek, TDE_DEK_LEN);
+        *gen_out = e->generation;
         found = true;
     }
-    
+    else if (e && e->rotating && e->prev_dek_valid)
+    {
+        /* Mid-rotation the outgoing key is still current for everyone else. */
+        memcpy(dek_out, e->prev_dek, TDE_DEK_LEN);
+        *gen_out = e->generation;
+        found = true;
+    }
+
     LWLockRelease(rel_dek_lock);
 
     if (found)
         return true;
 
-    /* ---- Slow path: catalog scan + KMS unwrap ---- */
-    {
-        TdeCatalogRow row;
-        unsigned char dek_temp[TDE_DEK_LEN];
-        bool          unwrap_ok;
-        const TdeKmsProvider *kms;
+    return tde_rel_dek_load(effective_relid, dek_out, gen_out);
+}
 
-        /* Guard: catalog absent on fresh install before CREATE EXTENSION. */
-        if (!tde_catalog_read_row(effective_relid, &row))
-        {
-            ereport(WARNING,
-                    errmsg("pg_vault_tde: catalog absent — "
-                           "no DEK available for relid=%u", effective_relid));
-            return false;
-        }
+bool
+pg_vault_tde_kms_get_rel_dek(Oid relid, unsigned char *dek_out, int dek_len)
+{
+    uint64 gen;
 
-        if (!row.found)
-        {
-            ereport(WARNING,
-                    errmsg("pg_vault_tde: no catalog entry for relid=%u",
-                           effective_relid));
-            return false;
-        }
-
-        if (row.wrapped_len == 0 || row.generation == 0)
-        {
-            ereport(WARNING,
-                    errmsg("pg_vault_tde: wrapped_dek IS NULL for relid=%u",
-                           effective_relid));
-            return false;
-        }
-
-        if (row.wrapped_len > (int) sizeof(row.wrapped_dek))
-        {
-            ereport(WARNING,
-                    errmsg("pg_vault_tde: wrapped_dek too large (%d bytes) "
-                           "for relid=%u", row.wrapped_len, effective_relid));
-            return false;
-        }
-
-        kms = tde_kms_provider();
-
-        if (!kms || !kms->unwrap_dek)
-        {
-            ereport(WARNING,
-                    errmsg("pg_vault_tde: no active KMS provider for "
-                           "unwrap_dek (relid=%u)", effective_relid));
-            return false;
-        }
-
-        {
-            int dek_temp_len = TDE_DEK_LEN;
-            unwrap_ok = kms->unwrap_dek(
-                            row.wrapped_dek, row.wrapped_len, dek_temp, &dek_temp_len);
-        }
-
-        OPENSSL_cleanse(row.wrapped_dek, sizeof(row.wrapped_dek));
-
-        if (!unwrap_ok)
-        {
-            OPENSSL_cleanse(dek_temp, TDE_DEK_LEN);
-            tde_audit(ACCESS_DENIED, psprintf("%u", effective_relid), false);
-            return false;
-        }
-
-        tde_audit(KMS_DEK_ACCESS, psprintf("%u", effective_relid), true);
-
-        memcpy(dek_out, dek_temp, TDE_DEK_LEN);
-
-        /* Store the DEK for next calls */
-        tde_rel_dek_cache_store(effective_relid, dek_temp, row.generation);
-        
-        OPENSSL_cleanse(dek_temp, TDE_DEK_LEN);
-        return true;
-    }
+    return pg_vault_tde_kms_get_rel_dek_gen(relid, dek_out, dek_len, &gen);
 }
 
 /* -------------------------------------------------------------------------
- * pg_vault_tde_kms_get_rel_prev_dek — fallback DEK during rotation
+ * pg_vault_tde_kms_get_rel_dek_for_gen — the key that decrypts generation gen
+ *
+ * The current DEK, the previous one, or — for the rotating worker only — the
+ * key it is rotating to.  The catalog only ever holds the current key, so a
+ * generation older than the previous one has no key once the cache is gone.
  * -------------------------------------------------------------------------*/
 bool
-pg_vault_tde_kms_get_rel_prev_dek(Oid relid,
-                                   unsigned char *prev_dek_out, int dek_len)
+pg_vault_tde_kms_get_rel_dek_for_gen(Oid relid, uint64 gen,
+                                     unsigned char *dek_out, int dek_len)
 {
     bool             found = false;
     Oid              effective_relid = resolve_effective_relid(relid);
     TdeRelDekMap    *e;
     TdeRelDekMapKey  search_key;
+    uint64           current_gen;
 
-    Assert(prev_dek_out != NULL);
+    Assert(dek_out != NULL);
     Assert(dek_len == TDE_DEK_LEN);
 
-    tde_rel_dek_key(&search_key, effective_relid);
+    if (tde_rotation_owns(effective_relid))
+    {
+        if (tde_rotation.new_valid && gen == tde_rotation.new_gen)
+            memcpy(dek_out, tde_rotation.new_dek, TDE_DEK_LEN);
+        else if (gen == tde_rotation.old_gen)
+            memcpy(dek_out, tde_rotation.old_dek, TDE_DEK_LEN);
+        else
+            return false;
+        return true;
+    }
 
     if (!rel_dek_map)
         return false;
 
+    tde_rel_dek_key(&search_key, effective_relid);
+
     LWLockAcquire(rel_dek_lock, LW_SHARED);
     e = (TdeRelDekMap*) hash_search(rel_dek_map, &search_key, HASH_FIND, NULL);
 
-    if (e && e->prev_dek_valid)
+    if (e && e->dek_valid && gen == e->generation)
     {
-        memcpy(prev_dek_out, e->prev_dek, TDE_DEK_LEN);
+        memcpy(dek_out, e->dek, TDE_DEK_LEN);
         found = true;
     }
-    
+    else if (e && e->dek_valid && e->prev_dek_valid && gen + 1 == e->generation)
+    {
+        memcpy(dek_out, e->prev_dek, TDE_DEK_LEN);
+        found = true;
+    }
+    else if (e && e->rotating && e->prev_dek_valid && gen == e->generation)
+    {
+        memcpy(dek_out, e->prev_dek, TDE_DEK_LEN);
+        found = true;
+    }
+
     LWLockRelease(rel_dek_lock);
 
-    return found; 
+    if (found)
+        return true;
+
+    /*
+     * Miss: the catalog's key serves only its own generation.  Straight to the
+     * catalog, not through get_rel_dek_gen(): mid-rotation that would answer
+     * with the outgoing key, while a reader whose snapshot already sees the
+     * rotation's commit needs the new one for the rows it rewrote.
+     */
+    if (!tde_rel_dek_load(effective_relid, dek_out, &current_gen))
+        return false;
+
+    if (current_gen == gen)
+        return true;
+
+    OPENSSL_cleanse(dek_out, dek_len);
+    return false;
 }
 
 /*
@@ -841,6 +952,7 @@ pg_vault_tde_catalog_update_rel_dek(Oid relid)
     SysScanDesc scan;
     Oid         catalog_idx;
     Oid         catalog_oid;
+    int64       new_gen;
 
     Oid ext_ns = get_extension_schema(get_extension_oid(pg_vault_tde_extension_name, true));
 
@@ -869,6 +981,15 @@ pg_vault_tde_catalog_update_rel_dek(Oid relid)
         ereport(ERROR,
                 errmsg("pg_vault_tde: wrap_dek failed for relid=%u", relid));
     }
+
+    /*
+     * The new key goes to the rotation, never to the shared cache: it belongs
+     * to a transaction that has not committed.  It becomes usable (new_valid)
+     * only once the catalog row below is written; an error before that aborts
+     * the transaction, and the abort callback wipes it.
+     */
+    if (tde_rotation_owns(resolve_effective_relid(relid)))
+        memcpy(tde_rotation.new_dek, dek, TDE_DEK_LEN);
 
     OPENSSL_cleanse(dek, TDE_DEK_LEN);
 
@@ -908,7 +1029,8 @@ pg_vault_tde_catalog_update_rel_dek(Oid relid)
         int64   old_gen = DatumGetInt64(
                               heap_getattr(old_tuple, Anum_pg_vault_tde_generation,
                                            tup_desc, &gen_isnull));
-        values[Anum_pg_vault_tde_generation-1] = Int64GetDatum(gen_isnull ? 2 : old_gen + 1);
+        new_gen = gen_isnull ? 2 : old_gen + 1;
+        values[Anum_pg_vault_tde_generation-1] = Int64GetDatum(new_gen);
     }
 
     values[Anum_pg_vault_tde_wrapped_dek-1]  = PointerGetDatum(wrapped_bytea);
@@ -922,6 +1044,12 @@ pg_vault_tde_catalog_update_rel_dek(Oid relid)
 
     new_tuple = heap_modify_tuple(old_tuple, tup_desc, values, isnull, do_replace);
     CatalogTupleUpdate(rel, &old_tuple->t_self, new_tuple);
+
+    if (tde_rotation_owns(resolve_effective_relid(relid)))
+    {
+        tde_rotation.new_gen   = (uint64) new_gen;
+        tde_rotation.new_valid = true;
+    }
     
     tde_audit(KMS_DEK_ROTATE, psprintf("%u", relid), true);
 
@@ -1076,87 +1204,100 @@ pg_vault_tde_catalog_cache_entries(void)
     return n;
 }
 
-uint64
-pg_vault_tde_catalog_get_rel_generation(Oid relid)
+
+/* -------------------------------------------------------------------------
+ * tde_rotation_xact_callback — end the rotation with its transaction
+ *
+ * COMMIT runs once the transaction is durable and visible but before its locks
+ * are released, so the writers queued behind the rotation's lock find the new
+ * key already current when they wake.  ABORT puts the outgoing key back.
+ * Neither may raise an error.  An entry evicted meanwhile is simply absent:
+ * the next access reloads it from the catalog, which is right either way.
+ * -------------------------------------------------------------------------*/
+static void
+tde_rotation_xact_callback(XactEvent event, void *arg)
 {
-    uint64           gen = 0;
-    Oid              effective_relid;
+    bool             committed;
     TdeRelDekMap    *e;
     TdeRelDekMapKey  search_key;
 
-    if(!OidIsValid(relid) || !rel_dek_map)
-        return 0;
+    if (!tde_rotation.active)
+        return;
 
-    effective_relid = resolve_effective_relid(relid);
-    tde_rel_dek_key(&search_key, effective_relid);
+    if (event == XACT_EVENT_COMMIT)
+        committed = true;
+    else if (event == XACT_EVENT_ABORT)
+        committed = false;
+    else
+        return;
 
-    LWLockAcquire(rel_dek_lock, LW_SHARED);
-
-    /*
-     * Only trust the cached generation next to a live DEK.
-     *
-     * generation is written to shared memory, which no transaction rolls back,
-     * while the value it mirrors lives in a pg_vault_tde_catalog row, which
-     * every transaction does roll back.  An entry with dek_valid = false is
-     * mid-rotation, exactly the window in which the two can disagree, so read
-     * through to the catalog there: it is the side that is always right.
-     */
-    e = (TdeRelDekMap*) hash_search(rel_dek_map, &search_key, HASH_FIND, NULL);
-    if(e && e->dek_valid)
-        gen = e->generation;
-
-    LWLockRelease(rel_dek_lock);
-
-    if (gen > 0)
-        return gen;
-
-    /* No live cached DEK (fresh backend, restart, or rotation in progress). */
+    if (rel_dek_map)
     {
-        TdeCatalogRow row;
+        tde_rel_dek_key(&search_key, tde_rotation.relid);
 
-        if (tde_catalog_read_row(effective_relid, &row) &&
-            row.found && !row.generation_isnull && row.generation > 0)
-            return row.generation;
+        LWLockAcquire(rel_dek_lock, LW_EXCLUSIVE);
+        e = (TdeRelDekMap*) hash_search(rel_dek_map, &search_key, HASH_FIND, NULL);
+        if (e)
+        {
+            if (committed && tde_rotation.new_valid)
+            {
+                memcpy(e->dek, tde_rotation.new_dek, TDE_DEK_LEN);
+                e->generation = tde_rotation.new_gen;
+                memcpy(e->prev_dek, tde_rotation.old_dek, TDE_DEK_LEN);
+                e->prev_dek_valid = true;
+            }
+            else
+            {
+                memcpy(e->dek, tde_rotation.old_dek, TDE_DEK_LEN);
+                e->generation = tde_rotation.old_gen;
+            }
+            e->dek_valid = true;
+            e->rotating  = false;
+        }
+        LWLockRelease(rel_dek_lock);
     }
 
-    return 1;
+    OPENSSL_cleanse(&tde_rotation, sizeof(tde_rotation));
 }
 
 void pg_vault_tde_catalog_zero_rel_dek(Oid relid)
 {
     Oid              effective_relid = resolve_effective_relid(relid);
     unsigned char    outgoing_dek[TDE_DEK_LEN];
+    uint64           outgoing_gen;
     TdeRelDekMap    *e;
     TdeRelDekMapKey  search_key;
     bool             demoted;
+    bool             busy;
 
     if (!rel_dek_map)
         return;
 
+    if (tde_rotation.active)
+        ereport(ERROR,
+                errmsg("pg_vault_tde: a rotation of relid=%u is already open "
+                       "in this transaction", tde_rotation.relid));
+
+    /* Registered before anything changes, so every exit path reaches it. */
+    if (!tde_rotation_callback_registered)
+    {
+        RegisterXactCallback(tde_rotation_xact_callback, NULL);
+        tde_rotation_callback_registered = true;
+    }
+
     /*
      * Recover the outgoing DEK BEFORE touching the cache, and unconditionally.
      *
-     * prev_dek[] is the only copy of this key once the caller goes on to
-     * overwrite the catalog row (pg_vault_tde_catalog_update_rel_dek), and
-     * every pre-rotation tuple needs it: those tuples carry generation N on
-     * the wire while the catalog moves to N+1, so tde_gcm_decrypt routes them
-     * to pg_vault_tde_kms_get_rel_prev_dek().
-     *
-     * This used to read e->dek straight out of the cache and, when the entry
-     * was missing, do nothing at all — silently, with no error.  A cold entry
-     * is not exotic: it is the normal state after a restart, and after
-     * wallet_lock() or wallet_unlock(), which evict.  The rotation then
-     * re-keyed the catalog and immediately failed to read its own rows
-     * ("pg_vault_tde: decryption failed").
-     *
-     * pg_vault_tde_kms_get_rel_dek() is the right recovery path: a plain
-     * LW_SHARED hit when the entry is warm, an unwrap from the catalog when it
-     * is not.  It has to run before the lock below because it takes
-     * rel_dek_lock itself, and demoting our own copy rather than re-reading
-     * e->dek closes the window where an eviction in between loses the key.
+     * Once pg_vault_tde_catalog_update_rel_dek() overwrites the catalog row,
+     * this backend's copy and prev_dek[] are the only ones left, and every
+     * pre-rotation tuple needs it.  A cold entry is not exotic: it is the
+     * normal state after a restart, and after wallet_lock() or wallet_unlock(),
+     * which evict.  pg_vault_tde_kms_get_rel_dek_gen() is a plain LW_SHARED hit
+     * when the entry is warm and an unwrap from the catalog when it is not; it
+     * takes rel_dek_lock itself, so it has to run before the lock below.
      */
-    if (!pg_vault_tde_kms_get_rel_dek(effective_relid, outgoing_dek,
-                                      TDE_DEK_LEN))
+    if (!pg_vault_tde_kms_get_rel_dek_gen(effective_relid, outgoing_dek,
+                                          TDE_DEK_LEN, &outgoing_gen))
         ereport(ERROR,
                 errmsg("pg_vault_tde: cannot rotate relid=%u: its current DEK "
                        "is neither cached nor recoverable from the catalog",
@@ -1167,44 +1308,54 @@ void pg_vault_tde_catalog_zero_rel_dek(Oid relid)
     LWLockAcquire(rel_dek_lock, LW_EXCLUSIVE);
 
     e = (TdeRelDekMap*) hash_search(rel_dek_map, &search_key, HASH_FIND, NULL);
-    demoted = (e != NULL);
+    busy    = (e != NULL && e->rotating);
+    demoted = (e != NULL && !e->rotating);
     if (demoted)
     {
+        /*
+         * From here until the transaction ends nobody installs a current key
+         * (tde_rel_dek_cache_store) and everyone but this backend keeps
+         * encrypting and decrypting with the outgoing one, which is what the
+         * catalog shows them.  generation stays the outgoing key's: the new
+         * generation is written by a transaction that may still abort, and
+         * shared memory does not roll back.
+         */
         memcpy(e->prev_dek, outgoing_dek, TDE_DEK_LEN);
         OPENSSL_cleanse(e->dek, TDE_DEK_LEN);
         e->dek_valid      = false;
         e->prev_dek_valid = true;
-        /*
-         * Deliberately NOT bumping e->generation here.  The generation belongs
-         * to the catalog row that pg_vault_tde_catalog_update_rel_dek() is
-         * about to write, and that write is transactional while this one is
-         * not: an aborted rotation rolled the catalog back to N while shared
-         * memory kept N+1 for the lifetime of the cluster.  Reads then
-         * resolved against a generation nothing on disk agreed with, and the
-         * next rotation could not decrypt the oldest rows at all.
-         *
-         * Nothing needs the bump: readers ignore a cached generation while
-         * dek_valid is false (pg_vault_tde_catalog_get_rel_generation) and go
-         * to the catalog, which has the new value as soon as update_rel_dek()
-         * commits it.  The refill in tde_rel_dek_cache_store() then brings
-         * dek[] and generation back in step together.
-         */
+        e->generation     = outgoing_gen;
+        e->rotating       = true;
     }
 
     LWLockRelease(rel_dek_lock);
 
-    OPENSSL_cleanse(outgoing_dek, TDE_DEK_LEN);
-
-    /*
-     * get_rel_dek() installed the entry a moment ago, so this only fires if a
-     * concurrent wallet_lock()/rotate_kek()/DROP raced us.  Fail the rotation
-     * rather than continue without the prev_dek the pre-rotation rows need.
-     */
     if (!demoted)
+    {
+        OPENSSL_cleanse(outgoing_dek, TDE_DEK_LEN);
+
+        if (busy)
+            ereport(ERROR,
+                    errmsg("pg_vault_tde: relid=%u is already being rotated",
+                           effective_relid));
+
+        /*
+         * get_rel_dek_gen() installed the entry a moment ago, so this only
+         * fires if a concurrent wallet_lock()/rotate_kek()/DROP raced us.
+         */
         ereport(ERROR,
                 errmsg("pg_vault_tde: DEK cache entry for relid=%u was evicted "
                        "while starting a rotation; retry the rotation",
                        effective_relid));
+    }
+
+    tde_rotation.active    = true;
+    tde_rotation.relid     = effective_relid;
+    memcpy(tde_rotation.old_dek, outgoing_dek, TDE_DEK_LEN);
+    tde_rotation.old_gen   = outgoing_gen;
+    tde_rotation.new_valid = false;
+
+    OPENSSL_cleanse(outgoing_dek, TDE_DEK_LEN);
 
     ereport(LOG,
             errmsg("pg_vault_tde: relid=%u DEK demoted to prev_dek; "
