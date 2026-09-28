@@ -3,11 +3,12 @@
 #
 # A rewrap walks pg_vault_tde_catalog, which CREATE EXTENSION creates
 # separately in every database and which no backend can read across a database
-# boundary, so it covers exactly the database it runs in.  The local provider
-# then replaces the wallet file outright, which is cluster-wide as soon as
-# pg_vault_tde.wallet_path points somewhere other than the per-database
-# default.  The first database to rotate therefore strands every other
-# database's wrapped DEKs under a KEK that no longer exists.
+# boundary, so it covers exactly the database it runs in.  The wallet file is
+# cluster-wide as soon as pg_vault_tde.wallet_path points somewhere other than
+# the per-database default.  Before 1.7.2 the local provider replaced that file
+# outright and the first database to rotate stranded every other database's
+# wrapped DEKs; since then the wallet keeps every KEK version (PSQLE-185), so
+# the others stay readable but are not re-wrapped until they rotate too.
 #
 # It stays a WARNING, not an ERROR: a single-database cluster may legitimately
 # set wallet_path, and refusing would break it.  What this test pins down is

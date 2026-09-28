@@ -247,6 +247,14 @@ Two other historical occurrences of the same bug were fixed in
 `src/kms/pg_vault_tde_kms_local.c` (lines ~1413 in `change_passphrase` and
 ~1706 in `rotate_kek` — both used `int new_len = sizeof(new_wrapped);`).
 
+This contract applies symmetrically to `unwrap_dek(wrapped, wrapped_len, dek_out, dek_len)`:
+`dek_len` here is **input-only capacity** because the unwrapped output is
+always exactly `TDE_DEK_LEN`. Providers MAY assert `dek_len >= TDE_DEK_LEN`.
+
+When implementing a new provider, call sites that allocate with
+`palloc(TDE_WRAPPED_DEK_MAX)` MUST still set `*out_len = TDE_WRAPPED_DEK_MAX`
+before the call — the same bidirectional contract holds for heap buffers.
+
 ### `change_passphrase` / `rotate_kek` SPI re-wrap contract (v1.6 patch)
 
 Both functions iterate over `pg_vault_tde_catalog` and re-wrap each DEK.
@@ -269,40 +277,43 @@ The required pattern is **two-phase**: snapshot the SELECT into caller-
 owned arrays in `TopTransactionContext` BEFORE issuing any UPDATE, then
 iterate the local arrays.
 
-### `change_passphrase` KEK derivation (v1.6 patch)
+### Local wallet: KEK versions (PSQLE-185)
 
-`local_open_wallet(path, NEW_pass, kek)` runs `PKCS12_verify_mac`, which
-fails on a wallet file still authenticated under the OLD passphrase.  The
-correct sequence is:
+The wallet keeps **every KEK version** in one PKCS#12 file: one shrouded key bag
+per version, friendlyName `pg_vault_tde_kek.v<N>`, current (highest) first.  A
+wallet written before 1.7.2 has a single bag `pg_vault_tde_kek`, read as
+version 1.  In memory: `LocalKekRing`, `kek[0]` current.
 
-1. `local_open_wallet(path, OLD_pass, old_kek)` — verifies on-disk MAC.
-2. `local_derive_kek_from_pass(NEW_pass, new_kek)` — PBKDF2-only with the
-   fixed `"pg_vault_tde_kek_v1"` salt; no file I/O, no MAC check.
-3. Re-wrap each DEK with `local_wrap_dek_with_kek(...new_kek)`.
-4. Rewrite the wallet file under `NEW_pass` via `local_create_wallet_file`.
+Rules, each paid for by a lost database in 1.7.1:
 
-`local_derive_kek_from_pass()` is the helper that decouples KEK
-derivation from MAC verification.  Use it instead of
-`local_wrap_dek_with_pass()` whenever the wallet file's MAC does not yet
-match the target passphrase.
+1. **Add, never replace, and do it first.**  `local_prepare_kek_rotation()` and
+   `pg_vault_tde_wallet_change_passphrase()` write the file with the new version
+   in front (`local_write_wallet_ring()`, `durable_rename()`) **before**
+   `pg_vault_tde_catalog_rewrap_all()` touches a row.  The file is not
+   transactional; if it changes only after the re-wrap, a rollback, a later
+   error in the statement or a crash leaves the catalog under a KEK that exists
+   nowhere.
+2. **Unwrap with every version** (`local_unwrap_dek_with_ring()`), newest first.
+   Wrapped DEKs carry no version tag: the RFC 3394 integrity check rejects a
+   wrong KEK.  `local_unwrap_dek_with_kek()` is silent on failure for that
+   reason — report once, after the last version.
+3. **Read-modify-write under the file lock** (`local_wallet_lock_file()`,
+   `<wallet>.lock`, `flock`).  Two rotations reading the same versions would
+   each write back a file missing the other's new one.
+4. **A cached ring can be stale.**  `wallet_unlock()` caches the ring per
+   backend; after another session adds a version, `local_unwrap_dek()` reloads
+   from the passphrase source, or tells the session to unlock again.  Wrapping
+   with an older cached `kek[0]` is safe because versions are never removed.
+5. **Rotation needs the passphrase from a source**, not a cached ring: the file
+   is re-encrypted under it.
+6. **Everything local is wrapped under a KEK the file holds.**  Nothing derives a
+   KEK from the passphrase: `migrate_vault_to_wallet()` did, and every table it
+   migrated was lost (PSQLE-188).  It now opens the wallet and uses `kek[0]`.
 
-### `rotate_kek` / `export_bundle` dual-source KEK (v1.6 patch, unified in v1.7)
-
-`pg_vault_tde_rotate_kek()` (v1.7, unified; replaced the local-wallet-only
-`pg_vault_tde_wallet_rotate_kek()` from v1.6) prefers
-`local_wallet_state->kek` (set by a prior `wallet_unlock`) over
-`local_get_passphrase()` when running under the `local` provider.  This means
-tests that already called `wallet_unlock` no longer need to configure
-`pg_vault_tde.wallet_passphrase_env` to call `rotate_kek`.  Under the `vault`
-provider the function calls Vault Transit key rotation and re-wraps all DEKs.
-
-This contract applies symmetrically to `unwrap_dek(wrapped, wrapped_len, dek_out, dek_len)`:
-`dek_len` here is **input-only capacity** because the unwrapped output is
-always exactly `TDE_DEK_LEN`. Providers MAY assert `dek_len >= TDE_DEK_LEN`.
-
-When implementing a new provider, call sites that allocate with
-`palloc(TDE_WRAPPED_DEK_MAX)` MUST still set `*out_len = TDE_WRAPPED_DEK_MAX`
-before the call — the same bidirectional contract holds for heap buffers.
+Pruning old versions is not implemented (1.8); `LOCAL_KEK_MAX_VERSIONS` caps the
+ring.  `pg_dump_tde_kms_local.c` has its own reader with the same rules, so a
+dump taken before a rotation restores.  Regression:
+`tap/30_rotate_kek_local_atomicity.t`.
 
 ### Provider Registration
 

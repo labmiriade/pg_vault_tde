@@ -1395,22 +1395,17 @@ pg_vault_tde_catalog_rewrap_all(void)
      *
      * A rewrap covers exactly one database: it walks pg_vault_tde_catalog,
      * which CREATE EXTENSION creates separately in each database and which no
-     * backend can read across a database boundary.  The local provider then
-     * replaces the wallet file outright (local_create_wallet_file() renames a
-     * new PKCS#12 over it), so the outgoing KEK is gone the moment the caller
-     * commits.  With the per-database default path the two scopes are the same
-     * file and this is invisible; point several databases at one wallet and
-     * the first to rotate strands every other database's wrapped DEKs under a
-     * KEK that no longer exists anywhere.
-     *
-     * Only the local provider is affected.  Vault Transit keeps previous key
-     * versions, and a PKCS#11 token keeps previous KEK generations, so an
-     * un-rewrapped DEK there still unwraps.
+     * backend can read across a database boundary.  Since 1.7.2 the local
+     * wallet keeps every KEK version (PSQLE-185), so the other databases'
+     * DEKs stay readable under the version they were wrapped with — but they
+     * are not re-wrapped: they move to the new KEK only when each of those
+     * databases rotates too.  Before 1.7.2 the file held one KEK and the first
+     * database to rotate stranded all the others.
      *
      * A WARNING rather than an ERROR: setting wallet_path is legitimate for a
-     * single-database cluster, and refusing would break those.  The message
-     * carries its own filter — a DBA who set a per-database path knows at once
-     * that no other database uses this file.
+     * single-database cluster.  The message carries its own filter — a DBA
+     * who set a per-database path knows at once that no other database uses
+     * this file.
      */
     if (pg_vault_tde_kms_provider != NULL &&
         strcmp(pg_vault_tde_kms_provider, "local") == 0 &&
@@ -1421,14 +1416,12 @@ pg_vault_tde_catalog_rewrap_all(void)
                 errdetail("pg_vault_tde.wallet_path points somewhere other than "
                           "this database's default "
                           "/var/lib/pg_vault_tde/%u/wallet.p12, and the new KEK "
-                          "replaces that file for every database reading it.",
+                          "version is added to that file for every database "
+                          "reading it.",
                           MyDatabaseId),
-                errhint("If any other database uses this same wallet file, its "
-                        "DEKs are still wrapped under the outgoing KEK and "
-                        "become unreadable once this completes; rotating them "
-                        "afterwards cannot recover it.  Rotate the KEK only "
-                        "when the wallet file belongs to exactly one "
-                        "database."));
+                errhint("Any other database using this wallet keeps its DEKs "
+                        "under the previous KEK version, still readable, until "
+                        "it rotates too; run the rotation there as well."));
 
     ext_ns  = get_extension_schema(get_extension_oid(pg_vault_tde_extension_name, true));
     rel_oid = get_relname_relid("pg_vault_tde_catalog", ext_ns);

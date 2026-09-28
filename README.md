@@ -476,6 +476,12 @@ outside `PGDATA`, so a plain `pg_basebackup` does not copy it alongside the
 wrapped DEKs it protects. No network dependency.
 Suitable for single-server deployments, air-gapped environments, and development.
 
+The file keeps **every KEK version** (since 1.7.2): `rotate_kek()` and
+`wallet_change_passphrase()` add one and never remove any, and write it before a
+single DEK is re-wrapped. A rotation that rolls back, fails later in its statement
+or dies in a crash therefore loses nothing — every DEK still unwraps with a version
+the file holds. See [KEK versions in the local wallet](#kek-versions-in-the-local-wallet).
+
 ```ini
 pg_vault_tde.kms_provider          = 'local'
 # wallet_path defaults to /var/lib/pg_vault_tde/<DB_OID>/wallet.p12 — omit unless overriding:
@@ -644,18 +650,18 @@ SELECT pg_vault_tde_rotate_kek();
 > attacker already holds the old passphrase, they already have the old KEK — changing
 > the passphrase without rotating the KEK provides no additional protection.
 
-> **KEK rotation is per-database, so never share one wallet between databases
-> you intend to rotate.**  Both `pg_vault_tde_rotate_kek()` and
+> **KEK rotation is per-database.**  Both `pg_vault_tde_rotate_kek()` and
 > `pg_vault_tde_wallet_change_passphrase()` rewrap only the
 > `pg_vault_tde_catalog` of the database they run in — that table is
-> per-database and no backend can reach another database's copy — and then
-> replace the wallet file.  With the default per-database `wallet_path`
-> (`/var/lib/pg_vault_tde/<DB_OID>/wallet.p12`) the two always match.  Set
-> `wallet_path` to one shared file in `postgresql.conf` and they no longer do:
-> the first database to rotate strands every other database's wrapped DEKs
-> under a KEK that no longer exists anywhere, and their data becomes
-> permanently unreadable.  Running the rotation in each database afterwards
-> does not repair it — the old KEK is gone after the first commit.
+> per-database and no backend can reach another database's copy.  With the
+> default per-database `wallet_path` (`/var/lib/pg_vault_tde/<DB_OID>/wallet.p12`)
+> that is the whole wallet.  Set `wallet_path` to one shared file and it is not:
+> up to 1.7.1 the rotation then replaced that file, and the first database to
+> rotate made every other database's data permanently unreadable.  Since 1.7.2
+> the file keeps every KEK version, so the other databases stay readable under
+> the version they were wrapped with — but each one moves to the new KEK only
+> when it rotates too, and a `wallet_change_passphrase()` in one database changes
+> the passphrase for all of them.
 >
 > Since `pg_vault_tde_wallet_init()` persists the resolved path per database
 > (`ALTER DATABASE ... SET FROM CURRENT`), and a database-level setting wins
@@ -824,7 +830,7 @@ log stream without any extension-level configuration.
 | `pg_vault_tde_rotation_status` | view | All in-progress/completed rotations across the cluster; readable by `pg_monitor` **(v1.5)** |
 | `pg_vault_tde_check_plaintext_index_keys()` | table | Meant to list `tde_btree` indexes on a plaintext-key operator class. **Known defect: returns no rows in 1.7.x**, and its `REINDEX` suggestion would not change the operator class. Use the query in [Upgrading to 1.7.2](#upgrading-to-172) instead; replaced in 1.8. `pg_monitor`/superuser only |
 | `pg_vault_tde_wallet_init(text)` | void | Create local wallet and generate KEK **(v1.5)** |
-| `pg_vault_tde_wallet_change_passphrase(text, text)` | void | Re-protect wallet with new passphrase and automatically rotate the KEK (`local` provider only); no separate `rotate_kek()` needed **(v1.6)** |
+| `pg_vault_tde_wallet_change_passphrase(text, text)` | void | Re-protect wallet with new passphrase and automatically rotate the KEK (`local` provider only); no separate `rotate_kek()` needed. Since 1.7.2 the new passphrase is in effect as soon as the wallet file is rewritten, even if the call then fails **(v1.6)** |
 | `pg_vault_tde_wallet_status()` | composite | Wallet existence, open state, algorithm, last opened, file perms (5 cols) **(v1.6)** |
 | `pg_vault_tde_wallet_unlock(text)` | void | Interactive wallet unlock without PG restart **(v1.6)** |
 | `pg_vault_tde_wallet_lock()` | void | Evict all DEKs from shmem, mark wallet closed **(v1.6)** |
@@ -833,7 +839,7 @@ log stream without any extension-level configuration.
 | `pg_vault_tde_seal_keys(text, text, text)` | void | Write an HMAC-SHA256-signed bundle of **all** wrapped DEKs (every provider) to a file, to accompany a physical backup (`pg_basebackup`); the KEK is never included **(v1.7)** |
 | `pg_vault_tde_seal_keys_bytea(text, text)` | bytea | Same signed bundle as `pg_vault_tde_seal_keys()`, returned as `bytea` instead of written server-side — used by `pg_basebackup_tde` to store the bundle on the client host **(v1.7)** |
 | `pg_vault_tde_unseal_keys(text, text)` | void | Verify (HMAC) and re-import a bundle written by `pg_vault_tde_seal_keys()`; rejects a tampered file or wrong passphrase before writing anything **(v1.7)** |
-| `pg_vault_tde_migrate_vault_to_wallet(text)` | void | Online Vault→local wallet migration **(v1.6)** |
+| `pg_vault_tde_migrate_vault_to_wallet(text)` | void | Online Vault→local wallet migration: pass the passphrase of the wallet created with `wallet_init()`; re-wraps every Vault DEK under the wallet's KEK and switches the database to the `local` provider. Broken before 1.7.2 — see [Upgrading to 1.7.2](#migrate_vault_to_wallet-before-172) **(v1.6)** |
 | `pg_vault_tde_vault_status()` | table | Vault provider diagnostics — `(configured, auth_method, reachable)` |
 | `pg_vault_tde_refresh_token()` | boolean | Manually renew the current Vault token lease |
 | `pg_vault_tde_hw_accel_info()` | record | OpenSSL provider/cipher diagnostics — `(openssl_version, configured_provider, provider_loaded, gcm_cipher, siv_cipher, aes_ni_available)` |
@@ -1125,6 +1131,53 @@ Nothing on disk changes. What you may notice:
 
 ---
 
+### KEK versions in the local wallet
+
+Up to 1.7.1, `pg_vault_tde_rotate_kek()` and `pg_vault_tde_wallet_change_passphrase()`
+on the local wallet replaced the file's only KEK **before** their transaction
+committed. A rotation that rolled back, failed later in the same statement, or died
+in a crash left every table of the database wrapped under a KEK that no longer
+existed. A session that had run `wallet_unlock()` also kept the old KEK in its own
+memory, could not read after another session's rotation, and wrapped the DEK of any
+table it created with the old key — lost at the next restart (PSQLE-185).
+
+1.7.2 keeps every KEK version in the wallet: one PKCS#12 key bag per version, the
+current one first. A rotation adds a version, durably, before it re-wraps anything,
+and removes none. A session holding an older copy reloads the wallet from its
+passphrase source when it meets a newer version, or asks for a new `wallet_unlock()`
+if it has none. The wrapped DEKs in `pg_vault_tde_catalog` are unchanged.
+
+What to know:
+
+- **Nothing to do before upgrading.** A 1.7.1 wallet is read as version 1; the first
+  rotation on 1.7.2 writes the new layout.
+- **Downgrading after a rotation on 1.7.2:** 1.7.1 reads the first — current — KEK of
+  the file, which is every DEK's after a rotation that committed. After one that did
+  not, some DEKs are under an older version that 1.7.1 cannot use.
+- **Dumps taken before a KEK rotation restore again** with the 1.7.2 `pg_restore_tde`:
+  their DEK is under an older version, which the wallet now keeps.
+- **A session unlocked only by `wallet_unlock()`**, with no passphrase source, has to
+  unlock again after another session rotates the KEK or changes the passphrase.
+- **If a rotation on 1.7.1 did not commit and your tables stopped reading,** restore
+  the wallet file from before that rotation: the catalog is still wrapped under it.
+
+### `migrate_vault_to_wallet()` before 1.7.2
+
+Up to 1.7.1, `pg_vault_tde_migrate_vault_to_wallet()` wrapped every DEK under a key
+derived from its passphrase argument instead of the KEK held by the wallet it was told
+to use, accepted any passphrase, and left the database on the Vault provider. Every
+migrated table became unreadable, and the Vault-wrapped copy of each DEK had been
+overwritten in `pg_vault_tde_catalog` (PSQLE-188).
+
+1.7.2 opens the wallet with the passphrase — a wrong one is refused before anything
+changes — wraps under the wallet's current KEK, keeps the cached keys so sessions keep
+reading, and switches the database to `kms_provider = 'local'`. Sessions connected
+before the migration keep the Vault provider until they reconnect.
+
+**If you ran it on 1.7.1:** the tables it migrated can only come back from a backup
+taken before the migration — of the database, or of `pg_vault_tde_catalog` while the
+Vault Transit key still exists.
+
 ### `rotate_online()` with concurrent access
 
 Up to 1.7.1, a `pg_vault_tde_rotate_online()` that ran while its table was read or
@@ -1237,7 +1290,7 @@ make ci-valgrind         # Valgrind memcheck over the full TDE workload (slow: 1
 make ci-cassert          # SQL suites + TAP files on PostgreSQL built --enable-cassert -DUSE_VALGRIND (builds PG from source)
 make ci-wallet           # SQL regression tests (local wallet provider)
 make ci-checksums        # regression tests + page checksum compatibility
-make ci-tap              # 29 TAP test files (starts a real Vault container for the Vault-dependent ones)
+make ci-tap              # 31 TAP test files (starts a real Vault container for the Vault-dependent ones)
 make ci-isolation        # 2 isolation specs: DEK rotation under load, relation rewrite under a concurrent reader
 make ci-vault            # Vault integration (Compose-based)
 make ci-openbao          # OpenBao Raft 3-node HA integration (12 tests)
@@ -1249,7 +1302,7 @@ make ci-bench BENCH_ROWS=100000  # with custom row count
 make ci-clean            # Remove test containers and images
 ```
 
-Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 423 assertions across 29 TAP files. Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
+Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 473 assertions across 31 TAP files. Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
 - Tests 1-4: extension loaded, access methods and SQL functions registered, wallet unlock
 - Tests 12-14: TAM INSERT/SELECT/UPDATE end-to-end
 - Test 15: DELETE

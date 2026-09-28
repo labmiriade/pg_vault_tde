@@ -100,11 +100,24 @@ If you need to move a database off Vault (e.g. decommissioning a Vault
 cluster, or moving a tenant to a fully offline deployment):
 
 ```sql
-SELECT pg_vault_tde_migrate_vault_to_wallet('a-new-wallet-passphrase');
+-- 1. Create the local wallet (wallet_init requires the local provider in this session):
+SET pg_vault_tde.kms_provider = 'local';
+SELECT pg_vault_tde_wallet_init('the-wallet-passphrase');
+RESET pg_vault_tde.kms_provider;
+
+-- 2. Re-wrap every Vault DEK under the wallet — with the SAME passphrase:
+SELECT pg_vault_tde_migrate_vault_to_wallet('the-wallet-passphrase');
 ```
 
-This is an online migration — see [KMS: Local Wallet](KMS-Local-Wallet) for
-wallet setup details first.
+The migration refuses a passphrase that does not open the wallet, re-wraps
+every Vault-protected DEK under the wallet's KEK, and switches the database to
+`kms_provider = 'local'`. Sessions connected before it keep the Vault provider
+until they reconnect. Configure a wallet passphrase source
+(`wallet_passphrase_env` / `_file` / `_command`) before the next restart — see
+[KMS: Local Wallet](KMS-Local-Wallet).
+
+> Up to 1.7.1 this function made every migrated table unreadable (PSQLE-188).
+> Do not run it on 1.7.1.
 
 ## See Also
 - [Key Management Overview](Key-Management-Overview)

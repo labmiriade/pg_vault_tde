@@ -1,6 +1,6 @@
 # pg_vault_tde Roadmap
 
-> Last updated: 2026-09-28 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 29 TAP files / 423 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 2 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
+> Last updated: 2026-09-28 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 31 TAP files / 473 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 2 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
 
 ---
 
@@ -321,6 +321,30 @@ distinguishes the builds.
    `Assert(txn->size == 0)`. The change callbacks now put the original lengths back once
    pgoutput has serialized the row. Found when `ci-cassert` began running the TAP files
    (`tap/12_logical_repl_toast.t`).
+
+8. **A local-wallet KEK rotation that did not commit lost the database (PSQLE-185).**
+   `rotate_kek()` and `wallet_change_passphrase()` replaced the wallet's only KEK before
+   their transaction committed; a rollback, a later error in the statement or a crash
+   left every DEK wrapped under a KEK that existed nowhere. A session that had run
+   `wallet_unlock()` also kept the old KEK: it could not read after another session's
+   rotation, and wrapped new tables with the old key. The wallet now keeps every KEK
+   version (one PKCS#12 key bag each, current first, written with `durable_rename()`
+   before any re-wrap, under a file lock), unwrap tries them newest first — the AES key
+   wrap's integrity check picks the right one, wrapped DEKs are unchanged — and a stale
+   session reloads the wallet. `pg_dump_tde` / `pg_restore_tde` read every version too,
+   so dumps taken before a rotation restore again. Vault and PKCS#11 already versioned
+   their keys. `tap/30_rotate_kek_local_atomicity.t`.
+
+9. **`migrate_vault_to_wallet()` made every migrated table unreadable (PSQLE-188).** It
+   wrapped the DEKs under a KEK derived from its passphrase argument
+   (`local_derive_kek_from_pass()`), while the wallet `wallet_init()` creates — which
+   the migration requires — holds a random one; it accepted any passphrase, evicted the
+   DEK cache, and left the database on the Vault provider, which cannot unwrap the new
+   wrapping. Now it opens the wallet with the passphrase (a wrong one is refused before
+   anything changes), wraps under the wallet's current KEK, leaves the cache alone (the
+   DEKs themselves do not change), and switches the database to `kms_provider = 'local'`
+   in the session and through a database-level setting. The derivation helper is gone.
+   `tap/31_migrate_vault_to_wallet.t`, with a real-Vault half.
 
 **New CI stage — `make ci-upgrade`.** Every other suite in this repo reads only data it
 wrote in the same run, so writer and reader always move together and a format-level

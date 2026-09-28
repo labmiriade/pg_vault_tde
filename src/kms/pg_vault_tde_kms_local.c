@@ -42,6 +42,8 @@
 #include "access/table.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
+#include "access/xact.h"        /* RegisterXactCallback */
+#include "storage/fd.h"         /* durable_rename */
 #include "catalog/indexing.h"
 #include "catalog/pg_db_role_setting.h"
 
@@ -53,6 +55,7 @@
 #include <openssl/crypto.h>
 
 #include <sys/stat.h>
+#include <sys/file.h>           /* flock */
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
@@ -76,14 +79,39 @@
 #define LOCAL_WRAP_OVERHEAD     8   /* RFC 3394 AES-WRAP overhead in bytes */
 #define LOCAL_WRAPPED_DEK_LEN   (TDE_DEK_LEN + LOCAL_WRAP_OVERHEAD)  /* 40 bytes */
 
-/*
- * PBKDF2 iteration count for KEK derivation from passphrase.
+
+/* -------------------------------------------------------------------------
+ * KEK versions (PSQLE-185)
  *
- * NIST SP 800-132 (2023) minimum for HMAC-SHA-256: 210 000.  We use
- * 600 000 to provide a comfortable safety margin against brute-force.
- * Increasing this value requires wallet re-initialisation.
- */
-#define LOCAL_PBKDF2_ITERS      600000
+ * A KEK rotation used to overwrite the wallet's only KEK before its
+ * transaction committed, so a rotation that rolled back, failed later in its
+ * statement or died in a crash left the catalog wrapped under a key that
+ * existed nowhere.  The wallet now keeps every KEK version: a rotation adds
+ * one, written durably before any DEK is re-wrapped, and nothing is removed.
+ * Whatever the transaction does, every row still unwraps with a key the
+ * wallet has — the same model as Vault Transit key versions and the PKCS#11
+ * provider's "<label>.v<N>" objects.
+ *
+ * On disk: one PKCS#12 key bag per version, friendlyName
+ * "pg_vault_tde_kek.v<N>", the current (highest) version first.  A wallet
+ * written before 1.7.2 has a single bag named "pg_vault_tde_kek", read as
+ * version 1.  PKCS12_parse() returns the first key, so a reader that knows
+ * nothing about versions still gets the current KEK.
+ *
+ * The wrapped DEK is unchanged — 40 bytes of RFC 3394 AES key wrap, no version
+ * tag.  Unwrap tries the versions newest first and the key wrap's own
+ * integrity check rejects a wrong KEK; after a committed rotation every row is
+ * under the current version, so that is a single attempt.
+ * -------------------------------------------------------------------------*/
+#define LOCAL_KEK_BAG_NAME      "pg_vault_tde_kek"
+#define LOCAL_KEK_MAX_VERSIONS  256
+
+typedef struct LocalKekRing
+{
+    int           n;                                        /* versions held */
+    uint32        version[LOCAL_KEK_MAX_VERSIONS];          /* [0] is current */
+    unsigned char kek[LOCAL_KEK_MAX_VERSIONS][TDE_DEK_LEN];
+} LocalKekRing;
 
 
 /*
@@ -105,8 +133,8 @@ typedef struct LocalWalletState
     bool         kek_loaded;    /* true while wallet is open (unlock caches KEK here);
                                  * cleared by wallet_lock() or backend exit */
     TimestampTz  last_opened;   /* last successful open timestamp; 0 = never */
-    /* per-backend KEK buffer — held while wallet is open, cleared on lock */
-    unsigned char kek[TDE_DEK_LEN];
+    /* every KEK version, cached by wallet_unlock(); cleared on lock */
+    LocalKekRing *ring;
 } LocalWalletState;
 
 static LocalWalletState *local_wallet_state = NULL;
@@ -136,17 +164,147 @@ local_state(void)
     return local_wallet_state;
 }
 
+static LocalKekRing *
+local_ring_new(MemoryContext cxt)
+{
+    return (LocalKekRing *) MemoryContextAllocZero(cxt, sizeof(LocalKekRing));
+}
+
+static void
+local_ring_free(LocalKekRing *ring)
+{
+    if (ring == NULL)
+        return;
+    OPENSSL_cleanse(ring, sizeof(LocalKekRing));
+    pfree(ring);
+}
+
+/* Keep every KEK version in this backend, as wallet_unlock() does. */
+static void
+local_cache_ring(const LocalKekRing *ring)
+{
+    LocalWalletState *st = local_state();
+
+    if (st->ring == NULL)
+        st->ring = local_ring_new(TopMemoryContext);
+    memcpy(st->ring, ring, sizeof(LocalKekRing));
+    st->kek_loaded  = true;
+    st->wallet_open = true;
+    st->last_opened = GetCurrentTimestamp();
+}
+
+static void
+local_drop_cached_ring(void)
+{
+    if (local_wallet_state == NULL)
+        return;
+    if (local_wallet_state->ring != NULL)
+        OPENSSL_cleanse(local_wallet_state->ring, sizeof(LocalKekRing));
+    local_wallet_state->kek_loaded = false;
+}
+
+/*
+ * next = a fresh random KEK as the new current version, then every version of
+ * cur.  Returns false only if no random KEK could be generated.
+ */
+static bool
+local_ring_add_version(const LocalKekRing *cur, LocalKekRing *next)
+{
+    if (cur->n >= LOCAL_KEK_MAX_VERSIONS)
+        ereport(ERROR,
+                errmsg("pg_vault_tde: the wallet already holds %d KEK versions, "
+                       "the most it can keep", LOCAL_KEK_MAX_VERSIONS),
+                errhint("Rotation and wallet_change_passphrase() are refused "
+                        "from here on; nothing was changed.  Removing old "
+                        "versions is planned for 1.8."));
+
+    memset(next, 0, sizeof(LocalKekRing));
+    if (!pg_strong_random(next->kek[0], TDE_DEK_LEN))
+        return false;
+    next->version[0] = (cur->n > 0 ? cur->version[0] : 0) + 1;
+    memcpy(&next->version[1], cur->version, (size_t) cur->n * sizeof(uint32));
+    memcpy(next->kek[1], cur->kek, (size_t) cur->n * TDE_DEK_LEN);
+    next->n = cur->n + 1;
+    return true;
+}
+
+/* "pg_vault_tde_kek" (wallets before 1.7.2) is version 1. */
+static bool
+local_kek_version_from_name(const char *name, uint32 *version)
+{
+    unsigned int v;
+    char         tail;
+
+    if (strcmp(name, LOCAL_KEK_BAG_NAME) == 0)
+    {
+        *version = 1;
+        return true;
+    }
+    if (sscanf(name, LOCAL_KEK_BAG_NAME ".v%u%c", &v, &tail) == 1 && v > 0)
+    {
+        *version = v;
+        return true;
+    }
+    return false;
+}
+
+/*
+ * Serialise every read-modify-write of the wallet file.  Two rotations — two
+ * sessions of one database, or two databases sharing a wallet — could
+ * otherwise read the same versions and each write back a file missing the
+ * other's new one, and the rows re-wrapped under the lost version with it.
+ * OpenTransientFile(): fd.c closes the file at transaction abort, which
+ * releases the lock even when an ERROR skips local_wallet_unlock_file().
+ */
+static int
+local_wallet_lock_file(const char *wallet_path)
+{
+    char lock_path[MAXPGPATH];
+    int  fd;
+
+    snprintf(lock_path, sizeof(lock_path), "%s.lock", wallet_path);
+    fd = OpenTransientFile(lock_path, O_RDWR | O_CREAT | PG_BINARY);
+    if (fd < 0)
+        ereport(ERROR,
+                errcode_for_file_access(),
+                errmsg("pg_vault_tde: could not open \"%s\": %m", lock_path));
+
+    while (flock(fd, LOCK_EX | LOCK_NB) != 0)
+    {
+        if (errno != EWOULDBLOCK && errno != EINTR)
+        {
+            int save_errno = errno;
+
+            CloseTransientFile(fd);
+            errno = save_errno;
+            ereport(ERROR,
+                    errcode_for_file_access(),
+                    errmsg("pg_vault_tde: could not lock \"%s\": %m", lock_path));
+        }
+        CHECK_FOR_INTERRUPTS();
+        pg_usleep(10000L);
+    }
+    return fd;
+}
+
+static void
+local_wallet_unlock_file(int fd)
+{
+    (void) flock(fd, LOCK_UN);
+    CloseTransientFile(fd);
+}
+
 /*
  * KEK rotation context — allocated in TopMemoryContext by prepare_kek_rotation(),
  * freed (after OPENSSL_cleanse) by commit/abort. NULL when no rotation is in progress.
  */
 typedef struct LocalKekRotationCtx
 {
-    unsigned char old_kek[TDE_DEK_LEN];
-    unsigned char new_kek[TDE_DEK_LEN];
+    LocalKekRing ring;      /* ring.kek[0] is the new KEK; all of it unwraps */
 } LocalKekRotationCtx;
 
 static LocalKekRotationCtx *local_kek_rotation_ctx = NULL;
+static bool local_kek_rotation_callback_registered = false;
 
 /* -------------------------------------------------------------------------
  * Forward declarations
@@ -166,12 +324,15 @@ static bool local_health_check(void);
 static void local_shutdown(void);
 
 /* Internal helpers */
+static bool local_open_wallet_ring(const char *path, const char *passphrase,
+                                   LocalKekRing *out);
+static void local_write_wallet_ring(const char *dest_path, const char *passphrase,
+                                    const LocalKekRing *ring);
+static bool local_unwrap_dek_with_ring(const unsigned char *wrapped,
+                                       int wrapped_len, unsigned char *dek_out,
+                                       int *dek_len, const LocalKekRing *ring);
 static bool local_open_wallet(const char *path, const char *passphrase,
                               unsigned char *kek_out);
-static void local_create_wallet_file(const char *path,
-                                     const char *passphrase, 
-                                     const unsigned char* kek, 
-                                     int kek_len);
 static bool local_wrap_dek_with_pass(const unsigned char *dek, int dek_len,
                                      unsigned char *wrapped_out, int *out_len,
                                      const char *passphrase,
@@ -188,8 +349,6 @@ static bool local_unwrap_dek_with_kek(const unsigned char *wrapped,
                                       int wrapped_len,
                                       unsigned char *dek_out, int *dek_len,
                                       const unsigned char *kek);
-static bool local_derive_kek_from_pass(const char *passphrase,
-                                       unsigned char *kek_out);
 #define TDE_DEFAULT_WALLET_FMT "/var/lib/pg_vault_tde/%u/wallet.p12"
 
 static const char *local_get_wallet_path(void);
@@ -252,8 +411,7 @@ pg_vault_tde_kms_local_reset(void)
     if (local_wallet_state == NULL)
         return;
 
-    OPENSSL_cleanse(local_wallet_state->kek, TDE_DEK_LEN);
-    local_wallet_state->kek_loaded  = false;
+    local_drop_cached_ring();
     local_wallet_state->wallet_open = false;
 }
 
@@ -426,11 +584,8 @@ local_unwrap_dek_with_pass(const unsigned char *wrapped, int wrapped_len,
                            unsigned char *dek_out, int *dek_len,
                            const char *passphrase, const char *wallet_path)
 {
-    unsigned char   kek[TDE_DEK_LEN];
-    EVP_CIPHER_CTX *ctx;
-    int             update_len = 0;
-    int             final_len  = 0;
-    bool            ok = false;
+    LocalKekRing *ring;
+    bool          ok;
 
     Assert(wrapped != NULL);
     Assert(wrapped_len == LOCAL_WRAPPED_DEK_LEN);
@@ -440,40 +595,23 @@ local_unwrap_dek_with_pass(const unsigned char *wrapped, int wrapped_len,
 
     if (wrapped_len != LOCAL_WRAPPED_DEK_LEN) return false;
 
-    if (!local_open_wallet(wallet_path, passphrase, kek))
+    ring = local_ring_new(CurrentMemoryContext);
+    if (!local_open_wallet_ring(wallet_path, passphrase, ring))
     {
+        local_ring_free(ring);
         ereport(WARNING,
                 errmsg("pg_vault_tde: local_unwrap_dek_with_pass: "
                        "could not open wallet \"%s\"", wallet_path));
         return false;
     }
 
-    ctx = EVP_CIPHER_CTX_new();
-    if (!ctx)
-    {
-        OPENSSL_cleanse(kek, TDE_DEK_LEN);
-        ereport(WARNING, errmsg("pg_vault_tde: EVP_CIPHER_CTX_new failed"));
-        return false;
-    }
-
-    /* AES-256-UNWRAP via EVP — symmetric inverse of wrap */
-    if (EVP_DecryptInit_ex2(ctx, EVP_aes_256_wrap(), kek, NULL, NULL) == 1 &&
-        EVP_DecryptUpdate(ctx, dek_out, &update_len, wrapped, wrapped_len) == 1 &&
-        EVP_DecryptFinal_ex(ctx, dek_out + update_len, &final_len) == 1)
-    {
-        *dek_len = update_len + final_len;
-        ok = true;
-    }
-    else
-    {
+    ok = local_unwrap_dek_with_ring(wrapped, wrapped_len, dek_out, dek_len, ring);
+    if (!ok)
         ereport(WARNING,
-                errmsg("pg_vault_tde: AES-256-UNWRAP failed (wrong passphrase "
-                       "or corrupt wrapped DEK): %s",
-                       ERR_reason_error_string(ERR_get_error())));
-    }
-
-    EVP_CIPHER_CTX_free(ctx);
-    OPENSSL_cleanse(kek, TDE_DEK_LEN);
+                errmsg("pg_vault_tde: AES-256-UNWRAP failed with all %d KEK "
+                       "version(s) of the wallet (wrong passphrase or corrupt "
+                       "wrapped DEK)", ring->n));
+    local_ring_free(ring);
     return ok;
 }
 
@@ -526,7 +664,8 @@ local_wrap_dek_with_kek(const unsigned char *dek, int dek_len,
 /* -------------------------------------------------------------------------
  * local_unwrap_dek_with_kek — AES-256-UNWRAP using a raw in-memory KEK.
  *
- * Symmetric inverse of local_wrap_dek_with_kek.
+ * Symmetric inverse of local_wrap_dek_with_kek.  Silent on failure: with
+ * several KEK versions a mismatch is expected, and the caller reports once.
  * -------------------------------------------------------------------------*/
 static bool
 local_unwrap_dek_with_kek(const unsigned char *wrapped, int wrapped_len,
@@ -557,49 +696,28 @@ local_unwrap_dek_with_kek(const unsigned char *wrapped, int wrapped_len,
         ok = true;
     }
     else
-        ereport(WARNING,
-                errmsg("pg_vault_tde: AES-256-UNWRAP (cached KEK) failed: %s",
-                       ERR_reason_error_string(ERR_get_error())));
+    {
+        OPENSSL_cleanse(dek_out, TDE_DEK_LEN);
+        ERR_clear_error();
+    }
 
     EVP_CIPHER_CTX_free(ctx);
     return ok;
 }
 
-/* -------------------------------------------------------------------------
- * local_derive_kek_from_pass — derive a KEK from a passphrase WITHOUT
- * touching the wallet file or verifying any MAC.
- *
- * Mirrors exactly the PBKDF2 derivation performed inside local_open_wallet()
- * (same fixed salt "pg_vault_tde_kek_v1", same iteration count, same MD).
- *
- * This is used during passphrase rotation: between the old MAC (still on
- * disk) and the new MAC (about to be written), we need to derive the NEW
- * KEK from the NEW passphrase to re-wrap DEKs.  Calling local_open_wallet()
- * with the new passphrase would fail PKCS12_verify_mac() because the file
- * is still authenticated under the OLD passphrase.
- *
- * kek_out must point to a TDE_DEK_LEN-byte buffer.
- * Caller MUST OPENSSL_cleanse(kek_out, TDE_DEK_LEN) after use.
- * -------------------------------------------------------------------------*/
+/* Every version, newest first; the key wrap's integrity check picks the one. */
 static bool
-local_derive_kek_from_pass(const char *passphrase, unsigned char *kek_out)
+local_unwrap_dek_with_ring(const unsigned char *wrapped, int wrapped_len,
+                           unsigned char *dek_out, int *dek_len,
+                           const LocalKekRing *ring)
 {
-    Assert(passphrase != NULL);
-    Assert(kek_out != NULL);
+    int i;
 
-    if (PKCS5_PBKDF2_HMAC(passphrase, -1,
-                          (const unsigned char *) "pg_vault_tde_kek_v1",
-                          19,                                 /* salt length */
-                          LOCAL_PBKDF2_ITERS,
-                          EVP_sha256(),
-                          TDE_DEK_LEN, kek_out) != 1)
-    {
-        ereport(WARNING,
-                errmsg("pg_vault_tde: PBKDF2 KEK derivation failed: %s",
-                       ERR_reason_error_string(ERR_get_error())));
-        return false;
-    }
-    return true;
+    for (i = 0; i < ring->n; i++)
+        if (local_unwrap_dek_with_kek(wrapped, wrapped_len, dek_out, dek_len,
+                                      ring->kek[i]))
+            return true;
+    return false;
 }
 
 /* -------------------------------------------------------------------------
@@ -627,7 +745,7 @@ local_wrap_dek(const unsigned char *dek, int dek_len,
      */
     if (local_wallet_state && local_wallet_state->kek_loaded)
         return local_wrap_dek_with_kek(dek, dek_len, wrapped_out, out_len,
-                                       local_wallet_state->kek);
+                                       local_wallet_state->ring->kek[0]);
 
     /* Slow path: re-derive passphrase from GUC source on every call. */
     {
@@ -667,10 +785,46 @@ local_unwrap_dek(const unsigned char *wrapped, int wrapped_len,
     Assert(wrapped_len == LOCAL_WRAPPED_DEK_LEN);
     Assert(dek_out != NULL && dek_len != NULL);
 
-    /* Fast path: cached KEK from wallet_unlock(). */
+    /* Fast path: KEK versions cached by wallet_unlock(). */
     if (local_wallet_state && local_wallet_state->kek_loaded)
-        return local_unwrap_dek_with_kek(wrapped, wrapped_len, dek_out, dek_len,
-                                         local_wallet_state->kek);
+    {
+        LocalKekRing *ring;
+
+        if (local_unwrap_dek_with_ring(wrapped, wrapped_len, dek_out, dek_len,
+                                       local_wallet_state->ring))
+            return true;
+
+        /*
+         * None of the versions this session holds opens it: the wallet gained
+         * one since wallet_unlock() — another session rotated the KEK or
+         * changed the passphrase.  Reload the wallet when a passphrase source
+         * can; otherwise only a new wallet_unlock() can.
+         */
+        if (!local_get_passphrase(pass, sizeof(pass)))
+        {
+            ereport(WARNING,
+                    errmsg("pg_vault_tde: local unwrap_dek: no KEK version "
+                           "cached by wallet_unlock() in this session opens "
+                           "this DEK"),
+                    errhint("If another session rotated the KEK or changed the "
+                            "passphrase, call pg_vault_tde_wallet_unlock() "
+                            "again."));
+            return false;
+        }
+        ring = local_ring_new(CurrentMemoryContext);
+        ok = local_open_wallet_ring(local_get_wallet_path(), pass, ring) &&
+             local_unwrap_dek_with_ring(wrapped, wrapped_len, dek_out, dek_len,
+                                        ring);
+        OPENSSL_cleanse(pass, sizeof(pass));
+        if (ok)
+            local_cache_ring(ring);
+        else
+            ereport(WARNING,
+                    errmsg("pg_vault_tde: AES-256-UNWRAP failed with every KEK "
+                           "version of the wallet"));
+        local_ring_free(ring);
+        return ok;
+    }
 
     /* Slow path: re-derive passphrase from GUC source. */
     if (!local_get_passphrase(pass, sizeof(pass)))
@@ -707,25 +861,18 @@ local_rewrap_dek(const unsigned char *old_wrapped, int old_len,
 
     if (local_kek_rotation_ctx != NULL)
     {
-        PG_TRY();
-        {
-            dek_temp_len = TDE_DEK_LEN;
-            ok = local_unwrap_dek_with_kek(old_wrapped, old_len,
-                                           dek_temp, &dek_temp_len,
-                                           local_kek_rotation_ctx->old_kek);
-            if (ok)
-                ok = local_wrap_dek_with_kek(dek_temp, TDE_DEK_LEN,
-                                             new_wrapped, new_len,
-                                             local_kek_rotation_ctx->new_kek);
-        }
-        PG_CATCH();
-        {
-            local_kek_rotation_ctx_free();
-            OPENSSL_cleanse(dek_temp, TDE_DEK_LEN);
+        const LocalKekRing *ring = &local_kek_rotation_ctx->ring;
 
-            PG_RE_THROW();
-        }
-        PG_END_TRY();
+        dek_temp_len = TDE_DEK_LEN;
+        ok = local_unwrap_dek_with_ring(old_wrapped, old_len,
+                                        dek_temp, &dek_temp_len, ring);
+        if (!ok)
+            ereport(WARNING,
+                    errmsg("pg_vault_tde: KEK rotation: a DEK unwraps with none "
+                           "of the wallet's %d KEK version(s)", ring->n));
+        else
+            ok = local_wrap_dek_with_kek(dek_temp, TDE_DEK_LEN,
+                                         new_wrapped, new_len, ring->kek[0]);
     }
     else
     {
@@ -748,99 +895,115 @@ local_kek_rotation_ctx_free(void)
 {
     if (local_kek_rotation_ctx == NULL)
         return;
-    OPENSSL_cleanse(local_kek_rotation_ctx->old_kek, TDE_DEK_LEN);
-    OPENSSL_cleanse(local_kek_rotation_ctx->new_kek, TDE_DEK_LEN);
+    OPENSSL_cleanse(local_kek_rotation_ctx, sizeof(LocalKekRotationCtx));
     pfree(local_kek_rotation_ctx);
     local_kek_rotation_ctx = NULL;
 }
 
+/* The keys go at the end of the transaction, whatever ends it. */
+static void
+local_kek_rotation_xact_callback(XactEvent event, void *arg)
+{
+    if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_ABORT ||
+        event == XACT_EVENT_PARALLEL_COMMIT || event == XACT_EVENT_PARALLEL_ABORT)
+        local_kek_rotation_ctx_free();
+}
+
+/*
+ * Arm a re-wrap: every row unwraps with some version of `ring` and is wrapped
+ * again under ring->kek[0].  A context left by a rotation that failed is
+ * replaced — nothing else can be using it.
+ */
+static void
+local_kek_rotation_ctx_set(const LocalKekRing *ring)
+{
+    local_kek_rotation_ctx_free();
+
+    if (!local_kek_rotation_callback_registered)
+    {
+        RegisterXactCallback(local_kek_rotation_xact_callback, NULL);
+        local_kek_rotation_callback_registered = true;
+    }
+
+    local_kek_rotation_ctx = (LocalKekRotationCtx *)
+        MemoryContextAllocZero(TopMemoryContext, sizeof(LocalKekRotationCtx));
+    memcpy(&local_kek_rotation_ctx->ring, ring, sizeof(LocalKekRing));
+}
+
 /* -------------------------------------------------------------------------
- * local_prepare_kek_rotation — vtable: arm the provider for a rewrap cycle.
+ * local_prepare_kek_rotation — vtable: add a KEK version and arm the re-wrap.
  *
- * Reads the current KEK (from cache or wallet), generates a fresh random KEK,
- * writes the new wallet file to disk (durability before the loop), then stores
- * both keys in local_kek_rotation_ctx so local_rewrap_dek() can use them.
+ * The new version goes into the wallet file, durably and ahead of every older
+ * one, BEFORE pg_vault_tde_catalog_rewrap_all() touches a row.  From then on
+ * each row unwraps with a version the file holds whatever the transaction
+ * does: commit, roll back, fail later in its statement, or crash.
+ *
+ * Needs the passphrase from a configured source, because the file is
+ * re-encrypted under it; a KEK cached by wallet_unlock() is not enough.
  * -------------------------------------------------------------------------*/
 static bool
 local_prepare_kek_rotation(void)
 {
-    unsigned char old_kek[TDE_DEK_LEN];
-    unsigned char new_kek[TDE_DEK_LEN];
     const char   *path = local_get_wallet_path();
     char          pass[1024];
+    LocalKekRing *cur;
+    LocalKekRing *next;
+    bool          ok;
 
-    if (local_kek_rotation_ctx != NULL)
-        ereport(ERROR,
-                errmsg("pg_vault_tde: KEK rotation already in progress"));
-
-    /* Obtain old KEK: from cache if available, otherwise from GUC + wallet. */
-    if (local_wallet_state && local_wallet_state->kek_loaded)
+    if (!local_get_passphrase(pass, sizeof(pass)))
     {
-        memcpy(old_kek, local_wallet_state->kek, TDE_DEK_LEN);
-    }
-    else
-    {
-        if (!local_get_passphrase(pass, sizeof(pass)) ||
-            !local_open_wallet(path, pass, old_kek))
-        {
-            OPENSSL_cleanse(pass, sizeof(pass));
-            OPENSSL_cleanse(old_kek, TDE_DEK_LEN);
-            return false;
-        }
-        OPENSSL_cleanse(pass, sizeof(pass));
-    }
-
-    if (!pg_strong_random(new_kek, sizeof(new_kek)))
-    {
-        OPENSSL_cleanse(old_kek, TDE_DEK_LEN);
+        ereport(WARNING,
+                errmsg("pg_vault_tde: KEK rotation needs the wallet passphrase "
+                       "from wallet_passphrase_command, wallet_passphrase_env "
+                       "or wallet_passphrase_file"));
         return false;
     }
 
-    /* Allocate rotation context in TopMemoryContext (survives query boundary). */
-    local_kek_rotation_ctx = (LocalKekRotationCtx *)
-        MemoryContextAllocZero(TopMemoryContext, sizeof(LocalKekRotationCtx));
-    memcpy(local_kek_rotation_ctx->old_kek, old_kek, TDE_DEK_LEN);
-    memcpy(local_kek_rotation_ctx->new_kek, new_kek, TDE_DEK_LEN);
+    cur  = local_ring_new(CurrentMemoryContext);
+    next = local_ring_new(CurrentMemoryContext);
 
-    OPENSSL_cleanse(old_kek, TDE_DEK_LEN);
-    OPENSSL_cleanse(new_kek, TDE_DEK_LEN);
-    return true;
+    PG_TRY();
+    {
+        int lock_fd = local_wallet_lock_file(path);
+
+        if (local_open_wallet_ring(path, pass, cur) &&
+            local_ring_add_version(cur, next))
+        {
+            local_write_wallet_ring(path, pass, next);
+            local_kek_rotation_ctx_set(next);
+            if (local_wallet_state && local_wallet_state->kek_loaded)
+                local_cache_ring(next);
+        }
+        else
+            next->n = 0;
+        local_wallet_unlock_file(lock_fd);
+    }
+    PG_FINALLY();
+    {
+        OPENSSL_cleanse(pass, sizeof(pass));
+    }
+    PG_END_TRY();
+
+    if (next->n > 0)
+        ereport(LOG,
+                errmsg("pg_vault_tde: KEK version %u added to the wallet; "
+                       "re-wrapping the DEKs", next->version[0]));
+
+    ok = (next->n > 0);
+    local_ring_free(cur);
+    local_ring_free(next);
+    return ok;
 }
 
 /* -------------------------------------------------------------------------
- * local_commit_kek_rotation — vtable: finalise after rewrap loop completes.
+ * local_commit_kek_rotation — vtable: the re-wrap is done.
  *
- * Copies new_kek into local_wallet_state so this backend can continue
- * wrapping/unwrapping without re-reading the passphrase.  Clears the ctx.
- * Safe to call even on error paths (idempotent when ctx is NULL).
+ * Nothing left to make durable: the wallet was written in prepare.  The
+ * context is released here, and at the end of the transaction otherwise.
  * -------------------------------------------------------------------------*/
 static void
 local_commit_kek_rotation(void)
 {
-    const char   *path = local_get_wallet_path();
-    char          pass[1024];
-
-    if (local_kek_rotation_ctx == NULL)
-        return;
-
-     /* Write new wallet file before the rewrap loop (durability first). */
-    if (!local_get_passphrase(pass, sizeof(pass)))
-    {
-        ereport(ERROR, 
-                errmsg("pg_vault_tde: can't get wallet passphrase"));
-    }
-    local_create_wallet_file(path, pass, local_kek_rotation_ctx->new_kek, TDE_DEK_LEN);
-    OPENSSL_cleanse(pass, sizeof(pass));
-
-    {
-        LocalWalletState *st = local_state();
-
-        memcpy(st->kek, local_kek_rotation_ctx->new_kek, TDE_DEK_LEN);
-        st->kek_loaded  = true;
-        st->wallet_open = true;
-        st->last_opened = GetCurrentTimestamp();
-    }
-
     local_kek_rotation_ctx_free();
 }
 /* -------------------------------------------------------------------------
@@ -883,16 +1046,11 @@ local_shutdown(void)
     if (!local_wallet_state)
         return;
 
-    /*
-     * Wipe the KEK buffer if somehow it was left loaded.
-     * In normal operation it is zeroed immediately after each use.
-     */
-    if (local_wallet_state->kek_loaded)
-        OPENSSL_cleanse(local_wallet_state->kek, TDE_DEK_LEN);
+    /* Wipe the KEK versions cached by wallet_unlock(), if any. */
+    local_drop_cached_ring();
 
     tde_audit(WALLET_CLOSE, NULL, true);
     local_wallet_state->wallet_open  = false;
-    local_wallet_state->kek_loaded   = false;
 }
 
 /* =========================================================================
@@ -1234,22 +1392,25 @@ local_get_passphrase(char *pass_out, Size pass_max)
  *
  * Returns true on success.
  */
+/*
+ * local_open_wallet_ring — every KEK version in the wallet, current first.
+ *
+ * Walks the PKCS#12 bags itself: PKCS12_parse() stops at the first key.
+ */
 static bool
-local_open_wallet(const char *path, const char *passphrase,
-                  unsigned char *kek_out)
+local_open_wallet_ring(const char *path, const char *passphrase,
+                       LocalKekRing *out)
 {
-    FILE     *fp;
-    PKCS12   *p12 = NULL;
-    EVP_PKEY *pkey = NULL;
-    X509     *cert = NULL;
-    STACK_OF(X509) *ca  = NULL;
-    bool      ok   = false;
-    unsigned char kek_buffer[32];
-    size_t kek_len     = sizeof(kek_buffer);
+    FILE            *fp;
+    PKCS12          *p12;
+    STACK_OF(PKCS7) *asafes;
+    int              i, j;
 
     Assert(path != NULL);
     Assert(passphrase != NULL);
-    Assert(kek_out != NULL);
+    Assert(out != NULL);
+
+    memset(out, 0, sizeof(LocalKekRing));
 
     fp = fopen(path, "rb");
     if (!fp)
@@ -1270,34 +1431,110 @@ local_open_wallet(const char *path, const char *passphrase,
         return false;
     }
 
-    if(PKCS12_verify_mac(p12, passphrase, -1))
+    if (!PKCS12_verify_mac(p12, passphrase, -1))
     {
-        if(PKCS12_parse(p12, passphrase, &pkey, &cert, &ca)){
-            if(EVP_PKEY_get_raw_private_key(pkey, kek_buffer, &kek_len) != 1)
-                ereport(WARNING,
-                    errmsg("pg_vault_tde: error while extracting the kek"));
-            else 
-                ok = true;
-        }
-        else
-            ereport(WARNING,
-                errmsg("pg_vault_tde: PKCS#12 parsing failed"));
-    }
-    else    
+        PKCS12_free(p12);
         ereport(WARNING,
-                errmsg(("pg_vault_tde: wallet MAC verification failed - "
-                     "wrong passphrase or corrupt wallet")));
+                errmsg("pg_vault_tde: wallet MAC verification failed - "
+                       "wrong passphrase or corrupt wallet"));
+        return false;
+    }
 
-    if(pkey) EVP_PKEY_free(pkey);
-    if(cert) X509_free(cert);
-    if(ca) sk_X509_pop_free(ca, X509_free);
-
+    asafes = PKCS12_unpack_authsafes(p12);
     PKCS12_free(p12);
+    if (!asafes)
+    {
+        ereport(WARNING, errmsg("pg_vault_tde: PKCS#12 parsing failed"));
+        return false;
+    }
 
-    /* Only copy the KEK when parsing succeeded; avoids writing uninitialized bytes on error. */
-    if(ok) memcpy(kek_out, kek_buffer, kek_len);
+    for (i = 0; i < sk_PKCS7_num(asafes); i++)
+    {
+        PKCS7                    *p7 = sk_PKCS7_value(asafes, i);
+        STACK_OF(PKCS12_SAFEBAG) *bags = NULL;
 
-    OPENSSL_cleanse(kek_buffer, kek_len);
+        if (PKCS7_type_is_data(p7))
+            bags = PKCS12_unpack_p7data(p7);
+        else if (PKCS7_type_is_encrypted(p7))
+            bags = PKCS12_unpack_p7encdata(p7, passphrase, -1);
+        if (!bags)
+            continue;
+
+        for (j = 0; j < sk_PKCS12_SAFEBAG_num(bags); j++)
+        {
+            PKCS12_SAFEBAG            *bag = sk_PKCS12_SAFEBAG_value(bags, j);
+            PKCS8_PRIV_KEY_INFO       *shrouded = NULL;
+            const PKCS8_PRIV_KEY_INFO *p8 = NULL;
+            EVP_PKEY                  *pkey;
+            char                      *name;
+            uint32                     version;
+            size_t                     klen = TDE_DEK_LEN;
+
+            if (PKCS12_SAFEBAG_get_nid(bag) == NID_pkcs8ShroudedKeyBag)
+                p8 = shrouded = PKCS12_decrypt_skey(bag, passphrase, -1);
+            else if (PKCS12_SAFEBAG_get_nid(bag) == NID_keyBag)
+                p8 = PKCS12_SAFEBAG_get0_p8inf(bag);
+            if (!p8)
+                continue;
+
+            pkey = EVP_PKCS82PKEY(p8);
+            if (shrouded)
+                PKCS8_PRIV_KEY_INFO_free(shrouded);
+            name = PKCS12_get_friendlyname(bag);
+
+            if (pkey && name && out->n < LOCAL_KEK_MAX_VERSIONS &&
+                local_kek_version_from_name(name, &version) &&
+                EVP_PKEY_get_raw_private_key(pkey, out->kek[out->n], &klen) == 1 &&
+                klen == TDE_DEK_LEN)
+            {
+                out->version[out->n] = version;
+                out->n++;
+            }
+            if (name)
+                OPENSSL_free(name);
+            if (pkey)
+                EVP_PKEY_free(pkey);
+        }
+        sk_PKCS12_SAFEBAG_pop_free(bags, PKCS12_SAFEBAG_free);
+    }
+    sk_PKCS7_pop_free(asafes, PKCS7_free);
+
+    if (out->n == 0)
+    {
+        ereport(WARNING,
+                errmsg("pg_vault_tde: wallet \"%s\" holds no KEK", path));
+        return false;
+    }
+
+    /* Newest first, whatever order the file had. */
+    for (i = 1; i < out->n; i++)
+        for (j = i; j > 0 && out->version[j] > out->version[j - 1]; j--)
+        {
+            uint32        v = out->version[j];
+            unsigned char k[TDE_DEK_LEN];
+
+            out->version[j]     = out->version[j - 1];
+            out->version[j - 1] = v;
+            memcpy(k, out->kek[j], TDE_DEK_LEN);
+            memcpy(out->kek[j], out->kek[j - 1], TDE_DEK_LEN);
+            memcpy(out->kek[j - 1], k, TDE_DEK_LEN);
+            OPENSSL_cleanse(k, TDE_DEK_LEN);
+        }
+
+    return true;
+}
+
+/* The current KEK only — for the callers that need nothing else. */
+static bool
+local_open_wallet(const char *path, const char *passphrase,
+                  unsigned char *kek_out)
+{
+    LocalKekRing *ring = local_ring_new(CurrentMemoryContext);
+    bool          ok   = local_open_wallet_ring(path, passphrase, ring);
+
+    if (ok)
+        memcpy(kek_out, ring->kek[0], TDE_DEK_LEN);
+    local_ring_free(ring);
     return ok;
 }
 
@@ -1492,25 +1729,19 @@ pg_vault_tde_wallet_init_sql(PG_FUNCTION_ARGS)
      * fails if the env var passphrase differs from the one just used here.
      */
     {
-        LocalWalletState *st = local_state();
-        unsigned char     kek_cache[TDE_DEK_LEN];
+        LocalKekRing *ring = local_ring_new(CurrentMemoryContext);
 
-        if (local_open_wallet(path, passphrase, kek_cache))
-        {
-            memcpy(st->kek, kek_cache, TDE_DEK_LEN);
-            st->kek_loaded  = true;
-            st->wallet_open = true;
-            st->last_opened = GetCurrentTimestamp();
-        }
+        if (local_open_wallet_ring(path, passphrase, ring))
+            local_cache_ring(ring);
         else
         {
             /* Wallet was just written — this should never fail */
             ereport(WARNING,
                     errmsg("pg_vault_tde: wallet created but could not be "
                            "re-opened for KEK caching at \"%s\"", path));
-            st->wallet_open = true;
+            local_state()->wallet_open = true;
         }
-        OPENSSL_cleanse(kek_cache, TDE_DEK_LEN);
+        local_ring_free(ring);
     }
 
     OPENSSL_cleanse(passphrase, strlen(passphrase));
@@ -1522,52 +1753,64 @@ pg_vault_tde_wallet_init_sql(PG_FUNCTION_ARGS)
 }
 
 /* -------------------------------------------------------------------------
- * local_create_wallet_file — create (or overwrite-via-rename) a PKCS#12 wallet
+ * local_write_wallet_ring — write every KEK version, current first
  *
- * Writes the new PKCS#12 file to `dest_path.new`, then renames atomically to
- * `dest_path`.  The caller holds responsibility for cleansing `passphrase`
- * after return.
- *
- * Returns true on success; on error emits ereport(ERROR) (longjmp).
+ * To `dest_path.new`, then durable_rename(): the file and its directory are
+ * fsync'd, so a crash leaves either the old wallet or the new one, never a
+ * half-written one and never a rename that did not reach the disk.
+ * ereports ERROR on failure.
  * -------------------------------------------------------------------------*/
 static void
-local_create_wallet_file(const char *dest_path, const char *passphrase, const unsigned char* kek, int kek_len)
+local_write_wallet_ring(const char *dest_path, const char *passphrase,
+                        const LocalKekRing *ring)
 {
-    char    tmp_path[MAXPGPATH];
-    PKCS12 *p12;
-    int     fd;
-    FILE   *fp;
-    EVP_PKEY* pkey;
+    char                      tmp_path[MAXPGPATH];
+    STACK_OF(PKCS12_SAFEBAG) *bags  = NULL;
+    STACK_OF(PKCS7)          *safes = NULL;
+    PKCS12                   *p12   = NULL;
+    int                       fd;
+    FILE                     *fp;
+    int                       i;
+    bool                      built = false;
 
     Assert(dest_path != NULL);
     Assert(passphrase != NULL);
-    Assert(kek != NULL);
-    Assert(kek_len > 0);
+    Assert(ring != NULL && ring->n > 0);
 
     snprintf(tmp_path, sizeof(tmp_path), "%s.new", dest_path);
 
-    pkey = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, kek, kek_len);
-    if(!pkey)
+    for (i = 0; i < ring->n; i++)
     {
-        ereport(ERROR, 
-                errmsg("pg_vault_tde: EVP_KEY creation failed"));
+        char            name[64];
+        EVP_PKEY       *pkey;
+        PKCS12_SAFEBAG *bag;
+
+        pkey = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL,
+                                            ring->kek[i], TDE_DEK_LEN);
+        if (!pkey)
+            break;
+        bag = PKCS12_add_key(&bags, pkey, 0, PKCS12_DEFAULT_ITER,
+                             NID_aes_256_cbc, passphrase);
+        EVP_PKEY_free(pkey);
+        snprintf(name, sizeof(name), LOCAL_KEK_BAG_NAME ".v%u", ring->version[i]);
+        if (!bag || !PKCS12_add_friendlyname(bag, name, -1))
+            break;
     }
+    if (i == ring->n &&
+        PKCS12_add_safe(&safes, bags, -1, 0, NULL) &&
+        (p12 = PKCS12_add_safes(safes, 0)) != NULL &&
+        PKCS12_set_mac(p12, passphrase, -1, NULL, 0, PKCS12_DEFAULT_ITER, NULL))
+        built = true;
 
-    p12 = PKCS12_create(passphrase, 
-                        "pg_vault_tde_kek", 
-                        pkey, 
-                        NULL, 
-                        NULL, 
-                        NID_aes_256_cbc, 
-                        NID_aes_256_cbc, 
-                        PKCS12_DEFAULT_ITER, 
-                        PKCS12_DEFAULT_ITER, 
-                        0);
-    EVP_PKEY_free(pkey);
-
-    if(!p12)
+    if (bags)
+        sk_PKCS12_SAFEBAG_pop_free(bags, PKCS12_SAFEBAG_free);
+    if (safes)
+        sk_PKCS7_pop_free(safes, PKCS7_free);
+    if (!built)
     {
-        ereport(ERROR, 
+        if (p12)
+            PKCS12_free(p12);
+        ereport(ERROR,
                 errmsg("pg_vault_tde: PKCS12 wallet creation failed"));
     }
 
@@ -1581,16 +1824,16 @@ local_create_wallet_file(const char *dest_path, const char *passphrase, const un
     }
 
     fp = fdopen(fd, "wb");
-    if (!fp || i2d_PKCS12_fp(fp, p12) != 1)
+    if (!fp || i2d_PKCS12_fp(fp, p12) != 1 || fclose(fp) != 0)
     {
-        if (fp) fclose(fp); else close(fd);
+        if (!fp)
+            close(fd);
         unlink(tmp_path);
         PKCS12_free(p12);
         ereport(ERROR,
                 errmsg("pg_vault_tde: could not write wallet to \"%s\"",
                        tmp_path));
     }
-    fclose(fp);
     PKCS12_free(p12);
 
     if (chmod(tmp_path, 0600) != 0)
@@ -1601,12 +1844,12 @@ local_create_wallet_file(const char *dest_path, const char *passphrase, const un
                        tmp_path));
     }
 
-    if (rename(tmp_path, dest_path) != 0)
+    if (durable_rename(tmp_path, dest_path, LOG) != 0)
     {
         unlink(tmp_path);
         ereport(ERROR,
-                errmsg("pg_vault_tde: could not rename \"%s\" to \"%s\": %m",
-                       tmp_path, dest_path));
+                errmsg("pg_vault_tde: could not install the wallet \"%s\"",
+                       dest_path));
     }
 }
 
@@ -1704,27 +1947,31 @@ pg_vault_tde_wallet_status_sql(PG_FUNCTION_ARGS)
 }
 
 /* -------------------------------------------------------------------------
- * pg_vault_tde_wallet_change_passphrase — re-wrap all DEKs under new passphrase
+ * pg_vault_tde_wallet_change_passphrase — new passphrase, new KEK version
  *
  * Algorithm:
- *   1. Verify old_passphrase opens the wallet.
- *   2. Fetch all catalog entries for kms_provider='local'.
- *   3. For each entry: unwrap with old passphrase → wrap with new passphrase → UPDATE.
- *   4. Create new wallet file (atomic rename).
- *   5. Evict shmem cache so next access uses new KEK.
+ *   1. Open every KEK version with old_passphrase.
+ *   2. Add a new version and write the wallet under new_passphrase — durably,
+ *      with every old version still in it, BEFORE any row changes.
+ *   3. Re-wrap every DEK under the new version.
+ *   4. Evict the shmem cache so the next access unwraps again.
+ *
+ * Step 2 is what makes a failure harmless: whatever happens to the
+ * transaction afterwards, every row unwraps with a version the wallet holds.
+ * The new passphrase is in effect from step 2 on, even if the call then fails.
  * -------------------------------------------------------------------------*/
 PG_FUNCTION_INFO_V1(pg_vault_tde_wallet_change_passphrase_sql);
 
 PGDLLEXPORT Datum
 pg_vault_tde_wallet_change_passphrase_sql(PG_FUNCTION_ARGS)
 {
-    text   *old_t   = PG_GETARG_TEXT_PP(0);
-    text   *new_t   = PG_GETARG_TEXT_PP(1);
-    char   *old_pass = text_to_cstring(old_t);
-    char   *new_pass = text_to_cstring(new_t);
-    const char *path;
-    unsigned char old_kek[TDE_DEK_LEN];
-    unsigned char new_kek[TDE_DEK_LEN];
+    text         *old_t    = PG_GETARG_TEXT_PP(0);
+    text         *new_t    = PG_GETARG_TEXT_PP(1);
+    char         *old_pass = text_to_cstring(old_t);
+    char         *new_pass = text_to_cstring(new_t);
+    const char   *path;
+    LocalKekRing *cur;
+    LocalKekRing *next;
 
     if (!superuser())
         ereport(ERROR,
@@ -1732,101 +1979,50 @@ pg_vault_tde_wallet_change_passphrase_sql(PG_FUNCTION_ARGS)
                 errmsg("pg_vault_tde_wallet_change_passphrase requires superuser"));
 
     path = local_get_wallet_path();
-
-    /*
-     * Verify old passphrase actually opens the wallet (MAC check on
-     * the on-disk PKCS#12 file, which is still authenticated under old_pass).
-     */
-    if (!local_open_wallet(path, old_pass, old_kek))
-    {
-        OPENSSL_cleanse(old_pass, strlen(old_pass));
-        OPENSSL_cleanse(new_pass, strlen(new_pass));
-        OPENSSL_cleanse(old_kek, TDE_DEK_LEN);
-        pfree(old_pass);
-        pfree(new_pass);
-        ereport(ERROR,
-                errcode(ERRCODE_INVALID_PASSWORD),
-                errmsg("pg_vault_tde: wrong passphrase (could not open wallet)"));
-    }
-
-    if(!pg_strong_random(new_kek, sizeof(new_kek)))
-    {
-        OPENSSL_cleanse(old_pass, strlen(old_pass));
-        OPENSSL_cleanse(new_pass, strlen(new_pass));
-        OPENSSL_cleanse(old_kek, TDE_DEK_LEN);
-        OPENSSL_cleanse(new_kek, TDE_DEK_LEN);
-        pfree(old_pass);
-        pfree(new_pass);
-        ereport(ERROR,
-                errmsg("pg_vault_tde: change_passphrase: could not generate new KEK"));
-    }
-    
-    /* Set up rotation context with explicit KEK pair (passphrase-derived). */
-    if (local_kek_rotation_ctx != NULL)
-    {
-        OPENSSL_cleanse(old_pass, strlen(old_pass));
-        OPENSSL_cleanse(new_pass, strlen(new_pass));
-        OPENSSL_cleanse(old_kek, TDE_DEK_LEN);
-        OPENSSL_cleanse(new_kek, TDE_DEK_LEN);
-        pfree(old_pass);
-        pfree(new_pass);
-        ereport(ERROR, errmsg("pg_vault_tde: KEK rotation already in progress"));
-    }
-
-    local_kek_rotation_ctx = (LocalKekRotationCtx *)
-        MemoryContextAllocZero(TopMemoryContext, sizeof(LocalKekRotationCtx));
-    memcpy(local_kek_rotation_ctx->old_kek, old_kek, TDE_DEK_LEN);
-    memcpy(local_kek_rotation_ctx->new_kek, new_kek, TDE_DEK_LEN);
+    cur  = local_ring_new(CurrentMemoryContext);
+    next = local_ring_new(CurrentMemoryContext);
 
     PG_TRY();
     {
+        int lock_fd = local_wallet_lock_file(path);
+
+        /* The MAC check authenticates old_pass against the file on disk. */
+        if (!local_open_wallet_ring(path, old_pass, cur))
+            ereport(ERROR,
+                    errcode(ERRCODE_INVALID_PASSWORD),
+                    errmsg("pg_vault_tde: wrong passphrase (could not open wallet)"));
+
+        if (!local_ring_add_version(cur, next))
+            ereport(ERROR,
+                    errmsg("pg_vault_tde: change_passphrase: could not generate new KEK"));
+
+        local_write_wallet_ring(path, new_pass, next);
+        local_wallet_unlock_file(lock_fd);
+
+        local_kek_rotation_ctx_set(next);
         pg_vault_tde_catalog_rewrap_all();
-    }
-    PG_CATCH();
-    {
         local_kek_rotation_ctx_free();
+    }
+    PG_FINALLY();
+    {
         OPENSSL_cleanse(old_pass, strlen(old_pass));
         OPENSSL_cleanse(new_pass, strlen(new_pass));
-        OPENSSL_cleanse(old_kek, TDE_DEK_LEN);
-        OPENSSL_cleanse(new_kek, TDE_DEK_LEN);
-        pfree(old_pass);
-        pfree(new_pass);
-        PG_RE_THROW();
     }
     PG_END_TRY();
-
-    local_kek_rotation_ctx_free();
 
     /* Evict shmem — next access loads with new KEK */
     pg_vault_tde_catalog_evict_db();
 
-    /* 
-     * Write new wallet file with new passphrase (atomic rename).
-     * From here on, on-disk MAC is authenticated under new_pass.
+    /*
+     * Always cache the KEK versions, whether or not wallet_unlock() ran first:
+     * a backend on the slow path would otherwise re-read the now-stale
+     * passphrase source against a wallet already re-MAC'd under new_pass, and
+     * fail its very next SELECT with "MAC verification failed".
      */
-    local_create_wallet_file(path, new_pass, new_kek, TDE_DEK_LEN);
+    local_cache_ring(next);
 
-    {
-        /*
-         * Always cache the new KEK and mark it loaded, regardless of whether
-         * wallet_unlock() was called before change_passphrase().  Without this,
-         * backends that use the slow path (env-var passphrase, kek_loaded=false)
-         * would attempt local_open_wallet() with the now-stale env-var passphrase
-         * against a wallet file already re-MAC'd under new_pass, producing a
-         * "MAC verification failed" error on the very next SELECT.
-         */
-        LocalWalletState *st = local_state();
-
-        memcpy(st->kek, new_kek, TDE_DEK_LEN);
-        st->kek_loaded   = true;
-        st->wallet_open  = true;
-        st->last_opened  = GetCurrentTimestamp();
-    }
-
-    OPENSSL_cleanse(old_pass, strlen(old_pass));
-    OPENSSL_cleanse(new_pass, strlen(new_pass));
-    OPENSSL_cleanse(old_kek, TDE_DEK_LEN);
-    OPENSSL_cleanse(new_kek, TDE_DEK_LEN);
+    local_ring_free(cur);
+    local_ring_free(next);
     pfree(old_pass);
     pfree(new_pass);
 
@@ -1855,7 +2051,7 @@ pg_vault_tde_wallet_unlock_sql(PG_FUNCTION_ARGS)
     text   *pass_t   = PG_GETARG_TEXT_PP(0);
     char   *passphrase = text_to_cstring(pass_t);
     const char *path;
-    unsigned char kek_test[TDE_DEK_LEN];
+    LocalKekRing *ring;
 
     if (!superuser())
         ereport(ERROR,
@@ -1863,11 +2059,12 @@ pg_vault_tde_wallet_unlock_sql(PG_FUNCTION_ARGS)
                 errmsg("pg_vault_tde_wallet_unlock requires superuser"));
 
     path = local_get_wallet_path();
+    ring = local_ring_new(CurrentMemoryContext);
 
-    if (!local_open_wallet(path, passphrase, kek_test))
+    if (!local_open_wallet_ring(path, passphrase, ring))
     {
         OPENSSL_cleanse(passphrase, strlen(passphrase));
-        OPENSSL_cleanse(kek_test, TDE_DEK_LEN);
+        local_ring_free(ring);
         pfree(passphrase);
         ereport(ERROR,
                 errcode(ERRCODE_INVALID_PASSWORD),
@@ -1890,15 +2087,8 @@ pg_vault_tde_wallet_unlock_sql(PG_FUNCTION_ARGS)
      *
      * kek_loaded is cleared by wallet_lock() and local_shutdown().
      */
-    {
-        LocalWalletState *st = local_state();
-
-        memcpy(st->kek, kek_test, TDE_DEK_LEN);
-        st->kek_loaded  = true;
-        st->wallet_open = true;
-        st->last_opened = GetCurrentTimestamp();
-    }
-    OPENSSL_cleanse(kek_test, TDE_DEK_LEN);
+    local_cache_ring(ring);
+    local_ring_free(ring);
 
     /*
      * Evict shmem so every backend reloads DEKs through the full
@@ -1941,9 +2131,7 @@ pg_vault_tde_wallet_lock_sql(PG_FUNCTION_ARGS)
          * wrap or unwrap DEKs without a fresh wallet_unlock() or a
          * configured passphrase GUC source.
          */
-        if (local_wallet_state->kek_loaded)
-            OPENSSL_cleanse(local_wallet_state->kek, TDE_DEK_LEN);
-        local_wallet_state->kek_loaded  = false;
+        local_drop_cached_ring();
         local_wallet_state->wallet_open = false;
     }
 
@@ -1955,14 +2143,21 @@ pg_vault_tde_wallet_lock_sql(PG_FUNCTION_ARGS)
 /* -------------------------------------------------------------------------
  * pg_vault_tde_migrate_vault_to_wallet — re-wrap all Vault DEKs under local wallet
  *
- * For each row in pg_vault_tde_catalog with kms_provider='vault':
+ * new_passphrase must open the wallet pg_vault_tde_wallet_init() created; its
+ * current KEK is the key everything is wrapped under.  For each row in
+ * pg_vault_tde_catalog with kms_provider='vault':
  *   1. Unwrap the DEK using the Vault provider.
- *   2. Re-wrap using the local wallet with new_passphrase.
+ *   2. Re-wrap it under the wallet's current KEK.
  *   3. UPDATE the catalog row with the new wrapped_dek and kms_provider='local'.
  *
- * After all rows are migrated, sets tde_active_kms_provider to the local
- * provider.  The Vault provider is NOT shut down (may still be referenced by
- * GUC settings until the server is restarted with kms_provider=local).
+ * Then the database switches to the local provider — this session at once,
+ * new sessions through a database-level setting — since the Vault provider
+ * cannot unwrap what was just written.  The plaintext DEKs do not change, so
+ * the shmem cache is left alone: every session keeps reading the tables it
+ * has cached, including those connected before the migration.
+ *
+ * Until PSQLE-188 the DEKs were wrapped under a KEK derived from the
+ * passphrase, which the wallet does not hold, so no migrated table read again.
  * -------------------------------------------------------------------------*/
 
 PGDLLEXPORT Datum
@@ -2027,16 +2222,26 @@ pg_vault_tde_migrate_vault_to_wallet_sql(PG_FUNCTION_ARGS)
     }
 
     /*
-     * Derive the local KEK from new_pass once before the scan loop.
-     * This avoids per-row PBKDF2 overhead that local_wrap_dek_with_pass
-     * would incur inside the loop.
+     * The wallet's own current KEK, once, before the scan loop.  Opening the
+     * file is also what proves new_pass is the wallet's passphrase: the MAC
+     * check fails otherwise, and nothing has been touched yet.
      */
-    if (!local_derive_kek_from_pass(new_pass, new_kek))
     {
-        OPENSSL_cleanse(new_pass, strlen(new_pass));
-        pfree(new_pass);
-        ereport(ERROR,
-                errmsg("pg_vault_tde: migrate_vault_to_wallet: could not derive KEK from passphrase"));
+        LocalKekRing *ring = local_ring_new(CurrentMemoryContext);
+
+        if (!local_open_wallet_ring(wallet_path, new_pass, ring))
+        {
+            local_ring_free(ring);
+            OPENSSL_cleanse(new_pass, strlen(new_pass));
+            pfree(new_pass);
+            ereport(ERROR,
+                    errcode(ERRCODE_INVALID_PASSWORD),
+                    errmsg("pg_vault_tde: migrate_vault_to_wallet: the passphrase "
+                           "does not open the local wallet at \"%s\"", wallet_path),
+                    errhint("Pass the passphrase given to pg_vault_tde_wallet_init()."));
+        }
+        memcpy(new_kek, ring->kek[0], TDE_DEK_LEN);
+        local_ring_free(ring);
     }
 
     ext_ns = get_extension_schema(get_extension_oid(pg_vault_tde_extension_name, true));
@@ -2179,7 +2384,27 @@ pg_vault_tde_migrate_vault_to_wallet_sql(PG_FUNCTION_ARGS)
     CatalogCloseIndexes(indstate);
     table_close(catalog_rel, ShareRowExclusiveLock);
 
-    pg_vault_tde_catalog_evict_db();
+    /*
+     * No pg_vault_tde_catalog_evict_db(): the DEKs are the same, only their
+     * wrapping moved, and evicting would send every session back to the
+     * Vault provider, which cannot unwrap the new wrapping.
+     *
+     * Switch this database to the local provider — this session now, and
+     * the ones that connect later through the database-level setting, the
+     * same mechanism local_set_wallet() uses for wallet_path.
+     */
+    {
+        VariableSetStmt *setstmt;
+
+        SetConfigOption("pg_vault_tde.kms_provider", "local",
+                        PGC_SUSET, PGC_S_SESSION);
+
+        setstmt        = makeNode(VariableSetStmt);
+        setstmt->kind  = VAR_SET_CURRENT;
+        setstmt->name  = "pg_vault_tde.kms_provider";
+        setstmt->args  = NIL;
+        AlterSetting(MyDatabaseId, InvalidOid, setstmt);
+    }
 
     {
         LocalWalletState *st = local_state();
@@ -2195,6 +2420,12 @@ pg_vault_tde_migrate_vault_to_wallet_sql(PG_FUNCTION_ARGS)
     ereport(LOG,
             errmsg("pg_vault_tde: vault-to-wallet migration complete; "
                    "%d entries migrated", migrated));
+    ereport(NOTICE,
+            errmsg("pg_vault_tde: this database now uses the local wallet "
+                   "(kms_provider = 'local')"),
+            errdetail("Sessions connected before the migration keep the Vault "
+                      "provider until they reconnect; they still read the "
+                      "tables whose keys are cached."));
 
     PG_RETURN_VOID();
 }

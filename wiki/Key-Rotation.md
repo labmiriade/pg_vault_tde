@@ -82,6 +82,12 @@ faster than a DEK rotation of any single large table.
 > so a crash mid-rotation is always safe to retry — see
 > [KMS: PKCS#11 / HSM](KMS-PKCS11-HSM) for the generation model.
 
+> **Local wallet users:** since 1.7.2 the wallet file keeps every KEK version,
+> and a rotation adds the new one before it re-wraps anything. A rotation that
+> rolls back, fails or crashes loses nothing. Up to 1.7.1 it replaced the only
+> KEK before committing, and a rotation that did not commit made the database
+> unreadable — see *KEK versions in the local wallet* in the README.
+
 ## Recommended Rotation Cadence
 
 pg_vault_tde does not enforce a rotation schedule — this is a policy

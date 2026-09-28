@@ -45,7 +45,7 @@ relation.
 | `pg_vault_tde_wallet_unlock(passphrase text)` | void | Superuser only | Interactive wallet unlock — no server restart needed |
 | `pg_vault_tde_wallet_lock()` | void | Superuser only | Evict all DEKs from shared memory and mark the wallet closed |
 | `pg_vault_tde_wallet_change_passphrase(old_passphrase text, new_passphrase text)` | void | Superuser only | Re-protect the wallet under a new passphrase; also rotates the KEK — do not call `rotate_kek()` separately afterward |
-| `pg_vault_tde_migrate_vault_to_wallet(new_passphrase text)` | void | Superuser only | Online migration from the Vault provider to a local wallet; the wallet must already exist |
+| `pg_vault_tde_migrate_vault_to_wallet(new_passphrase text)` | void | Superuser only | Online migration from the Vault provider to a local wallet; the wallet must already exist and the passphrase must open it; switches the database to the `local` provider. Broken before 1.7.2 |
 
 ## PKCS#11 / HSM
 
