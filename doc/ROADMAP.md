@@ -311,6 +311,17 @@ distinguishes the builds.
    worker, because its `PG_CATCH` called `CopyErrorData()` while still in `ErrorContext`
    (on a release build the copy was read after `FlushErrorState()` had freed it).
 
+7. **Logical decoding drifted the reorder buffer's memory accounting (PSQLE-186).** The
+   output plugin decrypts each change, and stitches its TOAST values, in place — the
+   copy-back is deliberate — and left the shorter `t_len` behind. The reorder buffer
+   sizes a change from `t_len` when it queues it and again when it frees it, so every
+   decoded encrypted row left its encryption overhead (about 37 bytes) in `rb->size`
+   until the walsender restarted; past `logical_decoding_work_mem` every transaction was
+   spilled or streamed. On an assert-enabled build the walsender died on
+   `Assert(txn->size == 0)`. The change callbacks now put the original lengths back once
+   pgoutput has serialized the row. Found when `ci-cassert` began running the TAP files
+   (`tap/12_logical_repl_toast.t`).
+
 **New CI stage — `make ci-upgrade`.** Every other suite in this repo reads only data it
 wrote in the same run, so writer and reader always move together and a format-level
 breakage leaves the suite green while data on disk becomes unreadable. That is how the
