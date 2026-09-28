@@ -322,6 +322,19 @@ distinguishes the builds.
    pgoutput has serialized the row. Found when `ci-cassert` began running the TAP files
    (`tap/12_logical_repl_toast.t`).
 
+8. **A local-wallet KEK rotation that did not commit lost the database (PSQLE-185).**
+   `rotate_kek()` and `wallet_change_passphrase()` replaced the wallet's only KEK before
+   their transaction committed; a rollback, a later error in the statement or a crash
+   left every DEK wrapped under a KEK that existed nowhere. A session that had run
+   `wallet_unlock()` also kept the old KEK: it could not read after another session's
+   rotation, and wrapped new tables with the old key. The wallet now keeps every KEK
+   version (one PKCS#12 key bag each, current first, written with `durable_rename()`
+   before any re-wrap, under a file lock), unwrap tries them newest first — the AES key
+   wrap's integrity check picks the right one, wrapped DEKs are unchanged — and a stale
+   session reloads the wallet. `pg_dump_tde` / `pg_restore_tde` read every version too,
+   so dumps taken before a rotation restore again. Vault and PKCS#11 already versioned
+   their keys. `tap/30_rotate_kek_local_atomicity.t`.
+
 **New CI stage — `make ci-upgrade`.** Every other suite in this repo reads only data it
 wrote in the same run, so writer and reader always move together and a format-level
 breakage leaves the suite green while data on disk becomes unreadable. That is how the

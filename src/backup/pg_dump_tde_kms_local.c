@@ -33,6 +33,23 @@
 
 #define KEK_LEN 32
 
+/*
+ * The server keeps every KEK version in the wallet (PSQLE-185): one PKCS#12
+ * key bag per version, friendlyName "pg_vault_tde_kek.v<N>", current first; a
+ * wallet written before 1.7.2 has one bag, "pg_vault_tde_kek", version 1.  A
+ * dump taken before a KEK rotation carries a DEK wrapped under an older
+ * version, so unwrap tries them all, newest first; wrap uses the current one.
+ */
+#define KEK_BAG_NAME        "pg_vault_tde_kek"
+#define KEK_MAX_VERSIONS    256
+
+typedef struct KekRing
+{
+    int           n;
+    unsigned int  version[KEK_MAX_VERSIONS];      /* [0] is current */
+    unsigned char kek[KEK_MAX_VERSIONS][KEK_LEN];
+} KekRing;
+
 #define LOCAL_ENV_MAX       256
 #define LOCAL_CMD_MAX      1024
 #define LOCAL_PATH_MAX     1024
@@ -59,6 +76,8 @@ static bool     local_get_passphrase(char *pass_out, Size pass_max);
 static bool     local_passphrase_from_command(char *pass_out, Size pass_max);
 static bool     local_passphrase_from_file(char *pass_out, Size pass_max);
 static bool     local_passphrase_from_env(char *pass_out, Size pass_max);
+static bool     local_open_wallet_ring(const char* path, const char* passphrase,
+                                       KekRing* out);
 static bool     local_open_wallet(const char* path, const char* passphrase, 
                                   unsigned char* kek_out);
 static bool     local_wrap_dek_with_pass(const unsigned char *dek, int dek_len,
@@ -85,19 +104,20 @@ static bool local_unwrap_dek_with_pass(const unsigned char* wrapped_dek, int wra
                                         unsigned char* dek_out, int *dek_len,
                                         const char* passphrase, const char* wallet_path)
 {
-    unsigned char kek[KEK_LEN];
+    KekRing        *ring;
     EVP_CIPHER_CTX *evp_ctx;
-    int update_len = 0;
-    int final_len = 0;
-    bool ok = false;
+    bool            ok = false;
+    int             i;
 
     Assert(wrapped_dek != NULL);
     Assert(dek_out != NULL && dek_len != NULL);
     Assert(passphrase != NULL);
     Assert(wallet_path != NULL);
 
-    if(!local_open_wallet(wallet_path, passphrase, kek))
+    ring = (KekRing *) pg_malloc0(sizeof(KekRing));
+    if(!local_open_wallet_ring(wallet_path, passphrase, ring))
     {
+        pg_free(ring);
         pg_log_error("pg_dump_tde: local_unwrap_dek_with_pass: "
                      "could not open wallet \"%s\"", wallet_path);
         return false;
@@ -106,27 +126,36 @@ static bool local_unwrap_dek_with_pass(const unsigned char* wrapped_dek, int wra
     evp_ctx = EVP_CIPHER_CTX_new();
     if(!evp_ctx)
     {
-        OPENSSL_cleanse(kek, KEK_LEN);
+        OPENSSL_cleanse(ring, sizeof(KekRing));
+        pg_free(ring);
         pg_log_error("pg_dump_tde: cant allocate CIPHER_CTX");
         return false;
     }
 
-    if(EVP_DecryptInit_ex2(evp_ctx, EVP_aes_256_wrap(), kek, NULL, NULL) == 1 &&
-       EVP_DecryptUpdate(evp_ctx, dek_out, &update_len, wrapped_dek, wrapped_len) == 1 &&
-       EVP_DecryptFinal_ex(evp_ctx, dek_out + update_len, &final_len) == 1)
+    /* AES key wrap's integrity check rejects every version but the right one. */
+    for(i = 0; i < ring->n && !ok; i++)
     {
-        *dek_len = update_len + final_len;
-        ok = true;
+        int update_len = 0;
+        int final_len = 0;
+
+        if(EVP_DecryptInit_ex2(evp_ctx, EVP_aes_256_wrap(), ring->kek[i], NULL, NULL) == 1 &&
+           EVP_DecryptUpdate(evp_ctx, dek_out, &update_len, wrapped_dek, wrapped_len) == 1 &&
+           EVP_DecryptFinal_ex(evp_ctx, dek_out + update_len, &final_len) == 1)
+        {
+            *dek_len = update_len + final_len;
+            ok = true;
+        }
+        else
+            ERR_clear_error();
     }
-    else
-    {
-        pg_log_error("pg_dump_tde: AES-256-UNWRAP failed (wrong passphrase "
-                     "or corrupt wrapped DEK): %s",
-                     ERR_reason_error_string(ERR_get_error()));
-    }
+    if(!ok)
+        pg_log_error("pg_dump_tde: AES-256-UNWRAP failed with all %d KEK "
+                     "version(s) of the wallet (wrong passphrase or corrupt "
+                     "wrapped DEK)", ring->n);
 
     EVP_CIPHER_CTX_free(evp_ctx);
-    OPENSSL_cleanse(kek, KEK_LEN);
+    OPENSSL_cleanse(ring, sizeof(KekRing));
+    pg_free(ring);
     return ok;
 }
 
@@ -254,21 +283,19 @@ static bool local_wrap_dek_with_pass(const unsigned char *dek, int dek_len,
  * @param passphrase wallet passphrase (verified via PKCS12_verify_mac)
  * @param kek_out    output buffer; must be at least KEK_LEN bytes
  */
-static bool local_open_wallet(const char* path, const char* passphrase,
-                                unsigned char* kek_out)
+static bool local_open_wallet_ring(const char* path, const char* passphrase,
+                                   KekRing* out)
 {
-    FILE    *fp;
-    PKCS12  *p12        = NULL;
-    EVP_PKEY *pkey       = NULL;
-    X509    *cert       = NULL;
-    STACK_OF(X509) *ca  = NULL;
-    bool   ok          = false;
-    unsigned char kek_buffer[KEK_LEN];
-    size_t kek_len     = sizeof(kek_buffer);
+    FILE            *fp;
+    PKCS12          *p12;
+    STACK_OF(PKCS7) *asafes;
+    int              i, j;
 
     Assert(path != NULL);
     Assert(passphrase != NULL);
-    Assert(kek_out != NULL);
+    Assert(out != NULL);
+
+    memset(out, 0, sizeof(KekRing));
 
     fp = fopen(path, "rb");
     if(!fp)
@@ -286,30 +313,113 @@ static bool local_open_wallet(const char* path, const char* passphrase,
         return false;
     }
 
-    /* Verify if the password opens the wallet */
-    if(PKCS12_verify_mac(p12, passphrase, -1))
+    if(!PKCS12_verify_mac(p12, passphrase, -1))
     {
-        if(PKCS12_parse(p12, passphrase, &pkey, &cert, &ca)){
-            if(EVP_PKEY_get_raw_private_key(pkey, kek_buffer, &kek_len) != 1)
-                pg_log_error("pg_dump_tde: error while extracting the kek");
-            else 
-                ok = true;
-        }
-        else
-            pg_log_error("pg_dump_tde: PKCS#12 parsing failed");
-    }
-    else    
+        PKCS12_free(p12);
         pg_log_error("pg_dump_tde: wallet MAC verification failed - "
                      "wrong passphrase or corrupt wallet");
+        return false;
+    }
 
-    if(pkey) EVP_PKEY_free(pkey);
-    if(cert) X509_free(cert);
-    if(ca) sk_X509_pop_free(ca, X509_free);
-    
+    asafes = PKCS12_unpack_authsafes(p12);
     PKCS12_free(p12);
-    if(ok) memcpy(kek_out, kek_buffer, kek_len);
+    if(!asafes)
+    {
+        pg_log_error("pg_dump_tde: PKCS#12 parsing failed");
+        return false;
+    }
 
-    OPENSSL_cleanse(kek_buffer, kek_len);
+    for(i = 0; i < sk_PKCS7_num(asafes); i++)
+    {
+        PKCS7                    *p7 = sk_PKCS7_value(asafes, i);
+        STACK_OF(PKCS12_SAFEBAG) *bags = NULL;
+
+        if(PKCS7_type_is_data(p7))
+            bags = PKCS12_unpack_p7data(p7);
+        else if(PKCS7_type_is_encrypted(p7))
+            bags = PKCS12_unpack_p7encdata(p7, passphrase, -1);
+        if(!bags)
+            continue;
+
+        for(j = 0; j < sk_PKCS12_SAFEBAG_num(bags); j++)
+        {
+            PKCS12_SAFEBAG            *bag = sk_PKCS12_SAFEBAG_value(bags, j);
+            PKCS8_PRIV_KEY_INFO       *shrouded = NULL;
+            const PKCS8_PRIV_KEY_INFO *p8 = NULL;
+            EVP_PKEY                  *pkey;
+            char                      *name;
+            unsigned int               version = 0;
+            char                       tail;
+            size_t                     klen = KEK_LEN;
+
+            if(PKCS12_SAFEBAG_get_nid(bag) == NID_pkcs8ShroudedKeyBag)
+                p8 = shrouded = PKCS12_decrypt_skey(bag, passphrase, -1);
+            else if(PKCS12_SAFEBAG_get_nid(bag) == NID_keyBag)
+                p8 = PKCS12_SAFEBAG_get0_p8inf(bag);
+            if(!p8)
+                continue;
+
+            pkey = EVP_PKCS82PKEY(p8);
+            if(shrouded)
+                PKCS8_PRIV_KEY_INFO_free(shrouded);
+            name = PKCS12_get_friendlyname(bag);
+
+            if(name && strcmp(name, KEK_BAG_NAME) == 0)
+                version = 1;
+            else if(name && sscanf(name, KEK_BAG_NAME ".v%u%c", &version, &tail) != 1)
+                version = 0;
+
+            if(pkey && version > 0 && out->n < KEK_MAX_VERSIONS &&
+               EVP_PKEY_get_raw_private_key(pkey, out->kek[out->n], &klen) == 1 &&
+               klen == KEK_LEN)
+            {
+                out->version[out->n] = version;
+                out->n++;
+            }
+            if(name)
+                OPENSSL_free(name);
+            if(pkey)
+                EVP_PKEY_free(pkey);
+        }
+        sk_PKCS12_SAFEBAG_pop_free(bags, PKCS12_SAFEBAG_free);
+    }
+    sk_PKCS7_pop_free(asafes, PKCS7_free);
+
+    if(out->n == 0)
+    {
+        pg_log_error("pg_dump_tde: wallet \"%s\" holds no KEK", path);
+        return false;
+    }
+
+    /* Newest first, whatever order the file had. */
+    for(i = 1; i < out->n; i++)
+        for(j = i; j > 0 && out->version[j] > out->version[j - 1]; j--)
+        {
+            unsigned int  v = out->version[j];
+            unsigned char k[KEK_LEN];
+
+            out->version[j]     = out->version[j - 1];
+            out->version[j - 1] = v;
+            memcpy(k, out->kek[j], KEK_LEN);
+            memcpy(out->kek[j], out->kek[j - 1], KEK_LEN);
+            memcpy(out->kek[j - 1], k, KEK_LEN);
+            OPENSSL_cleanse(k, KEK_LEN);
+        }
+
+    return true;
+}
+
+/* The current KEK — what a new dump wraps its DEK with. */
+static bool local_open_wallet(const char* path, const char* passphrase,
+                                unsigned char* kek_out)
+{
+    KekRing *ring = (KekRing *) pg_malloc0(sizeof(KekRing));
+    bool     ok   = local_open_wallet_ring(path, passphrase, ring);
+
+    if(ok)
+        memcpy(kek_out, ring->kek[0], KEK_LEN);
+    OPENSSL_cleanse(ring, sizeof(KekRing));
+    pg_free(ring);
     return ok;
 }
 

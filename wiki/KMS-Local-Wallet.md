@@ -93,6 +93,8 @@ SELECT pg_vault_tde_wallet_change_passphrase('old-passphrase', 'new-passphrase')
 
 This function **automatically rotates the KEK** as part of the passphrase
 change — a separate `pg_vault_tde_rotate_kek()` call afterward is unnecessary.
+Since 1.7.2 the wallet keeps every KEK version, and the new passphrase is in
+effect as soon as the file is rewritten, even if the call fails afterwards.
 Rationale: if an attacker already has the old passphrase, they already have
 the old KEK; changing only the passphrase without rotating the key
 underneath it would provide no additional protection.
