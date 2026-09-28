@@ -9,16 +9,11 @@
 
 ### Bitbucket Pipelines (`bitbucket-pipelines.yml`)
 
-5 jobs, against PostgreSQL 17 and 18 on Ubuntu 24.04:
-
-| Job | Purpose | PG Versions | Dependencies |
-|-----|---------|-------------|-------------|
-| `build` | Compile with `-Wall -Wextra`, zero warnings required | 17, 18 | None |
-| `regress` | Run the SQL regression suite (vault provider) | 17, 18 | `build` |
-| `wallet` | Run the SQL regression suite (local wallet provider) | 17, 18 | `build` |
-| `tap` | Run TAP tests with mock Vault | 17, 18 | `build` |
-| `isolation` | Run isolation tests (concurrency / MVCC) | 17, 18 | `build` |
-| `memcheck` | Valgrind + AddressSanitizer | 17, 18 | `build` |
+Pushes to `develop` and `master` only sync to GitHub (code and wiki). The test
+suite runs on demand, from custom pipelines: `test-all` (PG 17 and 18 in
+parallel), `test-pg-17`, `test-pg-18`. Each one runs `ci/scripts/run-all.sh`,
+the same stages as `make ci-all`, so developers are expected to run that locally
+before pushing.
 
 ### Local CI Pipeline (`ci/`)
 
