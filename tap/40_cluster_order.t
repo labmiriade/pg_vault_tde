@@ -9,8 +9,9 @@
 # (PSQLE-204).
 #
 # A plain heap twin with the same rows inserted in reverse is the reference.
-# Both paths core can choose are forced in turn: the index scan
-# (enable_sort = off) and the sort (enable_indexscan = off).  After each, the
+# Both paths core can choose are forced in turn — the index scan by making
+# the sequential scan expensive (PG 18 compares costs only), the sort with
+# enable_indexscan = off — and CLUSTER (VERBOSE) says which one ran.  After each, the
 # first rows in physical order, the contents, the out-of-line values and the
 # index (amcheck heapallindexed) must match the twin.  A tde_btree index is
 # ordered by the ciphertext of its keys, so CLUSTER on one must be refused,
@@ -22,7 +23,7 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 END { system('/bin/sh', '-c', 'rm -rf /var/lib/pg_vault_tde/*') }
 
-plan tests => 13;
+plan tests => 15;
 
 system('/bin/sh', '-c', 'rm -rf /var/lib/pg_vault_tde/*');
 my $node = PostgreSQL::Test::Cluster->new('cluster_order');
@@ -67,19 +68,28 @@ sub first_ids
         "SELECT string_agg(id::text, ',') FROM (SELECT id FROM $t ORDER BY ctid LIMIT 5) s");
 }
 
+# Returns what CLUSTER (VERBOSE) on the encrypted table said about its path.
 sub cluster_both
 {
     my ($force) = @_;
+    my $said = '';
     for my $t (qw(ch ce))
     {
-        $node->safe_psql('postgres', "SET $force = off; CLUSTER $t USING ${t}_pkey");
+        my ($rc, $out, $err) = $node->psql('postgres',
+            "$force CLUSTER (VERBOSE) $t USING ${t}_pkey");
+        die "CLUSTER $t failed: $err" if $rc;
+        $said = $err if $t eq 'ce';
     }
+    return $said;
 }
 
-for my $case (['enable_sort', 'index scan'], ['enable_indexscan', 'sort'])
+for my $case (
+    ['SET enable_sort = off; SET seq_page_cost = 1000; SET random_page_cost = 0.001;',
+     'index scan', qr/using index scan on "ce_pkey"/],
+    ['SET enable_indexscan = off;', 'sort', qr/using sequential scan and sort/])
 {
-    my ($force, $path) = @$case;
-    cluster_both($force);
+    my ($force, $path, $said_re) = @$case;
+    like(cluster_both($force), $said_re, "CLUSTER ($path): core chose the $path");
 
     is(first_ids('ch'), '1,2,3,4,5', "heap ($path): CLUSTER orders the rows (control)");
     is(first_ids('ce'), first_ids('ch'),

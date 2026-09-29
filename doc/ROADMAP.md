@@ -1,6 +1,6 @@
 # pg_vault_tde Roadmap
 
-> Last updated: 2026-09-29 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 40 TAP files / 719 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 3 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
+> Last updated: 2026-09-29 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 40 TAP files / 721 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 3 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
 
 ---
 
@@ -483,6 +483,18 @@ distinguishes the builds.
     unusable for older snapshots rather than failing the build. The scan also resets
     `ii_ExpressionsState` / `ii_PredicateState`, which pointed into its freed EState.
     `tap/39_index_build_old_snapshot.t`, with a parallel build checked by amcheck.
+
+20. **`CLUSTER` did not order the rows (PSQLE-204).** The TAM's `copy_for_cluster` read
+    the table sequentially and ignored `OldIndex` and `use_sort`: `CLUSTER` compacted,
+    kept every row, marked the index clustered, and left the order unchanged. It is now
+    a port of `heapam_relation_copy_for_cluster` on decrypted copies: an index scan in
+    `OldIndex` order or a tuplesort of decrypted rows, `rewrite_heap_dead_tuple()` for
+    the dead ones, heapam's counters and `pg_stat_progress_cluster` phases; the write
+    of each row (dropped columns NULL, TOAST moved, encryption) is one helper for both
+    paths. `CLUSTER` on a `tde_btree` index, ordered by ciphertext, is refused.
+    `tap/40_cluster_order.t` forces both paths and checks `CLUSTER (VERBOSE)` said
+    which ran. In PG 18 `enable_sort = off` does not steer `plan_cluster_use_sort()`,
+    which compares costs only.
 
 **New CI stage — `make ci-upgrade`.** Every other suite in this repo reads only data it
 wrote in the same run, so writer and reader always move together and a format-level

@@ -59,6 +59,15 @@ must stay heapam's; diff it against each new PostgreSQL major.  A recently dead
 tuple that no longer decrypts is skipped with `ii_BrokenHotChain` set.  It runs
 with the relation impersonating heapam (`heap_getnext()` checks rd_tableam).
 
+### `copy_for_cluster` is heapam's, on decrypted copies (PSQLE-204)
+
+`tde_cluster_copy` is `heapam_relation_copy_for_cluster` with each kept tuple
+decrypted before it is sorted or written (the sort computes `OldIndex`'s keys from
+it) and `tde_cluster_write_tuple` in place of `reform_and_rewrite_tuple`.  The
+decrypted copy keeps the original header and is rewrite_heap_tuple()'s old tuple.
+`tuplesort_getheaptuple(state, forward)` hands back the sort's own tuple: cleanse
+it, never free it.  `CLUSTER` on a tde_btree index is refused.
+
 ### Every place heapam deletes TOAST itself needs a TAM counterpart (PSQLE-197)
 
 heapam decides to delete a row's TOAST from the on-disk `HEAP_HASEXTERNAL`, which

@@ -1402,6 +1402,23 @@ rotations of the table left row versions an old snapshot can still see under a k
 that no longer exists, the index is built without them and marked unusable for older
 transactions, as PostgreSQL does for broken HOT chains.
 
+
+### `CLUSTER` on encrypted tables
+
+Up to 1.7.1, `CLUSTER t USING idx` on an encrypted table compacted it and marked the
+index clustered, but left the rows in the order they were in (PSQLE-204): the extension
+rewrote the table with its own sequential copy and ignored the index. 1.7.2 orders the
+rows as PostgreSQL does, through an index scan or a sort, whichever the planner picks.
+
+A `tde_btree` index is ordered by the ciphertext of its keys, not by their values, so
+`CLUSTER` on one is refused with an error: use `VACUUM FULL` to compact the table, or
+cluster on a plain btree index — the `PRIMARY KEY` and `UNIQUE` constraints of an
+encrypted table are plain btree indexes by default. A table marked clustered on a
+`tde_btree` index by an earlier release makes a plain `CLUSTER t` fail the same way;
+`ALTER TABLE t SET WITHOUT CLUSTER` clears the mark. A sort that outgrows
+`maintenance_work_mem` spills decrypted rows to temporary files, as any sort does — see
+the note on `temp_tablespaces` above.
+
 ## Compatibility
 
 | Feature | Status | Notes |
@@ -1508,7 +1525,7 @@ make ci-bench BENCH_ROWS=100000  # with custom row count
 make ci-clean            # Remove test containers and images
 ```
 
-Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 719 assertions across 40 TAP files. Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
+Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 721 assertions across 40 TAP files. Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
 - Tests 1-4: extension loaded, access methods and SQL functions registered, wallet unlock
 - Tests 12-14: TAM INSERT/SELECT/UPDATE end-to-end
 - Test 15: DELETE
@@ -1895,7 +1912,8 @@ run against 1.7.2.
   first-query latency matters — it needs a KMS that opens without an interactive unlock
   (see [GUC Parameters](#guc-parameters)).
 - **Put temporary files on encrypted storage.** Any query that spills past `work_mem` —
-  a sort, a hash, a `WITH HOLD` cursor — writes rows that are already decrypted to a
+  a sort, a hash, a `WITH HOLD` cursor, or `CLUSTER`'s sort past
+  `maintenance_work_mem` — writes rows that are already decrypted to a
   temporary file, and no extension hook can intercept it
   ([Limitation 6](#limitations-v17)). Point `temp_tablespaces` at an encrypted
   filesystem, and set `log_temp_files` to see how much spills.
