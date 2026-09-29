@@ -623,7 +623,7 @@ DEK access via `pg_vault_tde_kms_get_rel_dek(relid)`:
 ```sql
 SELECT pg_vault_tde_rotate_online('mytable', 1000);
 -- Monitor progress:
-SELECT * FROM pg_vault_tde_rotation_status('mytable');
+SELECT * FROM pg_vault_tde_get_rotation_status('mytable');
 ```
 
 `rotate_online` accepts both table relations and `tde_btree` index relations:
@@ -681,6 +681,27 @@ SELECT pg_vault_tde_rotate_kek();
 > collide across databases: each is 32 independent random bytes in its own
 > database's catalog, and the GCM AAD binds `MyDatabaseId`, so one database's
 > key can never silently decrypt another's rows.
+
+#### One key operation at a time
+
+Each key operation is tested on its own, and against the reads and writes running
+beside it — not against the others: `rotate_online()` (of a table or of a
+`tde_btree` index), `rotate_kek()`, `wallet_change_passphrase()`, `wallet_lock()` /
+`wallet_unlock()`, `migrate_vault_to_wallet()`, `seal_keys()` / `unseal_keys()` and
+`reencrypt_table()`. Until they are (1.8), run them one at a time in each database,
+and start the next only once the previous one has returned and this is empty:
+
+```sql
+SELECT * FROM pg_vault_tde_rotation_status WHERE status = 'running';
+```
+
+In particular:
+
+- no `rotate_kek()` or `wallet_change_passphrase()` while a `rotate_online()` runs;
+- no `wallet_lock()` while a rotation runs;
+- no second `rotate_online()`, of another table either, before the first is `complete`;
+- no `unseal_keys()` or `migrate_vault_to_wallet()` while a rotation runs;
+- no `DROP`, `TRUNCATE` or `ALTER TABLE` of a table being rotated.
 
 ---
 
@@ -963,7 +984,9 @@ newer](#logical-replication-on-postgresql-1711--18x-and-newer) below.
 1.7.2 changes the on-disk tuple layout (**v5**). Nothing has to be exported
 first — every row written by 1.7.0 or 1.7.1 keeps reading, byte for byte — but
 **each encrypted table needs one `VACUUM FULL` after the upgrade**, and until it
-has had one, `UPDATE` on some of its rows can crash the backend.
+has had one, `UPDATE` on some of its rows can crash the backend. Run key rotations
+and wallet operations one at a time, before and after the upgrade alike — see
+[One key operation at a time](#one-key-operation-at-a-time).
 
 ### Why
 

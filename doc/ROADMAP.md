@@ -550,6 +550,10 @@ distinguishes the builds.
     longer suggests deleting a key that may already wrap DEKs. Local and Vault passed
     every scenario as they were. `tap/30_rotate_kek_atomicity.t`.
 
+**Key operations one at a time (PSQLE-210).** Rotations and wallet operations are
+tested alone and against concurrent DML, not against each other; the README now says
+to run them one at a time per database and lists the combinations to avoid until 1.8.
+
 **New CI stage — `make ci-upgrade`.** Every other suite in this repo reads only data it
 wrote in the same run, so writer and reader always move together and a format-level
 breakage leaves the suite green while data on disk becomes unreadable. That is how the
