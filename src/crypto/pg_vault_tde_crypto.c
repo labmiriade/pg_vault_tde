@@ -38,11 +38,12 @@
  * differ.  Same conclusion, different mechanism.
  */
 #include "postgres.h"
-#include "miscadmin.h"          /* MyDatabaseId — needed for AAD binding */
+#include "miscadmin.h"          /* MyDatabaseId (AAD), MyProcPid (IV batch) */
 #include "utils/memutils.h"
 #include "common/pg_prng.h"
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#include <unistd.h>             /* getpid — the Assert in tde_next_iv() */
 
 #include "src/include/pg_vault_tde_kms.h"
 #include "src/include/pg_vault_tde_crypto.h"
@@ -89,12 +90,18 @@ static TdeCipherSlot tde_dec = { NULL, InvalidOid, 0 };
  * We amortise that cost by requesting 256 IVs at once and serving them from
  * a local array.  The array is wiped in tde_crypto_ctx_cleanup().
  *
- * Security note: AES-256-GCM with random 96-bit IVs has an IV-collision
- * probability of roughly 2^{-32} after 2^{32} encryptions under the same DEK
- * (birthday bound).  With DEK rotation at sane intervals this is far below
- * the safety threshold.  pg_strong_random uses /dev/urandom which is
- * automatically reseeded after fork() via getrandom(GRND_NONBLOCK);
- * fork-safety is maintained.
+ * The batch belongs to the process that filled it.  A fork() copies it, and
+ * two processes serving the same IVs under one DEK would void GCM for those
+ * tuples; the kernel reseeding pg_strong_random() after a fork does not help
+ * a copy already drawn.  No PostgreSQL process forks after drawing an IV —
+ * the postmaster encrypts nothing — so every process starts with an empty
+ * batch; iv_batch_pid keeps it so if that ever changes (PSQLE-178).
+ *
+ * Limit: with random 96-bit IVs, NIST SP 800-38D allows at most 2^32
+ * encryptions under one key.  Here that is one DEK generation: every tuple
+ * written — INSERT, UPDATE, each row VACUUM FULL, CLUSTER or a rotation
+ * rewrites, each TOAST chunk.  rotate_online() starts a new generation; see
+ * the README, "Routine administration".
  * ============================================================ */
 #define TDE_IV_BATCH_SIZE   256
 #define TDE_IV_BATCH_BYTES  (TDE_IV_BATCH_SIZE * TDE_GCM_IV_LEN)
@@ -107,6 +114,9 @@ static char  iv_batch[TDE_IV_BATCH_BYTES];
  */
 static int   iv_batch_pos = TDE_IV_BATCH_SIZE;
 
+/* The process that filled iv_batch; 0 while it is empty. */
+static int   iv_batch_pid = 0;
+
 /*
  * tde_next_iv -- return the next IV from the per-backend batch.
  *
@@ -116,13 +126,17 @@ static int   iv_batch_pos = TDE_IV_BATCH_SIZE;
 static void
 tde_next_iv(unsigned char *iv_out)
 {
-    if (iv_batch_pos >= TDE_IV_BATCH_SIZE)
+    /* Every process PostgreSQL forks sets MyProcPid first thing. */
+    Assert(MyProcPid == getpid());
+
+    if (iv_batch_pos >= TDE_IV_BATCH_SIZE || iv_batch_pid != MyProcPid)
     {
         /* Refill: one system call covers 256 IVs */
         if (!pg_strong_random(iv_batch, TDE_IV_BATCH_BYTES))
             ereport(ERROR,
                     (errmsg("[CRYPTO] Failed to generate IV batch")));
         iv_batch_pos = 0;
+        iv_batch_pid = MyProcPid;
     }
     memcpy(iv_out, iv_batch + iv_batch_pos * TDE_GCM_IV_LEN, TDE_GCM_IV_LEN);
     iv_batch_pos++;
@@ -165,6 +179,7 @@ tde_crypto_ctx_cleanup(void)
 
     OPENSSL_cleanse(iv_batch, TDE_IV_BATCH_BYTES);
     iv_batch_pos = TDE_IV_BATCH_SIZE;
+    iv_batch_pid = 0;
 }
 
 /*

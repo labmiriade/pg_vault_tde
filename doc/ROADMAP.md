@@ -1,6 +1,6 @@
 # pg_vault_tde Roadmap
 
-> Last updated: 2026-09-29 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 48 TAP files / 1161 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 3 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
+> Last updated: 2026-09-29 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 48 TAP files / 1164 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 3 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
 
 ---
 
@@ -559,6 +559,18 @@ distinguishes the builds.
     TOAST, amcheck and generation, before and after a restart. After a crash or an
     immediate shutdown the row still says `running`; the README says how to tell.
     `tap/46_rotate_online_interrupted.t`.
+
+27. **`pg_basebackup_tde` ran with the session's `search_path`, and the IV batch had no
+    owner (PSQLE-178).** The tool called `pg_vault_tde_seal_keys_bytea()` unqualified,
+    in a session whose `search_path` a database's owner sets: it now empties it right
+    after connecting, as core's client tools do, and calls the function in the
+    extension's schema — which also lets a database keep the extension in a schema off
+    its `search_path`: up to 1.7.1 that stopped the whole backup with "function …
+    does not exist". The per-process batch of 256 IVs is refilled by any process
+    that did not fill it — no PostgreSQL process forks after drawing an IV, so this is
+    defence in depth — and the limit of 2^32 encryptions per DEK generation is written
+    down, with a way to estimate it. `tap/47_basebackup_tde_search_path.t`,
+    `tap/48_iv_uniqueness.t`.
 
 **Key operations one at a time (PSQLE-210).** Rotations and wallet operations are
 tested alone and against concurrent DML, not against each other; the README now says

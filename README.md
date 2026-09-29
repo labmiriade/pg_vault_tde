@@ -1605,7 +1605,7 @@ make ci-bench BENCH_ROWS=100000  # with custom row count
 make ci-clean            # Remove test containers and images
 ```
 
-Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 1161 assertions across 48 TAP files (the soak test, `tap/43`, runs only under `make ci-soak`). Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
+Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 1164 assertions across 48 TAP files (the soak test, `tap/43`, runs only under `make ci-soak`). Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
 - Tests 1-4: extension loaded, access methods and SQL functions registered, wallet unlock
 - Tests 12-14: TAM INSERT/SELECT/UPDATE end-to-end
 - Test 15: DELETE
@@ -1910,7 +1910,11 @@ succeeds**, writes one bundle per database next to it:
 
 Use `--keys-dir DIR` to store the bundles elsewhere (e.g. outside `PGDATA`).
 Databases without the extension are skipped; a failed backup leaves no bundle
-files behind. The tar format (`-Ft`) is not supported — use the plain format
+files behind. Each session runs with an empty `search_path` and calls the function in
+the extension's own schema, whatever the database's settings; up to 1.7.1 it used the
+session's `search_path`, and a database with the extension in a schema off that path
+stopped the whole backup ("function pg_vault_tde_seal_keys_bytea(unknown, unknown) does
+not exist"). The tar format (`-Ft`) is not supported — use the plain format
 or run `pg_vault_tde_seal_keys()` manually.
 
 Restore stays manual, exactly as above: restore the data dir, provision the
@@ -2106,6 +2110,25 @@ run against 1.7.2.
   larger than a plain btree even right after a rebuild.
 - **Rotate keys on a schedule** — see [Key Rotation](#key-rotation). Online rotations are
   tracked in the `pg_vault_tde_rotation_status` view, readable by `pg_monitor`.
+- **Rotate the DEK of write-heavy tables before it reaches 2^32 encryptions.** With
+  random 96-bit IVs, AES-GCM allows at most 2^32 (about 4.3 billion) encryptions under
+  one key (NIST SP 800-38D). Here the key is one DEK generation of one table, and every
+  tuple written counts: each `INSERT`, each `UPDATE`, each row that `VACUUM FULL`,
+  `CLUSTER` or a rotation rewrites, and each out-of-line chunk. `rotate_online()` starts
+  a new generation. At 1,000 writes a second the limit is 50 days away; at 10,000, five.
+  The statistics give an estimate — inserts and updates of the table and its TOAST
+  relation, rotations included; they miss `VACUUM FULL` and `CLUSTER` and restart from
+  zero after a crash, so note them at each rotation and keep a wide margin:
+
+  ```sql
+  SELECT s.relid::regclass AS table_name,
+         s.n_tup_ins + s.n_tup_upd + coalesce(t.n_tup_ins, 0) AS writes
+  FROM pg_stat_all_tables s
+  JOIN pg_class c ON c.oid = s.relid
+  JOIN pg_am    a ON a.oid = c.relam AND a.amname = 'encrypted_heap'
+  LEFT JOIN pg_stat_all_tables t ON t.relid = c.reltoastrelid
+  ORDER BY writes DESC;
+  ```
 - **Check integrity off-peak.** `pg_vault_tde_verify_integrity('t')` verifies the GCM
   tag of every tuple and fetches every out-of-line value it references — a full scan of
   the table and of its TOAST relation. It does not look at chunks no row references,

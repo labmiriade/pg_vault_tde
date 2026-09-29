@@ -38,6 +38,7 @@
  */
 #include "postgres_fe.h"
 #include "libpq-fe.h"
+#include "common/connect.h"         /* ALWAYS_SECURE_SEARCH_PATH_SQL */
 #include "common/fe_memutils.h"
 
 #include <stdio.h>
@@ -222,6 +223,26 @@ connect_db(const char *host, const char *port, const char *user,
         PQfinish(conn);
         return NULL;
     }
+
+    /*
+     * As the client tools of core do: an empty search_path before anything
+     * else, and every name qualified below.  A database's owner sets the
+     * search_path of every session in it, and whatever it resolved to would
+     * run with the privileges of whoever takes the backup (PSQLE-178).
+     */
+    {
+        PGresult   *res = PQexec(conn, ALWAYS_SECURE_SEARCH_PATH_SQL);
+
+        if (PQresultStatus(res) != PGRES_TUPLES_OK)
+        {
+            fprintf(stderr, "%s: error: could not clear search_path: %s",
+                    progname, PQerrorMessage(conn));
+            PQclear(res);
+            PQfinish(conn);
+            return NULL;
+        }
+        PQclear(res);
+    }
     return conn;
 }
 
@@ -339,7 +360,7 @@ main(int argc, char **argv)
         return 1;
 
     res = PQexec(conn,
-                 "SELECT datname FROM pg_database "
+                 "SELECT datname FROM pg_catalog.pg_database "
                  "WHERE datallowconn AND datname <> 'template0' "
                  "ORDER BY datname");
     if (PQresultStatus(res) != PGRES_TUPLES_OK)
@@ -363,13 +384,18 @@ main(int argc, char **argv)
     for (int i = 0; i < ndbs; i++)
     {
         const char *params[2];
+        char       *nsp;
+        char       *call;
 
         conn = connect_db(host, port, user, NULL, datnames[i]);
         if (conn == NULL)
             return 1;
 
+        /* The extension's schema: its function is called there and only there. */
         res = PQexec(conn,
-                     "SELECT 1 FROM pg_extension WHERE extname = 'pg_vault_tde'");
+                     "SELECT n.nspname FROM pg_catalog.pg_extension e "
+                     "JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace "
+                     "WHERE e.extname = 'pg_vault_tde'");
         if (PQresultStatus(res) != PGRES_TUPLES_OK)
         {
             fprintf(stderr, "%s: error: extension check failed in \"%s\": %s",
@@ -384,14 +410,25 @@ main(int argc, char **argv)
             PQfinish(conn);
             continue;               /* no pg_vault_tde here: skip */
         }
+        nsp = PQescapeIdentifier(conn, PQgetvalue(res, 0, 0),
+                                 strlen(PQgetvalue(res, 0, 0)));
         PQclear(res);
+        if (nsp == NULL)
+        {
+            fprintf(stderr, "%s: error: could not quote the schema of pg_vault_tde "
+                    "in \"%s\": %s", progname, datnames[i], PQerrorMessage(conn));
+            PQfinish(conn);
+            return 1;
+        }
+        call = psprintf("SELECT %s.pg_vault_tde_seal_keys_bytea($1, $2)", nsp);
+        PQfreemem(nsp);
 
         params[0] = passphrase;
         params[1] = label != NULL ? label : "basebackup";
-        res = PQexecParams(conn,
-                           "SELECT pg_vault_tde_seal_keys_bytea($1, $2)",
+        res = PQexecParams(conn, call,
                            2, NULL, params, NULL, NULL,
                            1 /* binary result: raw bundle bytes */);
+        pfree(call);
         if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) != 1)
         {
             fprintf(stderr, "%s: error: sealing keys of database \"%s\" failed: %s",

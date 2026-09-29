@@ -15,9 +15,12 @@
 # search_path, with a function of the same name and signature that records
 # being called.  A superuser runs pg_basebackup_tde: the function must never
 # have run, and the bundle written for that database must be a real one.
+# A second database has the extension in a schema of its own, off its
+# search_path: up to 1.7.1 the unqualified call failed there ("function ...
+# does not exist") and the whole backup with it.
 use strict;
 use warnings;
-use Test::More tests => 4;
+use Test::More tests => 7;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 END { system('/bin/sh', '-c', 'rm -rf /var/lib/pg_vault_tde/*') }
@@ -55,6 +58,21 @@ $node->safe_psql('ownerdb', q{
     ALTER DATABASE ownerdb SET search_path = mine, public;
 });
 
+# A database with the extension in a schema of its own, off its search_path:
+# the tool has to find it there, and the extension has to work with the
+# empty search_path the tool now runs it under.
+$node->safe_psql('postgres', 'CREATE DATABASE schemadb');
+$node->safe_psql('schemadb', q{
+    CREATE SCHEMA tde_ext;
+    CREATE EXTENSION pg_vault_tde SCHEMA tde_ext;
+});
+$node->safe_psql('schemadb', "SELECT tde_ext.pg_vault_tde_wallet_init('test-password')");
+$node->safe_psql('schemadb', q{
+    CREATE TABLE secret (id int, v text) USING encrypted_heap;
+    INSERT INTO secret VALUES (1, 'sealed');
+    ALTER DATABASE schemadb SET search_path = public;
+});
+
 my $backup_dir = $node->backup_dir . '/bb';
 {
     local $ENV{PG_VAULT_TDE_SEAL_PASSPHRASE} = 'seal-pass';
@@ -76,5 +94,18 @@ if (open(my $fh, '<:raw', $bundle))
     close($fh);
 }
 is($head, 'TDESEAL', '... and it is the extension\'s own sealed bundle');
+
+my $bundle2 = "$backup_dir/pg_vault_tde_keys.schemadb.sealed";
+ok(-f $bundle2, 'a bundle was written for schemadb, whose extension lives in tde_ext');
+my $head2 = '';
+if (open(my $fh, '<:raw', $bundle2))
+{
+    read($fh, $head2, 7);
+    close($fh);
+}
+is($head2, 'TDESEAL', '... and it is a sealed bundle');
+is($node->safe_psql('schemadb',
+       "SELECT count(*) > 0 FROM tde_ext.pg_vault_tde_catalog"), 't',
+   '... of a database that does have keys');
 
 $node->stop;
