@@ -1259,6 +1259,11 @@ deleted only once the row has been updated, and an attempt that finds the row ch
 removes the chunks it had written, so the waiting `UPDATE` behaves as on a plain heap
 table.
 
+The same change fixes a failure that needed no concurrency: an `UPDATE` turning an
+out-of-line value into a compressed inline one — `SET col = repeat('x', 6000)` over a
+value stored out of line — failed with `tuple already updated by self` (PSQLE-191). No
+data was affected; the statement rolled back.
+
 
 ### Dropped columns and out-of-line values
 

@@ -395,6 +395,16 @@ distinguishes the builds.
     dropped column 1.7.1 left dangling (`whole_row_read_before_vacuum=no`), rotates
     and deletes from it, and Gate C's `VACUUM FULL` must repair it.
 
+13. **An `UPDATE` from out of line to compressed inline failed (PSQLE-191).** With a
+    tuple over the threshold the pre-TOAST ran and `toast_tuple_cleanup()` deleted the
+    old chunks; the compressed value then stayed inline, so the new row had no external
+    value and `tuple_update()`'s fallback deleted the same chunks again —
+    `tuple already updated by self`, the statement rolled back. The same cause as item
+    11: two places deleting TOAST. The item-11 restructure, which deletes in one place
+    after `heap_update()`, fixed it; `tap/33_toast_lifecycle.t` covers it (the step
+    "UPDATE from out of line to compressed inline" fails on the commit before that fix
+    and on 1.7.1).
+
 **New CI stage — `make ci-upgrade`.** Every other suite in this repo reads only data it
 wrote in the same run, so writer and reader always move together and a format-level
 breakage leaves the suite green while data on disk becomes unreadable. That is how the
