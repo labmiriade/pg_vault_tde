@@ -77,11 +77,13 @@ close($fh);
 $node->start;
 $node->psql('postgres', "SELECT pg_vault_tde_wallet_unlock('test-password')");
 
-# The premise: one value, and only one, no longer reads.
+# The premise: one value, and only one, no longer reads.  md5(), not
+# length(): in a single-byte encoding length() takes an uncompressed value's
+# size from its pointer and never reads a chunk.
 my $unreadable = 0;
 for my $id (1 .. 20)
 {
-    my ($rc) = $node->psql('postgres', "SELECT length(big) FROM vt WHERE id = $id");
+    my ($rc) = $node->psql('postgres', "SELECT md5(big) FROM vt WHERE id = $id");
     $unreadable++ if $rc;
 }
 is($unreadable, 1, 'the flip broke exactly one out-of-line value');

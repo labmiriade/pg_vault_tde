@@ -827,7 +827,7 @@ log stream without any extension-level configuration.
 | Function | Returns | Description |
 |---|---|---|
 | `pg_vault_tde_health_check()` | composite | Status (6 columns: version, build_version, enabled, kms_provider, enc_ops_available, checked_at) |
-| `pg_vault_tde_verify_integrity(regclass)` | record | GCM tag audit scan of all tuples — returns `(total_tuples, failed_tuples)` |
+| `pg_vault_tde_verify_integrity(regclass)` | record | GCM tag audit scan of all tuples and every out-of-line value they reference — returns `(total_tuples, failed_tuples)`, a row counted once whichever part failed |
 | `pg_vault_tde_encrypted_size(regclass)` | record | Encryption storage overhead — returns `(total_tuples, encryption_overhead_bytes)` |
 | `pg_vault_tde_reencrypt_table(regclass, int)` | void | Batch re-encrypt with current DEK (locks table); `int` = batch size, default 1000 |
 | `pg_vault_tde_rotate_online(regclass, int)` | void | BGW-based online rotation: reads continue, writes wait until it commits; accepts both `encrypted_heap` tables and `tde_btree` indexes **(v1.5)** |
@@ -1209,8 +1209,9 @@ about 2 kB after compression — under the outgoing key. The catalog keeps only 
 current key, so the outgoing one survived in shared memory alone: the values became
 unreadable at the next restart, or at once at the next rotation of the same table. No
 concurrent access is needed. The rest of each row stays readable, a `DELETE` of an
-affected row fails, and `pg_vault_tde_verify_integrity()` reports nothing wrong: it
-checks the rows, not their TOAST values (PSQLE-189).
+affected row fails, and up to 1.7.1 `pg_vault_tde_verify_integrity()` reports nothing
+wrong: it checked the rows, not their TOAST values (PSQLE-189, PSQLE-196). In 1.7.2 it
+counts such a row as failed.
 
 **Before the restart that installs 1.7.2:** run `VACUUM FULL` on every table with
 out-of-line values that has been rotated once since the last restart. It rewrites the
@@ -1449,7 +1450,7 @@ make ci-bench BENCH_ROWS=100000  # with custom row count
 make ci-clean            # Remove test containers and images
 ```
 
-Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 662 assertions across 36 TAP files. Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
+Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 663 assertions across 36 TAP files. Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
 - Tests 1-4: extension loaded, access methods and SQL functions registered, wallet unlock
 - Tests 12-14: TAM INSERT/SELECT/UPDATE end-to-end
 - Test 15: DELETE
@@ -1933,7 +1934,9 @@ run against 1.7.2.
 - **Rotate keys on a schedule** — see [Key Rotation](#key-rotation). Online rotations are
   tracked in the `pg_vault_tde_rotation_status` view, readable by `pg_monitor`.
 - **Check integrity off-peak.** `pg_vault_tde_verify_integrity('t')` verifies the GCM
-  tag of every tuple — a full scan.
+  tag of every tuple and fetches every out-of-line value it references — a full scan of
+  the table and of its TOAST relation. It does not look at chunks no row references,
+  nor at dropped columns.
 - **Check health.** `pg_vault_tde_health_check()`, `pg_vault_tde_hw_accel_info()` (is
   AES-NI in use?), and `pg_vault_tde_vault_status()` or `pg_vault_tde_wallet_status()`
   for the KMS — see [SQL Functions](#sql-functions).

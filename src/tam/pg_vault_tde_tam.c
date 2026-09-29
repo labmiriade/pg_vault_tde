@@ -2970,6 +2970,72 @@ int64 pg_vault_tde_reencrypt_table(Oid relid)
     return tuples_done;
 }
 /*
+ * tde_value_fetches — whether one on-disk out-of-line value can be fetched:
+ * every chunk present and decrypting.
+ *
+ * In its own subtransaction: an error halfway through a TOAST read leaves
+ * buffer pins and locks behind that only an abort releases.  Allocates in
+ * CurrentMemoryContext, which the caller resets.
+ */
+static bool
+tde_value_fetches(Datum value)
+{
+    MemoryContext   cxt = CurrentMemoryContext;
+    ResourceOwner   owner = CurrentResourceOwner;
+    volatile bool   ok = true;
+
+    BeginInternalSubTransaction(NULL);
+    MemoryContextSwitchTo(cxt);
+
+    PG_TRY();
+    {
+        (void) detoast_external_attr((struct varlena *) DatumGetPointer(value));
+        ReleaseCurrentSubTransaction();
+    }
+    PG_CATCH();
+    {
+        MemoryContextSwitchTo(cxt);
+        FlushErrorState();
+        RollbackAndReleaseCurrentSubTransaction();
+        ok = false;
+    }
+    PG_END_TRY();
+
+    MemoryContextSwitchTo(cxt);
+    CurrentResourceOwner = owner;
+    return ok;
+}
+
+/*
+ * tde_row_toast_readable — whether every out-of-line value of the decrypted
+ * row plain can be fetched.  Dropped columns are skipped: nothing reads them,
+ * and a VACUUM FULL up to 1.7.1 may have left their pointers dangling
+ * (PSQLE-192).  Allocates in cxt, which the caller resets.
+ */
+static bool
+tde_row_toast_readable(HeapTuple plain, TupleDesc desc, MemoryContext cxt)
+{
+    MemoryContext oldcxt = MemoryContextSwitchTo(cxt);
+    Datum        *values = palloc(desc->natts * sizeof(Datum));
+    bool         *isnull = palloc(desc->natts * sizeof(bool));
+    bool          ok = true;
+
+    heap_deform_tuple(plain, desc, values, isnull);
+
+    for (int i = 0; i < desc->natts && ok; i++)
+    {
+        Form_pg_attribute att = TupleDescAttr(desc, i);
+
+        if (!isnull[i] && !att->attisdropped && att->attlen == -1 &&
+            VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(values[i])))
+            ok = tde_value_fetches(values[i]);
+    }
+
+    MemoryContextSwitchTo(oldcxt);
+    return ok;
+}
+
+/*
  * pg_vault_tde_verify_integrity(regclass)
  *   → (total_tuples bigint, failed_tuples bigint)
  *
@@ -2977,8 +3043,13 @@ int64 pg_vault_tde_reencrypt_table(Oid relid)
  * manually attempts GCM decryption on each.  Catches per-tuple failures
  * via PG_TRY/PG_CATCH so a single corrupted row does not abort the scan.
  *
- * Returns a composite with the total tuple count and the number whose
- * GCM authentication tag verification failed.
+ * A row also fails when one of its out-of-line values cannot be fetched —
+ * a missing chunk, or one that does not decrypt: the row's own tag says
+ * nothing about its TOAST chunks (PSQLE-196).  That reads every out-of-line
+ * value of the table.
+ *
+ * Returns a composite with the total tuple count and the number of rows that
+ * failed either check; the total stays a row count.
  */
 PG_FUNCTION_INFO_V1(pg_vault_tde_verify_integrity);
 PGDLLEXPORT Datum
@@ -2991,6 +3062,7 @@ pg_vault_tde_verify_integrity(PG_FUNCTION_ARGS)
     const TableAmRoutine *saved_am;
     volatile int64       total = 0;
     volatile int64       failed = 0;
+    MemoryContext volatile toast_cxt = NULL;
     TupleDesc            tupdesc;
     Datum                values[2];
     bool                 nulls[2] = {false, false};
@@ -3002,6 +3074,10 @@ pg_vault_tde_verify_integrity(PG_FUNCTION_ARGS)
                         "that cannot accept type record")));
     tupdesc = BlessTupleDesc(tupdesc);
     rel = table_open(relid, AccessShareLock);
+    if (OidIsValid(rel->rd_rel->reltoastrelid))
+        toast_cxt = AllocSetContextCreate(CurrentMemoryContext,
+                                          "pg_vault_tde verify toast",
+                                          ALLOCSET_DEFAULT_SIZES);
     /*
      * Swap rd_tableam to heapam so the scan returns raw encrypted tuples
      * without triggering our decrypt-on-read wrappers.
@@ -3030,6 +3106,13 @@ pg_vault_tde_verify_integrity(PG_FUNCTION_ARGS)
                 HeapTuple plain = tde_decrypt_heap_tuple(bslot->base.tuple,
                                                           RelationGetRelid(rel),
                                                           RelationGetDescr(rel));
+
+                if (toast_cxt != NULL)
+                {
+                    if (!tde_row_toast_readable(plain, RelationGetDescr(rel), toast_cxt))
+                        failed++;
+                    MemoryContextReset(toast_cxt);
+                }
                 pfree(plain);
             }
             PG_CATCH(2);
@@ -3056,6 +3139,8 @@ pg_vault_tde_verify_integrity(PG_FUNCTION_ARGS)
         TDE_IMPERSONATE_EXIT();
     }
     table_close(rel, AccessShareLock);
+    if (toast_cxt != NULL)
+        MemoryContextDelete(toast_cxt);
     values[0] = Int64GetDatum((int64) total);
     values[1] = Int64GetDatum((int64) failed);
     result_tup = heap_form_tuple(tupdesc, values, nulls);

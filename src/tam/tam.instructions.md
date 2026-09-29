@@ -47,6 +47,14 @@ and `tde_toast_delete_unshared()` — used by UPDATE and DELETE — counts them.
 1.7.1 left their pointers dangling, and HEAP_HASEXTERNAL must not make core follow
 them.  Regression: `tap/33_toast_lifecycle.t`, `ci-upgrade` Probe E.
 
+### Catching errors from a TOAST read needs a subtransaction (PSQLE-196)
+
+`verify_integrity()` catches per-row decrypt errors with a bare
+`PG_TRY`/`FlushErrorState()`, which is safe only because `tde_decrypt_heap_tuple()`
+holds no resource.  A TOAST fetch does (buffer pins, index scan, locks): catch its
+errors only inside `BeginInternalSubTransaction()` /
+`RollbackAndReleaseCurrentSubTransaction()`, as `tde_value_fetches()` does.
+
 ### Write Path PG_TRY Contract (v1.6 patch — fix #1)
 
 All four write callbacks (`pg_vault_tde_tuple_insert`,

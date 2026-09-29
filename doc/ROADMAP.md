@@ -1,6 +1,6 @@
 # pg_vault_tde Roadmap
 
-> Last updated: 2026-09-29 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 36 TAP files / 662 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 3 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
+> Last updated: 2026-09-29 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 36 TAP files / 663 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 3 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
 
 ---
 
@@ -434,6 +434,18 @@ distinguishes the builds.
     amcheck `heapallindexed`, duplicates refused); tap/28 measures the rewrite with a
     `PRIMARY KEY`. Found while testing it: partial indexes on encrypted tables are
     built with every row — a separate defect, not fixed here.
+
+16. **`verify_integrity()` did not look at TOAST (PSQLE-196).** It checked the GCM tag
+    of every row and never read the TOAST relation, so a value lost under a retired
+    DEK (item 10) or a damaged chunk left it reporting `N|0` while `SELECT` failed. Now
+    a row also counts as failed when one of its out-of-line values cannot be fetched —
+    a missing chunk or one that does not decrypt — each fetched in its own
+    subtransaction (an error halfway through a TOAST read holds pins and locks only an
+    abort releases), in a memory context reset per row. The result keeps its shape,
+    since a patch release cannot change the SQL: `total_tuples` is still a row count
+    and a row is counted once whichever part failed. Chunks no row references and
+    dropped columns are not checked. `tap/36_verify_integrity_toast.t` (one byte
+    flipped in one chunk's ciphertext).
 
 **New CI stage — `make ci-upgrade`.** Every other suite in this repo reads only data it
 wrote in the same run, so writer and reader always move together and a format-level

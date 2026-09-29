@@ -337,6 +337,16 @@ my @workloads = (
             $t =~ /_enc$/ ? "SELECT pg_vault_tde_reencrypt_table('$t');"
                           : "UPDATE $t SET big = big || '';" } },
 
+    # verify_integrity() fetching every out-of-line value, each in a
+    # subtransaction (PSQLE-196); the plain twin reads every value (md5(), as
+    # length() does not read the chunks in a single-byte encoding).
+    {   name  => 'pg_vault_tde_verify_integrity() of out-of-line TOAST values',
+        whole => 1,
+        setup => sub { my ($t, $m) = @_; toast_table($t, $m) },
+        run   => sub { my $t = shift;
+            $t =~ /_enc$/ ? "SELECT * FROM pg_vault_tde_verify_integrity('$t');"
+                          : "SELECT count(md5(big)) FROM $t;" } },
+
     # The rotation's rewrite inserting an index entry per row (PSQLE-194).
     {   name  => 'pg_vault_tde_reencrypt_table() with a PRIMARY KEY',
         whole => 1,
