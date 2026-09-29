@@ -42,6 +42,7 @@
 #include "access/relation.h"
 #include "access/table.h"
 #include "access/xact.h"        /* RegisterXactCallback */
+#include "access/xlog.h"        /* RecoveryInProgress */
 #include "miscadmin.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
@@ -513,8 +514,39 @@ tde_rel_dek_cache_store(Oid relid,
 
     if(found && stored_slot->dek_valid)
     {
+        /*
+         * A valid entry is replaced only when it is stale: the catalog shows a
+         * newer generation (a rotation replayed on a standby, or promoted
+         * since), or recovery is over and the entry, read during it, differs
+         * from the catalog at all.  An older generation during recovery comes
+         * from a reader with an older snapshot, and must not win (PSQLE-190).
+         */
+        bool checked = stored_slot->loaded_in_recovery && !RecoveryInProgress();
+        bool stale   = generation > stored_slot->generation ||
+                       (checked && generation != stored_slot->generation);
+
+        if (stale)
+        {
+            /* prev_dek[] is the generation just before, or nothing. */
+            if (generation == stored_slot->generation + 1)
+            {
+                memcpy(stored_slot->prev_dek, stored_slot->dek, TDE_DEK_LEN);
+                stored_slot->prev_dek_valid = true;
+            }
+            else
+            {
+                OPENSSL_cleanse(stored_slot->prev_dek, TDE_DEK_LEN);
+                stored_slot->prev_dek_valid = false;
+            }
+            memcpy(stored_slot->dek, dek, TDE_DEK_LEN);
+            stored_slot->generation = generation;
+            stored_slot->loaded_in_recovery = RecoveryInProgress();
+        }
+        else if (checked)
+            stored_slot->loaded_in_recovery = false;
+
         LWLockRelease(rel_dek_lock);
-        return false;
+        return stale;
     }
     else if(found && !stored_slot->dek_valid && stored_slot->prev_dek_valid)
     {
@@ -527,6 +559,7 @@ tde_rel_dek_cache_store(Oid relid,
         memcpy(stored_slot->dek, dek, TDE_DEK_LEN);
         stored_slot->dek_valid  = true;
         stored_slot->generation = generation;
+        stored_slot->loaded_in_recovery = RecoveryInProgress();
 
         LWLockRelease(rel_dek_lock);
         return true;
@@ -543,6 +576,7 @@ tde_rel_dek_cache_store(Oid relid,
     memcpy(stored_slot->dek, dek, TDE_DEK_LEN);
     stored_slot->dek_valid = true; 
     stored_slot->generation = generation;
+    stored_slot->loaded_in_recovery = RecoveryInProgress();
 
     LWLockRelease(rel_dek_lock);
     return true;
@@ -681,7 +715,14 @@ pg_vault_tde_kms_get_rel_dek_gen(Oid relid, unsigned char *dek_out,
     LWLockAcquire(rel_dek_lock, LW_SHARED);
     e = (TdeRelDekMap*) hash_search(rel_dek_map, &search_key, HASH_FIND, NULL);
 
-    if (e && e->dek_valid)
+    /*
+     * Not an entry read during recovery that nobody has checked since: a
+     * promoted node would encrypt under a key a rotation replayed meanwhile
+     * had retired (PSQLE-190).  The slow path checks it once.  Nothing is
+     * encrypted during recovery, so this costs one catalog read per relation
+     * after a promotion.
+     */
+    if (e && e->dek_valid && !(e->loaded_in_recovery && !RecoveryInProgress()))
     {
         memcpy(dek_out, e->dek, TDE_DEK_LEN);
         *gen_out = e->generation;
@@ -1253,6 +1294,8 @@ tde_rotation_xact_callback(XactEvent event, void *arg)
             }
             e->dek_valid = true;
             e->rotating  = false;
+            /* Both keys came from this node's own catalog, not a replay. */
+            e->loaded_in_recovery = false;
         }
         LWLockRelease(rel_dek_lock);
     }

@@ -24,8 +24,28 @@
 #         layout: v4 rows stay readable but keep a data area the core cannot
 #         walk, so heap_update() still dies on them until they are rewritten.
 #
+# whole_row_read_before_vacuum
+#   yes — every row written by the previous release can be read as a whole
+#         (SELECT t, t::text, row_to_json(t)).
+#   no  — it cannot: up to 1.7.1 VACUUM FULL copied a dropped column's
+#         out-of-line pointer into the rewritten table as it was, pointing at
+#         chunks of the TOAST relation it replaced (PSQLE-192). Live columns
+#         still read; a whole-row read fails with "missing chunk number 0"
+#         until the row is rewritten — VACUUM FULL, a rotation or an UPDATE of
+#         the row — by the new build, and the release notes must say so.
+#
+# partial_index_results_before_reindex
+#   right — a query through a partial index built by the previous release
+#           returns what a sequential scan returns.
+#   wrong — it does not: up to 1.7.1 the TAM built partial indexes with every
+#           row, and the planner drops the quals the predicate implies
+#           (PSQLE-198). Every partial index on an encrypted table must be
+#           rebuilt with REINDEX, and the release notes must say so.
+#
 # Changing a value here without changing the release notes is the bug this
 # file exists to prevent.
 
 readable_after_upgrade=yes
 update_in_place_before_vacuum=no
+whole_row_read_before_vacuum=no
+partial_index_results_before_reindex=wrong

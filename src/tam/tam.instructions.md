@@ -21,6 +21,60 @@ Every write callback MUST follow this sequence:
 4. Copy physical TID back to the slot
 5. `OPENSSL_cleanse` + `pfree` the plaintext copy
 
+### TOAST deletion waits for the heap operation (PSQLE-193)
+
+The pre-TOAST runs before `heap_update()`, because the new row needs its TOAST
+pointers before it is encrypted; core toasts inside `heap_update()`, once the
+row is known to be updatable.  So the pre-TOAST may insert chunks but never
+delete any: `pg_vault_tde_toast_tuple()` clears `TOAST_NEEDS_DELETE_OLD` before
+`toast_tuple_cleanup()`.  `pg_vault_tde_tuple_update()` then calls
+`tde_toast_delete_unshared()`: on `TM_Ok` it deletes the old row's values the
+new one no longer references; on any other result it kills the chunks this
+call inserted (`heap_abort_speculative`), because READ COMMITTED may skip the
+row or retry on a newer version that still points at the old ones.  The old
+row is fetched with `SnapshotAny` — after an EvalPlanQual recheck `otid` is a
+version the statement's snapshot does not see.  Regression:
+`test/isolation/specs/toast_update_concurrency.spec`.
+
+### Dropped columns keep their values until the row is rewritten (PSQLE-192)
+
+Core nulls dropped columns whenever it rewrites a row (the executor's UPDATE
+projection, `reform_and_rewrite_tuple()` on VACUUM FULL/CLUSTER) and deletes their
+chunks with the rest.  Every TAM path must do the same: `copy_for_cluster` rewrites
+them as NULL (`tde_without_dropped()`), the rotation's fetch-back sets them to NULL,
+and `tde_toast_delete_unshared()` — used by UPDATE and DELETE — counts them.
+`tde_tuple_has_external_desc()` alone skips them, on purpose: a VACUUM FULL up to
+1.7.1 left their pointers dangling, and HEAP_HASEXTERNAL must not make core follow
+them.  Regression: `tap/33_toast_lifecycle.t`, `ci-upgrade` Probe E.
+
+### The index build scan is heapam's, on decrypted copies (PSQLE-198, PSQLE-201)
+
+`tde_index_build_heap_scan` is `heapam_index_build_range_scan`
+(`access/heap/heapam_handler.c`) with one change: each tuple heapam would index is
+decrypted before the predicate and `FormIndexDatum`, and tde_btree keys are
+encrypted.  Everything that decides which tuples reach the index — `SnapshotAny` +
+`HeapTupleSatisfiesVacuum`, recently dead tuples, `ii_BrokenHotChain`, waits on
+in-progress writers, the predicate with `reltuples` counted before it, HOT roots —
+must stay heapam's; diff it against each new PostgreSQL major.  A recently dead
+tuple that no longer decrypts is skipped with `ii_BrokenHotChain` set.  It runs
+with the relation impersonating heapam (`heap_getnext()` checks rd_tableam).
+
+### Every place heapam deletes TOAST itself needs a TAM counterpart (PSQLE-197)
+
+heapam decides to delete a row's TOAST from the on-disk `HEAP_HASEXTERNAL`, which
+encrypted tuples never carry: `heap_delete()`, `heap_update()`,
+`heap_abort_speculative()`.  Each has a TAM wrapper that deletes from the decrypted
+row — `tuple_delete`, `tuple_update`, `tuple_complete_speculative`.  A new heapam
+entry point that frees a row needs one too.
+
+### Catching errors from a TOAST read needs a subtransaction (PSQLE-196)
+
+`verify_integrity()` catches per-row decrypt errors with a bare
+`PG_TRY`/`FlushErrorState()`, which is safe only because `tde_decrypt_heap_tuple()`
+holds no resource.  A TOAST fetch does (buffer pins, index scan, locks): catch its
+errors only inside `BeginInternalSubTransaction()` /
+`RollbackAndReleaseCurrentSubTransaction()`, as `tde_value_fetches()` does.
+
 ### Write Path PG_TRY Contract (v1.6 patch — fix #1)
 
 All four write callbacks (`pg_vault_tde_tuple_insert`,

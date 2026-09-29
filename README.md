@@ -47,8 +47,14 @@ packaged (OS, PG) combinations and what CI exercises on each in the
 > TOAST values must be dumped *before* the new binary is installed.
 >
 > **Upgrading from 1.7.1?** If `pg_vault_tde_rotate_online()` has run since the
-> last restart on a table that was being read or written, copy that table out
-> *before* restarting — see [`rotate_online()` with concurrent access](#rotate_online-with-concurrent-access).
+> last restart, act *before* restarting: copy out a rotated table that was being
+> read or written — see [`rotate_online()` with concurrent access](#rotate_online-with-concurrent-access) —
+> and run `VACUUM FULL` on a rotated table with out-of-line values — see
+> [`rotate_online()` and out-of-line values](#rotate_online-and-out-of-line-values).
+> A standby promoted while still on 1.7.1 must be restarted before its first write —
+> see [Streaming standby and `rotate_online()`](#streaming-standby-and-rotate_online).
+> Every table ever rotated needs a `REINDEX` — see [`rotate_online()` and indexes](#rotate_online-and-indexes) —
+> and so does every partial index on an encrypted table — see [Partial indexes on encrypted tables](#partial-indexes-on-encrypted-tables).
 > Otherwise nothing has to be done before installing 1.7.2, but existing
 > encrypted tables need one `VACUUM FULL` afterwards — see
 > [Upgrading to 1.7.2](#upgrading-to-172). Rows stay readable either way; until
@@ -623,7 +629,7 @@ SELECT * FROM pg_vault_tde_rotation_status('mytable');
 
 | Target | What happens |
 |--------|-------------|
-| `encrypted_heap` table | Generates a new table DEK, re-encrypts every tuple in-place in one transaction (`ShareRowExclusiveLock` on the table: `SELECT` continues, writes and a second rotation wait), then rebuilds any `tde_btree` indexes on the table so their SIV ciphertexts match the new DEK. Standard `btree` indexes on encrypted columns need no rebuild. |
+| `encrypted_heap` table | Generates a new table DEK, re-encrypts every tuple in-place in one transaction (`ShareRowExclusiveLock` on the table: `SELECT` continues, writes and a second rotation wait), then rebuilds any `tde_btree` indexes on the table so their SIV ciphertexts match the new DEK. Every other index — the `PRIMARY KEY` and `UNIQUE` constraints included — gets an entry for each rewritten row, as with an `UPDATE`. |
 | `tde_btree` index | Generates a new index DEK, then calls `reindex_index` (`AccessExclusiveLock` on the index, `ShareRowExclusiveLock` on its table) to rebuild the index with keys encrypted under the new DEK. The parent table's DEK and heap data are untouched. Passing a non-`tde_btree` index raises an error before touching shmem or the catalog. |
 
 When a table with `tde_btree` indexes is rotated, the index rebuild uses the new table DEK
@@ -822,7 +828,7 @@ log stream without any extension-level configuration.
 | Function | Returns | Description |
 |---|---|---|
 | `pg_vault_tde_health_check()` | composite | Status (6 columns: version, build_version, enabled, kms_provider, enc_ops_available, checked_at) |
-| `pg_vault_tde_verify_integrity(regclass)` | record | GCM tag audit scan of all tuples — returns `(total_tuples, failed_tuples)` |
+| `pg_vault_tde_verify_integrity(regclass)` | record | GCM tag audit scan of all tuples and every out-of-line value they reference — returns `(total_tuples, failed_tuples)`, a row counted once whichever part failed |
 | `pg_vault_tde_encrypted_size(regclass)` | record | Encryption storage overhead — returns `(total_tuples, encryption_overhead_bytes)` |
 | `pg_vault_tde_reencrypt_table(regclass, int)` | void | Batch re-encrypt with current DEK (locks table); `int` = batch size, default 1000 |
 | `pg_vault_tde_rotate_online(regclass, int)` | void | BGW-based online rotation: reads continue, writes wait until it commits; accepts both `encrypted_heap` tables and `tde_btree` indexes **(v1.5)** |
@@ -1196,6 +1202,206 @@ What changes in 1.7.2: `SELECT` keeps working during a rotation, while `INSERT`,
 commit. The whole table is re-encrypted in one transaction, so on a large table treat a
 rotation as a window with no writes.
 
+### `rotate_online()` and out-of-line values
+
+Up to 1.7.1, `pg_vault_tde_rotate_online()` re-encrypted every row but left its
+out-of-line (TOAST) values — typically `text`, `bytea` or `jsonb` values still over
+about 2 kB after compression — under the outgoing key. The catalog keeps only the
+current key, so the outgoing one survived in shared memory alone: the values became
+unreadable at the next restart, or at once at the next rotation of the same table. No
+concurrent access is needed. The rest of each row stays readable, a `DELETE` of an
+affected row fails, and up to 1.7.1 `pg_vault_tde_verify_integrity()` reports nothing
+wrong: it checked the rows, not their TOAST values (PSQLE-189, PSQLE-196). In 1.7.2 it
+counts such a row as failed.
+
+**Before the restart that installs 1.7.2:** run `VACUUM FULL` on every table with
+out-of-line values that has been rotated once since the last restart. It rewrites the
+values under the table's current key while the outgoing one is still in shared memory;
+`UPDATE t SET col = col || ''` on each affected column does the same. This lists the
+candidates:
+
+```sql
+SELECT p.relid::regclass AS table_name, p.updated_at AS rotated_at
+FROM pg_vault_tde_rotation_progress p
+JOIN pg_class c ON c.oid = p.relid
+WHERE p.status = 'complete'
+  AND p.updated_at > pg_postmaster_start_time()
+  AND c.reltoastrelid <> 0
+  AND pg_relation_size(c.reltoastrelid) > 0;
+```
+
+A table rotated twice since the restart, or rotated before it, has already lost the
+values stored before its last rotation, and only a backup brings them back.
+`SELECT sum(length(t::text)) FROM t` reads every value of `t` and fails with
+`decryption failed` if any of them is lost. A `missing chunk number 0` from the same
+query is a different, harmless defect — see [Dropped columns and out-of-line values](#dropped-columns-and-out-of-line-values).
+
+What changes in 1.7.2: the rotation rewrites every out-of-line value under the new key
+and deletes the old chunks; dropped columns become NULL, as in any `UPDATE`, and their
+chunks go too. A rotation of a table with large
+values reads and writes all of them, so it takes longer and writes more WAL than in
+1.7.1.
+
+### Concurrent `UPDATE` of out-of-line values
+
+Up to 1.7.1, an `UPDATE` that replaced an out-of-line value deleted the old value's
+chunks before it found out whether another transaction had changed the row. When one
+had — a concurrent `UPDATE` or `DELETE` of the same row, under `READ COMMITTED` — the
+waiting `UPDATE` could (PSQLE-193):
+
+- skip the row, because its `WHERE` no longer matched the newer version, which still
+  pointed at the deleted chunks: the value kept reading until the next `VACUUM`, then
+  failed with `missing chunk number 0 for toast value …`;
+- fail with `tuple concurrently deleted` when the other transaction had replaced or
+  deleted the same value;
+- go ahead on the newer version and leave the chunks of the values it did not change
+  behind, referenced by nothing.
+
+A value already lost cannot be brought back except from a backup;
+`SELECT sum(length(t::text)) FROM t` fails on a table that has one. The orphaned
+chunks only take space, and `VACUUM FULL` drops them. In 1.7.2 the old chunks are
+deleted only once the row has been updated, and an attempt that finds the row changed
+removes the chunks it had written, so the waiting `UPDATE` behaves as on a plain heap
+table.
+
+The same change fixes a failure that needed no concurrency: an `UPDATE` turning an
+out-of-line value into a compressed inline one — `SET col = repeat('x', 6000)` over a
+value stored out of line — failed with `tuple already updated by self` (PSQLE-191). No
+data was affected; the statement rolled back.
+
+An `INSERT ... ON CONFLICT` that lost the race to a concurrent insert of the same key
+also left its out-of-line values behind, referenced by nothing (PSQLE-197). They only
+take space; `VACUUM FULL` drops them, and 1.7.2 no longer leaves them.
+
+
+### Dropped columns and out-of-line values
+
+A column dropped with `ALTER TABLE ... DROP COLUMN` keeps its values in every row until
+the row is rewritten. Up to 1.7.1 the TAM mishandled the out-of-line ones (PSQLE-192):
+
+- `DELETE` left their chunks in the TOAST relation, referenced by nothing, whenever
+  the row had no other out-of-line value — and so did a `DELETE` that waited on a
+  concurrent `UPDATE` of the row, for every value of the row;
+- `VACUUM FULL` and `CLUSTER` copied the dropped column's pointer as it was into the
+  rewritten table, where it points into the TOAST relation the rewrite replaced. The
+  live columns read normally, but a read of the whole row — `SELECT t FROM t`,
+  `t::text`, `row_to_json(t)` — fails with `missing chunk number 0 for toast value …`;
+- with the 1.7.2 fix for [out-of-line values in a rotation](#rotate_online-and-out-of-line-values)
+  alone, the same pointers made `rotate_online()` fail; that combination never shipped.
+
+**After installing 1.7.2:** the `VACUUM FULL` that [Upgrading to 1.7.2](#upgrading-to-172)
+already asks for repairs all of it: it rewrites dropped columns as NULL, as core does,
+which removes the dangling pointers and the orphaned chunks. A rotation or an `UPDATE`
+of a row repairs that row too, and `rotate_online()` and `DELETE` work on the tables
+as they are. `make ci-upgrade` checks each of these on data written by 1.7.1.
+
+
+### Streaming standby and `rotate_online()`
+
+The rotation moves the primary's shared-memory DEK cache to the new key when it
+commits; a streaming standby learns of it only from the replicated catalog row. Up to
+1.7.1 a standby that had a table's DEK cached kept the retired one (PSQLE-190):
+
+- every row of the new generation went through the catalog and the KMS — one unwrap
+  per row, an HTTP call each with Vault — until the standby restarted;
+- after a promotion the node encrypted new rows of such a table with the retired key.
+  In 1.7.1 the table stops reading at once, at the first scan that meets a new row;
+  with the rest of 1.7.2's fixes alone the rows would have been lost at the next
+  restart.
+
+**Still on 1.7.1:** after promoting a standby, restart it before the first write —
+with the local wallet, `pg_vault_tde_wallet_unlock()` in each database does the same.
+Both empty the cache, so every key comes from the catalog again.
+
+What changes in 1.7.2: a catalog read that shows a newer generation than the cached
+one replaces it, so the standby unwraps once per rotated table rather than once per
+row; and once a node leaves recovery, the first write to each table checks the key it
+cached during recovery against the catalog. `tap/34_standby_rotation.t` covers both,
+including a table first touched by an `INSERT` after the promotion.
+
+
+### `rotate_online()` and indexes
+
+The rotation rewrites every row, and a rewrite that cannot stay on its page puts the
+new version elsewhere; an `UPDATE` would then add an entry for it to every index. Up to
+1.7.1 the rotation added none (PSQLE-194). It rebuilt the table's `tde_btree` indexes
+and left every other one pointing at the retired row versions only:
+
+- after the rotation an index scan through them finds nothing — including lookups by
+  `PRIMARY KEY` or through a `UNIQUE` constraint, which on an encrypted table are
+  standard btree indexes by default;
+- `PRIMARY KEY` and `UNIQUE` no longer hold: a duplicate is accepted.
+
+Sequential scans still return every row, so nothing is lost, but queries that use
+those indexes return wrong results.
+
+**After installing 1.7.2 (or right away on 1.7.1):** run `REINDEX TABLE` on every
+table `pg_vault_tde_rotate_online()` or `pg_vault_tde_reencrypt_table()` has ever
+rewritten. The online rotations are listed by
+`SELECT relid::regclass FROM pg_vault_tde_rotation_progress WHERE status = 'complete'`.
+If duplicates got in meanwhile, `REINDEX` of the unique index fails and names the
+key: remove the extra rows first (`SELECT id, count(*) FROM t GROUP BY id HAVING
+count(*) > 1` for a key `id`).
+
+What changes in 1.7.2: the rotation inserts the index entries of every row it
+rewrites, as the executor's `UPDATE` does — partial and expression indexes and
+uniqueness checks included — and still rebuilds the `tde_btree` ones. The new entries
+take no lock beyond the rotation's own; only the `tde_btree` rebuild at the end locks
+its index. `tap/35_rotate_online_indexes.t`.
+
+
+### Partial indexes on encrypted tables
+
+`CREATE INDEX` and `REINDEX` on an encrypted table run the extension's own build scan,
+which decrypts each row before computing its keys. Up to 1.7.1 it never evaluated the
+index predicate, so a partial index (`CREATE INDEX ... WHERE ...`) received every row
+(PSQLE-198):
+
+- **queries through it can return wrong rows.** The planner drops the conditions the
+  predicate implies, trusting the index to hold only rows that satisfy it: with an
+  index on `(customer) WHERE status = 'open'`, `WHERE customer = 7 AND status = 'open'`
+  returned every order of customer 7;
+- a valid `CREATE UNIQUE INDEX ... WHERE ...` was refused when the key repeated outside
+  the predicate;
+- partial indexes were as large as full ones.
+
+**After installing 1.7.2:** `REINDEX` every partial index on an encrypted table. This
+lists them:
+
+```sql
+SELECT ix.indexrelid::regclass AS index_name, ix.indrelid::regclass AS table_name
+FROM pg_index ix
+JOIN pg_class t ON t.oid = ix.indrelid
+JOIN pg_am    a ON a.oid = t.relam AND a.amname = 'encrypted_heap'
+WHERE ix.indpred IS NOT NULL
+ORDER BY 1;
+```
+
+Until it is rebuilt, a partial index can answer wrongly; `REINDEX INDEX CONCURRENTLY`
+rebuilds it without blocking writes. `make ci-upgrade` builds one with 1.7.1 and checks
+that this query finds it and that `REINDEX` makes it answer what a sequential scan
+answers.
+
+
+### Indexes built while an older snapshot is open
+
+PostgreSQL builds an index so that transactions already running when it was built can
+use it too: it also indexes row versions that are dead for everyone else but may still
+be visible to them, and when a HOT chain changed the indexed column it marks the index
+unusable for those older transactions (`pg_index.indcheckxmin`). Up to 1.7.1 the
+extension's own build scan did neither: it indexed only what a fresh snapshot saw
+(PSQLE-201). A `REPEATABLE READ` or `SERIALIZABLE` transaction that started before a
+`CREATE INDEX` and then queried through the new index missed rows deleted or updated
+after its snapshot, and could get rows whose version visible to it does not satisfy
+the query.
+
+Only those older transactions were affected, and only until they ended: for every
+transaction started after the build, an index built by 1.7.1 is correct. Nothing needs
+to be done after installing 1.7.2, which builds indexes as heapam does. If two
+rotations of the table left row versions an old snapshot can still see under a key
+that no longer exists, the index is built without them and marked unusable for older
+transactions, as PostgreSQL does for broken HOT chains.
+
 ## Compatibility
 
 | Feature | Status | Notes |
@@ -1290,8 +1496,8 @@ make ci-valgrind         # Valgrind memcheck over the full TDE workload (slow: 1
 make ci-cassert          # SQL suites + TAP files on PostgreSQL built --enable-cassert -DUSE_VALGRIND (builds PG from source)
 make ci-wallet           # SQL regression tests (local wallet provider)
 make ci-checksums        # regression tests + page checksum compatibility
-make ci-tap              # 31 TAP test files (starts a real Vault container for the Vault-dependent ones)
-make ci-isolation        # 2 isolation specs: DEK rotation under load, relation rewrite under a concurrent reader
+make ci-tap              # 39 TAP test files (starts a real Vault container for the Vault-dependent ones)
+make ci-isolation        # 3 isolation specs: DEK rotation under load, relation rewrite under a concurrent reader, UPDATE of out-of-line values racing another transaction
 make ci-vault            # Vault integration (Compose-based)
 make ci-openbao          # OpenBao Raft 3-node HA integration (12 tests)
 make ci-upgrade          # Read data written by the previous release tag (upgrade compatibility)
@@ -1302,7 +1508,7 @@ make ci-bench BENCH_ROWS=100000  # with custom row count
 make ci-clean            # Remove test containers and images
 ```
 
-Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 473 assertions across 31 TAP files. Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
+Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 706 assertions across 39 TAP files. Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
 - Tests 1-4: extension loaded, access methods and SQL functions registered, wallet unlock
 - Tests 12-14: TAM INSERT/SELECT/UPDATE end-to-end
 - Test 15: DELETE
@@ -1405,6 +1611,7 @@ Concurrency — `make ci-isolation` (`test/isolation/specs/`):
 
 - `per_table_dek_rotation.spec` — online DEK rotation racing readers, writers and VACUUM
 - `encrypted_rewrite_concurrency.spec` — `VACUUM FULL` / `CLUSTER` (i.e. `pg_vault_tde_relation_copy_for_cluster`) with a second backend holding a `REPEATABLE READ` snapshot across the relfilenode change, and with an uncommitted writer the rewrite must wait for. Payloads are `STORAGE EXTERNAL` so the rewrite has real TOAST chunks to migrate. This spec found the `toast_save_datum()` segfault that TEST 153 now guards; it does **not** cover `wallet_lock()`, because the stage sets `wallet_dev_mode_passphrase` and those permutations would pass vacuously — the spec says so in a comment rather than shipping a test that checks nothing
+- `toast_update_concurrency.spec` — an `UPDATE` that replaces an out-of-line value while another transaction updates or deletes the same row: the waiting `UPDATE` that skips the row, goes ahead on the newer version, or finds it deleted, and a `DELETE` waiting on an `UPDATE`. Each permutation ends with `VACUUM` and counts the values left in the TOAST relation, so a lost value and an orphaned one both show (PSQLE-193). The expected output is what the same spec prints on a plain `heap` table
 
 On-disk corruption — `tap/20_ondisk_fuzz.t`:
 
@@ -1785,7 +1992,9 @@ run against 1.7.2.
 - **Rotate keys on a schedule** — see [Key Rotation](#key-rotation). Online rotations are
   tracked in the `pg_vault_tde_rotation_status` view, readable by `pg_monitor`.
 - **Check integrity off-peak.** `pg_vault_tde_verify_integrity('t')` verifies the GCM
-  tag of every tuple — a full scan.
+  tag of every tuple and fetches every out-of-line value it references — a full scan of
+  the table and of its TOAST relation. It does not look at chunks no row references,
+  nor at dropped columns.
 - **Check health.** `pg_vault_tde_health_check()`, `pg_vault_tde_hw_accel_info()` (is
   AES-NI in use?), and `pg_vault_tde_vault_status()` or `pg_vault_tde_wallet_status()`
   for the KMS — see [SQL Functions](#sql-functions).

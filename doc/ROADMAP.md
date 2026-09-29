@@ -1,6 +1,6 @@
 # pg_vault_tde Roadmap
 
-> Last updated: 2026-09-28 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 31 TAP files / 473 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 2 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
+> Last updated: 2026-09-29 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 39 TAP files / 706 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 3 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
 
 ---
 
@@ -345,6 +345,144 @@ distinguishes the builds.
    DEKs themselves do not change), and switches the database to `kms_provider = 'local'`
    in the session and through a database-level setting. The derivation helper is gone.
    `tap/31_migrate_vault_to_wallet.t`, with a real-Vault half.
+
+10. **`rotate_online()` left out-of-line values under the outgoing key (PSQLE-189).**
+    The worker rewrites each row with `tuple_update()`, whose pre-TOAST hands the old
+    tuple to `toast_tuple_init()`: an unchanged external value was reused as it was, so
+    its chunks kept DEK N while the row moved to N+1. N then lived only in the
+    shared-memory cache, and the values broke at the next restart or the next rotation —
+    no concurrency needed, and `verify_integrity()` does not read TOAST chunks. A
+    `DELETE` of such a row failed too. Now `reencrypt_table()` fetches every on-disk
+    external value back (still compressed) before the update, so the toaster stores it
+    under the new key and the old chunks are deleted; dropped columns become NULL, as in
+    any `UPDATE` (see item 12).
+    `tap/32_rotate_online_toast.t`, on every provider.
+
+11. **A concurrent `UPDATE` of an out-of-line value could lose it (PSQLE-193).** The
+    TAM toasts the new row before `heap_update()`, so it can encrypt it, and that
+    toaster also deleted the replaced values — while core does it inside
+    `heap_update()`, once the row is known to be updatable. When `heap_update()` then
+    found the row changed by a concurrent transaction, READ COMMITTED skipped it or
+    retried on the newer version, which still pointed at the deleted chunks: the value
+    broke at the next `VACUUM` (`missing chunk number 0`), the retry failed with
+    `tuple concurrently deleted`, or the unchanged values of the newer version were
+    left orphaned. Now the pre-TOAST only inserts; after `heap_update()` the old
+    row's values the new one no longer references are deleted on `TM_Ok`, and the
+    chunks the attempt inserted are killed otherwise (`heap_abort_speculative`, as
+    for a failed `INSERT ... ON CONFLICT`). The old row is read with `SnapshotAny`,
+    since after a recheck it is a version the statement's snapshot does not see.
+    The separate fallback that deleted the old values when the new row had none is
+    gone with it. `test/isolation/specs/toast_update_concurrency.spec`, whose
+    expected output is the same spec run on a plain heap table.
+
+12. **Dropped columns' out-of-line values: leaked, and dangling after `VACUUM FULL`
+    (PSQLE-192).** `DELETE` decided whether to delete TOAST with
+    `tde_tuple_has_external()`, which skips dropped columns, so a row whose only
+    out-of-line value sat in one left its chunks behind; it also read the row with the
+    statement's snapshot, which after an EvalPlanQual recheck does not see the version
+    being deleted, so a `DELETE` waiting on an `UPDATE` left every value behind.
+    `copy_for_cluster` did not null dropped columns as core's
+    `reform_and_rewrite_tuple()` does: it copied such a pointer as it was into the
+    rewritten table, pointing into the TOAST relation the rewrite replaced, and a
+    whole-row read (`SELECT t`, `t::text`) failed with `missing chunk number 0` — on
+    1.7.1 too. The item-10 fix, which fetched dropped values back, made the next
+    rotation fail on them. Now `DELETE` reads the row with `SnapshotAny` and deletes
+    through the same helper as `UPDATE`, dropped columns included; `VACUUM FULL` and
+    `CLUSTER` rewrite dropped columns as NULL; the rotation sets them to NULL.
+    `tap/33_toast_lifecycle.t` puts a plain heap twin through the same statements and
+    compares contents, whole rows and TOAST values after each; the isolation spec gains
+    a `DELETE` waiting on an `UPDATE`; `ci-upgrade` Probe E reads a table whose
+    dropped column 1.7.1 left dangling (`whole_row_read_before_vacuum=no`), rotates
+    and deletes from it, and Gate C's `VACUUM FULL` must repair it.
+
+13. **An `UPDATE` from out of line to compressed inline failed (PSQLE-191).** With a
+    tuple over the threshold the pre-TOAST ran and `toast_tuple_cleanup()` deleted the
+    old chunks; the compressed value then stayed inline, so the new row had no external
+    value and `tuple_update()`'s fallback deleted the same chunks again —
+    `tuple already updated by self`, the statement rolled back. The same cause as item
+    11: two places deleting TOAST. The item-11 restructure, which deletes in one place
+    after `heap_update()`, fixed it; `tap/33_toast_lifecycle.t` covers it (the step
+    "UPDATE from out of line to compressed inline" fails on the commit before that fix
+    and on 1.7.1).
+
+14. **A streaming standby kept the retired DEK after a rotation (PSQLE-190).** The
+    commit callback that moves the cache to the new key runs on the primary; a standby
+    only replays the catalog row, and `tde_rel_dek_cache_store()` never replaced a
+    valid entry. Every row of the new generation took the slow path (catalog read +
+    KMS unwrap), and after a promotion `get_rel_dek_gen()` encrypted new rows with the
+    cached, retired key — lost at the next restart, or, in 1.7.1 where DEK and
+    generation were not read together, unreadable at once. Now a catalog read showing a
+    newer generation replaces the entry (the old key becomes `prev_dek` only when the
+    generations are consecutive; an older one during recovery, from an older snapshot,
+    never wins), and entries stored during recovery are marked `loaded_in_recovery`:
+    after recovery the first encryption checks each against the catalog once, and the
+    rotation's commit callback clears the mark. `tap/34_standby_rotation.t`: a table
+    read after the rotation, one only written after the promotion, one rotated twice,
+    a cold control.
+
+15. **`rotate_online()` left the indexes without entries for the rewritten rows
+    (PSQLE-194).** `reencrypt_table()` calls `tuple_update()` — `heap_update()`
+    underneath, which leaves index maintenance to its caller — and ignored
+    `update_indexes`. Its rewrite is never HOT on a full page, so every index but the
+    `tde_btree` ones it rebuilt pointed at the retired versions only: after a rotation
+    lookups through a `PRIMARY KEY`, a `UNIQUE` constraint (standard btrees by default
+    on an encrypted table) or any plain index found nothing, and duplicates were
+    accepted. Also in 1.7.1. Now each rewritten row gets its entries through
+    `ExecInsertIndexTuples()`, as the executor's `UPDATE` does, in a per-row memory
+    context; the tde_btree rebuild stays. Users must `REINDEX` tables rotated before.
+    `tap/35_rotate_online_indexes.t` (lookups through each index, a full range,
+    amcheck `heapallindexed`, duplicates refused); tap/28 measures the rewrite with a
+    `PRIMARY KEY`. Found while testing it: partial indexes on encrypted tables are
+    built with every row — a separate defect, not fixed here.
+
+16. **`verify_integrity()` did not look at TOAST (PSQLE-196).** It checked the GCM tag
+    of every row and never read the TOAST relation, so a value lost under a retired
+    DEK (item 10) or a damaged chunk left it reporting `N|0` while `SELECT` failed. Now
+    a row also counts as failed when one of its out-of-line values cannot be fetched —
+    a missing chunk or one that does not decrypt — each fetched in its own
+    subtransaction (an error halfway through a TOAST read holds pins and locks only an
+    abort releases), in a memory context reset per row. The result keeps its shape,
+    since a patch release cannot change the SQL: `total_tuples` is still a row count
+    and a row is counted once whichever part failed. Chunks no row references and
+    dropped columns are not checked. `tap/36_verify_integrity_toast.t` (one byte
+    flipped in one chunk's ciphertext).
+
+17. **An `INSERT ... ON CONFLICT` that lost the race left its TOAST chunks
+    (PSQLE-197).** The row was killed by heapam's `complete_speculative` with
+    `heap_abort_speculative()`, which deletes TOAST only when the on-disk tuple has
+    `HEAP_HASEXTERNAL` — never set on an encrypted tuple. The TAM now wraps
+    `complete_speculative`: on failure it reads the row back and kills its chunks
+    through `tde_toast_delete_unshared(..., speculative)`, as core does, before heapam
+    kills the row. `tap/37_speculative_abort_toast.t` makes the race deterministic
+    without injection points: an expression index filled before the unique one blocks
+    on an advisory lock between the speculative insert and the unique check.
+
+18. **Partial indexes were built with every row (PSQLE-198).** The TAM's own
+    `index_build_range_scan` (it must decrypt before `FormIndexDatum`) never evaluated
+    `ii_Predicate`: a valid `UNIQUE ... WHERE` was refused, partial indexes held every
+    row, and since the planner drops the quals a predicate implies, queries through one
+    returned rows that do not satisfy it (40 instead of 0 in `ci-upgrade`). Also in
+    1.7.1. Now the scan prepares and checks the predicate as heapam does, counting
+    `reltuples` before it — that count becomes the heap's statistics. Users must
+    `REINDEX` their existing partial indexes. `tap/38_partial_index_build.t` against a
+    plain heap twin; `ci-upgrade` Probe F on an index 1.7.1 built
+    (`partial_index_results_before_reindex=wrong`); tap/35's amcheck now covers its
+    partial index too. The CREATE INDEX CONCURRENTLY validation scan already checked
+    the predicate.
+
+19. **An index built while an older snapshot was open misled it (PSQLE-201).** The TAM's
+    build scan read a fresh MVCC snapshot: no recently dead tuples, no
+    `ii_BrokenHotChain`, no waiting for in-progress writers under a uniqueness check.
+    A REPEATABLE READ transaction older than the index, querying through it, missed the
+    rows deleted after its snapshot and got HOT-updated rows under their new values
+    (0, 0 and 10 where heap gives 10, 10 and 0). The scan is now a port of
+    `heapam_index_build_range_scan` (identical in PG 17 and 18) run on decrypted
+    copies, with the relation impersonating heapam as in `copy_for_cluster`. One case
+    heapam never meets: a recently dead tuple under a DEK generation nobody holds any
+    more (two rotations under an open snapshot) is left out, and the index is marked
+    unusable for older snapshots rather than failing the build. The scan also resets
+    `ii_ExpressionsState` / `ii_PredicateState`, which pointed into its freed EState.
+    `tap/39_index_build_old_snapshot.t`, with a parallel build checked by amcheck.
 
 **New CI stage — `make ci-upgrade`.** Every other suite in this repo reads only data it
 wrote in the same run, so writer and reader always move together and a format-level

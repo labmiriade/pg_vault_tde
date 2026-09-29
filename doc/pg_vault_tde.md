@@ -623,7 +623,10 @@ The rotation worker runs one transaction:
    key in the worker's own memory. `generation` stays the outgoing key's.
 3. `pg_vault_tde_catalog_update_rel_dek()` writes DEK N+1 to the catalog row and hands
    it to the worker's memory, never to the shared cache.
-4. `pg_vault_tde_reencrypt_table()` rewrites every row with DEK N+1.
+4. `pg_vault_tde_reencrypt_table()` rewrites every row with DEK N+1. Out-of-line values
+   are fetched back from the TOAST relation first (still compressed), so the toaster
+   stores them again under DEK N+1 and deletes the old chunks — reused as they were,
+   they kept DEK N, which the catalog no longer holds (PSQLE-189).
 5. A transaction callback moves the cache entry to DEK N+1 at commit (before the locks
    are released) or back to DEK N at abort, and clears `rotating`.
 
@@ -1424,7 +1427,7 @@ Starts PostgreSQL with `initdb -k` (`--data-checksums`). Verifies that:
 
 ### TAP Tests (`tap/`)
 
-31 files, run together by `make ci-tap` (which also starts the Vault container
+39 files, run together by `make ci-tap` (which also starts the Vault container
 the Vault-dependent files need; they `skip_all` when `VAULT_ADDR` is unset).
 
 | File | Coverage |
@@ -1460,6 +1463,14 @@ the Vault-dependent files need; they `skip_all` when `VAULT_ADDR` is unset).
 | `tap/29_rotate_online_concurrent_access.t` | A table read or written while `pg_vault_tde_rotate_online()` runs stays readable after the rotation, after a second rotation and after a restart; a row lock on `pg_vault_tde_catalog` holds the worker inside the window (PSQLE-184). Runs once per available provider: local, Vault (`VAULT_ADDR`), PKCS#11 (SoftHSM2) |
 | `tap/30_rotate_kek_local_atomicity.t` | A local-wallet KEK rotation that rolls back, fails later in its statement, or dies in a crash leaves every table readable; so do a session that unlocked the wallet before another session rotated the KEK, and a `CREATE TABLE` that waited on an aborted rotation — each checked right after and after a restart (PSQLE-185) |
 | `tap/31_migrate_vault_to_wallet.t` | `pg_vault_tde_migrate_vault_to_wallet()` refuses a passphrase that does not open the wallet and leaves every migrated table readable under the local wallet — in a session opened before the migration, a new one and after a restart; the real-Vault half runs when `VAULT_ADDR` is set (PSQLE-188) |
+| `tap/32_rotate_online_toast.t` | Out-of-line values — stored uncompressed and compressed — stay readable after `pg_vault_tde_rotate_online()`, after a restart, after a second rotation and after another restart, and the TOAST relation keeps the same number of live chunks (PSQLE-189). Runs once per available provider, as `tap/29` |
+| `tap/33_toast_lifecycle.t` | Out-of-line values go through every write path as on a plain heap twin put through the same statements — UPDATEs that keep, replace, inline or drop them, DELETE, VACUUM, `DROP COLUMN`, VACUUM FULL, two rotations and a restart; after each step the contents, a read of every whole row and the number of values left in the TOAST relation must match (PSQLE-189, 191, 192) |
+| `tap/34_standby_rotation.t` | A streaming standby across `rotate_online()` on the primary: tables it had cached before the rotation read after it without an unwrap per row, and after a promotion new rows — including those of a table first touched by an `INSERT` — survive the promoted node's restart; one table rotated twice, one first read after the rotation as the control (PSQLE-190) |
+| `tap/35_rotate_online_indexes.t` | Every index keeps finding every row across `pg_vault_tde_rotate_online()` — PRIMARY KEY, UNIQUE, plain, partial and `tde_btree`: a lookup through each, a full range, amcheck `heapallindexed`, and duplicate keys refused, after two rotations, a VACUUM and a restart (PSQLE-194) |
+| `tap/36_verify_integrity_toast.t` | `pg_vault_tde_verify_integrity()` counts a row whose out-of-line value no longer decrypts: one byte flipped in a TOAST chunk's ciphertext (checksums off, as `tap/20`), the row counted once, the total still a row count, an untouched table clean, no resource left behind (PSQLE-196) |
+| `tap/37_speculative_abort_toast.t` | An `INSERT ... ON CONFLICT` that loses the race to a concurrent insert leaves no out-of-line value behind, for DO NOTHING and DO UPDATE, on `encrypted_heap` and on a plain heap: the race is made deterministic with an expression index that blocks on an advisory lock, no injection points needed (PSQLE-197) |
+| `tap/38_partial_index_build.t` | A partial index on `encrypted_heap` holds only the rows its predicate admits, against a plain heap twin: a valid `UNIQUE ... WHERE` builds and enforces, a partial btree has the heap twin's size after CREATE INDEX and REINDEX, amcheck `heapallindexed` passes, a `tde_btree` partial index answers, `reltuples` still counts every row (PSQLE-198) |
+| `tap/39_index_build_old_snapshot.t` | An index built while an older REPEATABLE READ snapshot is open gives that snapshot what a plain heap twin gives it — rows deleted after it, HOT-updated rows by their old values only; after two rotations under an open snapshot `CREATE INDEX` still builds and marks the index `indcheckxmin`; a parallel build passes amcheck (PSQLE-201) |
 
 #### `tap/19_crash_recovery_rmgr.t`
 
@@ -1525,12 +1536,15 @@ Plus a regression guard on the postmaster: a cluster-level `local` provider
 must not attempt to open a wallet at startup, where there is no database and
 therefore no wallet path.
 
-### Isolation Tests (`isolation/dek_rotation.spec`)
+### Isolation Tests (`test/isolation/specs/`)
 
-Verifies:
-1. DEK rotation does not block concurrent read transactions.
-2. New inserts after rotation use the new generation.
-3. Reads that started before rotation complete without error (MVCC + local cache).
+- `per_table_dek_rotation.spec`: DEK rotation racing readers, writers and VACUUM.
+- `encrypted_rewrite_concurrency.spec`: `VACUUM FULL` / `CLUSTER` with a reader
+  holding a snapshot across the relfilenode change, and with a writer to wait for.
+- `toast_update_concurrency.spec`: an `UPDATE` replacing an out-of-line value
+  while another transaction updates or deletes the row, and a `DELETE` waiting on an
+  `UPDATE`; every permutation ends
+  with `VACUUM` and counts the values left in the TOAST relation (PSQLE-193).
 
 ### Anti-Patterns (DO NOT)
 

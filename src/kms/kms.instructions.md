@@ -555,9 +555,30 @@ were gone at the next restart (PSQLE-184).  The rules now:
    runs after the commit is visible and before locks are released, so the
    queued writers wake up to the new key; `XACT_EVENT_ABORT` restores the old
    one.  The callback must not raise an error.
+5. **The rewrite covers the TOAST relation.**  A row handed to
+   `tuple_update()` as scanned keeps its external pointers, and the toaster
+   reuses unchanged ones: the chunks would stay under the outgoing key, which
+   no catalog row holds once the rotation commits (PSQLE-189).
+   `reencrypt_table()` fetches on-disk external values back first
+   (`tde_fetch_back_external()`); dropped columns become NULL instead, as in any
+   UPDATE — a VACUUM FULL up to 1.7.1 may have left their pointers dangling
+   (PSQLE-192).
+
+6. **A standby only sees the catalog.**  Nothing but the replicated row tells a
+   standby's cache about a rotation, so `tde_rel_dek_cache_store()` replaces a
+   valid entry when the catalog shows a newer generation, and entries stored during
+   recovery carry `loaded_in_recovery` until checked: after recovery,
+   `pg_vault_tde_kms_get_rel_dek_gen()` does not encrypt with one before the slow
+   path has compared it with the catalog (PSQLE-190).
+
+7. **The rewrite maintains every index.**  `heap_update()` leaves index entries
+   to its caller; `reencrypt_table()` inserts them with `ExecInsertIndexTuples()`
+   for every rewrite that is not HOT, and rebuilds only the tde_btree indexes,
+   whose keys depend on the DEK (PSQLE-194).
 
 Regression: `tap/29_rotate_online_concurrent_access.t` (a row lock on
-`pg_vault_tde_catalog` holds the worker inside the window).
+`pg_vault_tde_catalog` holds the worker inside the window);
+`tap/32_rotate_online_toast.t` for rule 5; `tap/34_standby_rotation.t` for rule 6; `tap/35_rotate_online_indexes.t` for rule 7.
 
 ### Evicting many entries is per-database
 

@@ -30,7 +30,7 @@ SELECT * FROM pg_vault_tde_rotation_status;   -- view, readable by pg_monitor
 
 | Target | What happens |
 |---|---|
-| `encrypted_heap` table | Generates a new table DEK, re-encrypts every tuple in place in one transaction (`ShareRowExclusiveLock` on the table: `SELECT` continues, writes wait), then rebuilds any `tde_btree` indexes on the table so their AES-SIV ciphertexts match the new DEK. Plain `btree` indexes on encrypted columns need no rebuild. |
+| `encrypted_heap` table | Generates a new table DEK, re-encrypts every tuple in place in one transaction (`ShareRowExclusiveLock` on the table: `SELECT` continues, writes wait), then rebuilds any `tde_btree` indexes on the table so their AES-SIV ciphertexts match the new DEK. Every other index — `PRIMARY KEY` and `UNIQUE` included — gets an entry for each rewritten row, as with an `UPDATE`. Up to 1.7.1 they got none; see *`rotate_online()` and indexes* in the README. |
 | `tde_btree` index | Generates a new **index** DEK, then rebuilds the index (`AccessExclusiveLock` on the index, `ShareRowExclusiveLock` on its table) with keys encrypted under the new DEK. The parent table's DEK and heap data are untouched. Passing a non-`tde_btree` index raises an error before touching shared memory or the catalog. |
 
 Mechanically, rotation works by **generation epoch**. Every ciphertext
@@ -40,7 +40,7 @@ carries the generation of the key that wrote it:
    takes its snapshot, so every row committed before it started is included.
 2. The current DEK moves to `prev_dek`, and the new DEK stays in the
    rotation worker's own memory. The worker re-encrypts every row with it,
-   in one transaction.
+   out-of-line (TOAST) values included, in one transaction.
 3. Every other session keeps reading with the outgoing DEK, which is what
    the catalog shows them until the rotation commits.
 4. At commit the shared cache switches to the new DEK before the lock is
@@ -56,6 +56,10 @@ carries the generation of the key that wrote it:
 > Up to 1.7.1 a rotation of a table that was being read or written could
 > make it unreadable after the next restart. See *`rotate_online()` with
 > concurrent access* in the README before restarting to install 1.7.2.
+>
+> Up to 1.7.1 a rotation also left the table's out-of-line values under the
+> outgoing key: they became unreadable at the next restart or the next
+> rotation. See *`rotate_online()` and out-of-line values* in the README.
 
 If a table has `tde_btree` indexes, rotating the table implicitly produces
 correct index entries under the new table DEK (the index rebuild reads the

@@ -65,7 +65,9 @@ if [[ ! -f "$EXPECTED_FILE" ]]; then
 fi
 EXP_READABLE="$(grep -E '^readable_after_upgrade=' "$EXPECTED_FILE" | cut -d= -f2)"
 EXP_UPDATE="$(grep -E '^update_in_place_before_vacuum=' "$EXPECTED_FILE" | cut -d= -f2)"
-log_info "Declared: readable_after_upgrade=$EXP_READABLE update_in_place_before_vacuum=$EXP_UPDATE"
+EXP_WHOLEROW="$(grep -E '^whole_row_read_before_vacuum=' "$EXPECTED_FILE" | cut -d= -f2)"
+EXP_PARTIAL="$(grep -E '^partial_index_results_before_reindex=' "$EXPECTED_FILE" | cut -d= -f2)"
+log_info "Declared: readable_after_upgrade=$EXP_READABLE update_in_place_before_vacuum=$EXP_UPDATE whole_row_read_before_vacuum=$EXP_WHOLEROW partial_index_results_before_reindex=$EXP_PARTIAL"
 
 # ── Images: baseline (from the tag's own tree) and current ───────────────
 BASELINE_IMAGE="pg-tde-baseline:${BASELINE}-pg${PG_MAJOR}"
@@ -132,6 +134,12 @@ SELECT md5(string_agg(x, '|' ORDER BY x)) FROM (
                 || ':' || coalesce(c::text,'-')             AS x FROM up_nulls
     UNION ALL
     SELECT 'm:' || id || ':' || amount                      AS x FROM up_numeric
+    UNION ALL
+    SELECT 'd:' || id || ':' || v                           AS x FROM up_dropped
+    UNION ALL
+    SELECT 'r:' || id || ':' || v                           AS x FROM up_dropped_rot
+    UNION ALL
+    SELECT 'q:' || id || ':' || customer || ':' || status   AS x FROM up_partial
 ) s;
 SQL
 
@@ -177,6 +185,35 @@ INSERT INTO up_nulls VALUES (1, 'x', '2026-01-01 00:00:00+00'),
 CREATE TABLE up_numeric (id int4, amount numeric) USING encrypted_heap;
 INSERT INTO up_numeric SELECT g, g * 1.25 FROM generate_series(1, 200) g;
 CREATE INDEX up_numeric_amount ON up_numeric USING tde_btree (amount);
+
+-- PSQLE-192: out-of-line values only in a column that is then dropped, and a
+-- VACUUM FULL by the baseline.  Up to 1.7.1 the rewrite copies the dropped
+-- column's pointer as it is, into the TOAST relation it is replacing: every
+-- row is left pointing at chunks that no longer exist.  Two copies, one for
+-- the rotation in Probe E and one for the VACUUM FULL of Gate C.
+CREATE TABLE up_dropped (id int4, v text, gone text) USING encrypted_heap;
+ALTER TABLE up_dropped ALTER COLUMN gone SET STORAGE EXTERNAL;
+INSERT INTO up_dropped SELECT g, 'v' || g, string_agg(md5((g * 1000 + s)::text), '')
+  FROM generate_series(1, 10) g, generate_series(1, 400) s GROUP BY g;
+ALTER TABLE up_dropped DROP COLUMN gone;
+VACUUM FULL up_dropped;
+CREATE TABLE up_dropped_rot (id int4, v text, gone text) USING encrypted_heap;
+ALTER TABLE up_dropped_rot ALTER COLUMN gone SET STORAGE EXTERNAL;
+INSERT INTO up_dropped_rot SELECT g, 'v' || g, string_agg(md5((g * 1000 + s)::text), '')
+  FROM generate_series(1, 10) g, generate_series(1, 400) s GROUP BY g;
+ALTER TABLE up_dropped_rot DROP COLUMN gone;
+VACUUM FULL up_dropped_rot;
+
+-- PSQLE-198: a partial index the baseline builds with every row in it.  Up to
+-- 1.7.1 the TAM's build scan ignored the predicate, and the planner drops the
+-- quals the predicate implies: customer 7 has no open order, yet a query
+-- through this index returns every one of its orders.
+CREATE TABLE up_partial (id int4, customer int4, status text) USING encrypted_heap;
+INSERT INTO up_partial SELECT g, g % 50, CASE WHEN g % 10 = 0 THEN 'open' ELSE 'closed' END
+  FROM generate_series(1, 2000) g;
+CREATE INDEX up_partial_open ON up_partial USING tde_btree (customer tde_int4_enc_ops)
+  WHERE status = 'open';
+ANALYZE up_partial;
 
 CHECKPOINT;
 SQL
@@ -256,10 +293,111 @@ if [[ "$ACT_UPDATE" != "$EXP_UPDATE" ]]; then
     exit 2
 fi
 
+# ── Probe E: a dropped column the baseline's VACUUM FULL left dangling ───
+# up_dropped and up_dropped_rot keep, in their dropped column, pointers into a
+# TOAST relation the baseline replaced (PSQLE-192).  Reading only the live
+# columns never follows them; a whole-row read (SELECT t, t::text,
+# row_to_json(t)) flattens every column and does.  Declared, like Probe B.
+# A rotation and a DELETE must cope as they are, before any remedy.  Only
+# ERROR lines count: the first access to a table in a backend also prints the
+# dev_mode_passphrase WARNING.
+log_info "Probe E — rows whose dropped column the baseline's VACUUM FULL left dangling ..."
+WR_ERR="$(container_psql "$CONTAINER" -q -c \
+    "SELECT sum(length(t::text)) FROM up_dropped t;" 2>&1 >/dev/null | grep -E "ERROR|FATAL|server closed" || true)"
+if [[ -n "$WR_ERR" ]]; then
+    ACT_WHOLEROW=no
+    log_warn "Probe E: whole-row read refused — $(echo "$WR_ERR" | head -1)"
+else
+    ACT_WHOLEROW=yes
+    log_ok "Probe E: whole rows read as they are"
+fi
+if [[ "$ACT_WHOLEROW" != "$EXP_WHOLEROW" ]]; then
+    log_error "UPGRADE: whole_row_read_before_vacuum is '$ACT_WHOLEROW', ci/upgrade-compat.expected declares '$EXP_WHOLEROW'."
+    log_error "        Either fix the change, or flip the declaration AND say so in the release notes."
+    exit 2
+fi
+
+container_psql "$CONTAINER" -q -c \
+    "SET client_min_messages = warning; SELECT pg_vault_tde_rotate_online('up_dropped_rot');" >/dev/null 2>&1
+ROT=""
+for _ in $(seq 1 60); do
+    ROT="$(container_psql "$CONTAINER" -tAc \
+        "SELECT status FROM pg_vault_tde_rotation_progress WHERE relid = 'up_dropped_rot'::regclass::oid" \
+        2>/dev/null | tr -d '[:space:]')"
+    [[ "$ROT" == complete || "$ROT" == failed ]] && break
+    sleep 1
+done
+if [[ "$ROT" != complete ]]; then
+    log_error "PROBE E: rotate_online() of a table with dangling dropped-column pointers ended '${ROT:-<nothing>}'"
+    exit 2
+fi
+WR_ERR="$(container_psql "$CONTAINER" -q -c \
+    "SELECT sum(length(t::text)) FROM up_dropped_rot t;" 2>&1 >/dev/null | grep -E "ERROR|FATAL|server closed" || true)"
+if [[ -n "$WR_ERR" ]]; then
+    log_error "PROBE E: whole rows still fail after the rotation rewrote them — $(echo "$WR_ERR" | head -1)"
+    exit 2
+fi
+log_ok "PROBE E: the rotation completes and leaves whole rows readable"
+
+DEL_ERR="$(container_psql "$CONTAINER" -q -c \
+    "BEGIN; DELETE FROM up_dropped; ROLLBACK;" 2>&1 >/dev/null | grep -E "ERROR|FATAL|server closed" || true)"
+if [[ -n "$DEL_ERR" ]]; then
+    log_error "PROBE E: DELETE of rows with dangling dropped-column pointers failed — $(echo "$DEL_ERR" | head -1)"
+    exit 2
+fi
+log_ok "PROBE E: DELETE copes with them"
+
+# ── Probe F: a partial index the baseline built with every row ───────────
+# up_partial_open was built by the baseline, whose build scan ignored the
+# predicate (PSQLE-198).  Declared, like Probe B: whether a query through it
+# answers what a sequential scan answers before any REINDEX.  Then the README
+# query must find it, and REINDEX must make it right.
+log_info "Probe F — a partial index built by $BASELINE ..."
+Q_IDX="SET enable_seqscan = off; SET enable_bitmapscan = off; SELECT count(*) FROM up_partial WHERE customer = 7 AND status = 'open'"
+Q_SEQ="SET enable_indexscan = off; SET enable_indexonlyscan = off; SET enable_bitmapscan = off; SELECT count(*) FROM up_partial WHERE customer = 7 AND status = 'open'"
+BY_SEQ="$(container_psql "$CONTAINER" -q -tAc "$Q_SEQ" 2>/dev/null | tr -d '[:space:]')"
+BY_IDX="$(container_psql "$CONTAINER" -q -tAc "$Q_IDX" 2>/dev/null | tr -d '[:space:]')"
+if [[ "$BY_IDX" == "$BY_SEQ" ]]; then
+    ACT_PARTIAL=right
+    log_ok "Probe F: the partial index answers what a sequential scan does ($BY_SEQ)"
+else
+    ACT_PARTIAL=wrong
+    log_warn "Probe F: through the partial index $BY_IDX rows, by sequential scan $BY_SEQ"
+fi
+if [[ "$ACT_PARTIAL" != "$EXP_PARTIAL" ]]; then
+    log_error "UPGRADE: partial_index_results_before_reindex is '$ACT_PARTIAL', ci/upgrade-compat.expected declares '$EXP_PARTIAL'."
+    log_error "        Either fix the change, or flip the declaration AND say so in the release notes."
+    exit 2
+fi
+
+# The query README -> "Partial indexes on encrypted tables" gives users.
+# Keep the two copies identical.
+read -r -d '' FIND_PARTIAL <<'SQL' || true
+SELECT ix.indexrelid::regclass AS index_name, ix.indrelid::regclass AS table_name
+FROM pg_index ix
+JOIN pg_class t ON t.oid = ix.indrelid
+JOIN pg_am    a ON a.oid = t.relam AND a.amname = 'encrypted_heap'
+WHERE ix.indpred IS NOT NULL
+ORDER BY 1;
+SQL
+FOUND="$(container_psql "$CONTAINER" -tA -F '|' -c "$FIND_PARTIAL" 2>&1 | cut -d'|' -f1 | tr '\n' ' ' | sed 's/ *$//')"
+if [[ "$FOUND" != "up_partial_open" ]]; then
+    log_error "PROBE F: the README detection query found '$FOUND', expected 'up_partial_open'"
+    exit 2
+fi
+container_psql "$CONTAINER" -v ON_ERROR_STOP=1 -q -c "REINDEX INDEX up_partial_open;" \
+    || { log_error "PROBE F: REINDEX of the baseline's partial index failed"; exit 2; }
+BY_IDX="$(container_psql "$CONTAINER" -q -tAc "$Q_IDX" 2>/dev/null | tr -d '[:space:]')"
+if [[ "$BY_IDX" != "$BY_SEQ" ]]; then
+    log_error "PROBE F: after REINDEX the partial index still returns $BY_IDX rows, a sequential scan $BY_SEQ"
+    exit 2
+fi
+log_ok "PROBE F: the README query finds it, and REINDEX makes it right"
+
 # ── Gate C: the documented remedy has to work ────────────────────────────
 log_info "Gate C — VACUUM FULL must migrate the rows without altering them ..."
 container_psql "$CONTAINER" -v ON_ERROR_STOP=1 -q -c \
-    "VACUUM FULL up_plain, up_late_key, up_toast, up_nulls, up_numeric;" \
+    "VACUUM FULL up_plain, up_late_key, up_toast, up_nulls, up_numeric, up_dropped;" \
     || { log_error "GATE C: VACUUM FULL failed on baseline data"; exit 2; }
 
 MIGRATED="$(container_psql "$CONTAINER" -tAc "$FINGERPRINT" 2>/dev/null | tr -d '[:space:]')"
@@ -277,6 +415,14 @@ if [[ -n "$POST_ERR" ]]; then
     exit 2
 fi
 log_ok "GATE C: rows update normally once rewritten"
+
+WR_ERR="$(container_psql "$CONTAINER" -q -c \
+    "SELECT sum(length(t::text)) FROM up_dropped t;" 2>&1 >/dev/null | grep -E "ERROR|FATAL|server closed" || true)"
+if [[ -n "$WR_ERR" ]]; then
+    log_error "GATE C: whole rows still fail after VACUUM FULL — $(echo "$WR_ERR" | head -1)"
+    exit 2
+fi
+log_ok "GATE C: whole rows read once rewritten"
 
 # ── Probe D: an index the current build refuses to create ────────────────
 # up_numeric_amount was built by the baseline; this build refuses numeric
