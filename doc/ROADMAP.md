@@ -447,6 +447,16 @@ distinguishes the builds.
     dropped columns are not checked. `tap/36_verify_integrity_toast.t` (one byte
     flipped in one chunk's ciphertext).
 
+17. **An `INSERT ... ON CONFLICT` that lost the race left its TOAST chunks
+    (PSQLE-197).** The row was killed by heapam's `complete_speculative` with
+    `heap_abort_speculative()`, which deletes TOAST only when the on-disk tuple has
+    `HEAP_HASEXTERNAL` — never set on an encrypted tuple. The TAM now wraps
+    `complete_speculative`: on failure it reads the row back and kills its chunks
+    through `tde_toast_delete_unshared(..., speculative)`, as core does, before heapam
+    kills the row. `tap/37_speculative_abort_toast.t` makes the race deterministic
+    without injection points: an expression index filled before the unique one blocks
+    on an advisory lock between the speculative insert and the unique check.
+
 **New CI stage — `make ci-upgrade`.** Every other suite in this repo reads only data it
 wrote in the same run, so writer and reader always move together and a format-level
 breakage leaves the suite green while data on disk becomes unreadable. That is how the

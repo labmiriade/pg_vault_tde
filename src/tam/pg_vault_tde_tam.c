@@ -126,6 +126,9 @@ static TM_Result  (*heapam_tuple_lock_cb)(Relation, ItemPointer, Snapshot,
 static bool       (*heapam_tuple_satisfies_snapshot_cb)(Relation,
                                                          TupleTableSlot *,
                                                          Snapshot);
+static void       (*heapam_tuple_complete_speculative_cb)(Relation,
+                                                          TupleTableSlot *,
+                                                          uint32, bool);
 /* save original heapam delete callback */
 static TM_Result (*heapam_tuple_delete_cb)(Relation rel,
                                            ItemPointer tid,
@@ -2103,6 +2106,57 @@ tde_tuple_has_external(HeapTuple tup, Relation rel)
 }
 
 /*
+ * pg_vault_tde_tuple_complete_speculative
+ *
+ * An INSERT ... ON CONFLICT that lost the race: heapam kills the row with
+ * heap_abort_speculative(), which deletes its TOAST chunks only when the
+ * on-disk tuple carries HEAP_HASEXTERNAL — and an encrypted tuple never does
+ * (see tde_encrypt_heap_tuple).  So kill the chunks first, from the decrypted
+ * row; they were inserted by this transaction a moment ago, which is what
+ * heap_abort_speculative() requires of them (PSQLE-197).
+ */
+static void
+pg_vault_tde_tuple_complete_speculative(Relation rel, TupleTableSlot *slot,
+                                        uint32 specToken, bool succeeded)
+{
+    if (!succeeded && OidIsValid(rel->rd_rel->reltoastrelid))
+    {
+        TupleTableSlot   *own = table_slot_create(rel, NULL);
+        HeapTuple volatile plain = NULL;
+        bool              shouldFree = false;
+
+        Assert(ItemPointerIsValid(&slot->tts_tid));
+
+        if (pg_vault_tde_tuple_fetch_row_version(rel, &slot->tts_tid,
+                                                 SnapshotAny, own))
+            plain = ExecFetchSlotHeapTuple(own, true, &shouldFree);
+
+        /* Our own speculative insert, which nothing can have pruned. */
+        Assert(plain != NULL);
+
+        PG_TRY();
+        {
+            if (plain != NULL)
+                tde_toast_delete_unshared(rel, plain, NULL, true);
+        }
+        PG_CATCH();
+        {
+            if (shouldFree && plain != NULL)
+                tde_release_plain(plain);
+            ExecDropSingleTupleTableSlot(own);
+            PG_RE_THROW();
+        }
+        PG_END_TRY();
+
+        if (shouldFree && plain != NULL)
+            tde_release_plain(plain);
+        ExecDropSingleTupleTableSlot(own);
+    }
+
+    heapam_tuple_complete_speculative_cb(rel, slot, specToken, succeeded);
+}
+
+/*
  * pg_vault_tde_tuple_delete
  *
  * DELETE path.  Delegates the physical row removal to heapam's tuple_delete,
@@ -2647,12 +2701,14 @@ pg_vault_tde_tam_init(void)
     heapam_tuple_lock_cb                    = heapam->tuple_lock;
     heapam_tuple_satisfies_snapshot_cb      = heapam->tuple_satisfies_snapshot;
     heapam_tuple_delete_cb                  = heapam->tuple_delete;
+    heapam_tuple_complete_speculative_cb    = heapam->tuple_complete_speculative;
     /* --- Install encrypt/decrypt wrappers --- */
     /* Slot type: always buffer-backed (needed for decode_slot cast) */
     tde_methods.slot_callbacks              = pg_vault_tde_slot_callbacks;
     /* Write paths: encrypt before calling heapam storage layer */
     tde_methods.tuple_insert                = pg_vault_tde_tuple_insert;
     tde_methods.tuple_insert_speculative    = pg_vault_tde_tuple_insert_speculative;
+    tde_methods.tuple_complete_speculative  = pg_vault_tde_tuple_complete_speculative;
     tde_methods.multi_insert                = pg_vault_tde_multi_insert;
     tde_methods.tuple_update                = pg_vault_tde_tuple_update;
     tde_methods.tuple_delete                = pg_vault_tde_tuple_delete;
@@ -2680,7 +2736,7 @@ pg_vault_tde_tam_init(void)
      * HEAP_TABLE_AM_OID (large column values work but are stored unencrypted).
      */
     tde_methods.relation_toast_am           = pg_vault_tde_toast_am;
-    /* All other callbacks (delete, complete_speculative, scan_begin/end/rescan,
+    /* All other callbacks (scan_begin/end/rescan,
      * finish_bulk_insert, vacuum, analyze, relation_*, parallelscan_*, ...) are
      * inherited from heapam unchanged via the memcpy above. */
     ereport(LOG,

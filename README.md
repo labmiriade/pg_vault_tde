@@ -1268,6 +1268,10 @@ out-of-line value into a compressed inline one — `SET col = repeat('x', 6000)`
 value stored out of line — failed with `tuple already updated by self` (PSQLE-191). No
 data was affected; the statement rolled back.
 
+An `INSERT ... ON CONFLICT` that lost the race to a concurrent insert of the same key
+also left its out-of-line values behind, referenced by nothing (PSQLE-197). They only
+take space; `VACUUM FULL` drops them, and 1.7.2 no longer leaves them.
+
 
 ### Dropped columns and out-of-line values
 

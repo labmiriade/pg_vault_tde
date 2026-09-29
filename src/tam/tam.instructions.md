@@ -47,6 +47,14 @@ and `tde_toast_delete_unshared()` — used by UPDATE and DELETE — counts them.
 1.7.1 left their pointers dangling, and HEAP_HASEXTERNAL must not make core follow
 them.  Regression: `tap/33_toast_lifecycle.t`, `ci-upgrade` Probe E.
 
+### Every place heapam deletes TOAST itself needs a TAM counterpart (PSQLE-197)
+
+heapam decides to delete a row's TOAST from the on-disk `HEAP_HASEXTERNAL`, which
+encrypted tuples never carry: `heap_delete()`, `heap_update()`,
+`heap_abort_speculative()`.  Each has a TAM wrapper that deletes from the decrypted
+row — `tuple_delete`, `tuple_update`, `tuple_complete_speculative`.  A new heapam
+entry point that frees a row needs one too.
+
 ### Catching errors from a TOAST read needs a subtransaction (PSQLE-196)
 
 `verify_integrity()` catches per-row decrypt errors with a bare
