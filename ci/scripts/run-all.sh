@@ -97,7 +97,7 @@ while [[ $# -gt 0 ]]; do
         --help|-h)
             echo "Usage: $0 [--skip-bench] [--skip-openbao] [--skip-wallet] [--skip-install-test] [--skip-valgrind] [--skip-deep] [--skip-matrix] [--only stage1 stage2 ...]"
             echo ""
-            echo "Stages: regress matrix errorpath checksums tap isolation vault openbao wallet pkcs11 schema scan-build ubsan valgrind cassert install-test bench"
+            echo "Stages: pins regress matrix errorpath checksums tap isolation vault openbao wallet pkcs11 schema scan-build ubsan valgrind cassert install-test bench"
             exit 0
             ;;
         *)
@@ -110,7 +110,7 @@ done
 # ---------------------------------------------------------------------------
 # Stage definitions
 # ---------------------------------------------------------------------------
-ALL_STAGES=(regress matrix errorpath checksums tap isolation vault openbao wallet pkcs11 schema upgrade scan-build ubsan valgrind cassert install-test bench)
+ALL_STAGES=(pins regress matrix errorpath checksums tap isolation vault openbao wallet pkcs11 schema upgrade scan-build ubsan valgrind cassert install-test bench)
 
 should_run() {
     local stage="$1"

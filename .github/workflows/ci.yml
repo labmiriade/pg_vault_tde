@@ -37,6 +37,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Actions, images and downloads are pinned
+        run: bash ci/scripts/run-pins.sh
+
       - name: Install PostgreSQL ${{ matrix.pg }} headers and build dependencies
         run: |
           set -euo pipefail
