@@ -1714,7 +1714,7 @@ On-disk corruption — `tap/20_ondisk_fuzz.t`:
 
 Flips 72 random bits across the heap file over 6 rounds (fixed seed, so a failure reproduces) and classifies every row afterwards. The property under test is that the layer has exactly two behaviours under arbitrary damage — correct data, or a refusal — and never hands the client a value derived from damaged ciphertext. Data page checksums are **disabled** for this test on purpose: with them on, PostgreSQL rejects the page before the extension is asked to decrypt anything, and the test would measure core's checksums instead of AES-256-GCM.
 
-A third outcome is counted separately and accepted: the row *vanishing*. Our wire format keeps the `HeapTupleHeader` in plaintext and authenticates only `[t_hoff .. t_len)`, so a flip in xmin, infomask or the null bitmap is outside the GCM tag by construction and can make the tuple invisible. That is data loss from unauthenticated-header damage, not a forged value — the test distinguishes the two rather than conflating them.
+A third outcome is counted separately and accepted: the row *vanishing*. Our wire format keeps the `HeapTupleHeader` in plaintext and authenticates only the attribute values, so a flip in xmin, infomask or the null bitmap is outside the GCM tag by construction and can make the tuple invisible (what the tag does not cover: [doc/pg_vault_tde.md](doc/pg_vault_tde.md#what-the-authentication-tag-does-not-cover)). That is data loss from unauthenticated-header damage, not a forged value — the test distinguishes the two rather than conflating them.
 
 Cross-version — `make ci-matrix`:
 
@@ -2000,6 +2000,23 @@ run against 1.7.2.
 - **Treat the server log as sensitive.** Statement text is logged with its literals: with
   `log_statement = 'mod'` or `'all'`, and by default for every statement that fails
   (`log_min_error_statement = error`).
+- **Keep secrets out of statement text and out of `PGDATA`.**
+  - A passphrase given to `pg_vault_tde_wallet_init()`, `_wallet_unlock()`,
+    `_wallet_change_passphrase()`, `_migrate_vault_to_wallet()` or a seal function is
+    part of the statement: logged as above, and visible in `pg_stat_activity` to the same
+    role and to `pg_read_all_stats` while the call runs. Make those calls from a session
+    that has run `SET log_statement = 'none'` and `SET log_min_error_statement = 'panic'`.
+  - `vault_token`, `vault_role_id`, `vault_secret_id` and `wallet_dev_mode_passphrase`
+    hold the secret itself, and exist only as settings. Never set them with `SET`
+    (statement text), `ALTER SYSTEM` (it writes `postgresql.auto.conf`, inside `PGDATA` and
+    so inside every base backup) or `ALTER DATABASE`/`ALTER ROLE … SET` (stored in
+    `pg_db_role_setting`, and in every `pg_dumpall`). Put them in a file outside `PGDATA`,
+    readable only by the server's operating-system user, loaded with `include`. For the
+    wallet, prefer `wallet_passphrase_env`, `_file` or `_command`, which hold only where
+    the passphrase is.
+  - `wallet_passphrase_command` runs through `popen()` — a shell, as the server's
+    operating-system user — every time the wallet is opened; whatever it writes to
+    standard error reaches the server log.
 
 ### Designing encrypted tables
 

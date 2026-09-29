@@ -130,6 +130,13 @@ before reporting:
 - Denial of service through ordinary resource exhaustion (a very large query,
   an intentionally slow KMS).
 
+## Security Review
+
+The threat model behind the scope above, the method a code review follows, the risks
+the project has accepted and where each is documented, and every finding recorded so
+far, with its ticket, are in [doc/SECURITY-REVIEW.md](doc/SECURITY-REVIEW.md). The
+document ships in the release bundle; signed reviews of each release are listed there.
+
 ## Deployment Hardening
 
 If you are looking for how to configure a deployment securely rather than how

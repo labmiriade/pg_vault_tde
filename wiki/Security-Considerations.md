@@ -54,12 +54,17 @@ in-database authorization.
 
 ## Hardening Checklist
 
-- **Never put secrets in `postgresql.conf`.** Vault tokens, AppRole
-  credentials, and wallet passphrases should be supplied via environment
-  variables, a `0400`-permission file, or a command
-  (`wallet_passphrase_command`) — never as an inline GUC value. The
-  extension already hides these GUCs from `pg_settings`, but keep them out
-  of configuration-management history and `postgresql.conf` backups too.
+- **Keep secrets out of statement text and out of `PGDATA`.** Supply the
+  wallet passphrase through `wallet_passphrase_env`, `wallet_passphrase_file`
+  (mode `0400`) or `wallet_passphrase_command`, never inline. The Vault token
+  and AppRole credentials exist only as settings: put them in a file outside
+  `PGDATA`, readable only by the server's operating-system user, loaded with
+  `include` — never with `SET`, `ALTER SYSTEM` (it writes
+  `postgresql.auto.conf`, inside `PGDATA`) or `ALTER DATABASE`/`ALTER ROLE …
+  SET`. The extension hides these settings from non-superusers, but keep them
+  out of configuration-management history too. Passphrases passed to the
+  wallet functions are part of the statement text: see *Running pg_vault_tde
+  in Production* in the README.
 - **Keep the wallet base directory outside `PGDATA`.**
   `/var/lib/pg_vault_tde/` must not live inside the data directory — a plain
   `pg_basebackup`/filesystem snapshot of `PGDATA` would then carry the KEK

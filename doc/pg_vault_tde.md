@@ -1150,6 +1150,35 @@ Tuple payload bytes in WAL are the encrypted bytes written to disk —
 a WAL stream viewer sees ciphertext in DATA positions. Structural
 metadata (LSN, block numbers, relation OID, MVCC fields) is plaintext.
 
+### What the authentication tag does not cover
+
+The GCM tag of a tuple authenticates the bytes of its attribute values,
+concatenated in attribute order, and an AAD of `[MyDatabaseId | relid | generation]`.
+A ciphertext therefore does not verify in another database, another relation, or
+under another DEK generation: moved there, it is refused. Damage to the value bytes
+is refused too. The tag does not bind:
+
+- **the tuple's position** — its block and line pointer. heapam chooses where a
+  tuple goes after it has been formed, ciphertext included, so the position cannot
+  be part of the AAD. Within one relation and one generation, a tuple image written
+  back to another place, or an older image of the same table, still verifies.
+- **the tuple header** — `xmin`, `xmax`, the infomask. Core rewrites them (hint
+  bits, `xmax`, freezing) without the key. Damage there can make a row version
+  visible or invisible (`tap/20_ondisk_fuzz.t` counts that outcome apart).
+- **the layout of the values** — the null bitmap and the length headers of
+  variable-length attributes, which v5 keeps in clear (see
+  [Wire Format per Encrypted Region](#wire-format-per-encrypted-region)). They say
+  where one value ends and the next begins, and they are not part of the tag: whoever
+  can write the data files can change how a row's bytes are divided among its
+  variable-length attributes without failing it. No plaintext byte can be changed or
+  added that way. Authenticating the layout is a change of tuple format, planned
+  for 1.8.
+
+Detecting a replayed or moved tuple needs integrity over pages or relations, which
+an extension cannot add; data checksums detect accidental damage only. All three are
+outside the threat model: the attacker it defends against reads files, and does not
+write to the data directory (see `doc/SECURITY-REVIEW.md`).
+
 ### Superuser Bypass
 
 A PostgreSQL superuser executing SQL sees plaintext (decrypted through
