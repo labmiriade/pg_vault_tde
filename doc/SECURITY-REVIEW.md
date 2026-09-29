@@ -1,22 +1,22 @@
-# pg_vault_tde — Security Review
+# pg_vault_tde - Security Review
 
 This document is the method for reviewing the security of `pg_vault_tde`: the threat
 model a review works against, the trust boundaries it has to cross, the checklist it
 goes through, the risks the project has accepted and documented, and the findings
 recorded so far. The review of a given release is written by a person, against this
-document, and signed (see [Workflow](#workflow)). Automated tools — CodeQL,
-scan-build, UBSan, Valgrind, a PostgreSQL built with assertions — produce evidence
+document, and signed (see [Workflow](#workflow)). Automated tools - CodeQL,
+scan-build, UBSan, Valgrind, a PostgreSQL built with assertions - produce evidence
 that a review can cite; they are not the review.
 
 It exists because the PostgreSQL packaging repositories (yum.postgresql.org,
 apt.postgresql.org) accept new extensions only with a security review of their code
-written by a person — see the RFC in
+written by a person - see the RFC in
 [GitHub discussion #9](https://github.com/labmiriade/pg_vault_tde/discussions/9).
 
 | | |
 |---|---|
 | Version under review | 1.7.2 |
-| Reviews signed so far | none — the first is [Reviews](#reviews), row 1.7.2 |
+| Reviews signed so far | none - the first is [Reviews](#reviews), row 1.7.2 |
 | Reporting a vulnerability | [SECURITY.md](../SECURITY.md) |
 
 ---
@@ -33,13 +33,13 @@ written by a person — see the RFC in
 - The **integrity** of those values: damaged ciphertext is refused, never decrypted
   into a wrong value, and a ciphertext moved to another database, relation or key
   generation is refused. Integrity against someone who *writes* the data files, within
-  one relation, is not claimed ([H4](#findings), [H10](#findings)).
+  one relation, is not claimed ([PSQLE-177](#findings), [1.8 (v5 layout, to be opened)](#findings)).
 
 ### Attackers in scope
 
 | | Attacker | Holds | Must not obtain |
 |---|---|---|---|
-| A1 | Theft of files or backups | Relation and TOAST files, a copy of the data directory, a base backup, a `pg_dump_tde` archive, a key-seal bundle — without the KEK | Any value, any DEK |
+| A1 | Theft of files or backups | Relation and TOAST files, a copy of the data directory, a base backup, a `pg_dump_tde` archive, a key-seal bundle - without the KEK | Any value, any DEK |
 | A2 | Access to the data directory without access to the database | Read access to `PGDATA` (a storage or backup operator, a volume snapshot), no role in the cluster, no access to the KMS or the wallet directory | Any value, any DEK |
 | A3 | The replication stream | Physical replication: the WAL stream. Logical replication: see the accepted risk [Logical decoding](#accepted-risks) | From WAL: any value, any DEK. Structural metadata is not protected (see non-goals) |
 | A4 | A memory dump | A core file, a swap or hibernation image, taken after the key material in it was no longer needed | Key material the extension has finished with: it must have been cleansed |
@@ -51,13 +51,13 @@ A review does not treat these as findings; the design does not defend against th
 - **A PostgreSQL superuser, or any role that can read the table through SQL.**
   Decryption is transparent; TDE protects the storage layer, not in-database
   authorization. The same goes for the roles the key-management functions are open to
-  (superuser, see [H9](#findings)).
+  (superuser, see [PSQLE-206](#findings)).
 - **The operating-system user that runs PostgreSQL** (`postgres`). It can read the
   wallet directory, the passphrase source and the memory of every backend.
 - **A server compromised while it runs**: code executing in a backend, a debugger
-  attached to one, a dump of a running server — the DEKs of every relation in use sit
+  attached to one, a dump of a running server - the DEKs of every relation in use sit
   in shared memory.
-- **WAL structural metadata** — LSNs, block numbers, relation OIDs, tuple headers.
+- **WAL structural metadata** - LSNs, block numbers, relation OIDs, tuple headers.
   Only tuple payloads are ciphertext; full WAL encryption is not possible from an
   extension.
 - **Traffic between clients and the server**, and between primary and standby: TLS
@@ -72,7 +72,7 @@ A review does not treat these as findings; the design does not defend against th
    the [accepted risks](#accepted-risks).
 2. Every ciphertext is authenticated before any byte of its plaintext is used, and a
    failure is an error, never a value. What the tag covers is exactly what
-   [H4](#findings) and [H10](#findings) say.
+   [PSQLE-177](#findings) and [1.8 (v5 layout, to be opened)](#findings) say.
 3. No key is written to disk unwrapped, logged, or returned by an SQL function.
 4. Key material is cleansed (`OPENSSL_cleanse`) as soon as it is no longer needed,
    on the error paths too.
@@ -102,15 +102,15 @@ The last column is what the code is meant to check on each crossing; the
 A review goes through every item and records, for each, *verified*, *finding* (with
 its ID) or *not applicable*. File names are starting points, not limits.
 
-### Cryptography — `src/crypto/`, `src/iam/`
+### Cryptography - `src/crypto/`, `src/iam/`
 
 - [ ] AES-256-GCM for tuples and TOAST chunks: a 96-bit IV per encryption from
-      `pg_strong_random()`, never reused under one DEK — including across `fork()`
-      ([H5](#findings)); the documented limit of encryptions per DEK.
+      `pg_strong_random()`, never reused under one DEK - including across `fork()`
+      ([PSQLE-178](#findings)); the documented limit of encryptions per DEK.
 - [ ] The tag is verified before any plaintext is used; a failure raises an error and
       frees the buffers.
 - [ ] The AAD is rebuilt from the reader's context, not read from disk, and the tag
-      covers what [H4](#findings) and [H10](#findings) say — no more is claimed anywhere.
+      covers what [PSQLE-177](#findings) and [1.8 (v5 layout, to be opened)](#findings) say - no more is claimed anywhere.
 - [ ] AES-256-SIV for `tde_btree` keys: key length, determinism limited to equality,
       no plaintext key reaches the index page.
 - [ ] Key wrapping: AES-256 key wrap (local), transit (Vault), `CKM_AES_KEY_WRAP_PAD`
@@ -120,7 +120,7 @@ its ID) or *not applicable*. File names are starting points, not limits.
 - [ ] Every buffer that held a key, an IV batch or a passphrase is cleansed, on the
       error paths too.
 
-### Key management — `src/kms/`
+### Key management - `src/kms/`
 
 - [ ] The shared-memory DEK cache: who can reach it, its capacity, and that evicted
       and replaced entries are cleansed.
@@ -133,21 +133,21 @@ its ID) or *not applicable*. File names are starting points, not limits.
 - [ ] Rotations (`rotate_online()`, `rotate_kek()`, `wallet_change_passphrase()`):
       a rotation that aborts, fails or crashes leaves every key needed to read the
       data (TAP 29, 30, 46).
-- [ ] Secrets in GUCs, SQL arguments and commands — [H6](#findings).
+- [ ] Secrets in GUCs, SQL arguments and commands - [PSQLE-177](#findings).
 
-### SQL surface — `sql/pg_vault_tde--1.7.sql` and the C functions it binds
+### SQL surface - `sql/pg_vault_tde--1.7.sql` and the C functions it binds
 
 - [ ] Every function: its `GRANT`s, and whether it is `SECURITY DEFINER`; every
-      `SECURITY DEFINER` function has a fixed `search_path` ([H1](#findings)).
+      `SECURITY DEFINER` function has a fixed `search_path` ([1.8 (search_path, to be opened)](#findings)).
 - [ ] Every privileged function checks the calling role, not the owner
-      ([H8](#findings), [H9](#findings)).
+      ([PSQLE-205](#findings), [PSQLE-206](#findings)).
 - [ ] Every GUC: context (`PGC_SUSET` or `PGC_POSTMASTER`), `GUC_SUPERUSER_ONLY` on
       those that name secrets or paths, `GUC_NOT_IN_SAMPLE` on secret values.
-- [ ] Functions that take a server file path ([H3](#findings)).
+- [ ] Functions that take a server file path ([PSQLE-206](#findings)).
 - [ ] The extension's tables (`pg_vault_tde_catalog`, `pg_vault_tde_rotation_progress`)
       are revoked from `PUBLIC`.
 
-### Hooks and core integration — `src/pg_vault_tde.c`, `src/tam/`, `src/iam/`, `src/logical/`
+### Hooks and core integration - `src/pg_vault_tde.c`, `src/tam/`, `src/iam/`, `src/logical/`
 
 - [ ] Every read path of the table access method decrypts, and no write path stores a
       value unencrypted; the callbacks that rewrite tables (`CLUSTER`, `VACUUM FULL`,
@@ -171,10 +171,10 @@ its ID) or *not applicable*. File names are starting points, not limits.
 - [ ] Core dumps and swap: what the extension cleanses, and what it cannot (the shared
       cache while the server runs).
 
-### Client tools — `src/backup/`
+### Client tools - `src/backup/`
 
 - [ ] Each tool secures its session (`search_path`) before calling the extension, and
-      calls it schema-qualified ([H2](#findings)).
+      calls it schema-qualified ([PSQLE-178](#findings)).
 - [ ] Archives and bundles read on restore are untrusted input: framing, lengths and
       the HMAC checked before any field is used.
 - [ ] Files written on the client host: permissions, and where key material ends up.
@@ -205,32 +205,31 @@ review checks that the documentation still says what the code does.
 | **Legacy `tde_btree` operator classes store keys in plaintext** (`tde_int4_ops`, `tde_int8_ops`, `tde_uuid_ops`, `tde_date_ops`, `tde_timestamptz_ops`) | The classes are kept only for indexes already built on them, and a new index can use them only with `allow_plaintext_index = on`; 1.8 removes the classes. Native btree indexes, which the same setting allows, are not affected | [pg_vault_tde.md › Operator Class](pg_vault_tde.md#operator-class); [README › SQL Functions](../README.md#sql-functions) (`check_plaintext_index_keys`, known defect) |
 | **`PRIMARY KEY` and `UNIQUE` constraints are backed by a native btree**, with the key in plaintext | Core builds that index itself; the extension can only warn | [README › What Gets Encrypted](../README.md#what-gets-encrypted); [README › Designing encrypted tables](../README.md#designing-encrypted-tables) |
 | **Logical decoding sends plaintext**: the output plugin decrypts for subscribers | That is its purpose; the stream needs TLS and the subscriber its own encryption | [pg_vault_tde.md › Logical Decoding and Replication](pg_vault_tde.md#logical-decoding-and-replication) and [› Structural limitations](pg_vault_tde.md#structural-limitations) |
-| **The tag binds database, relation, key generation and the value bytes — not a tuple's position, its header, or the layout that divides its bytes among variable-length attributes** ([H4](#findings), [H10](#findings)) | heapam chooses a tuple's place after the tuple, ciphertext included, has been formed; core rewrites the header without the key. The layout could be authenticated: 1.8 | [pg_vault_tde.md › What the authentication tag does not cover](pg_vault_tde.md#what-the-authentication-tag-does-not-cover) |
+| **The tag binds database, relation, key generation and the value bytes - not a tuple's position, its header, or the layout that divides its bytes among variable-length attributes** ([PSQLE-177](#findings), [1.8 (v5 layout, to be opened)](#findings)) | heapam chooses a tuple's place after the tuple, ciphertext included, has been formed; core rewrites the header without the key. The layout could be authenticated: 1.8 | [pg_vault_tde.md › What the authentication tag does not cover](pg_vault_tde.md#what-the-authentication-tag-does-not-cover) |
 
 ---
 
 ## Findings
 
-One row per finding. Every finding has a ticket, and this table changes in the commit
-that changes its status. Findings describe what to correct, not how to exploit it.
+One row per ticket, and a ticket that covers two findings lists both. Every finding
+has a ticket; the two planned for 1.8 get their number when they are opened. This table
+changes in the commit that changes a status. Findings describe what to correct, not how
+to exploit it.
 
 Severity: **High** — breaks a property above for an attacker in scope, or grants a
 privilege the documentation does not. **Medium** — the same, given a precondition (a
 granted role, a particular configuration). **Low** — defence in depth, or a
 documentation gap.
 
-| ID | Area | Finding | Severity | Status | Ticket |
-|---|---|---|---|---|---|
-| H1 | SQL surface | The 12 `SECURITY DEFINER` functions run without a fixed `search_path`; two are `LANGUAGE SQL` (`pg_vault_tde_reencrypt_table(text, int)`, `pg_vault_tde_check_plaintext_index_keys()`). The fix changes the extension script. Until then, a superuser can run `ALTER FUNCTION … SET search_path = pg_catalog, <extension schema>` on each, and revoke `reencrypt_table()` from `pg_monitor` ([README](../README.md#who-may-call-reencrypt_table)) | Medium | Open — 1.8 | to be opened |
-| H2 | Client tools | `pg_basebackup_tde` does not secure its session's `search_path` and calls the extension's function unqualified | Medium | Open | PSQLE-178 |
-| H3 | SQL surface | `pg_vault_tde_seal_keys()` and `pg_vault_tde_unseal_keys()` write and read a file on the server at a path the caller chooses | Low | Resolved: the calling role must be a superuser, the same power as writing server files | PSQLE-206 |
-| H4 | Cryptography | The AAD does not bind a tuple's position or header | Low | Accepted, documented | PSQLE-177 |
-| H5 | Cryptography | IVs come from a per-process batch of 256 random values, with no check that the process drawing from it is the one that filled it; there is no written limit of encryptions per DEK before rotation | Medium | Open | PSQLE-178 |
-| H6 | Key management | Secrets can reach the server log or plaintext configuration: `SET` or `ALTER SYSTEM` of a secret GUC, passphrases passed as SQL arguments; `wallet_passphrase_command` runs through `popen()` | Low | Resolved: documented | PSQLE-177 |
-| H7 | Supply chain | GitHub Actions pinned by tag rather than by commit; floating container images in CI (`openbao:2`, `vault:latest`) | Medium | Open | PSQLE-180 |
-| H8 | SQL surface | `pg_vault_tde_reencrypt_table()`, granted to `pg_monitor`, rewrote any table without a privilege check | Medium | Fixed in 1.7.2: requires `MAINTAIN` on the table, checked on the calling role; removing the grant is 1.8 | PSQLE-205 |
-| H9 | SQL surface | The key-management functions checked `superuser()` inside `SECURITY DEFINER`, which is the owner; `wallet_init()` is granted to `pg_monitor`; `pkcs11_keygen()` checked nothing | High | Fixed in 1.7.2: the calling role must be a superuser; removing the grant is 1.8 | PSQLE-206 |
-| H10 | Cryptography | The v5 layout — the null bitmap and the length headers of variable-length attributes — is outside the tag and the AAD: a writer to the data files can redistribute a row's bytes among its variable-length attributes without failing the tag, though not change or add one. Fix: authenticate the layout in a new tuple format | Low (needs write access to the data files) | Open — 1.8 | to be opened |
+| Ticket | Area | Finding | Severity | Status |
+|---|---|---|---|---|
+| PSQLE-177 | Cryptography, key management | (1) The AAD binds database, relation and key generation, not a tuple's position or its header. (2) Secrets can reach the server log or plaintext configuration: `SET` or `ALTER SYSTEM` of a secret GUC, passphrases passed as SQL arguments; `wallet_passphrase_command` runs through `popen()` | Low | (1) Accepted, documented. (2) Resolved: documented |
+| PSQLE-178 | Client tools, cryptography | (1) `pg_basebackup_tde` does not secure its session's `search_path` and calls the extension's function unqualified. (2) IVs come from a per-process batch of 256 random values, with no check that the process drawing from it is the one that filled it; there is no written limit of encryptions per DEK before rotation | Medium | Open |
+| PSQLE-180 | Supply chain | GitHub Actions pinned by tag rather than by commit; floating container images in CI (`openbao:2`, `vault:latest`) | Medium | Open |
+| PSQLE-205 | SQL surface | `pg_vault_tde_reencrypt_table()`, granted to `pg_monitor`, rewrote any table without a privilege check | Medium | Fixed in 1.7.2: requires `MAINTAIN` on the table, checked on the calling role; removing the grant is 1.8 (PSQLE-212) |
+| PSQLE-206 | SQL surface | (1) The key-management functions checked `superuser()` inside `SECURITY DEFINER`, which is the owner; `wallet_init()` is granted to `pg_monitor`; `pkcs11_keygen()` checked nothing. (2) `pg_vault_tde_seal_keys()` and `pg_vault_tde_unseal_keys()` write and read a file on the server at a path the caller chooses | High | Fixed in 1.7.2: the calling role must be a superuser — for (2) the same power as writing server files; removing the grant is 1.8 (PSQLE-212) |
+| 1.8 (search_path, to be opened) | SQL surface | The 12 `SECURITY DEFINER` functions run without a fixed `search_path`; two are `LANGUAGE SQL` (`pg_vault_tde_reencrypt_table(text, int)`, `pg_vault_tde_check_plaintext_index_keys()`). The fix changes the extension script. Until then, a superuser can run `ALTER FUNCTION … SET search_path = pg_catalog, <extension schema>` on each, and revoke `reencrypt_table()` from `pg_monitor` ([README](../README.md#who-may-call-reencrypt_table)) | Medium | Open — 1.8 |
+| 1.8 (v5 layout, to be opened) | Cryptography | The v5 layout — the null bitmap and the length headers of variable-length attributes — is outside the tag and the AAD: a writer to the data files can redistribute a row's bytes among its variable-length attributes without failing the tag, though not change or add one. Fix: authenticate the layout in a new tuple format | Low (needs write access to the data files) | Open — 1.8 |
 
 ---
 
@@ -244,14 +243,14 @@ documentation gap.
   fingerprint, the tag or commit reviewed, the scope and the date. Anyone checks both
   with `git verify-commit` and `git verify-tag`.
 - **Scope.**
-  - *Full review* — every release that changes `extversion` (1.7 → 1.8), and any
+  - *Full review* - every release that changes `extversion` (1.7 → 1.8), and any
     release that changes the cryptography, the on-disk format or the handling of keys.
-  - *Delta review* — other patch releases: the diff since the last reviewed tag,
+  - *Delta review* - other patch releases: the diff since the last reviewed tag,
     against this checklist.
-- **Findings.** Every finding becomes a ticket and a row in [Findings](#findings); a
-  release is not tagged while a High finding is open.
+- **Findings.** Every finding becomes a ticket, and [Findings](#findings) lists it
+  under that ticket; a release is not tagged while a High finding is open.
 - **Evidence.** The output of the automated stages for the release under review is
-  attached to the review — `make ci-security-report` (PSQLE-182), with ASan and the
+  attached to the review - `make ci-security-report` (PSQLE-182), with ASan and the
   project's Semgrep rules (PSQLE-181), and the SBOM and signed checksums of the
   release (PSQLE-180).
 
@@ -259,7 +258,7 @@ documentation gap.
 
 | Version | Scope | Reviewer | Commit / tag | Date |
 |---|---|---|---|---|
-| 1.7.2 | Full (first review; the on-disk format changed) | — | — | pending (PSQLE-183) |
+| 1.7.2 | Full (first review; the on-disk format changed) | - | - | pending (PSQLE-183) |
 
 ---
 
@@ -268,5 +267,5 @@ documentation gap.
 - [SECURITY.md](../SECURITY.md) links here.
 - The file is part of the PGXN release bundle: `make dist` archives `doc/`, and only
   `doc/logical_decoding_research.md` is excluded (`.gitattributes`). Every link above
-  points into the bundle — the README and `doc/` — never to the wiki, which the bundle
+  points into the bundle - the README and `doc/` - never to the wiki, which the bundle
   does not carry.
