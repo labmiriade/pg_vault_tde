@@ -1596,6 +1596,8 @@ make ci-wallet           # SQL regression tests (local wallet provider)
 make ci-checksums        # regression tests + page checksum compatibility
 make ci-tap              # 48 TAP test files (starts a real Vault container for the Vault-dependent ones)
 make ci-pins             # every GitHub Action pinned by commit, every third-party image by digest, every downloaded binary checked (first stage of ci-all)
+make ci-sbom             # SPDX SBOM of the source bundle (syft), scanned by grype — informational, as on the release
+make ci-security-report  # the stages a security review cites, on this commit → doc/security/evidence/v<VERSION>.md (doc/SECURITY-REVIEW.md › Workflow)
 make ci-soak             # tap/43_soak.t alone: 30 min of random writes, rotations and immediate stops against a heap twin (SOAK_MINUTES, SOAK_SEED)
 make ci-isolation        # 3 isolation specs: DEK rotation under load, relation rewrite under a concurrent reader, UPDATE of out-of-line values racing another transaction
 make ci-vault            # Vault integration (Compose-based)

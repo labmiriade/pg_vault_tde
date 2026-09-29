@@ -120,10 +120,9 @@ pg_vault_tde_rotate_online_sql(PG_FUNCTION_ARGS)
 
     /*
      * Only superusers may trigger key rotation — it degrades performance and
-     * touches every row in the table.  Not SECURITY DEFINER, so superuser()
-     * is asked about the caller here.
+     * touches every row in the table.
      */
-    /* nosemgrep: tde-caller-superuser */
+    /* nosemgrep: tde-caller-superuser — not SECURITY DEFINER: superuser() is the caller */
     if (!superuser())
         ereport(ERROR,
                 (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),

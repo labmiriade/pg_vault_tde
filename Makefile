@@ -179,7 +179,7 @@ bench-cpu:
 # All targets delegate to ci/scripts/ which auto-detect podman/docker.
 # Override container runtime:  make ci-all CONTAINER_RT=docker
 # ===========================================================================
-.PHONY: ci-all ci-pins ci-regress ci-matrix ci-errorpath ci-checksums ci-tap ci-soak ci-isolation ci-vault ci-openbao ci-wallet ci-pkcs11 ci-schema ci-valgrind ci-cassert ci-ubsan ci-scan-build ci-asan ci-semgrep ci-bench ci-install-test ci-clean
+.PHONY: ci-all ci-pins ci-regress ci-matrix ci-errorpath ci-checksums ci-tap ci-soak ci-isolation ci-vault ci-openbao ci-wallet ci-pkcs11 ci-schema ci-valgrind ci-cassert ci-ubsan ci-scan-build ci-asan ci-semgrep ci-sbom ci-security-report ci-bench ci-install-test ci-clean
 
 ci-all:
 	@bash ci/scripts/run-all.sh
@@ -210,6 +210,12 @@ ci-scan-build:
 
 ci-semgrep:
 	@bash ci/scripts/run-semgrep.sh
+
+ci-sbom:
+	@bash ci/scripts/run-sbom.sh
+
+ci-security-report:
+	@bash ci/scripts/run-security-report.sh
 
 ci-checksums:
 	@bash ci/scripts/run-checksums.sh

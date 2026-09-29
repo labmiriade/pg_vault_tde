@@ -259,10 +259,19 @@ documentation gap.
     against this checklist.
 - **Findings.** Every finding becomes a ticket, and [Findings](#findings) lists it
   under that ticket; a release is not tagged while a High finding is open.
-- **Evidence.** The output of the automated stages for the release under review is
-  attached to the review - `make ci-security-report` (PSQLE-182), with ASan and the
-  project's Semgrep rules (PSQLE-181), and the SBOM and signed checksums of the
-  release (PSQLE-180).
+- **Evidence.** `make ci-security-report` (PSQLE-182), or the Bitbucket custom
+  pipeline `security-report`, run on the commit under review, writes
+  `doc/security/evidence/v<version>.md`: that commit and whether the tree was clean,
+  the system libraries the module and the client tools link, by soname (OpenSSL 3,
+  libcurl, libpq: not in the SBOM, updated by the system), the tools and their
+  versions, and the result and counts of the pin check, the
+  Semgrep rules, the SBOM of the source bundle and its grype scan, the error-path
+  suite, scan-build, UBSan, ASan, Valgrind and the assertion-enabled build
+  (PSQLE-181), with every `nosemgrep` line of the code. It is
+  committed with the review; the release tag may differ from the commit it names only
+  in `doc/security/` and the [Reviews](#reviews) table
+  (`git diff --stat <commit> v<version>`). CodeQL's alerts and the signed checksums
+  are those of the release (PSQLE-180), which publishes the same SBOM and scan.
 
 ### Reviews
 

@@ -602,6 +602,20 @@ distinguishes the builds.
     `ci-ubsan` and `ci-cassert` now stop on a failed image build; they used to run
     on the previous image and pass.
 
+30. **`make ci-security-report` (PSQLE-182).** The evidence a security review
+    cites, in one file: `doc/security/evidence/v<version>.md` names the commit and
+    whether the tree was clean, then gives the tools, their versions and the result
+    and counts of the pin check, the Semgrep rules, the SBOM of the source bundle and
+    its vulnerability scan (`make ci-sbom`: syft and grype, one container each, pinned
+    by digest, informational as on the release), the error-path suite, scan-build,
+    UBSan, ASan, Valgrind and the assertion-enabled build, and lists every
+    `nosemgrep` in the code. It also names the system libraries the module and the
+    client tools link, by soname and so by ABI, not release: OpenSSL 3, libcurl, libpq
+    — the SBOM of the source holds none of them. With `GITHUB_TOKEN` set it counts
+    CodeQL's open alerts. The Bitbucket custom pipeline `security-report` runs it and
+    keeps the report and the raw logs as artifacts. It is part of the release checklist, on the release
+    commit.
+
 **Key operations one at a time (PSQLE-210).** Rotations and wallet operations are
 tested alone and against concurrent DML, not against each other; the README now says
 to run them one at a time per database and lists the combinations to avoid until 1.8.
