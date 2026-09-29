@@ -1427,7 +1427,7 @@ Starts PostgreSQL with `initdb -k` (`--data-checksums`). Verifies that:
 
 ### TAP Tests (`tap/`)
 
-39 files, run together by `make ci-tap` (which also starts the Vault container
+40 files, run together by `make ci-tap` (which also starts the Vault container
 the Vault-dependent files need; they `skip_all` when `VAULT_ADDR` is unset).
 
 | File | Coverage |
@@ -1471,6 +1471,7 @@ the Vault-dependent files need; they `skip_all` when `VAULT_ADDR` is unset).
 | `tap/37_speculative_abort_toast.t` | An `INSERT ... ON CONFLICT` that loses the race to a concurrent insert leaves no out-of-line value behind, for DO NOTHING and DO UPDATE, on `encrypted_heap` and on a plain heap: the race is made deterministic with an expression index that blocks on an advisory lock, no injection points needed (PSQLE-197) |
 | `tap/38_partial_index_build.t` | A partial index on `encrypted_heap` holds only the rows its predicate admits, against a plain heap twin: a valid `UNIQUE ... WHERE` builds and enforces, a partial btree has the heap twin's size after CREATE INDEX and REINDEX, amcheck `heapallindexed` passes, a `tde_btree` partial index answers, `reltuples` still counts every row (PSQLE-198) |
 | `tap/39_index_build_old_snapshot.t` | An index built while an older REPEATABLE READ snapshot is open gives that snapshot what a plain heap twin gives it — rows deleted after it, HOT-updated rows by their old values only; after two rotations under an open snapshot `CREATE INDEX` still builds and marks the index `indcheckxmin`; a parallel build passes amcheck (PSQLE-201) |
+| `tap/40_cluster_order.t` | `CLUSTER` on `encrypted_heap` puts the rows in index order through both paths core can choose (index scan, sort), against a plain heap twin with out-of-line values and a dropped column; `CLUSTER` on a `tde_btree` index is refused; `VACUUM FULL` still works (PSQLE-204) |
 
 #### `tap/19_crash_recovery_rmgr.t`
 
