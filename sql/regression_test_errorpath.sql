@@ -489,7 +489,10 @@ BEGIN
     FOR len IN 1960..2100 BY 5 LOOP
         INSERT INTO tde_toast_boundary VALUES (len, repeat('x', len));
 
-        SELECT length(payload) INTO got
+        -- The value itself: length() of a compressed value may not
+        -- decompress it in a single-byte encoding (PSQLE-202).
+        SELECT CASE WHEN payload = repeat('x', len) THEN len ELSE length(payload) END
+        INTO got
         FROM tde_toast_boundary WHERE id = len;
 
         IF got IS DISTINCT FROM len THEN
@@ -504,7 +507,7 @@ BEGIN
     INSERT INTO tde_toast_boundary VALUES (2000, repeat('z', 2000))
         ON CONFLICT (id) DO UPDATE SET payload = repeat('w', 2000);
 
-    SELECT length(payload) INTO got
+    SELECT CASE WHEN payload = repeat('w', 2000) THEN 2000 ELSE -1 END INTO got
     FROM tde_toast_boundary WHERE id = 2000;
     IF got <> 2000 THEN
         RAISE EXCEPTION 'TEST 153 FAILED: boundary row damaged by UPDATE/UPSERT';
@@ -525,7 +528,7 @@ DECLARE
     bad int;
 BEGIN
     SELECT count(*) INTO bad FROM tde_toast_boundary
-    WHERE id BETWEEN 3000 AND 3040 AND length(payload) <> 2000;
+    WHERE id BETWEEN 3000 AND 3040 AND payload IS DISTINCT FROM repeat('q', 2000);
     IF bad <> 0 THEN
         RAISE EXCEPTION 'TEST 153 FAILED: % boundary rows damaged by COPY', bad;
     END IF;

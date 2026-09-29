@@ -1671,6 +1671,8 @@ DO $$
 DECLARE
     toast_bytes bigint;
     mismatches  int;
+    sig_src     text;
+    sig_snap    text;
 BEGIN
     DROP TABLE IF EXISTS tde_ctas_src_140, tde_ctas_snap_140;
 
@@ -1692,12 +1694,19 @@ BEGIN
     END IF;
 
     -- The definitive check: drop the (now unrelated) source and confirm the
-    -- destination is still fully readable.
+    -- destination is still fully readable.  The values are random, so the
+    -- source's are fingerprinted first; md5() reads every chunk, where
+    -- length() may read none in a single-byte encoding (PSQLE-202).
+    SELECT string_agg(md5(big_val), ',' ORDER BY id) INTO sig_src FROM tde_ctas_src_140;
     DROP TABLE tde_ctas_src_140;
 
     SELECT count(*) INTO mismatches
     FROM tde_ctas_snap_140
     WHERE big_val IS NULL OR length(big_val) <> 12800;
+    SELECT string_agg(md5(big_val), ',' ORDER BY id) INTO sig_snap FROM tde_ctas_snap_140;
+    IF sig_snap IS DISTINCT FROM sig_src THEN
+        mismatches := mismatches + 1;
+    END IF;
     IF mismatches <> 0 THEN
         RAISE EXCEPTION 'TEST 140 FAILED: % row(s) unreadable/wrong length after dropping the source table', mismatches;
     END IF;

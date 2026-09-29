@@ -208,6 +208,14 @@ SELECT * FROM test_dek_b;  -- OK
    through it — and if the declared expectations change, the release notes
    change with them.
 
+- **DO NOT** prove that a TOAST value reads with `length()` (PSQLE-202).  In a
+  single-byte encoding — the cassert image runs in one — `length(text)` takes an
+  uncompressed out-of-line value's size from its pointer and reads no chunk, and
+  never decompresses a compressed one; `length(bytea)` never reads anything, in
+  any encoding.  A damaged or missing chunk then passes.  Compare the value
+  (`col = repeat('x', n)`), or its `md5()` against one taken before, and keep
+  `length()` only where the length is what is being tested.
+
 ---
 
 ## TAP Test Conventions

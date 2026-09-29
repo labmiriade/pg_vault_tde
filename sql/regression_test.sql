@@ -845,9 +845,15 @@ BEGIN
     -- Insert a 4000-byte value (typically triggers TOAST compression)
     INSERT INTO tde_large VALUES (2, repeat('Y', 4000));
 
+    -- The value itself: length() of a compressed or out-of-line value may not
+    -- read it at all in a single-byte encoding (PSQLE-202).
     SELECT length(payload) INTO vlen FROM tde_large WHERE id = 2;
     IF vlen IS DISTINCT FROM 4000 THEN
         RAISE EXCEPTION 'TEST 32b FAILED: 4000B payload returned length %', vlen;
+    END IF;
+    SELECT payload INTO v FROM tde_large WHERE id = 2;
+    IF v IS DISTINCT FROM repeat('Y', 4000) THEN
+        RAISE EXCEPTION 'TEST 32b FAILED: 4000B payload content mismatch';
     END IF;
 
     -- Verify round-trip fidelity
@@ -1172,8 +1178,8 @@ BEGIN
     IF (SELECT payload FROM tde_hw_test WHERE id = 1) != 'hardware acceleration test payload' THEN
         RAISE EXCEPTION 'TEST 43 FAILED: short payload mismatch';
     END IF;
-    IF (SELECT length(payload) FROM tde_hw_test WHERE id = 2) != 4096 THEN
-        RAISE EXCEPTION 'TEST 43 FAILED: 4KB payload length mismatch';
+    IF (SELECT payload FROM tde_hw_test WHERE id = 2) IS DISTINCT FROM repeat('x', 4096) THEN
+        RAISE EXCEPTION 'TEST 43 FAILED: 4KB payload mismatch';
     END IF;
     IF (SELECT payload FROM tde_hw_test WHERE id = 3) IS NOT NULL THEN
         RAISE EXCEPTION 'TEST 43 FAILED: NULL payload not NULL';

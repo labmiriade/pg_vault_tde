@@ -111,8 +111,11 @@ my $r1 = $node->safe_psql('postgres', "SELECT t_text, t_int, t_bool FROM types_t
 like($r1, qr/hello.*42.*t/s, 'Multi-type values restored correctly');
 
 # Verify TOAST round-trip
-my $big_len = $node->safe_psql('postgres', 'SELECT length(big) FROM toast_table;');
-is($big_len, '131072', 'TOAST large value (128 KB) restored with correct length');
+# The value itself, not length(): in a single-byte encoding length() takes an
+# out-of-line value's size from its pointer and reads no chunk (PSQLE-202).
+my $big_ok = $node->safe_psql('postgres',
+    "SELECT big = repeat('X', 131072) FROM toast_table;");
+is($big_ok, 't', 'TOAST large value (128 KB) restored intact');
 
 # Verify NULL round-trip
 my $null_count = $node->safe_psql('postgres',

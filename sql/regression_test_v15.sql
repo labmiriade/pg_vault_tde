@@ -268,12 +268,13 @@ BEGIN
         RAISE EXCEPTION 'TEST 60 FAILED: expected 10 rows, got %', cnt;
     END IF;
 
+    -- The value itself, not length(), which may not read it (PSQLE-202).
     SELECT count(*) INTO mismatch
     FROM tde_toast_copy_test
-    WHERE length(val) <> length(repeat('toast_copy_row_', 210));
+    WHERE val IS DISTINCT FROM repeat('toast_copy_row_', 210);
 
     IF mismatch > 0 THEN
-        RAISE EXCEPTION 'TEST 60 FAILED: % rows have wrong payload length',
+        RAISE EXCEPTION 'TEST 60 FAILED: % rows have a wrong payload',
                         mismatch;
     END IF;
 
