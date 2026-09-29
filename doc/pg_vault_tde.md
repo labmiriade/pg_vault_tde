@@ -1424,7 +1424,7 @@ Starts PostgreSQL with `initdb -k` (`--data-checksums`). Verifies that:
 
 ### TAP Tests (`tap/`)
 
-31 files, run together by `make ci-tap` (which also starts the Vault container
+32 files, run together by `make ci-tap` (which also starts the Vault container
 the Vault-dependent files need; they `skip_all` when `VAULT_ADDR` is unset).
 
 | File | Coverage |
@@ -1460,6 +1460,7 @@ the Vault-dependent files need; they `skip_all` when `VAULT_ADDR` is unset).
 | `tap/29_rotate_online_concurrent_access.t` | A table read or written while `pg_vault_tde_rotate_online()` runs stays readable after the rotation, after a second rotation and after a restart; a row lock on `pg_vault_tde_catalog` holds the worker inside the window (PSQLE-184). Runs once per available provider: local, Vault (`VAULT_ADDR`), PKCS#11 (SoftHSM2) |
 | `tap/30_rotate_kek_local_atomicity.t` | A local-wallet KEK rotation that rolls back, fails later in its statement, or dies in a crash leaves every table readable; so do a session that unlocked the wallet before another session rotated the KEK, and a `CREATE TABLE` that waited on an aborted rotation — each checked right after and after a restart (PSQLE-185) |
 | `tap/31_migrate_vault_to_wallet.t` | `pg_vault_tde_migrate_vault_to_wallet()` refuses a passphrase that does not open the wallet and leaves every migrated table readable under the local wallet — in a session opened before the migration, a new one and after a restart; the real-Vault half runs when `VAULT_ADDR` is set (PSQLE-188) |
+| `tap/32_rotate_online_toast.t` | Out-of-line values — stored uncompressed and compressed — stay readable after `pg_vault_tde_rotate_online()`, after a restart, after a second rotation and after another restart, and the TOAST relation keeps the same number of live chunks (PSQLE-189). Runs once per available provider, as `tap/29` |
 
 #### `tap/19_crash_recovery_rmgr.t`
 
