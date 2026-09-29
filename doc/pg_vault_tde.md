@@ -623,7 +623,10 @@ The rotation worker runs one transaction:
    key in the worker's own memory. `generation` stays the outgoing key's.
 3. `pg_vault_tde_catalog_update_rel_dek()` writes DEK N+1 to the catalog row and hands
    it to the worker's memory, never to the shared cache.
-4. `pg_vault_tde_reencrypt_table()` rewrites every row with DEK N+1.
+4. `pg_vault_tde_reencrypt_table()` rewrites every row with DEK N+1. Out-of-line values
+   are fetched back from the TOAST relation first (still compressed), so the toaster
+   stores them again under DEK N+1 and deletes the old chunks — reused as they were,
+   they kept DEK N, which the catalog no longer holds (PSQLE-189).
 5. A transaction callback moves the cache entry to DEK N+1 at commit (before the locks
    are released) or back to DEK N at abort, and clears `rotating`.
 

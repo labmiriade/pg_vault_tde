@@ -23,6 +23,7 @@
                                        heap_getnextslot */
 #include "access/heaptoast.h"       /* TOAST_TUPLE_THRESHOLD, TOAST_MAX_CHUNK_SIZE */
 #include "access/toast_internals.h" /* TOAST_TUPLE_THRESHOLD */
+#include "access/detoast.h"         /* detoast_external_attr */
 #include "access/genam.h"           /* index_insert */
 #include "access/htup_details.h"    /* HeapTupleHeaderData, HEAPTUPLESIZE,
                                        HeapTupleHeaderSetSpeculativeToken */
@@ -2582,7 +2583,8 @@ pg_vault_tde_get_tableam_routine(void)
  * When used after key rotation with prev_dek fallback:
  *   1. KMS provider replaces current DEK → prev_dek retained
  *   2. reencrypt_table() reads old rows (fallback to prev_dek),
- *      writes new tuples (encrypted with current DEK), and
+ *      writes new tuples (encrypted with current DEK) and new TOAST
+ *      chunks for their out-of-line values, and
  *      rebuilds any tde_btree indexes (SIV keys are DEK-bound)
  *   3. KMS provider wipes prev_dek after re-encryption completes
  *
@@ -2612,11 +2614,54 @@ pg_vault_tde_reencrypt_table_sql(PG_FUNCTION_ARGS)
     PG_RETURN_VOID();
 }
 
+/*
+ * tde_fetch_back_external — src's row in dst, with out-of-line values fetched
+ * back from the TOAST relation (still compressed, if they were).
+ *
+ * Handed the scanned row as it is, tuple_update()'s pre-TOAST sees each
+ * external pointer unchanged and reuses it: the row is re-encrypted, its
+ * TOAST chunks keep the old DEK, and once that key has left the cache the
+ * values are unreadable (PSQLE-189).  A fetched-back value differs from the
+ * old pointer, so toast_tuple_init() stores it again under the current key
+ * and toast_tuple_cleanup() deletes the old chunks.  Dropped columns are
+ * rewritten too: nothing reads them, but their chunks stay in the TOAST
+ * relation, and every chunk there has to be readable with a key the catalog
+ * still has.  Allocates in cxt.
+ */
+static void
+tde_fetch_back_external(TupleTableSlot *src, TupleTableSlot *dst,
+                        MemoryContext cxt)
+{
+    TupleDesc     desc = src->tts_tupleDescriptor;
+    MemoryContext oldcxt = MemoryContextSwitchTo(cxt);
+
+    slot_getallattrs(src);
+    ExecClearTuple(dst);
+
+    for (int i = 0; i < desc->natts; i++)
+    {
+        Datum value = src->tts_values[i];
+
+        if (!src->tts_isnull[i] && TupleDescAttr(desc, i)->attlen == -1 &&
+            VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(value)))
+            value = PointerGetDatum(
+                detoast_external_attr((struct varlena *) DatumGetPointer(value)));
+
+        dst->tts_values[i] = value;
+        dst->tts_isnull[i] = src->tts_isnull[i];
+    }
+
+    ExecStoreVirtualTuple(dst);
+    MemoryContextSwitchTo(oldcxt);
+}
+
 int64 pg_vault_tde_reencrypt_table(Oid relid)
 {    
     Relation rel;
     TableScanDesc       scan;
     TupleTableSlot     *slot;
+    TupleTableSlot     *upd_slot = NULL;
+    MemoryContext       row_cxt = NULL;
     CommandId           cid;
     TU_UpdateIndexes    update_idxs;
     LockTupleMode       lock_mode;
@@ -2626,6 +2671,15 @@ int64 pg_vault_tde_reencrypt_table(Oid relid)
 
     rel = table_open(relid, RowExclusiveLock);
     slot = table_slot_create(rel, NULL);
+
+    /* Out-of-line values are rewritten too; see tde_fetch_back_external(). */
+    if (OidIsValid(rel->rd_rel->reltoastrelid))
+    {
+        upd_slot = MakeSingleTupleTableSlot(RelationGetDescr(rel), &TTSOpsVirtual);
+        row_cxt = AllocSetContextCreate(CurrentMemoryContext,
+                                        "pg_vault_tde reencrypt row",
+                                        ALLOCSET_DEFAULT_SIZES);
+    }
 
     cid = GetCurrentCommandId(true);
     lock_mode = LockTupleExclusive;
@@ -2640,9 +2694,12 @@ int64 pg_vault_tde_reencrypt_table(Oid relid)
 
         CHECK_FOR_INTERRUPTS();
 
+        if (upd_slot)
+            tde_fetch_back_external(slot, upd_slot, row_cxt);
+
         result = pg_vault_tde_tuple_update(rel,
                                            &otid,
-                                           slot,
+                                           upd_slot ? upd_slot : slot,
                                            cid,
                                            GetActiveSnapshot(),
                                            InvalidSnapshot,
@@ -2656,6 +2713,12 @@ int64 pg_vault_tde_reencrypt_table(Oid relid)
                     (errcode(ERRCODE_INTERNAL_ERROR),
                      errmsg("pg_vault_tde: reencrypting table failed with TAM code %d", result)));
         tuples_done++;
+
+        if (upd_slot)
+        {
+            ExecClearTuple(upd_slot);
+            MemoryContextReset(row_cxt);
+        }
     }
 
     /*
@@ -2684,6 +2747,11 @@ int64 pg_vault_tde_reencrypt_table(Oid relid)
     }
 
     ExecDropSingleTupleTableSlot(slot);
+    if (upd_slot)
+    {
+        ExecDropSingleTupleTableSlot(upd_slot);
+        MemoryContextDelete(row_cxt);
+    }
     table_endscan(scan);
     table_close(rel, NoLock); /* lock released at end of transaction */
 

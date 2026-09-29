@@ -47,8 +47,10 @@ packaged (OS, PG) combinations and what CI exercises on each in the
 > TOAST values must be dumped *before* the new binary is installed.
 >
 > **Upgrading from 1.7.1?** If `pg_vault_tde_rotate_online()` has run since the
-> last restart on a table that was being read or written, copy that table out
-> *before* restarting — see [`rotate_online()` with concurrent access](#rotate_online-with-concurrent-access).
+> last restart, act *before* restarting: copy out a rotated table that was being
+> read or written — see [`rotate_online()` with concurrent access](#rotate_online-with-concurrent-access) —
+> and run `VACUUM FULL` on a rotated table with out-of-line values — see
+> [`rotate_online()` and out-of-line values](#rotate_online-and-out-of-line-values).
 > Otherwise nothing has to be done before installing 1.7.2, but existing
 > encrypted tables need one `VACUUM FULL` afterwards — see
 > [Upgrading to 1.7.2](#upgrading-to-172). Rows stay readable either way; until
@@ -1195,6 +1197,43 @@ What changes in 1.7.2: `SELECT` keeps working during a rotation, while `INSERT`,
 `UPDATE`, `DELETE`, `COPY` and a second rotation of the same table wait for it to
 commit. The whole table is re-encrypted in one transaction, so on a large table treat a
 rotation as a window with no writes.
+
+### `rotate_online()` and out-of-line values
+
+Up to 1.7.1, `pg_vault_tde_rotate_online()` re-encrypted every row but left its
+out-of-line (TOAST) values — typically `text`, `bytea` or `jsonb` values still over
+about 2 kB after compression — under the outgoing key. The catalog keeps only the
+current key, so the outgoing one survived in shared memory alone: the values became
+unreadable at the next restart, or at once at the next rotation of the same table. No
+concurrent access is needed. The rest of each row stays readable, a `DELETE` of an
+affected row fails, and `pg_vault_tde_verify_integrity()` reports nothing wrong: it
+checks the rows, not their TOAST values (PSQLE-189).
+
+**Before the restart that installs 1.7.2:** run `VACUUM FULL` on every table with
+out-of-line values that has been rotated once since the last restart. It rewrites the
+values under the table's current key while the outgoing one is still in shared memory;
+`UPDATE t SET col = col || ''` on each affected column does the same. This lists the
+candidates:
+
+```sql
+SELECT p.relid::regclass AS table_name, p.updated_at AS rotated_at
+FROM pg_vault_tde_rotation_progress p
+JOIN pg_class c ON c.oid = p.relid
+WHERE p.status = 'complete'
+  AND p.updated_at > pg_postmaster_start_time()
+  AND c.reltoastrelid <> 0
+  AND pg_relation_size(c.reltoastrelid) > 0;
+```
+
+A table rotated twice since the restart, or rotated before it, has already lost the
+values stored before its last rotation, and only a backup brings them back.
+`SELECT sum(length(t::text)) FROM t` reads every value of `t` and fails with
+`decryption failed` if any of them is lost.
+
+What changes in 1.7.2: the rotation rewrites every out-of-line value under the new key
+and deletes the old chunks, dropped columns included. A rotation of a table with large
+values reads and writes all of them, so it takes longer and writes more WAL than in
+1.7.1.
 
 ## Compatibility
 

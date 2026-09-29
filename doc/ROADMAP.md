@@ -346,6 +346,18 @@ distinguishes the builds.
    in the session and through a database-level setting. The derivation helper is gone.
    `tap/31_migrate_vault_to_wallet.t`, with a real-Vault half.
 
+10. **`rotate_online()` left out-of-line values under the outgoing key (PSQLE-189).**
+    The worker rewrites each row with `tuple_update()`, whose pre-TOAST hands the old
+    tuple to `toast_tuple_init()`: an unchanged external value was reused as it was, so
+    its chunks kept DEK N while the row moved to N+1. N then lived only in the
+    shared-memory cache, and the values broke at the next restart or the next rotation —
+    no concurrency needed, and `verify_integrity()` does not read TOAST chunks. A
+    `DELETE` of such a row failed too. Now `reencrypt_table()` fetches every on-disk
+    external value back (still compressed) before the update, so the toaster stores it
+    under the new key and `toast_tuple_cleanup()` deletes the old chunks; dropped
+    columns are rewritten as well, so every chunk left in the TOAST relation decrypts.
+    `tap/32_rotate_online_toast.t`, on every provider.
+
 **New CI stage — `make ci-upgrade`.** Every other suite in this repo reads only data it
 wrote in the same run, so writer and reader always move together and a format-level
 breakage leaves the suite green while data on disk becomes unreadable. That is how the
