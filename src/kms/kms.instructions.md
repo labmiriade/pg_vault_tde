@@ -571,9 +571,14 @@ were gone at the next restart (PSQLE-184).  The rules now:
    `pg_vault_tde_kms_get_rel_dek_gen()` does not encrypt with one before the slow
    path has compared it with the catalog (PSQLE-190).
 
+7. **The rewrite maintains every index.**  `heap_update()` leaves index entries
+   to its caller; `reencrypt_table()` inserts them with `ExecInsertIndexTuples()`
+   for every rewrite that is not HOT, and rebuilds only the tde_btree indexes,
+   whose keys depend on the DEK (PSQLE-194).
+
 Regression: `tap/29_rotate_online_concurrent_access.t` (a row lock on
 `pg_vault_tde_catalog` holds the worker inside the window);
-`tap/32_rotate_online_toast.t` for rule 5; `tap/34_standby_rotation.t` for rule 6.
+`tap/32_rotate_online_toast.t` for rule 5; `tap/34_standby_rotation.t` for rule 6; `tap/35_rotate_online_indexes.t` for rule 7.
 
 ### Evicting many entries is per-database
 

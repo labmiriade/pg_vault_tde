@@ -1,6 +1,6 @@
 # pg_vault_tde Roadmap
 
-> Last updated: 2026-09-29 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 35 TAP files / 654 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 3 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
+> Last updated: 2026-09-29 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 35 TAP files / 655 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 3 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
 
 ---
 
@@ -419,6 +419,21 @@ distinguishes the builds.
     rotation's commit callback clears the mark. `tap/34_standby_rotation.t`: a table
     read after the rotation, one only written after the promotion, one rotated twice,
     a cold control.
+
+15. **`rotate_online()` left the indexes without entries for the rewritten rows
+    (PSQLE-194).** `reencrypt_table()` calls `tuple_update()` — `heap_update()`
+    underneath, which leaves index maintenance to its caller — and ignored
+    `update_indexes`. Its rewrite is never HOT on a full page, so every index but the
+    `tde_btree` ones it rebuilt pointed at the retired versions only: after a rotation
+    lookups through a `PRIMARY KEY`, a `UNIQUE` constraint (standard btrees by default
+    on an encrypted table) or any plain index found nothing, and duplicates were
+    accepted. Also in 1.7.1. Now each rewritten row gets its entries through
+    `ExecInsertIndexTuples()`, as the executor's `UPDATE` does, in a per-row memory
+    context; the tde_btree rebuild stays. Users must `REINDEX` tables rotated before.
+    `tap/35_rotate_online_indexes.t` (lookups through each index, a full range,
+    amcheck `heapallindexed`, duplicates refused); tap/28 measures the rewrite with a
+    `PRIMARY KEY`. Found while testing it: partial indexes on encrypted tables are
+    built with every row — a separate defect, not fixed here.
 
 **New CI stage — `make ci-upgrade`.** Every other suite in this repo reads only data it
 wrote in the same run, so writer and reader always move together and a format-level

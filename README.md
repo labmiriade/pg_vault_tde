@@ -53,6 +53,7 @@ packaged (OS, PG) combinations and what CI exercises on each in the
 > [`rotate_online()` and out-of-line values](#rotate_online-and-out-of-line-values).
 > A standby promoted while still on 1.7.1 must be restarted before its first write —
 > see [Streaming standby and `rotate_online()`](#streaming-standby-and-rotate_online).
+> Every table ever rotated needs a `REINDEX` — see [`rotate_online()` and indexes](#rotate_online-and-indexes).
 > Otherwise nothing has to be done before installing 1.7.2, but existing
 > encrypted tables need one `VACUUM FULL` afterwards — see
 > [Upgrading to 1.7.2](#upgrading-to-172). Rows stay readable either way; until
@@ -627,7 +628,7 @@ SELECT * FROM pg_vault_tde_rotation_status('mytable');
 
 | Target | What happens |
 |--------|-------------|
-| `encrypted_heap` table | Generates a new table DEK, re-encrypts every tuple in-place in one transaction (`ShareRowExclusiveLock` on the table: `SELECT` continues, writes and a second rotation wait), then rebuilds any `tde_btree` indexes on the table so their SIV ciphertexts match the new DEK. Standard `btree` indexes on encrypted columns need no rebuild. |
+| `encrypted_heap` table | Generates a new table DEK, re-encrypts every tuple in-place in one transaction (`ShareRowExclusiveLock` on the table: `SELECT` continues, writes and a second rotation wait), then rebuilds any `tde_btree` indexes on the table so their SIV ciphertexts match the new DEK. Every other index — the `PRIMARY KEY` and `UNIQUE` constraints included — gets an entry for each rewritten row, as with an `UPDATE`. |
 | `tde_btree` index | Generates a new index DEK, then calls `reindex_index` (`AccessExclusiveLock` on the index, `ShareRowExclusiveLock` on its table) to rebuild the index with keys encrypted under the new DEK. The parent table's DEK and heap data are untouched. Passing a non-`tde_btree` index raises an error before touching shmem or the catalog. |
 
 When a table with `tde_btree` indexes is rotated, the index rebuild uses the new table DEK
@@ -1312,6 +1313,36 @@ row; and once a node leaves recovery, the first write to each table checks the k
 cached during recovery against the catalog. `tap/34_standby_rotation.t` covers both,
 including a table first touched by an `INSERT` after the promotion.
 
+
+### `rotate_online()` and indexes
+
+The rotation rewrites every row, and a rewrite that cannot stay on its page puts the
+new version elsewhere; an `UPDATE` would then add an entry for it to every index. Up to
+1.7.1 the rotation added none (PSQLE-194). It rebuilt the table's `tde_btree` indexes
+and left every other one pointing at the retired row versions only:
+
+- after the rotation an index scan through them finds nothing — including lookups by
+  `PRIMARY KEY` or through a `UNIQUE` constraint, which on an encrypted table are
+  standard btree indexes by default;
+- `PRIMARY KEY` and `UNIQUE` no longer hold: a duplicate is accepted.
+
+Sequential scans still return every row, so nothing is lost, but queries that use
+those indexes return wrong results.
+
+**After installing 1.7.2 (or right away on 1.7.1):** run `REINDEX TABLE` on every
+table `pg_vault_tde_rotate_online()` or `pg_vault_tde_reencrypt_table()` has ever
+rewritten. The online rotations are listed by
+`SELECT relid::regclass FROM pg_vault_tde_rotation_progress WHERE status = 'complete'`.
+If duplicates got in meanwhile, `REINDEX` of the unique index fails and names the
+key: remove the extra rows first (`SELECT id, count(*) FROM t GROUP BY id HAVING
+count(*) > 1` for a key `id`).
+
+What changes in 1.7.2: the rotation inserts the index entries of every row it
+rewrites, as the executor's `UPDATE` does — partial and expression indexes and
+uniqueness checks included — and still rebuilds the `tde_btree` ones. The new entries
+take no lock beyond the rotation's own; only the `tde_btree` rebuild at the end locks
+its index. `tap/35_rotate_online_indexes.t`.
+
 ## Compatibility
 
 | Feature | Status | Notes |
@@ -1418,7 +1449,7 @@ make ci-bench BENCH_ROWS=100000  # with custom row count
 make ci-clean            # Remove test containers and images
 ```
 
-Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 654 assertions across 35 TAP files. Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
+Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 655 assertions across 35 TAP files. Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
 - Tests 1-4: extension loaded, access methods and SQL functions registered, wallet unlock
 - Tests 12-14: TAM INSERT/SELECT/UPDATE end-to-end
 - Test 15: DELETE

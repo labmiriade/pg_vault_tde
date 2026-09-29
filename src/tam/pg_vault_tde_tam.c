@@ -2731,7 +2731,8 @@ pg_vault_tde_get_tableam_routine(void)
  *   the index no longer match what aminsert would produce with the new DEK,
  *   so equality lookups silently return empty results.  REINDEX re-encrypts
  *   every key datum with the current DEK, restoring correctness.
- *   Standard btree indexes are unaffected (they store only ctid).
+ *   Every other index gets an entry for each new row version as the rows are
+ *   rewritten, as an UPDATE's would (PSQLE-194).
  *
  * After re-encryption, run VACUUM to physically remove old ciphertext
  * from the heap pages (dead tuples from the UPDATE still contain
@@ -2803,6 +2804,8 @@ int64 pg_vault_tde_reencrypt_table(Oid relid)
     TupleTableSlot     *slot;
     TupleTableSlot     *upd_slot = NULL;
     MemoryContext       row_cxt = NULL;
+    EState             *estate = NULL;
+    ResultRelInfo      *rri = NULL;
     CommandId           cid;
     TU_UpdateIndexes    update_idxs;
     LockTupleMode       lock_mode;
@@ -2820,6 +2823,23 @@ int64 pg_vault_tde_reencrypt_table(Oid relid)
         row_cxt = AllocSetContextCreate(CurrentMemoryContext,
                                         "pg_vault_tde reencrypt row",
                                         ALLOCSET_DEFAULT_SIZES);
+    }
+
+    /*
+     * Index entries for the new versions.  tuple_update() is heap_update()
+     * underneath, which leaves that to its caller: a rewrite that cannot stay
+     * HOT puts the new version on another page, and without an entry every
+     * index but the tde_btree ones rebuilt below keeps pointing at the
+     * retired version only — no index scan finds the row, and PRIMARY KEY
+     * and UNIQUE stop holding (PSQLE-194).  Inserted as the executor's UPDATE
+     * does, so partial and expression indexes and uniqueness behave alike.
+     */
+    if (rel->rd_rel->relhasindex)
+    {
+        estate = CreateExecutorState();
+        rri = makeNode(ResultRelInfo);
+        InitResultRelInfo(rri, rel, 0, NULL, 0);
+        ExecOpenIndices(rri, false);
     }
 
     cid = GetCurrentCommandId(true);
@@ -2855,6 +2875,22 @@ int64 pg_vault_tde_reencrypt_table(Oid relid)
                      errmsg("pg_vault_tde: reencrypting table failed with TAM code %d", result)));
         tuples_done++;
 
+        /*
+         * tuple_update() left the new TID in the slot it was given.  Not an
+         * UPDATE for the "index unchanged" hint: that needs a range table this
+         * call does not have, and it only steers bottom-up deletion.
+         */
+        if (rri != NULL && update_idxs != TU_None)
+        {
+            MemoryContext oldcxt = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
+
+            (void) ExecInsertIndexTuples(rri, upd_slot ? upd_slot : slot, estate,
+                                         false, false, NULL, NIL,
+                                         update_idxs == TU_Summarizing);
+            MemoryContextSwitchTo(oldcxt);
+            ResetPerTupleExprContext(estate);
+        }
+
         if (upd_slot)
         {
             ExecClearTuple(upd_slot);
@@ -2866,7 +2902,7 @@ int64 pg_vault_tde_reencrypt_table(Oid relid)
      * Collect OIDs of tde_btree indexes before releasing the relation.
      * We must rebuild them because AES-256-SIV key material is DEK-bound:
      * after rotation the stored ciphertexts no longer match lookups under
-     * the new DEK.  Standard btree (and heap) indexes need no rebuild.
+     * the new DEK.  Every other index got its entries in the loop above.
      */
     tde_btree_amoid = get_index_am_oid("tde_btree", true);
     if (OidIsValid(tde_btree_amoid))
@@ -2892,6 +2928,11 @@ int64 pg_vault_tde_reencrypt_table(Oid relid)
     {
         ExecDropSingleTupleTableSlot(upd_slot);
         MemoryContextDelete(row_cxt);
+    }
+    if (rri != NULL)
+    {
+        ExecCloseIndices(rri);
+        FreeExecutorState(estate);
     }
     table_endscan(scan);
     table_close(rel, NoLock); /* lock released at end of transaction */

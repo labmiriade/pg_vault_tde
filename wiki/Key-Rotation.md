@@ -30,7 +30,7 @@ SELECT * FROM pg_vault_tde_rotation_status;   -- view, readable by pg_monitor
 
 | Target | What happens |
 |---|---|
-| `encrypted_heap` table | Generates a new table DEK, re-encrypts every tuple in place in one transaction (`ShareRowExclusiveLock` on the table: `SELECT` continues, writes wait), then rebuilds any `tde_btree` indexes on the table so their AES-SIV ciphertexts match the new DEK. Plain `btree` indexes on encrypted columns need no rebuild. |
+| `encrypted_heap` table | Generates a new table DEK, re-encrypts every tuple in place in one transaction (`ShareRowExclusiveLock` on the table: `SELECT` continues, writes wait), then rebuilds any `tde_btree` indexes on the table so their AES-SIV ciphertexts match the new DEK. Every other index — `PRIMARY KEY` and `UNIQUE` included — gets an entry for each rewritten row, as with an `UPDATE`. Up to 1.7.1 they got none; see *`rotate_online()` and indexes* in the README. |
 | `tde_btree` index | Generates a new **index** DEK, then rebuilds the index (`AccessExclusiveLock` on the index, `ShareRowExclusiveLock` on its table) with keys encrypted under the new DEK. The parent table's DEK and heap data are untouched. Passing a non-`tde_btree` index raises an error before touching shared memory or the catalog. |
 
 Mechanically, rotation works by **generation epoch**. Every ciphertext

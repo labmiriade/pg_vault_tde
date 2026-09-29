@@ -334,6 +334,19 @@ my @workloads = (
         run   => sub { my $t = shift;
             $t =~ /_enc$/ ? "SELECT pg_vault_tde_reencrypt_table('$t');"
                           : "UPDATE $t SET big = big || '';" } },
+
+    # The rotation's rewrite inserting an index entry per row (PSQLE-194).
+    {   name  => 'pg_vault_tde_reencrypt_table() with a PRIMARY KEY',
+        whole => 1,
+        setup => sub { my ($t, $m) = @_; (
+            "DROP TABLE IF EXISTS $t",
+            "SET client_min_messages = error",
+            "CREATE TABLE $t (k int4 PRIMARY KEY, pad text)" . amend($m),
+            "INSERT INTO $t SELECT g, 'x' FROM generate_series(1,$R) g",
+        ) },
+        run   => sub { my $t = shift;
+            $t =~ /_enc$/ ? "SELECT pg_vault_tde_reencrypt_table('$t');"
+                          : "UPDATE $t SET pad = pad || '';" } },
 );
 
 my $n = 0;
