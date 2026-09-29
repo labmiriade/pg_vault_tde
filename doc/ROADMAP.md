@@ -496,6 +496,17 @@ distinguishes the builds.
     which ran. In PG 18 `enable_sort = off` does not steer `plan_cluster_use_sort()`,
     which compares costs only.
 
+21. **`reencrypt_table()` rewrote any table for any role that could call it
+    (PSQLE-205).** The script grants `EXECUTE` on both overloads to `pg_monitor` (the
+    `text` one is `SECURITY DEFINER`) and the C code checked nothing: a monitoring role
+    rewrote tables it could not even `SELECT`. Now the SQL entry point requires
+    `MAINTAIN` on the table — core's privilege for `VACUUM FULL`, `CLUSTER` and
+    `REINDEX` — of the calling role, `GetOuterUserId()`, since inside the
+    `SECURITY DEFINER` overload the current user is the function's owner. The rotation
+    worker calls the rewrite directly and is unaffected. 1.8: drop the grant to
+    `pg_monitor`, make the `text` overload `SECURITY INVOKER` and check `GetUserId()`.
+    `tap/41_reencrypt_table_privileges.t`.
+
 **New CI stage — `make ci-upgrade`.** Every other suite in this repo reads only data it
 wrote in the same run, so writer and reader always move together and a format-level
 breakage leaves the suite green while data on disk becomes unreadable. That is how the

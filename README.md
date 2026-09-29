@@ -830,7 +830,7 @@ log stream without any extension-level configuration.
 | `pg_vault_tde_health_check()` | composite | Status (6 columns: version, build_version, enabled, kms_provider, enc_ops_available, checked_at) |
 | `pg_vault_tde_verify_integrity(regclass)` | record | GCM tag audit scan of all tuples and every out-of-line value they reference — returns `(total_tuples, failed_tuples)`, a row counted once whichever part failed |
 | `pg_vault_tde_encrypted_size(regclass)` | record | Encryption storage overhead — returns `(total_tuples, encryption_overhead_bytes)` |
-| `pg_vault_tde_reencrypt_table(regclass, int)` | void | Batch re-encrypt with current DEK (locks table); `int` = batch size, default 1000 |
+| `pg_vault_tde_reencrypt_table(regclass, int)` | void | Batch re-encrypt with current DEK (locks table); `int` = batch size, default 1000. Requires `MAINTAIN` on the table (its owner, `pg_maintain`, superusers) since 1.7.2 — see [Who may call `reencrypt_table()`](#who-may-call-reencrypt_table) |
 | `pg_vault_tde_rotate_online(regclass, int)` | void | BGW-based online rotation: reads continue, writes wait until it commits; accepts both `encrypted_heap` tables and `tde_btree` indexes **(v1.5)** |
 | `pg_vault_tde_get_rotation_status(regclass)` | table | Online rotation progress for one relation (status, tuples_done/total, pct_complete, timestamps) **(v1.5)** |
 | `pg_vault_tde_rotation_status` | view | All in-progress/completed rotations across the cluster; readable by `pg_monitor` **(v1.5)** |
@@ -1418,6 +1418,27 @@ encrypted table are plain btree indexes by default. A table marked clustered on 
 `ALTER TABLE t SET WITHOUT CLUSTER` clears the mark. A sort that outgrows
 `maintenance_work_mem` spills decrypted rows to temporary files, as any sort does — see
 the note on `temp_tablespaces` above.
+
+
+### Who may call `reencrypt_table()`
+
+`pg_vault_tde_reencrypt_table()` rewrites every row of a table: it takes locks, writes
+WAL and leaves the old versions behind until `VACUUM`. Up to 1.7.1 the extension granted
+`EXECUTE` on it to `pg_monitor` — a role meant for monitoring — and checked nothing
+else, so any member of it could rewrite any encrypted table, including tables it had no
+privilege on (PSQLE-205). 1.7.2 also requires the caller to hold `MAINTAIN` on the
+table, as `VACUUM FULL`, `CLUSTER` and `REINDEX` do: the table's owner, members of
+`pg_maintain` and superusers hold it. Granting `EXECUTE` to another role no longer
+lets that role rewrite tables it may not maintain.
+
+**Still on 1.7.1:** take the function away from `pg_monitor`, as a superuser:
+
+```sql
+REVOKE EXECUTE ON FUNCTION pg_vault_tde_reencrypt_table(regclass, int),
+                           pg_vault_tde_reencrypt_table(text, int) FROM pg_monitor;
+```
+
+1.8 removes the grant from the extension script.
 
 ## Compatibility
 

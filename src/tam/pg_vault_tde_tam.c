@@ -2991,6 +2991,8 @@ pg_vault_tde_get_tableam_routine(void)
  * ================================================================ */
 #include "funcapi.h"               /* get_call_result_type, BlessTupleDesc */
 #include "utils/lsyscache.h"       /* get_rel_name */
+#include "utils/acl.h"             /* pg_class_aclcheck, aclcheck_error */
+#include "catalog/objectaddress.h" /* get_relkind_objtype */
 #include "utils/builtins.h"        /* quote_identifier */
 /*
  * pg_vault_tde_reencrypt_table(regclass [, batch_size int DEFAULT 1000])
@@ -3029,6 +3031,19 @@ PGDLLEXPORT Datum
 pg_vault_tde_reencrypt_table_sql(PG_FUNCTION_ARGS)
 {
     Oid                 relid = PG_GETARG_OID(0);
+
+    /*
+     * The rewrite takes locks, writes WAL and leaves dead versions behind, so
+     * it asks what core asks for VACUUM FULL, CLUSTER and REINDEX: MAINTAIN on
+     * the table.  EXECUTE on this function used to be enough, and it is
+     * granted to pg_monitor (PSQLE-205).  Asked of the calling role:
+     * GetOuterUserId(), because the text overload is SECURITY DEFINER and
+     * the current user inside it is the function's owner.
+     */
+    if (pg_class_aclcheck(relid, GetOuterUserId(), ACL_MAINTAIN) != ACLCHECK_OK)
+        aclcheck_error(ACLCHECK_NO_PRIV,
+                       get_relkind_objtype(get_rel_relkind(relid)),
+                       get_rel_name(relid));
 
     pg_vault_tde_reencrypt_table(relid);
 

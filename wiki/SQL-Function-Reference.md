@@ -28,7 +28,7 @@ each function without being a superuser.
 
 | Function | Returns | Privilege | Description |
 |---|---|---|---|
-| `pg_vault_tde_reencrypt_table(rel regclass \| text, batch_size int DEFAULT 1000)` | void | `pg_monitor` + superuser | Batch re-encrypt every row, and its out-of-line values, with the current DEK; locks the table for the duration |
+| `pg_vault_tde_reencrypt_table(rel regclass \| text, batch_size int DEFAULT 1000)` | void | `EXECUTE` (granted to `pg_monitor`) **and** `MAINTAIN` on the table (since 1.7.2) | Batch re-encrypt every row, and its out-of-line values, with the current DEK; locks the table for the duration |
 | `pg_vault_tde_rotate_online(rel regclass, batch_size int DEFAULT 1000)` | void | Any role* | Online DEK rotation: reads continue, writes wait until it commits; accepts `encrypted_heap` tables and `tde_btree` indexes (see [Key Rotation](Key-Rotation)) |
 | `pg_vault_tde_check_plaintext_index_keys()` | table: `table_name`, `index_name`, `column_name`, `opclass_name`, `suggestion` | `pg_monitor` + superuser | Lists `tde_btree` indexes still using a pre-v1.6 plaintext operator class, with a ready-to-run `REINDEX` command in `suggestion` |
 
