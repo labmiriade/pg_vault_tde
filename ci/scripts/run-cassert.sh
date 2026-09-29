@@ -55,6 +55,9 @@ $RT build \
     -f "$CI_DIR/containers/pg-cassert.Containerfile" \
     -t "$CA_IMAGE:latest" \
     "$REPO_ROOT" 2>&1 | tail -3
+# With set +e a failed build would go unnoticed, and the stage run on the
+# previous image.
+[ "${PIPESTATUS[0]}" -eq 0 ] || { log_error "CASSERT: image build failed"; exit 13; }
 log_ok "Image $CA_IMAGE built"
 
 $RT rm -f "$CONTAINER" 2>/dev/null || true

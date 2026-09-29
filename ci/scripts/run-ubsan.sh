@@ -41,6 +41,9 @@ $RT build \
     -f "$CI_DIR/containers/pg-ubsan.Containerfile" \
     -t "$UB_IMAGE:latest" \
     "$REPO_ROOT" 2>&1 | tail -3
+# With set +e a failed build would go unnoticed, and the stage run on the
+# previous image.
+[ "${PIPESTATUS[0]}" -eq 0 ] || { log_error "UBSAN: image build failed"; exit 11; }
 log_ok "Image $UB_IMAGE built"
 
 mkdir -p "$OUT_DIR"

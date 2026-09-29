@@ -599,6 +599,8 @@ distinguishes the builds.
     `pg_strong_random()`, a client-tool query calling the extension outside its schema
     (PSQLE-178). Each rule has a test file of lines on which it must and must not
     fire. Neither stage found a defect: the three `rd_tableam` writes left are PSQLE-213.
+    `ci-ubsan` and `ci-cassert` now stop on a failed image build; they used to run
+    on the previous image and pass.
 
 **Key operations one at a time (PSQLE-210).** Rotations and wallet operations are
 tested alone and against concurrent DML, not against each other; the README now says
