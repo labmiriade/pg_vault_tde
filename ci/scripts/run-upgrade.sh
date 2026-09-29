@@ -65,7 +65,8 @@ if [[ ! -f "$EXPECTED_FILE" ]]; then
 fi
 EXP_READABLE="$(grep -E '^readable_after_upgrade=' "$EXPECTED_FILE" | cut -d= -f2)"
 EXP_UPDATE="$(grep -E '^update_in_place_before_vacuum=' "$EXPECTED_FILE" | cut -d= -f2)"
-log_info "Declared: readable_after_upgrade=$EXP_READABLE update_in_place_before_vacuum=$EXP_UPDATE"
+EXP_WHOLEROW="$(grep -E '^whole_row_read_before_vacuum=' "$EXPECTED_FILE" | cut -d= -f2)"
+log_info "Declared: readable_after_upgrade=$EXP_READABLE update_in_place_before_vacuum=$EXP_UPDATE whole_row_read_before_vacuum=$EXP_WHOLEROW"
 
 # ── Images: baseline (from the tag's own tree) and current ───────────────
 BASELINE_IMAGE="pg-tde-baseline:${BASELINE}-pg${PG_MAJOR}"
@@ -132,6 +133,10 @@ SELECT md5(string_agg(x, '|' ORDER BY x)) FROM (
                 || ':' || coalesce(c::text,'-')             AS x FROM up_nulls
     UNION ALL
     SELECT 'm:' || id || ':' || amount                      AS x FROM up_numeric
+    UNION ALL
+    SELECT 'd:' || id || ':' || v                           AS x FROM up_dropped
+    UNION ALL
+    SELECT 'r:' || id || ':' || v                           AS x FROM up_dropped_rot
 ) s;
 SQL
 
@@ -177,6 +182,24 @@ INSERT INTO up_nulls VALUES (1, 'x', '2026-01-01 00:00:00+00'),
 CREATE TABLE up_numeric (id int4, amount numeric) USING encrypted_heap;
 INSERT INTO up_numeric SELECT g, g * 1.25 FROM generate_series(1, 200) g;
 CREATE INDEX up_numeric_amount ON up_numeric USING tde_btree (amount);
+
+-- PSQLE-192: out-of-line values only in a column that is then dropped, and a
+-- VACUUM FULL by the baseline.  Up to 1.7.1 the rewrite copies the dropped
+-- column's pointer as it is, into the TOAST relation it is replacing: every
+-- row is left pointing at chunks that no longer exist.  Two copies, one for
+-- the rotation in Probe E and one for the VACUUM FULL of Gate C.
+CREATE TABLE up_dropped (id int4, v text, gone text) USING encrypted_heap;
+ALTER TABLE up_dropped ALTER COLUMN gone SET STORAGE EXTERNAL;
+INSERT INTO up_dropped SELECT g, 'v' || g, string_agg(md5((g * 1000 + s)::text), '')
+  FROM generate_series(1, 10) g, generate_series(1, 400) s GROUP BY g;
+ALTER TABLE up_dropped DROP COLUMN gone;
+VACUUM FULL up_dropped;
+CREATE TABLE up_dropped_rot (id int4, v text, gone text) USING encrypted_heap;
+ALTER TABLE up_dropped_rot ALTER COLUMN gone SET STORAGE EXTERNAL;
+INSERT INTO up_dropped_rot SELECT g, 'v' || g, string_agg(md5((g * 1000 + s)::text), '')
+  FROM generate_series(1, 10) g, generate_series(1, 400) s GROUP BY g;
+ALTER TABLE up_dropped_rot DROP COLUMN gone;
+VACUUM FULL up_dropped_rot;
 
 CHECKPOINT;
 SQL
@@ -256,10 +279,64 @@ if [[ "$ACT_UPDATE" != "$EXP_UPDATE" ]]; then
     exit 2
 fi
 
+# ── Probe E: a dropped column the baseline's VACUUM FULL left dangling ───
+# up_dropped and up_dropped_rot keep, in their dropped column, pointers into a
+# TOAST relation the baseline replaced (PSQLE-192).  Reading only the live
+# columns never follows them; a whole-row read (SELECT t, t::text,
+# row_to_json(t)) flattens every column and does.  Declared, like Probe B.
+# A rotation and a DELETE must cope as they are, before any remedy.  Only
+# ERROR lines count: the first access to a table in a backend also prints the
+# dev_mode_passphrase WARNING.
+log_info "Probe E — rows whose dropped column the baseline's VACUUM FULL left dangling ..."
+WR_ERR="$(container_psql "$CONTAINER" -q -c \
+    "SELECT sum(length(t::text)) FROM up_dropped t;" 2>&1 >/dev/null | grep -E "ERROR|FATAL|server closed" || true)"
+if [[ -n "$WR_ERR" ]]; then
+    ACT_WHOLEROW=no
+    log_warn "Probe E: whole-row read refused — $(echo "$WR_ERR" | head -1)"
+else
+    ACT_WHOLEROW=yes
+    log_ok "Probe E: whole rows read as they are"
+fi
+if [[ "$ACT_WHOLEROW" != "$EXP_WHOLEROW" ]]; then
+    log_error "UPGRADE: whole_row_read_before_vacuum is '$ACT_WHOLEROW', ci/upgrade-compat.expected declares '$EXP_WHOLEROW'."
+    log_error "        Either fix the change, or flip the declaration AND say so in the release notes."
+    exit 2
+fi
+
+container_psql "$CONTAINER" -q -c \
+    "SET client_min_messages = warning; SELECT pg_vault_tde_rotate_online('up_dropped_rot');" >/dev/null 2>&1
+ROT=""
+for _ in $(seq 1 60); do
+    ROT="$(container_psql "$CONTAINER" -tAc \
+        "SELECT status FROM pg_vault_tde_rotation_progress WHERE relid = 'up_dropped_rot'::regclass::oid" \
+        2>/dev/null | tr -d '[:space:]')"
+    [[ "$ROT" == complete || "$ROT" == failed ]] && break
+    sleep 1
+done
+if [[ "$ROT" != complete ]]; then
+    log_error "PROBE E: rotate_online() of a table with dangling dropped-column pointers ended '${ROT:-<nothing>}'"
+    exit 2
+fi
+WR_ERR="$(container_psql "$CONTAINER" -q -c \
+    "SELECT sum(length(t::text)) FROM up_dropped_rot t;" 2>&1 >/dev/null | grep -E "ERROR|FATAL|server closed" || true)"
+if [[ -n "$WR_ERR" ]]; then
+    log_error "PROBE E: whole rows still fail after the rotation rewrote them — $(echo "$WR_ERR" | head -1)"
+    exit 2
+fi
+log_ok "PROBE E: the rotation completes and leaves whole rows readable"
+
+DEL_ERR="$(container_psql "$CONTAINER" -q -c \
+    "BEGIN; DELETE FROM up_dropped; ROLLBACK;" 2>&1 >/dev/null | grep -E "ERROR|FATAL|server closed" || true)"
+if [[ -n "$DEL_ERR" ]]; then
+    log_error "PROBE E: DELETE of rows with dangling dropped-column pointers failed — $(echo "$DEL_ERR" | head -1)"
+    exit 2
+fi
+log_ok "PROBE E: DELETE copes with them"
+
 # ── Gate C: the documented remedy has to work ────────────────────────────
 log_info "Gate C — VACUUM FULL must migrate the rows without altering them ..."
 container_psql "$CONTAINER" -v ON_ERROR_STOP=1 -q -c \
-    "VACUUM FULL up_plain, up_late_key, up_toast, up_nulls, up_numeric;" \
+    "VACUUM FULL up_plain, up_late_key, up_toast, up_nulls, up_numeric, up_dropped;" \
     || { log_error "GATE C: VACUUM FULL failed on baseline data"; exit 2; }
 
 MIGRATED="$(container_psql "$CONTAINER" -tAc "$FINGERPRINT" 2>/dev/null | tr -d '[:space:]')"
@@ -277,6 +354,14 @@ if [[ -n "$POST_ERR" ]]; then
     exit 2
 fi
 log_ok "GATE C: rows update normally once rewritten"
+
+WR_ERR="$(container_psql "$CONTAINER" -q -c \
+    "SELECT sum(length(t::text)) FROM up_dropped t;" 2>&1 >/dev/null | grep -E "ERROR|FATAL|server closed" || true)"
+if [[ -n "$WR_ERR" ]]; then
+    log_error "GATE C: whole rows still fail after VACUUM FULL — $(echo "$WR_ERR" | head -1)"
+    exit 2
+fi
+log_ok "GATE C: whole rows read once rewritten"
 
 # ── Probe D: an index the current build refuses to create ────────────────
 # up_numeric_amount was built by the baseline; this build refuses numeric

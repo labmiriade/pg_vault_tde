@@ -102,3 +102,47 @@ toast_values
            0
 (1 row)
 
+
+starting permutation: u1_begin u1_flag u2_delete u1_commit c_vacuum c_check c_values
+step u1_begin: BEGIN;
+step u1_flag: UPDATE tde_tu SET flag = 1 WHERE id = 1;
+step u2_delete: DELETE FROM tde_tu WHERE id = 1; <waiting ...>
+step u1_commit: COMMIT;
+step u2_delete: <... completed>
+step c_vacuum: VACUUM tde_tu;
+step c_check: SELECT id, flag, left(big, 7) AS big, length(big) AS big_len,
+                         keep = repeat('keep_', 1000) AS keep_ok,
+                         tde_tu_values() AS toast_values
+                  FROM tde_tu ORDER BY id;
+id|flag|big|big_len|keep_ok|toast_values
+--+----+---+-------+-------+------------
+(0 rows)
+
+step c_values: SELECT tde_tu_values() AS toast_values;
+toast_values
+------------
+           0
+(1 row)
+
+
+starting permutation: u1_begin u1_big u2_delete u1_commit c_vacuum c_check c_values
+step u1_begin: BEGIN;
+step u1_big: UPDATE tde_tu SET big = repeat('big_u1_', 1000) WHERE id = 1;
+step u2_delete: DELETE FROM tde_tu WHERE id = 1; <waiting ...>
+step u1_commit: COMMIT;
+step u2_delete: <... completed>
+step c_vacuum: VACUUM tde_tu;
+step c_check: SELECT id, flag, left(big, 7) AS big, length(big) AS big_len,
+                         keep = repeat('keep_', 1000) AS keep_ok,
+                         tde_tu_values() AS toast_values
+                  FROM tde_tu ORDER BY id;
+id|flag|big|big_len|keep_ok|toast_values
+--+----+---+-------+-------+------------
+(0 rows)
+
+step c_values: SELECT tde_tu_values() AS toast_values;
+toast_values
+------------
+           0
+(1 row)
+

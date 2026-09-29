@@ -1351,7 +1351,7 @@ make ci-valgrind         # Valgrind memcheck over the full TDE workload (slow: 1
 make ci-cassert          # SQL suites + TAP files on PostgreSQL built --enable-cassert -DUSE_VALGRIND (builds PG from source)
 make ci-wallet           # SQL regression tests (local wallet provider)
 make ci-checksums        # regression tests + page checksum compatibility
-make ci-tap              # 32 TAP test files (starts a real Vault container for the Vault-dependent ones)
+make ci-tap              # 33 TAP test files (starts a real Vault container for the Vault-dependent ones)
 make ci-isolation        # 3 isolation specs: DEK rotation under load, relation rewrite under a concurrent reader, UPDATE of out-of-line values racing another transaction
 make ci-vault            # Vault integration (Compose-based)
 make ci-openbao          # OpenBao Raft 3-node HA integration (12 tests)
@@ -1363,7 +1363,7 @@ make ci-bench BENCH_ROWS=100000  # with custom row count
 make ci-clean            # Remove test containers and images
 ```
 
-Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 533 assertions across 32 TAP files. Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
+Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 594 assertions across 33 TAP files. Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
 - Tests 1-4: extension loaded, access methods and SQL functions registered, wallet unlock
 - Tests 12-14: TAM INSERT/SELECT/UPDATE end-to-end
 - Test 15: DELETE
@@ -1466,7 +1466,7 @@ Concurrency — `make ci-isolation` (`test/isolation/specs/`):
 
 - `per_table_dek_rotation.spec` — online DEK rotation racing readers, writers and VACUUM
 - `encrypted_rewrite_concurrency.spec` — `VACUUM FULL` / `CLUSTER` (i.e. `pg_vault_tde_relation_copy_for_cluster`) with a second backend holding a `REPEATABLE READ` snapshot across the relfilenode change, and with an uncommitted writer the rewrite must wait for. Payloads are `STORAGE EXTERNAL` so the rewrite has real TOAST chunks to migrate. This spec found the `toast_save_datum()` segfault that TEST 153 now guards; it does **not** cover `wallet_lock()`, because the stage sets `wallet_dev_mode_passphrase` and those permutations would pass vacuously — the spec says so in a comment rather than shipping a test that checks nothing
-- `toast_update_concurrency.spec` — an `UPDATE` that replaces an out-of-line value while another transaction updates or deletes the same row: the waiting `UPDATE` that skips the row, goes ahead on the newer version, or finds it deleted. Each permutation ends with `VACUUM` and counts the values left in the TOAST relation, so a lost value and an orphaned one both show (PSQLE-193). The expected output is what the same spec prints on a plain `heap` table
+- `toast_update_concurrency.spec` — an `UPDATE` that replaces an out-of-line value while another transaction updates or deletes the same row: the waiting `UPDATE` that skips the row, goes ahead on the newer version, or finds it deleted, and a `DELETE` waiting on an `UPDATE`. Each permutation ends with `VACUUM` and counts the values left in the TOAST relation, so a lost value and an orphaned one both show (PSQLE-193). The expected output is what the same spec prints on a plain `heap` table
 
 On-disk corruption — `tap/20_ondisk_fuzz.t`:
 

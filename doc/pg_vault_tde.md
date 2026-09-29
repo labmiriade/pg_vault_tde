@@ -1427,7 +1427,7 @@ Starts PostgreSQL with `initdb -k` (`--data-checksums`). Verifies that:
 
 ### TAP Tests (`tap/`)
 
-32 files, run together by `make ci-tap` (which also starts the Vault container
+33 files, run together by `make ci-tap` (which also starts the Vault container
 the Vault-dependent files need; they `skip_all` when `VAULT_ADDR` is unset).
 
 | File | Coverage |
@@ -1464,6 +1464,7 @@ the Vault-dependent files need; they `skip_all` when `VAULT_ADDR` is unset).
 | `tap/30_rotate_kek_local_atomicity.t` | A local-wallet KEK rotation that rolls back, fails later in its statement, or dies in a crash leaves every table readable; so do a session that unlocked the wallet before another session rotated the KEK, and a `CREATE TABLE` that waited on an aborted rotation — each checked right after and after a restart (PSQLE-185) |
 | `tap/31_migrate_vault_to_wallet.t` | `pg_vault_tde_migrate_vault_to_wallet()` refuses a passphrase that does not open the wallet and leaves every migrated table readable under the local wallet — in a session opened before the migration, a new one and after a restart; the real-Vault half runs when `VAULT_ADDR` is set (PSQLE-188) |
 | `tap/32_rotate_online_toast.t` | Out-of-line values — stored uncompressed and compressed — stay readable after `pg_vault_tde_rotate_online()`, after a restart, after a second rotation and after another restart, and the TOAST relation keeps the same number of live chunks (PSQLE-189). Runs once per available provider, as `tap/29` |
+| `tap/33_toast_lifecycle.t` | Out-of-line values go through every write path as on a plain heap twin put through the same statements — UPDATEs that keep, replace, inline or drop them, DELETE, VACUUM, `DROP COLUMN`, VACUUM FULL, two rotations and a restart; after each step the contents, a read of every whole row and the number of values left in the TOAST relation must match (PSQLE-189, 191, 192) |
 
 #### `tap/19_crash_recovery_rmgr.t`
 
@@ -1535,7 +1536,8 @@ therefore no wallet path.
 - `encrypted_rewrite_concurrency.spec`: `VACUUM FULL` / `CLUSTER` with a reader
   holding a snapshot across the relfilenode change, and with a writer to wait for.
 - `toast_update_concurrency.spec`: an `UPDATE` replacing an out-of-line value
-  while another transaction updates or deletes the row; every permutation ends
+  while another transaction updates or deletes the row, and a `DELETE` waiting on an
+  `UPDATE`; every permutation ends
   with `VACUUM` and counts the values left in the TOAST relation (PSQLE-193).
 
 ### Anti-Patterns (DO NOT)

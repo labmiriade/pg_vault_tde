@@ -16,6 +16,10 @@
 # Every permutation ends with VACUUM and a check that reads every value and
 # counts the out-of-line values the TOAST relation still holds: two per live
 # row, one for each external column — fewer is a loss, more is a leak.
+#
+# A DELETE waiting on the same row has the mirror problem: it read the row with
+# the statement's snapshot, which after the recheck does not see the version it
+# deletes, and so never deleted that version's values (PSQLE-192).
 
 setup
 {
@@ -67,6 +71,7 @@ step "u1_abort"  { ROLLBACK; }
 session "u2"
 setup { SET client_min_messages = error; }
 step "u2_big"     { UPDATE tde_tu SET big = repeat('big_u2_', 1000) WHERE id = 1; }
+step "u2_delete"  { DELETE FROM tde_tu WHERE id = 1; }
 step "u2_big_if0" { UPDATE tde_tu SET big = repeat('big_u2_', 1000) WHERE id = 1 AND flag = 0; }
 
 session "check"
@@ -96,3 +101,8 @@ permutation "u1_begin" "u1_big" "u2_big" "u1_abort" "c_vacuum" "c_check"
 # The row is deleted under the waiting UPDATE, which then updates nothing:
 # no row, and no value left in the TOAST relation.
 permutation "u1_begin" "u1_delete" "u2_big" "u1_commit" "c_vacuum" "c_check" "c_values"
+
+# A DELETE waiting on an UPDATE deletes the newer version, and every value
+# with it.
+permutation "u1_begin" "u1_flag" "u2_delete" "u1_commit" "c_vacuum" "c_check" "c_values"
+permutation "u1_begin" "u1_big" "u2_delete" "u1_commit" "c_vacuum" "c_check" "c_values"
