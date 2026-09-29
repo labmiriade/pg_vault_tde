@@ -45,7 +45,7 @@
 #include "storage/lmgr.h"          /* LockRelationOid */
 #include "storage/lwlock.h"
 #include "storage/proc.h"
-#include "tcop/tcopprot.h"           /* die */
+#include "tcop/tcopprot.h"           /* StatementCancelHandler */
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"         /* F_OIDEQ */
 #include "utils/lsyscache.h"
@@ -307,7 +307,15 @@ pg_vault_tde_rotation_bgw_main(Datum main_arg)
 
     memcpy(&args, MyBgworkerEntry->bgw_extra, sizeof(args));
 
-    pqsignal(SIGTERM, die);
+    /*
+     * SIGTERM — pg_terminate_backend(), a smart or fast shutdown — as a
+     * cancel: the rotation's transaction aborts through the PG_CATCH below,
+     * which records 'failed', and the worker then returns.  die() ended it
+     * with a FATAL, which no PG_CATCH sees, and left the progress row
+     * 'running' for good (PSQLE-211).  After a crash or an immediate
+     * shutdown nothing runs, and the row still says 'running'.
+     */
+    pqsignal(SIGTERM, StatementCancelHandler);
     BackgroundWorkerUnblockSignals();
 
     BackgroundWorkerInitializeConnectionByOid(args.dboid, InvalidOid, 0);

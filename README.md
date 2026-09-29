@@ -689,11 +689,19 @@ beside it — not against the others: `rotate_online()` (of a table or of a
 `tde_btree` index), `rotate_kek()`, `wallet_change_passphrase()`, `wallet_lock()` /
 `wallet_unlock()`, `migrate_vault_to_wallet()`, `seal_keys()` / `unseal_keys()` and
 `reencrypt_table()`. Until they are (1.8), run them one at a time in each database,
-and start the next only once the previous one has returned and this is empty:
+and start the next only once the previous one has returned and no rotation worker is
+left:
 
 ```sql
-SELECT * FROM pg_vault_tde_rotation_status WHERE status = 'running';
+SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'pg_vault_tde rotation';  -- 0
 ```
+
+`pg_vault_tde_rotation_status` says how each `rotate_online()` ended: `complete`, or
+`failed` when it hit an error or was stopped — `pg_cancel_backend()`,
+`pg_terminate_backend()`, a smart or fast shutdown. A rotation is one transaction, so a
+failed one has changed nothing: run it again. After a crash or an immediate shutdown
+its row stays `running` with no worker behind it; that is the same case. Up to 1.7.1 a
+terminated rotation, or one stopped by a fast shutdown, stayed `running` too.
 
 In particular:
 

@@ -348,6 +348,13 @@ else if (strcmp(guc_kms_provider, "kmip") == 0)
 > registration happens in the GUC **assign hook**
 > `tde_kms_provider_assign()` in `pg_vault_tde.c` — NOT in `_PG_init`.
 
+### Rotation worker signals (PSQLE-211)
+
+The rotation worker takes SIGTERM as a cancel (`StatementCancelHandler`), never
+`die()`: its progress row is recorded `failed` only by its PG_CATCH, which a FATAL
+skips.  A crash or an immediate shutdown leaves the row `running` with no worker —
+documented, not detectable from the row alone.
+
 ### Local Wallet Provider Rules (`local`)
 
 - Wallet file: `/var/lib/pg_vault_tde/<DB_OID>/wallet.p12` (default; GUC `pg_vault_tde.wallet_path`)

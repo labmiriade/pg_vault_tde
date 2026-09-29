@@ -550,6 +550,16 @@ distinguishes the builds.
     longer suggests deleting a key that may already wrap DEKs. Local and Vault passed
     every scenario as they were. `tap/30_rotate_kek_atomicity.t`.
 
+26. **A terminated `rotate_online()` stayed `running` for good (PSQLE-211).** The worker
+    handled SIGTERM with `die()`: `pg_terminate_backend()`, or a smart or fast shutdown,
+    ended it with a FATAL, which its PG_CATCH never sees, so nothing recorded `failed`.
+    It now takes SIGTERM as a cancel (`StatementCancelHandler`), and the rotation
+    aborts through the same path as `pg_cancel_backend()`. The data was safe in every
+    case — the TAP stops the worker halfway through the rewrite and checks tags, twin,
+    TOAST, amcheck and generation, before and after a restart. After a crash or an
+    immediate shutdown the row still says `running`; the README says how to tell.
+    `tap/46_rotate_online_interrupted.t`.
+
 **Key operations one at a time (PSQLE-210).** Rotations and wallet operations are
 tested alone and against concurrent DML, not against each other; the README now says
 to run them one at a time per database and lists the combinations to avoid until 1.8.

@@ -99,11 +99,17 @@ reads and writes, not against one another. Until 1.8, run `rotate_online()`,
 `rotate_kek()`, `wallet_change_passphrase()`, `wallet_lock()` /
 `wallet_unlock()`, `migrate_vault_to_wallet()`, `seal_keys()` /
 `unseal_keys()` and `reencrypt_table()` one at a time in each database, and
-start the next only once `pg_vault_tde_rotation_status` shows no rotation
-`running`: no KEK rotation or passphrase change during a DEK rotation, no
+start the next only once no `pg_vault_tde rotation` process is left in
+`pg_stat_activity`: no KEK rotation or passphrase change during a DEK rotation, no
 `wallet_lock()` during a rotation, no two DEK rotations at once (even of
 different tables), no DDL on a table being rotated. See *One key operation at
 a time* in the README.
+
+A rotation stopped halfway — cancelled, terminated, a server shutdown — is one
+transaction that never committed: the table is as it was, and the progress
+row says `failed`. After a crash or an immediate shutdown the row still says
+`running` although no worker exists; treat it as `failed` and run the
+rotation again.
 
 ## Recommended Rotation Cadence
 
