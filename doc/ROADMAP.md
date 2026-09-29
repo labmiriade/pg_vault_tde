@@ -1,6 +1,6 @@
 # pg_vault_tde Roadmap
 
-> Last updated: 2026-09-29 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 33 TAP files / 594 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 3 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
+> Last updated: 2026-09-29 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 33 TAP files / 597 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 3 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
 
 ---
 
@@ -354,8 +354,8 @@ distinguishes the builds.
     no concurrency needed, and `verify_integrity()` does not read TOAST chunks. A
     `DELETE` of such a row failed too. Now `reencrypt_table()` fetches every on-disk
     external value back (still compressed) before the update, so the toaster stores it
-    under the new key and `toast_tuple_cleanup()` deletes the old chunks; dropped
-    columns are rewritten as well, so every chunk left in the TOAST relation decrypts.
+    under the new key and the old chunks are deleted; dropped columns become NULL, as in
+    any `UPDATE` (see item 12).
     `tap/32_rotate_online_toast.t`, on every provider.
 
 11. **A concurrent `UPDATE` of an out-of-line value could lose it (PSQLE-193).** The
@@ -374,6 +374,26 @@ distinguishes the builds.
     The separate fallback that deleted the old values when the new row had none is
     gone with it. `test/isolation/specs/toast_update_concurrency.spec`, whose
     expected output is the same spec run on a plain heap table.
+
+12. **Dropped columns' out-of-line values: leaked, and dangling after `VACUUM FULL`
+    (PSQLE-192).** `DELETE` decided whether to delete TOAST with
+    `tde_tuple_has_external()`, which skips dropped columns, so a row whose only
+    out-of-line value sat in one left its chunks behind; it also read the row with the
+    statement's snapshot, which after an EvalPlanQual recheck does not see the version
+    being deleted, so a `DELETE` waiting on an `UPDATE` left every value behind.
+    `copy_for_cluster` did not null dropped columns as core's
+    `reform_and_rewrite_tuple()` does: it copied such a pointer as it was into the
+    rewritten table, pointing into the TOAST relation the rewrite replaced, and a
+    whole-row read (`SELECT t`, `t::text`) failed with `missing chunk number 0` — on
+    1.7.1 too. The item-10 fix, which fetched dropped values back, made the next
+    rotation fail on them. Now `DELETE` reads the row with `SnapshotAny` and deletes
+    through the same helper as `UPDATE`, dropped columns included; `VACUUM FULL` and
+    `CLUSTER` rewrite dropped columns as NULL; the rotation sets them to NULL.
+    `tap/33_toast_lifecycle.t` puts a plain heap twin through the same statements and
+    compares contents, whole rows and TOAST values after each; the isolation spec gains
+    a `DELETE` waiting on an `UPDATE`; `ci-upgrade` Probe E reads a table whose
+    dropped column 1.7.1 left dangling (`whole_row_read_before_vacuum=no`), rotates
+    and deletes from it, and Gate C's `VACUUM FULL` must repair it.
 
 **New CI stage — `make ci-upgrade`.** Every other suite in this repo reads only data it
 wrote in the same run, so writer and reader always move together and a format-level

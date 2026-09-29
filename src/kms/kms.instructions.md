@@ -560,7 +560,9 @@ were gone at the next restart (PSQLE-184).  The rules now:
    reuses unchanged ones: the chunks would stay under the outgoing key, which
    no catalog row holds once the rotation commits (PSQLE-189).
    `reencrypt_table()` fetches on-disk external values back first
-   (`tde_fetch_back_external()`), dropped columns included.
+   (`tde_fetch_back_external()`); dropped columns become NULL instead, as in any
+   UPDATE — a VACUUM FULL up to 1.7.1 may have left their pointers dangling
+   (PSQLE-192).
 
 Regression: `tap/29_rotate_online_concurrent_access.t` (a row lock on
 `pg_vault_tde_catalog` holds the worker inside the window);

@@ -2033,6 +2033,11 @@ pg_vault_tde_tuple_update(Relation rel, ItemPointer otid,
  * calling heap_insert(), otherwise it will call heap_toast_insert_or_update.
  * Shared by tde_tuple_has_external() (Relation-based callers) and
  * tde_decrypt_heap_tuple() (which only has a TupleDesc on hand).
+ *
+ * Dropped columns are skipped on purpose: a VACUUM FULL up to 1.7.1 left
+ * their pointers dangling, and a HEAP_HASEXTERNAL set for them would make core
+ * follow them (heap_copy_tuple_as_datum flattens a flagged tuple).  Deleting
+ * their chunks does not go through here — see tde_toast_delete_unshared().
 */
 static bool
 tde_tuple_has_external_desc(HeapTuple tup, TupleDesc tupdesc)
@@ -2103,18 +2108,15 @@ tde_tuple_has_external(HeapTuple tup, Relation rel)
  * DELETE path.  Delegates the physical row removal to heapam's tuple_delete,
  * then cleans up any TOAST chunks that belong to the deleted row.
  *
- * TOAST detection is two-level:
- *  1. HeapTupleHasExternal(plain) — fast-path check of the HEAP_HASEXTERNAL
- *     infomask bit.  Normally reliable, but VACUUM FULL clears this bit on
- *     encrypted tuples to satisfy rewrite_heap_tuple's assertion
- *     (see pg_vault_tde_relation_copy_for_cluster).
- *  2. tde_tuple_has_external() — per-attribute VARATT_IS_EXTERNAL scan
- *     on the decrypted tuple.  Falls back to this when the bit is clear so
- *     TOAST chunks from VACUUM FULL-rewritten rows are never orphaned.
+ * heap_delete() would do that itself, but the on-disk tuple never carries
+ * HEAP_HASEXTERNAL (see tde_encrypt_heap_tuple), so the row is fetched and
+ * decrypted first and, once TM_Ok is confirmed, tde_toast_delete_unshared()
+ * deletes every out-of-line value in it — dropped columns included, whose
+ * chunks nothing else ever deletes (PSQLE-192).
  *
- * We must fetch and decrypt the tuple BEFORE calling heapam's delete so that
- * the decrypted plaintext is available for the TOAST scan.  After TM_Ok is
- * confirmed, heap_toast_delete cleans up the TOAST relation.
+ * The row is read with SnapshotAny: after an EvalPlanQual recheck tid is a
+ * version committed after the statement's snapshot was taken, which that
+ * snapshot does not see, and its values were left behind.
  */
 static TM_Result
 pg_vault_tde_tuple_delete(Relation rel,
@@ -2129,32 +2131,26 @@ pg_vault_tde_tuple_delete(Relation rel,
     TM_Result result;
     TupleTableSlot * slot = NULL;
     HeapTuple volatile plain = NULL;
-   
-    bool volatile has_externals = false;
     bool shouldFree = false;
 
     slot = table_slot_create(rel, NULL);
 
-    if(pg_vault_tde_tuple_fetch_row_version(rel, tid, snapshot, slot)){
+    if (pg_vault_tde_tuple_fetch_row_version(rel, tid, SnapshotAny, slot))
         plain = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
-        /*
-         * Check HEAP_HASEXTERNAL first (fast path).  Fall back to a
-         * per-attribute scan because VACUUM FULL clears HEAP_HASEXTERNAL
-         * from encrypted tuples to satisfy rewrite_heap_tuple's assertion;
-         * without the fallback those TOAST chunks would be orphaned.
-         */
-        has_externals = tde_tuple_has_external(plain, rel);
-    }
+
+    /* As in tuple_update: a TID the executor just read or locked. */
+    Assert(plain != NULL);
 
     PG_TRY();
     {
         result = heapam_tuple_delete_cb(rel, tid, cid, snapshot, crosscheck, wait, tmfd, changingPart);
 
-        if(result == TM_Ok && has_externals) heap_toast_delete(rel, plain, false);
+        if (result == TM_Ok && plain != NULL)
+            tde_toast_delete_unshared(rel, plain, NULL, false);
     }
     PG_CATCH();
     {
-        if (shouldFree)
+        if (shouldFree && plain != NULL)
             tde_release_plain(plain);
 
         if (slot != NULL)
@@ -2164,7 +2160,7 @@ pg_vault_tde_tuple_delete(Relation rel,
     }
     PG_END_TRY();
 
-    if (shouldFree)
+    if (shouldFree && plain != NULL)
         tde_release_plain(plain);
     
     if (slot != NULL)
@@ -2173,6 +2169,46 @@ pg_vault_tde_tuple_delete(Relation rel,
     return result;
 }
 
+
+static bool
+tde_desc_has_dropped(TupleDesc desc)
+{
+    for (int i = 0; i < desc->natts; i++)
+    {
+        if (TupleDescAttr(desc, i)->attisdropped)
+            return true;
+    }
+    return false;
+}
+
+/*
+ * tde_without_dropped — plain with its dropped columns set to NULL, as a new
+ * palloc'd tuple; core's reform_and_rewrite_tuple() does the same on every
+ * rewrite.  The header is fresh: rewrite_heap_tuple() copies the visibility
+ * fields over from the old tuple.
+ */
+static HeapTuple
+tde_without_dropped(HeapTuple plain, TupleDesc desc)
+{
+    Datum    *values = palloc(desc->natts * sizeof(Datum));
+    bool     *isnull = palloc(desc->natts * sizeof(bool));
+    HeapTuple out;
+
+    heap_deform_tuple(plain, desc, values, isnull);
+    for (int i = 0; i < desc->natts; i++)
+    {
+        if (TupleDescAttr(desc, i)->attisdropped)
+            isnull[i] = true;
+    }
+
+    out = heap_form_tuple(desc, values, isnull);
+    out->t_self = plain->t_self;
+    out->t_tableOid = plain->t_tableOid;
+
+    pfree(values);
+    pfree(isnull);
+    return out;
+}
 
 /*
  * pg_vault_tde_relation_copy_for_cluster
@@ -2205,8 +2241,8 @@ pg_vault_tde_tuple_delete(Relation rel,
  * rewrite_heap_tuple asserts !HeapTupleHasExternal(newTuple).  For re-toasted
  * tuples we clear HEAP_HASEXTERNAL from enc_new's t_infomask before the call.
  * TOAST chunk cleanup on later DELETE is still correct because
- * pg_vault_tde_tuple_delete uses tde_tuple_has_external as a fallback
- * that does a per-attribute varlena tag scan instead of relying on the flag.
+ * pg_vault_tde_tuple_delete scans the decrypted row's attributes
+ * (tde_toast_delete_unshared) instead of relying on the flag.
  */
 static void
 pg_vault_tde_relation_copy_for_cluster(Relation OldTable,
@@ -2224,6 +2260,7 @@ pg_vault_tde_relation_copy_for_cluster(Relation OldTable,
     HeapTuple       enc_raw;        /* raw ciphertext, points into buffer page */
     RewriteState    rwstate;
     TupleDesc       tupdesc = RelationGetDescr(OldTable);
+    const bool      has_dropped = tde_desc_has_dropped(tupdesc);
 
     /*
      * rd_tableam impersonation: heap_beginscan, heap_getnext, and
@@ -2361,6 +2398,24 @@ pg_vault_tde_relation_copy_for_cluster(Relation OldTable,
             PG_TRY(2);
             {
                 plain = tde_decrypt_heap_tuple(enc_copy, RelationGetRelid(OldTable), tupdesc);
+
+                /*
+                 * Dropped columns are rewritten as NULL, as core does.  Copied
+                 * as they were, their out-of-line pointers would point into
+                 * the TOAST relation this rewrite replaces: every whole-row
+                 * read, and every later rotation, then fails on a missing
+                 * chunk (PSQLE-192).
+                 */
+                if (has_dropped)
+                {
+                    HeapTuple reformed = tde_without_dropped(plain, tupdesc);
+                    Size      hdr = plain->t_data->t_hoff;
+
+                    OPENSSL_cleanse((char *) plain->t_data + hdr,
+                                    plain->t_len - hdr);
+                    pfree(plain);
+                    plain = reformed;
+                }
                 plain_for_write = plain;
 
                 /* Header bit is cleared on disk (see tde_encrypt_heap_tuple);
@@ -2448,7 +2503,7 @@ pg_vault_tde_relation_copy_for_cluster(Relation OldTable,
                  *
                  * Clear the flag so the assertion passes.
                  * pg_vault_tde_tuple_delete compensates via
-                 * tde_tuple_has_external, which does a per-attribute
+                 * tde_toast_delete_unshared, which does a per-attribute
                  * VARATT_IS_EXTERNAL scan on the decrypted tuple regardless
                  * of this flag.
                  */
@@ -2705,10 +2760,10 @@ pg_vault_tde_reencrypt_table_sql(PG_FUNCTION_ARGS)
  * TOAST chunks keep the old DEK, and once that key has left the cache the
  * values are unreadable (PSQLE-189).  A fetched-back value differs from the
  * old pointer, so toast_tuple_init() stores it again under the current key
- * and toast_tuple_cleanup() deletes the old chunks.  Dropped columns are
- * rewritten too: nothing reads them, but their chunks stay in the TOAST
- * relation, and every chunk there has to be readable with a key the catalog
- * still has.  Allocates in cxt.
+ * and pg_vault_tde_tuple_update() deletes the old chunks.  Dropped columns
+ * become NULL, as in any UPDATE, and their chunks are deleted with the rest:
+ * fetching them back would follow pointers that a VACUUM FULL up to 1.7.1
+ * left dangling (PSQLE-192).  Allocates in cxt.
  */
 static void
 tde_fetch_back_external(TupleTableSlot *src, TupleTableSlot *dst,
@@ -2720,17 +2775,21 @@ tde_fetch_back_external(TupleTableSlot *src, TupleTableSlot *dst,
     slot_getallattrs(src);
     ExecClearTuple(dst);
 
+    Assert(dst->tts_tupleDescriptor->natts == desc->natts);
+
     for (int i = 0; i < desc->natts; i++)
     {
-        Datum value = src->tts_values[i];
+        Form_pg_attribute att = TupleDescAttr(desc, i);
+        Datum             value = src->tts_values[i];
+        bool              isnull = src->tts_isnull[i] || att->attisdropped;
 
-        if (!src->tts_isnull[i] && TupleDescAttr(desc, i)->attlen == -1 &&
+        if (!isnull && att->attlen == -1 &&
             VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(value)))
             value = PointerGetDatum(
                 detoast_external_attr((struct varlena *) DatumGetPointer(value)));
 
-        dst->tts_values[i] = value;
-        dst->tts_isnull[i] = src->tts_isnull[i];
+        dst->tts_values[i] = isnull ? (Datum) 0 : value;
+        dst->tts_isnull[i] = isnull;
     }
 
     ExecStoreVirtualTuple(dst);

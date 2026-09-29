@@ -1228,10 +1228,12 @@ WHERE p.status = 'complete'
 A table rotated twice since the restart, or rotated before it, has already lost the
 values stored before its last rotation, and only a backup brings them back.
 `SELECT sum(length(t::text)) FROM t` reads every value of `t` and fails with
-`decryption failed` if any of them is lost.
+`decryption failed` if any of them is lost. A `missing chunk number 0` from the same
+query is a different, harmless defect — see [Dropped columns and out-of-line values](#dropped-columns-and-out-of-line-values).
 
 What changes in 1.7.2: the rotation rewrites every out-of-line value under the new key
-and deletes the old chunks, dropped columns included. A rotation of a table with large
+and deletes the old chunks; dropped columns become NULL, as in any `UPDATE`, and their
+chunks go too. A rotation of a table with large
 values reads and writes all of them, so it takes longer and writes more WAL than in
 1.7.1.
 
@@ -1256,6 +1258,28 @@ chunks only take space, and `VACUUM FULL` drops them. In 1.7.2 the old chunks ar
 deleted only once the row has been updated, and an attempt that finds the row changed
 removes the chunks it had written, so the waiting `UPDATE` behaves as on a plain heap
 table.
+
+
+### Dropped columns and out-of-line values
+
+A column dropped with `ALTER TABLE ... DROP COLUMN` keeps its values in every row until
+the row is rewritten. Up to 1.7.1 the TAM mishandled the out-of-line ones (PSQLE-192):
+
+- `DELETE` left their chunks in the TOAST relation, referenced by nothing, whenever
+  the row had no other out-of-line value — and so did a `DELETE` that waited on a
+  concurrent `UPDATE` of the row, for every value of the row;
+- `VACUUM FULL` and `CLUSTER` copied the dropped column's pointer as it was into the
+  rewritten table, where it points into the TOAST relation the rewrite replaced. The
+  live columns read normally, but a read of the whole row — `SELECT t FROM t`,
+  `t::text`, `row_to_json(t)` — fails with `missing chunk number 0 for toast value …`;
+- with the 1.7.2 fix for [out-of-line values in a rotation](#rotate_online-and-out-of-line-values)
+  alone, the same pointers made `rotate_online()` fail; that combination never shipped.
+
+**After installing 1.7.2:** the `VACUUM FULL` that [Upgrading to 1.7.2](#upgrading-to-172)
+already asks for repairs all of it: it rewrites dropped columns as NULL, as core does,
+which removes the dangling pointers and the orphaned chunks. A rotation or an `UPDATE`
+of a row repairs that row too, and `rotate_online()` and `DELETE` work on the tables
+as they are. `make ci-upgrade` checks each of these on data written by 1.7.1.
 
 ## Compatibility
 
@@ -1363,7 +1387,7 @@ make ci-bench BENCH_ROWS=100000  # with custom row count
 make ci-clean            # Remove test containers and images
 ```
 
-Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 594 assertions across 33 TAP files. Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
+Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 597 assertions across 33 TAP files. Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
 - Tests 1-4: extension loaded, access methods and SQL functions registered, wallet unlock
 - Tests 12-14: TAM INSERT/SELECT/UPDATE end-to-end
 - Test 15: DELETE

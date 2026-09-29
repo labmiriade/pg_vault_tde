@@ -36,6 +36,17 @@ row is fetched with `SnapshotAny` — after an EvalPlanQual recheck `otid` is a
 version the statement's snapshot does not see.  Regression:
 `test/isolation/specs/toast_update_concurrency.spec`.
 
+### Dropped columns keep their values until the row is rewritten (PSQLE-192)
+
+Core nulls dropped columns whenever it rewrites a row (the executor's UPDATE
+projection, `reform_and_rewrite_tuple()` on VACUUM FULL/CLUSTER) and deletes their
+chunks with the rest.  Every TAM path must do the same: `copy_for_cluster` rewrites
+them as NULL (`tde_without_dropped()`), the rotation's fetch-back sets them to NULL,
+and `tde_toast_delete_unshared()` — used by UPDATE and DELETE — counts them.
+`tde_tuple_has_external_desc()` alone skips them, on purpose: a VACUUM FULL up to
+1.7.1 left their pointers dangling, and HEAP_HASEXTERNAL must not make core follow
+them.  Regression: `tap/33_toast_lifecycle.t`, `ci-upgrade` Probe E.
+
 ### Write Path PG_TRY Contract (v1.6 patch — fix #1)
 
 All four write callbacks (`pg_vault_tde_tuple_insert`,

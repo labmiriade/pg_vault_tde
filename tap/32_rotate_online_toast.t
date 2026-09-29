@@ -12,13 +12,14 @@
 #
 #   ext   STORAGE EXTERNAL, stored uncompressed
 #   cmp   EXTENDED, compressed and still too large, stored compressed
-#   gone  a dropped column: nothing reads it, but its chunks stay in the
-#         TOAST relation
+#   gone  a dropped column: its chunks stay until a rotation rewrites the row,
+#         which sets it to NULL as any UPDATE does (PSQLE-192)
 #
 # Checked after each step: every tag verifies, the contents equal a plain-heap
-# twin, and the TOAST relation holds as many live chunks as before and every
-# one of them decrypts (the old chunks are deleted, not orphaned, and none is
-# left under a key the catalog no longer has).  Steps: rotation #1, a
+# twin, and every chunk in the TOAST relation decrypts: as many as before
+# the first rotation, then exactly those of the live values — the old ones
+# deleted, not orphaned, none left under a key the catalog no longer has,
+# and nothing left of the dropped column.  Steps: rotation #1, a
 # restart, rotation #2, a restart — the first restart is the common case, the
 # second rotation drops the key the first one left behind.
 #
@@ -43,9 +44,9 @@ my ($module) = grep { $_ && -e $_ } (
 my @providers = ('local');
 push @providers, 'vault'  if $vault_addr;
 push @providers, 'pkcs11' if $module;
-plan tests => 19 * scalar(@providers);
+plan tests => 20 * scalar(@providers);
 
-my ($node, $p, $toast, $chunks);
+my ($node, $p, $toast, $chunks, $live_chunks);
 
 # A started node on provider $p, with the extension and its KEK in place.
 sub new_node
@@ -105,10 +106,10 @@ sub new_node
 }
 
 # Three assertions: every tag verifies, the contents equal the twin, and the
-# TOAST relation holds as many live chunks as it started with.
+# TOAST relation holds $expect chunks, every one of which decrypts.
 sub check_table
 {
-    my ($when) = @_;
+    my ($when, $expect) = @_;
     my ($rc, $out, $err) = $node->psql('postgres',
         "SELECT total_tuples || '|' || failed_tuples "
       . "FROM pg_vault_tde_verify_integrity('tr')");
@@ -120,7 +121,7 @@ sub check_table
             (SELECT * FROM tr_truth EXCEPT ALL SELECT * FROM tr)) d});
     is($out, '0', "$p $when: contents equal the plain-heap twin") or diag $err;
     ($rc, $out, $err) = $node->psql('postgres', "SELECT count(*) FROM $toast");
-    is($out, $chunks, "$p $when: the TOAST relation holds $chunks live chunks")
+    is($out, $expect, "$p $when: the TOAST relation holds $expect chunks, all readable")
       or diag $err;
 }
 
@@ -176,21 +177,30 @@ sub scenario
         "SELECT reltoastrelid::regclass FROM pg_class WHERE oid = 'tr'::regclass");
     $chunks = $node->safe_psql('postgres', "SELECT count(*) FROM $toast");
     ok($chunks > 0, "$p: the TOAST relation holds chunks ($chunks)");
+    # The chunks of the values still visible; a rotation rewrites them at the
+    # same sizes, so the count holds across it.
+    $live_chunks = $node->safe_psql('postgres', qq{
+        SELECT count(*) FROM $toast
+        WHERE chunk_id IN (SELECT pg_column_toast_chunk_id(ext) FROM tr
+                           UNION ALL
+                           SELECT pg_column_toast_chunk_id(cmp) FROM tr)});
+    ok($live_chunks > 0 && $live_chunks < $chunks,
+       "$p: the dropped column holds some of them ($live_chunks live of $chunks)");
     is($node->safe_psql('postgres', q{
            SELECT count(*) FROM tr
            WHERE pg_column_compression(cmp) = 'pglz' AND pg_column_size(cmp) > 4000}),
        '20', "$p: every cmp value is stored compressed and out of line");
-    check_table('before any rotation');
+    check_table('before any rotation', $chunks);
 
     rotate('rotation #1');
-    check_table('after rotation #1');
+    check_table('after rotation #1', $live_chunks);
     restart();
-    check_table('after rotation #1 and a restart');
+    check_table('after rotation #1 and a restart', $live_chunks);
 
     rotate('rotation #2');
-    check_table('after rotation #2');
+    check_table('after rotation #2', $live_chunks);
     restart();
-    check_table('after rotation #2 and a restart');
+    check_table('after rotation #2 and a restart', $live_chunks);
 }
 
 for (@providers)
