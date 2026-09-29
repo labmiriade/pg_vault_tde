@@ -65,6 +65,7 @@
 #include <openssl/crypto.h>     /* OPENSSL_cleanse */
 
 #include "src/include/pg_vault_tde_catalog.h"
+#include "src/include/pg_vault_tde_kms.h"      /* tde_caller_is_superuser */
 #include "src/include/pg_vault_tde_catalog_d.h"
 #include "src/include/pg_vault_tde_audit.h"
 #include "src/include/pg_vault_tde_guc.h"
@@ -1745,7 +1746,7 @@ pg_vault_tde_rotate_kek_sql(PG_FUNCTION_ARGS)
 {
     const TdeKmsProvider *kms;
 
-    if (!superuser())
+    if (!tde_caller_is_superuser())
         ereport(ERROR,
                 (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
                  errmsg("pg_vault_tde_rotate_kek requires superuser")));

@@ -9,7 +9,7 @@ you need is the first decision in any rotation runbook:
 | What gets re-encrypted | Every row of the target table (and its `tde_btree` indexes, if rebuilt) | Nothing — only the wrapped DEK blobs in `pg_vault_tde_catalog` are re-wrapped |
 | Function | `pg_vault_tde_rotate_online(regclass, batch_size)` | `pg_vault_tde_rotate_kek()` |
 | Scope | One table (or index) at a time | Cluster-wide (the KEK is per-database, per-provider) |
-| Locking | `RowExclusiveLock` while re-encrypting; never `AccessExclusiveLock` on the table | Transactional catalog updates only |
+| Locking | `ShareRowExclusiveLock` while re-encrypting: reads continue, writes wait; never `AccessExclusiveLock` on the table | Transactional catalog updates only |
 | Typical trigger | Suspected compromise of a specific table's key, routine per-table key hygiene | Suspected KEK compromise, compliance-mandated rotation interval, wallet passphrase change |
 
 Both are **online** operations — no downtime and no exclusive lock that
@@ -91,6 +91,25 @@ faster than a DEK rotation of any single large table.
 > rolls back, fails or crashes loses nothing. Up to 1.7.1 it replaced the only
 > KEK before committing, and a rotation that did not commit made the database
 > unreadable — see *KEK versions in the local wallet* in the README.
+
+## One Key Operation at a Time
+
+Rotations and wallet operations are tested on their own and under concurrent
+reads and writes, not against one another. Until 1.8, run `rotate_online()`,
+`rotate_kek()`, `wallet_change_passphrase()`, `wallet_lock()` /
+`wallet_unlock()`, `migrate_vault_to_wallet()`, `seal_keys()` /
+`unseal_keys()` and `reencrypt_table()` one at a time in each database, and
+start the next only once no `pg_vault_tde rotation` process is left in
+`pg_stat_activity`: no KEK rotation or passphrase change during a DEK rotation, no
+`wallet_lock()` during a rotation, no two DEK rotations at once (even of
+different tables), no DDL on a table being rotated. See *One key operation at
+a time* in the README.
+
+A rotation stopped halfway — cancelled, terminated, a server shutdown — is one
+transaction that never committed: the table is as it was, and the progress
+row says `failed`. After a crash or an immediate shutdown the row still says
+`running` although no worker exists; treat it as `failed` and run the
+rotation again.
 
 ## Recommended Rotation Cadence
 

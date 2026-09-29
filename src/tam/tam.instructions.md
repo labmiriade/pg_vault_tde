@@ -59,6 +59,15 @@ must stay heapam's; diff it against each new PostgreSQL major.  A recently dead
 tuple that no longer decrypts is skipped with `ii_BrokenHotChain` set.  It runs
 with the relation impersonating heapam (`heap_getnext()` checks rd_tableam).
 
+### `copy_for_cluster` is heapam's, on decrypted copies (PSQLE-204)
+
+`tde_cluster_copy` is `heapam_relation_copy_for_cluster` with each kept tuple
+decrypted before it is sorted or written (the sort computes `OldIndex`'s keys from
+it) and `tde_cluster_write_tuple` in place of `reform_and_rewrite_tuple`.  The
+decrypted copy keeps the original header and is rewrite_heap_tuple()'s old tuple.
+`tuplesort_getheaptuple(state, forward)` hands back the sort's own tuple: cleanse
+it, never free it.  `CLUSTER` on a tde_btree index is refused.
+
 ### Every place heapam deletes TOAST itself needs a TAM counterpart (PSQLE-197)
 
 heapam decides to delete a row's TOAST from the on-disk `HEAP_HASEXTERNAL`, which
@@ -218,6 +227,15 @@ result = heapam_cb(rel, ...);
 **ALWAYS restore before any error path.** `RelationData` is per-backend but
 leaving it corrupted causes cascading failures in subsequent operations on
 the same relcache entry.
+
+**The swap does not survive a relcache rebuild.** An invalidation of the relation
+processed while it is swapped — at any lock acquisition, and a TOAST read takes
+several — rebuilds the open entry, and `rd_tableam` is the TAM again: every later
+dispatch through it decrypts.  `verify_integrity()` counted every later tuple as
+failed that way (PSQLE-207).  Where heapam's functions can be called directly
+(`heap_beginscan()`, `heap_getnextslot()`, `heap_endscan()`), call them and leave
+`rd_tableam` alone; keep the swap only around a single heapam call that processes
+no invalidations.
 
 ### TOAST Override
 

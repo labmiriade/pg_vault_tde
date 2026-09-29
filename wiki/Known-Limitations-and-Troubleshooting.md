@@ -84,12 +84,39 @@ result. Common causes:
   data specifically to make this fail loudly instead of silently decrypting
   as the wrong row.
 
+### `verify_integrity()` reports failed tuples, but every row reads (1.7.1)
+
+Up to 1.7.1 `pg_vault_tde_verify_integrity()` pointed the table's relcache
+entry at heapam for the length of its scan. A relcache invalidation of the
+table during the scan — autovacuum updating its statistics, an `ALTER TABLE`,
+a `GRANT` — put the encrypted access method back, and from then on every tuple
+came back already decrypted and was counted as failed ("encrypted tuple too
+short", "decryption failed"). The data was intact. Run it again, and read the
+rows (`SELECT count(*), count(md5(t::text)) FROM mytable t`); fixed in 1.7.2.
+
 ### `pg_vault_tde_wallet_init()` fails / wallet base directory error
 
 The base directory `/var/lib/pg_vault_tde/` must exist, be owned by the OS
 user running PostgreSQL, and live outside `PGDATA` before the wallet can be
 created. Package installs create it automatically; source builds do not —
 see [Installation](Installation) and [KMS: Local Wallet](KMS-Local-Wallet).
+
+### `wallet_init()` refuses: "no wallet at ..., but N key(s) of this database are wrapped under a local wallet"
+
+The wallet file is gone — lost, moved, or never copied to this server — but
+the database still has tables encrypted under it. A new wallet would hold a
+new KEK that opens none of them. Put the file back from its backup (on a
+standby, copy the primary's) and check `pg_vault_tde.wallet_path`. To start
+over with the old data abandoned, drop the encrypted tables first.
+
+A database created with `CREATE DATABASE ... TEMPLATE` from one with
+encrypted tables is in this state too — its catalog came with the template's
+keys, its wallet directory did not — and a wallet would not help its rows:
+each row's AAD names the database it was written in, so the copied rows never
+authenticate in the clone. Drop those tables there, or `TRUNCATE` them after
+copying the template's `wallet.p12` into `/var/lib/pg_vault_tde/<clone_oid>/`
+if you want to keep the empty tables. To copy encrypted data between
+databases, use `pg_dump_tde` / `pg_restore_tde`.
 
 ### A rotation or `unseal_keys()` call fails with a concurrency error
 

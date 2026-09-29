@@ -1673,18 +1673,20 @@ $$;
 -- CLUSTER rewrites all live tuples in index order using the same
 -- pg_vault_tde_relation_copy_for_cluster path as VACUUM FULL.
 -- Verifies that both TOAST and non-TOAST rows survive clustering
--- with correct decryption.
+-- with correct decryption, in the order of the clustering index — a plain
+-- btree (the primary key).  A tde_btree index is ordered by ciphertext, so
+-- CLUSTER on one is refused (PSQLE-204).
 -- ================================================================
 DO $$
 DECLARE
     large_val text;
     readback  text;
     cnt       int;
+    order_ids text;
+    refused   boolean := false;
 BEGIN
-    
-
     CREATE TABLE tde_cluster_61 (
-        id      int,
+        id      int PRIMARY KEY,
         payload text
     ) USING encrypted_heap;
 
@@ -1698,7 +1700,21 @@ BEGIN
     INSERT INTO tde_cluster_61 VALUES (4, 'small_d');
     INSERT INTO tde_cluster_61 VALUES (2, 'small_b');
 
-    CLUSTER tde_cluster_61 USING tde_cluster_61_idx;
+    BEGIN
+        CLUSTER tde_cluster_61 USING tde_cluster_61_idx;
+    EXCEPTION WHEN feature_not_supported THEN
+        refused := true;
+    END;
+    IF NOT refused THEN
+        RAISE EXCEPTION 'TEST 94 FAILED: CLUSTER on a tde_btree index was not refused';
+    END IF;
+
+    CLUSTER tde_cluster_61 USING tde_cluster_61_pkey;
+
+    SELECT string_agg(id::text, ',' ORDER BY ctid) INTO order_ids FROM tde_cluster_61;
+    IF order_ids IS DISTINCT FROM '1,2,3,4' THEN
+        RAISE EXCEPTION 'TEST 94 FAILED: rows not in index order after CLUSTER: %', order_ids;
+    END IF;
 
     SELECT payload INTO readback FROM tde_cluster_61 WHERE id = 1;
     IF readback IS DISTINCT FROM large_val || '_A' THEN

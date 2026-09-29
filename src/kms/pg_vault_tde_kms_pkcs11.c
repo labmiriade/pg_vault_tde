@@ -1434,7 +1434,8 @@ cleanup:
  * updates in-backend cache state once pg_vault_tde_catalog_rewrap_all()
  * has re-wrapped every row (and, if that fails, PG_CATCH unwinds without
  * ever calling commit — the new key sits unused under "<label>.v<N+1>",
- * harmless, and the next rotation attempt simply reuses or supersedes it).
+ * harmless, and the next rotation, from any session, takes the version above
+ * the highest on the token).
  */
 
 /*
@@ -1452,24 +1453,40 @@ pkcs11_prepare_kek_rotation(void)
     const char *label = pg_vault_tde_pkcs11_key_label;
     char        new_label[PKCS11_LABEL_MAX];
     uint32      new_version;
+    uint32      top_version;
     CK_OBJECT_HANDLE existing;
 
     if (!pkcs11_ensure_session())
         return false;
 
+    /*
+     * Above the highest version on the token, not above this session's: a
+     * rotation that failed after this point — cancelled, timed out, an error
+     * in the re-wrap — leaves its key on the token and this session's
+     * kek_version where it was, and every retry from the session asked for
+     * that same label again (PSQLE-209).
+     */
     new_version = pkcs11_state.kek_version + 1;
+    if (pkcs11_find_current_version(label, &top_version, &existing) &&
+        top_version >= new_version)
+        new_version = top_version + 1;
+    Assert(new_version > pkcs11_state.kek_version);
     pkcs11_kek_label_for_version(label, new_version, new_label,
                                  sizeof(new_label));
 
+    /*
+     * Only a rotation running in another session since the scan above can
+     * have made this label.  Its key may already wrap DEKs: never suggest
+     * removing it.
+     */
     if (pkcs11_find_key_by_label(new_label, &existing))
     {
         ereport(WARNING,
                 errmsg("pg_vault_tde: a key labelled \"%s\" already exists — "
-                       "KEK rotation already in progress or was interrupted",
+                       "another session is rotating the KEK",
                        new_label),
-                errhint("Remove the stale key with the HSM tooling, or just "
-                        "retry: a fresh rotation will pick the next free "
-                        "version."));
+                errhint("Run one KEK rotation at a time; retry once the other "
+                        "has finished."));
         return false;
     }
 
@@ -1648,6 +1665,12 @@ pg_vault_tde_pkcs11_keygen_sql(PG_FUNCTION_ARGS)
     uint32      existing_version;
     CK_OBJECT_HANDLE existing;
     CK_OBJECT_HANDLE kek;
+
+    /* The token is the cluster's; it checked nothing before (PSQLE-206). */
+    if (!tde_caller_is_superuser())
+        ereport(ERROR,
+                (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                 errmsg("pg_vault_tde_pkcs11_keygen requires superuser")));
 
     if (tde_kms_provider() == NULL ||
         strcmp(tde_active_kms_provider->name, "pkcs11") != 0)

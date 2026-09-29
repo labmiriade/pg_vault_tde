@@ -55,6 +55,7 @@ packaged (OS, PG) combinations and what CI exercises on each in the
 > see [Streaming standby and `rotate_online()`](#streaming-standby-and-rotate_online).
 > Every table ever rotated needs a `REINDEX` — see [`rotate_online()` and indexes](#rotate_online-and-indexes) —
 > and so does every partial index on an encrypted table — see [Partial indexes on encrypted tables](#partial-indexes-on-encrypted-tables).
+> Check who created each database's wallet — see [Who may call the key-management functions](#who-may-call-the-key-management-functions).
 > Otherwise nothing has to be done before installing 1.7.2, but existing
 > encrypted tables need one `VACUUM FULL` afterwards — see
 > [Upgrading to 1.7.2](#upgrading-to-172). Rows stay readable either way; until
@@ -622,7 +623,7 @@ DEK access via `pg_vault_tde_kms_get_rel_dek(relid)`:
 ```sql
 SELECT pg_vault_tde_rotate_online('mytable', 1000);
 -- Monitor progress:
-SELECT * FROM pg_vault_tde_rotation_status('mytable');
+SELECT * FROM pg_vault_tde_get_rotation_status('mytable');
 ```
 
 `rotate_online` accepts both table relations and `tde_btree` index relations:
@@ -680,6 +681,35 @@ SELECT pg_vault_tde_rotate_kek();
 > collide across databases: each is 32 independent random bytes in its own
 > database's catalog, and the GCM AAD binds `MyDatabaseId`, so one database's
 > key can never silently decrypt another's rows.
+
+#### One key operation at a time
+
+Each key operation is tested on its own, and against the reads and writes running
+beside it — not against the others: `rotate_online()` (of a table or of a
+`tde_btree` index), `rotate_kek()`, `wallet_change_passphrase()`, `wallet_lock()` /
+`wallet_unlock()`, `migrate_vault_to_wallet()`, `seal_keys()` / `unseal_keys()` and
+`reencrypt_table()`. Until they are (1.8), run them one at a time in each database,
+and start the next only once the previous one has returned and no rotation worker is
+left:
+
+```sql
+SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'pg_vault_tde rotation';  -- 0
+```
+
+`pg_vault_tde_rotation_status` says how each `rotate_online()` ended: `complete`, or
+`failed` when it hit an error or was stopped — `pg_cancel_backend()`,
+`pg_terminate_backend()`, a smart or fast shutdown. A rotation is one transaction, so a
+failed one has changed nothing: run it again. After a crash or an immediate shutdown
+its row stays `running` with no worker behind it; that is the same case. Up to 1.7.1 a
+terminated rotation, or one stopped by a fast shutdown, stayed `running` too.
+
+In particular:
+
+- no `rotate_kek()` or `wallet_change_passphrase()` while a `rotate_online()` runs;
+- no `wallet_lock()` while a rotation runs;
+- no second `rotate_online()`, of another table either, before the first is `complete`;
+- no `unseal_keys()` or `migrate_vault_to_wallet()` while a rotation runs;
+- no `DROP`, `TRUNCATE` or `ALTER TABLE` of a table being rotated.
 
 ---
 
@@ -828,14 +858,14 @@ log stream without any extension-level configuration.
 | Function | Returns | Description |
 |---|---|---|
 | `pg_vault_tde_health_check()` | composite | Status (6 columns: version, build_version, enabled, kms_provider, enc_ops_available, checked_at) |
-| `pg_vault_tde_verify_integrity(regclass)` | record | GCM tag audit scan of all tuples and every out-of-line value they reference — returns `(total_tuples, failed_tuples)`, a row counted once whichever part failed |
+| `pg_vault_tde_verify_integrity(regclass)` | record | GCM tag audit scan of all tuples and every out-of-line value they reference — returns `(total_tuples, failed_tuples)`, a row counted once whichever part failed. Up to 1.7.1 it could count intact rows as failed when the table was invalidated during its scan (autovacuum updating its statistics): on 1.7.1, run it again before acting on a failure |
 | `pg_vault_tde_encrypted_size(regclass)` | record | Encryption storage overhead — returns `(total_tuples, encryption_overhead_bytes)` |
-| `pg_vault_tde_reencrypt_table(regclass, int)` | void | Batch re-encrypt with current DEK (locks table); `int` = batch size, default 1000 |
+| `pg_vault_tde_reencrypt_table(regclass, int)` | void | Batch re-encrypt with current DEK (locks table); `int` = batch size, default 1000. Requires `MAINTAIN` on the table (its owner, `pg_maintain`, superusers) since 1.7.2 — see [Who may call `reencrypt_table()`](#who-may-call-reencrypt_table) |
 | `pg_vault_tde_rotate_online(regclass, int)` | void | BGW-based online rotation: reads continue, writes wait until it commits; accepts both `encrypted_heap` tables and `tde_btree` indexes **(v1.5)** |
 | `pg_vault_tde_get_rotation_status(regclass)` | table | Online rotation progress for one relation (status, tuples_done/total, pct_complete, timestamps) **(v1.5)** |
 | `pg_vault_tde_rotation_status` | view | All in-progress/completed rotations across the cluster; readable by `pg_monitor` **(v1.5)** |
 | `pg_vault_tde_check_plaintext_index_keys()` | table | Meant to list `tde_btree` indexes on a plaintext-key operator class. **Known defect: returns no rows in 1.7.x**, and its `REINDEX` suggestion would not change the operator class. Use the query in [Upgrading to 1.7.2](#upgrading-to-172) instead; replaced in 1.8. `pg_monitor`/superuser only |
-| `pg_vault_tde_wallet_init(text)` | void | Create local wallet and generate KEK **(v1.5)** |
+| `pg_vault_tde_wallet_init(text)` | void | Create local wallet and generate KEK **(v1.5)**; refused while keys of the database are wrapped under a wallet that is missing. Superuser only — the calling role, see [Who may call the key-management functions](#who-may-call-the-key-management-functions) |
 | `pg_vault_tde_wallet_change_passphrase(text, text)` | void | Re-protect wallet with new passphrase and automatically rotate the KEK (`local` provider only); no separate `rotate_kek()` needed. Since 1.7.2 the new passphrase is in effect as soon as the wallet file is rewritten, even if the call then fails **(v1.6)** |
 | `pg_vault_tde_wallet_status()` | composite | Wallet existence, open state, algorithm, last opened, file perms (5 cols) **(v1.6)** |
 | `pg_vault_tde_wallet_unlock(text)` | void | Interactive wallet unlock without PG restart **(v1.6)** |
@@ -962,7 +992,9 @@ newer](#logical-replication-on-postgresql-1711--18x-and-newer) below.
 1.7.2 changes the on-disk tuple layout (**v5**). Nothing has to be exported
 first — every row written by 1.7.0 or 1.7.1 keeps reading, byte for byte — but
 **each encrypted table needs one `VACUUM FULL` after the upgrade**, and until it
-has had one, `UPDATE` on some of its rows can crash the backend.
+has had one, `UPDATE` on some of its rows can crash the backend. Run key rotations
+and wallet operations one at a time, before and after the upgrade alike — see
+[One key operation at a time](#one-key-operation-at-a-time).
 
 ### Why
 
@@ -1402,6 +1434,70 @@ rotations of the table left row versions an old snapshot can still see under a k
 that no longer exists, the index is built without them and marked unusable for older
 transactions, as PostgreSQL does for broken HOT chains.
 
+
+### `CLUSTER` on encrypted tables
+
+Up to 1.7.1, `CLUSTER t USING idx` on an encrypted table compacted it and marked the
+index clustered, but left the rows in the order they were in (PSQLE-204): the extension
+rewrote the table with its own sequential copy and ignored the index. 1.7.2 orders the
+rows as PostgreSQL does, through an index scan or a sort, whichever the planner picks.
+
+A `tde_btree` index is ordered by the ciphertext of its keys, not by their values, so
+`CLUSTER` on one is refused with an error: use `VACUUM FULL` to compact the table, or
+cluster on a plain btree index — the `PRIMARY KEY` and `UNIQUE` constraints of an
+encrypted table are plain btree indexes by default. A table marked clustered on a
+`tde_btree` index by an earlier release makes a plain `CLUSTER t` fail the same way;
+`ALTER TABLE t SET WITHOUT CLUSTER` clears the mark. A sort that outgrows
+`maintenance_work_mem` spills decrypted rows to temporary files, as any sort does — see
+the note on `temp_tablespaces` above.
+
+
+### Who may call `reencrypt_table()`
+
+`pg_vault_tde_reencrypt_table()` rewrites every row of a table: it takes locks, writes
+WAL and leaves the old versions behind until `VACUUM`. Up to 1.7.1 the extension granted
+`EXECUTE` on it to `pg_monitor` — a role meant for monitoring — and checked nothing
+else, so any member of it could rewrite any encrypted table, including tables it had no
+privilege on (PSQLE-205). 1.7.2 also requires the caller to hold `MAINTAIN` on the
+table, as `VACUUM FULL`, `CLUSTER` and `REINDEX` do: the table's owner, members of
+`pg_maintain` and superusers hold it. Granting `EXECUTE` to another role no longer
+lets that role rewrite tables it may not maintain.
+
+**Still on 1.7.1:** take the function away from `pg_monitor`, as a superuser:
+
+```sql
+REVOKE EXECUTE ON FUNCTION pg_vault_tde_reencrypt_table(regclass, int),
+                           pg_vault_tde_reencrypt_table(text, int) FROM pg_monitor;
+```
+
+1.8 removes the grant from the extension script.
+
+
+### Who may call the key-management functions
+
+`wallet_init`, `wallet_unlock`, `wallet_lock`, `wallet_change_passphrase`,
+`migrate_vault_to_wallet`, `seal_keys`, `seal_keys_bytea`, `unseal_keys` and
+`rotate_kek` are `SECURITY DEFINER`, and each checked `superuser()` — which inside such
+a function asks about its owner, the superuser who ran `CREATE EXTENSION`, and is
+always true (PSQLE-206). Only `REVOKE ... FROM PUBLIC` kept them closed, and
+`wallet_init()` is granted to `pg_monitor`: up to 1.7.1 any member of it could create
+the wallet of a database that had none, with a passphrase of its own choosing, and so
+hold the KEK of every table later encrypted there. `pkcs11_keygen()` checked nothing.
+
+1.7.2 checks the role that called the function, whoever has been granted `EXECUTE`:
+all of them require a superuser. Delegating a database's wallet to its owner or to a
+tenant role is planned for 1.8.
+
+**Still on 1.7.1:** take `wallet_init()` away from `pg_monitor`, as a superuser —
+`REVOKE EXECUTE ON FUNCTION pg_vault_tde_wallet_init(text) FROM pg_monitor;` — and
+check that every database with a wallet got it from a superuser. The wallets are the
+directories under `/var/lib/pg_vault_tde/`, one per database OID; each creation left a
+`pg_vault_tde: wallet initialized at "…"` line in the server log, which names the role
+when `log_line_prefix` includes `%u` — otherwise match its time and PID against the
+connection log (`log_connections`). If a wallet may have been created by someone else,
+change its passphrase (`pg_vault_tde_wallet_change_passphrase()`) and rotate the KEK
+(`pg_vault_tde_rotate_kek()`).
+
 ## Compatibility
 
 | Feature | Status | Notes |
@@ -1496,7 +1592,8 @@ make ci-valgrind         # Valgrind memcheck over the full TDE workload (slow: 1
 make ci-cassert          # SQL suites + TAP files on PostgreSQL built --enable-cassert -DUSE_VALGRIND (builds PG from source)
 make ci-wallet           # SQL regression tests (local wallet provider)
 make ci-checksums        # regression tests + page checksum compatibility
-make ci-tap              # 39 TAP test files (starts a real Vault container for the Vault-dependent ones)
+make ci-tap              # 46 TAP test files (starts a real Vault container for the Vault-dependent ones)
+make ci-soak             # tap/43_soak.t alone: 30 min of random writes, rotations and immediate stops against a heap twin (SOAK_MINUTES, SOAK_SEED)
 make ci-isolation        # 3 isolation specs: DEK rotation under load, relation rewrite under a concurrent reader, UPDATE of out-of-line values racing another transaction
 make ci-vault            # Vault integration (Compose-based)
 make ci-openbao          # OpenBao Raft 3-node HA integration (12 tests)
@@ -1508,7 +1605,7 @@ make ci-bench BENCH_ROWS=100000  # with custom row count
 make ci-clean            # Remove test containers and images
 ```
 
-Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 706 assertions across 39 TAP files. Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
+Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 1152 assertions across 46 TAP files (the soak test, `tap/43`, runs only under `make ci-soak`). Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
 - Tests 1-4: extension loaded, access methods and SQL functions registered, wallet unlock
 - Tests 12-14: TAM INSERT/SELECT/UPDATE end-to-end
 - Test 15: DELETE
@@ -1895,7 +1992,8 @@ run against 1.7.2.
   first-query latency matters — it needs a KMS that opens without an interactive unlock
   (see [GUC Parameters](#guc-parameters)).
 - **Put temporary files on encrypted storage.** Any query that spills past `work_mem` —
-  a sort, a hash, a `WITH HOLD` cursor — writes rows that are already decrypted to a
+  a sort, a hash, a `WITH HOLD` cursor, or `CLUSTER`'s sort past
+  `maintenance_work_mem` — writes rows that are already decrypted to a
   temporary file, and no extension hook can intercept it
   ([Limitation 6](#limitations-v17)). Point `temp_tablespaces` at an encrypted
   filesystem, and set `log_temp_files` to see how much spills.
@@ -1994,7 +2092,9 @@ run against 1.7.2.
 - **Check integrity off-peak.** `pg_vault_tde_verify_integrity('t')` verifies the GCM
   tag of every tuple and fetches every out-of-line value it references — a full scan of
   the table and of its TOAST relation. It does not look at chunks no row references,
-  nor at dropped columns.
+  nor at dropped columns. Up to 1.7.1 a failure could be false — autovacuum updating the
+  table's statistics during the scan was enough — so on 1.7.1 run it a second time, and
+  check that the rows read, before treating a table as damaged.
 - **Check health.** `pg_vault_tde_health_check()`, `pg_vault_tde_hw_accel_info()` (is
   AES-NI in use?), and `pg_vault_tde_vault_status()` or `pg_vault_tde_wallet_status()`
   for the KMS — see [SQL Functions](#sql-functions).
@@ -2007,7 +2107,17 @@ run against 1.7.2.
   the KEK. With the local provider the wallet lives outside `PGDATA`, at
   `/var/lib/pg_vault_tde/<db_oid>/wallet.p12`, and `DROP DATABASE` deletes it. Back up the
   wallet file and its passphrase on their own schedule: without them, every dump of that
-  database is undecryptable.
+  database is undecryptable. If the file goes missing, put it back: `wallet_init()`
+  refuses to make a new one while any key of the database is wrapped under a local
+  wallet, since a new KEK would open none of them (before 1.7.2 it made one, and the
+  tables created afterwards were lost when the real file came back).
+- **`CREATE DATABASE ... TEMPLATE` does not copy encrypted data usably.** Every row's AAD
+  names the database it was written in, so the clone's copied rows never authenticate,
+  and its catalog holds keys wrapped under the template's wallet while its own wallet
+  directory is empty. Drop the encrypted tables in the clone — or `TRUNCATE` them, after
+  copying the template's `wallet.p12` into the clone's `/var/lib/pg_vault_tde/<db_oid>/`,
+  to keep the empty tables. Copy encrypted data between databases with `pg_dump_tde` and
+  `pg_restore_tde`.
 - **Standbys** need pg_vault_tde preloaded, the id check above, and access to the KEK —
   a copy of the wallet, or the same Vault or HSM.
 - **Upgrades**: follow the notes for each release. [Upgrading to 1.7.2](#upgrading-to-172)

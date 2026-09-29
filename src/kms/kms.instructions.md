@@ -313,7 +313,7 @@ Rules, each paid for by a lost database in 1.7.1:
 Pruning old versions is not implemented (1.8); `LOCAL_KEK_MAX_VERSIONS` caps the
 ring.  `pg_dump_tde_kms_local.c` has its own reader with the same rules, so a
 dump taken before a rotation restores.  Regression:
-`tap/30_rotate_kek_local_atomicity.t`.
+`tap/30_rotate_kek_atomicity.t`, for every provider.
 
 ### Provider Registration
 
@@ -348,6 +348,13 @@ else if (strcmp(guc_kms_provider, "kmip") == 0)
 > registration happens in the GUC **assign hook**
 > `tde_kms_provider_assign()` in `pg_vault_tde.c` — NOT in `_PG_init`.
 
+### Rotation worker signals (PSQLE-211)
+
+The rotation worker takes SIGTERM as a cancel (`StatementCancelHandler`), never
+`die()`: its progress row is recorded `failed` only by its PG_CATCH, which a FATAL
+skips.  A crash or an immediate shutdown leaves the row `running` with no worker —
+documented, not detectable from the row alone.
+
 ### Local Wallet Provider Rules (`local`)
 
 - Wallet file: `/var/lib/pg_vault_tde/<DB_OID>/wallet.p12` (default; GUC `pg_vault_tde.wallet_path`)
@@ -360,6 +367,11 @@ else if (strcmp(guc_kms_provider, "kmip") == 0)
 - On `unwrap_dek()`: open wallet, derive KEK, `EVP_aes_256_unwrap()`, return plaintext
   DEK to caller's stack frame; `OPENSSL_cleanse(kek, 32)` immediately after
 - Wallet file permissions MUST be `0600` — enforced at create time and in `health_check()`
+- Every wallet write reaches the disk before anything is wrapped under it:
+  `local_write_wallet_ring()` (`.new` + `durable_rename()`), and `wallet_init()`
+  (`O_EXCL`, `pg_fsync`, both directory levels).
+- `wallet_init()` never makes a wallet while a catalog row is `local`: a new KEK
+  opens none of those keys (PSQLE-208).
 - PKCS#11 (HSM-backed keys) is a separate `pkcs11` provider — `local` is software-only
 
 ### PKCS#11 Provider Rules (`pkcs11`, v1.7)
@@ -395,6 +407,12 @@ else if (strcmp(guc_kms_provider, "kmip") == 0)
   resolves the right key regardless of what's current.  `commit_kek_rotation`
   is a pure in-backend cache update — no token-side promotion, hence no
   crash window.
+- The next version is the highest **on the token** + 1, never this
+  backend's `kek_version` + 1: a rotation that failed after
+  `prepare_kek_rotation` left its key there and the cache where it was, and
+  the same session asked for that label forever (PSQLE-209).  A label that
+  exists anyway means a concurrent rotation — its key may already wrap DEKs:
+  never advise removing it.
 - **Cross-backend rotation propagation**: `commit_kek_rotation` is per-
   backend cache state (`Pkcs11State`, a file-scope `static`) — without more,
   an already-connected sibling backend would keep wrapping new DEKs under
@@ -579,6 +597,17 @@ were gone at the next restart (PSQLE-184).  The rules now:
 Regression: `tap/29_rotate_online_concurrent_access.t` (a row lock on
 `pg_vault_tde_catalog` holds the worker inside the window);
 `tap/32_rotate_online_toast.t` for rule 5; `tap/34_standby_rotation.t` for rule 6; `tap/35_rotate_online_indexes.t` for rule 7.
+
+### Who may call: the calling role, never the current one (PSQLE-206)
+
+Most key-management functions are `SECURITY DEFINER`.  Inside them `superuser()`
+and `GetUserId()` are the function's owner — the superuser who ran `CREATE
+EXTENSION` — so a check on them lets through anyone who has been granted
+`EXECUTE`.  Check the role that called the function: `tde_caller_is_superuser()`
+(`superuser_arg(GetOuterUserId())`, `pg_vault_tde_kms.h`); a privilege on a table,
+as in `reencrypt_table()`, with `pg_class_aclcheck(..., GetOuterUserId(), ...)`.
+Every new SQL-callable function that manages keys or rewrites data needs one.
+Regression: `tap/41_reencrypt_table_privileges.t`, `tap/42_security_definer_callers.t`.
 
 ### Evicting many entries is per-database
 

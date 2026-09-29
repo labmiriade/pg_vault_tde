@@ -1,6 +1,6 @@
 # pg_vault_tde Roadmap
 
-> Last updated: 2026-09-29 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 39 TAP files / 706 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 3 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
+> Last updated: 2026-09-29 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 46 TAP files / 1152 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 3 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
 
 ---
 
@@ -333,7 +333,7 @@ distinguishes the builds.
    wrap's integrity check picks the right one, wrapped DEKs are unchanged — and a stale
    session reloads the wallet. `pg_dump_tde` / `pg_restore_tde` read every version too,
    so dumps taken before a rotation restore again. Vault and PKCS#11 already versioned
-   their keys. `tap/30_rotate_kek_local_atomicity.t`.
+   their keys. `tap/30_rotate_kek_atomicity.t` (local only until PSQLE-209).
 
 9. **`migrate_vault_to_wallet()` made every migrated table unreadable (PSQLE-188).** It
    wrapped the DEKs under a KEK derived from its passphrase argument
@@ -484,6 +484,86 @@ distinguishes the builds.
     `ii_ExpressionsState` / `ii_PredicateState`, which pointed into its freed EState.
     `tap/39_index_build_old_snapshot.t`, with a parallel build checked by amcheck.
 
+20. **`CLUSTER` did not order the rows (PSQLE-204).** The TAM's `copy_for_cluster` read
+    the table sequentially and ignored `OldIndex` and `use_sort`: `CLUSTER` compacted,
+    kept every row, marked the index clustered, and left the order unchanged. It is now
+    a port of `heapam_relation_copy_for_cluster` on decrypted copies: an index scan in
+    `OldIndex` order or a tuplesort of decrypted rows, `rewrite_heap_dead_tuple()` for
+    the dead ones, heapam's counters and `pg_stat_progress_cluster` phases; the write
+    of each row (dropped columns NULL, TOAST moved, encryption) is one helper for both
+    paths. `CLUSTER` on a `tde_btree` index, ordered by ciphertext, is refused.
+    `tap/40_cluster_order.t` forces both paths and checks `CLUSTER (VERBOSE)` said
+    which ran. In PG 18 `enable_sort = off` does not steer `plan_cluster_use_sort()`,
+    which compares costs only.
+
+21. **`reencrypt_table()` rewrote any table for any role that could call it
+    (PSQLE-205).** The script grants `EXECUTE` on both overloads to `pg_monitor` (the
+    `text` one is `SECURITY DEFINER`) and the C code checked nothing: a monitoring role
+    rewrote tables it could not even `SELECT`. Now the SQL entry point requires
+    `MAINTAIN` on the table — core's privilege for `VACUUM FULL`, `CLUSTER` and
+    `REINDEX` — of the calling role, `GetOuterUserId()`, since inside the
+    `SECURITY DEFINER` overload the current user is the function's owner. The rotation
+    worker calls the rewrite directly and is unaffected. 1.8: drop the grant to
+    `pg_monitor`, make the `text` overload `SECURITY INVOKER` and check `GetUserId()`.
+    `tap/41_reencrypt_table_privileges.t`.
+
+22. **The key-management functions trusted `superuser()` inside `SECURITY DEFINER`
+    (PSQLE-206).** There it asks about the function's owner and is always true, so only
+    `REVOKE ... FROM PUBLIC` kept nine functions closed — and `wallet_init()` is granted
+    to `pg_monitor`: a monitoring role created a database's wallet with its own
+    passphrase. `pkcs11_keygen()` checked nothing. Now every one of them calls
+    `tde_caller_is_superuser()` (`superuser_arg(GetOuterUserId())`, in
+    `pg_vault_tde_kms.h`, excluded from the frontend clients). `rotate_online()` is not
+    `SECURITY DEFINER` and keeps `superuser()`. 1.8: remove the grant, and delegate a
+    database's wallet through a `pg_vault_tde.wallet_admin_role` GUC (a role, or
+    `owner`). `tap/42_security_definer_callers.t`.
+
+23. **With the wallet file missing, `wallet_init()` made a new one (PSQLE-208).** Its
+    KEK opens none of the database's keys, the tables created next were wrapped under
+    it, and putting the real file back lost those. It now refuses while any catalog row
+    is `local`; `vault` rows do not count, so `migrate_vault_to_wallet()` still starts
+    from `wallet_init()`. A `CREATE DATABASE ... TEMPLATE` clone is refused too: its
+    copied rows never authenticate there (the AAD names the database), and the README
+    now says so. It also wrote the file without `fsync`, the only wallet write
+    that did: the file and both directory levels are now synced. Every other damage —
+    truncated, empty, random bytes, one byte flipped, unreadable, leftover `.new` or
+    `.lock` — already ended in an ERROR without touching the file.
+    `tap/44_damaged_wallet.t`.
+
+24. **`verify_integrity()` counted intact rows as failed (PSQLE-207).** Found by the
+    soak test. It read the raw tuples by pointing the table's relcache entry at heapam
+    for its scan; a relcache invalidation processed meanwhile — autovacuum's statistics,
+    about a minute after a restart — rebuilt the entry with the TAM in it, and every
+    later tuple came back decrypted and failed as ciphertext. It now calls heapam's scan
+    directly (`heap_beginscan()` / `heap_getnextslot()`) and leaves `rd_tableam` alone.
+    `index_fetch_tuple`, the index build scan and `copy_for_cluster` still swap
+    `rd_tableam`; there an invalidation mid-scan can only end in an ERROR, and they hold
+    locks that keep most invalidations out — to be replaced the same way in 1.8.
+    `tap/45_verify_integrity_relcache_inval.t`.
+
+25. **A PKCS#11 KEK rotation that failed could not be retried from its session
+    (PSQLE-209).** Found by the new per-provider `tap/30`: a rotation cancelled after
+    `prepare_kek_rotation()` had made `v<N+1>` on the token left that session at
+    `kek_version = N`, and every retry asked for `v<N+1>` again ("already exists"),
+    while its hint said to retry or to remove the key. The next version is now the
+    highest on the token + 1; the message is left for a concurrent rotation, and no
+    longer suggests deleting a key that may already wrap DEKs. Local and Vault passed
+    every scenario as they were. `tap/30_rotate_kek_atomicity.t`.
+
+26. **A terminated `rotate_online()` stayed `running` for good (PSQLE-211).** The worker
+    handled SIGTERM with `die()`: `pg_terminate_backend()`, or a smart or fast shutdown,
+    ended it with a FATAL, which its PG_CATCH never sees, so nothing recorded `failed`.
+    It now takes SIGTERM as a cancel (`StatementCancelHandler`), and the rotation
+    aborts through the same path as `pg_cancel_backend()`. The data was safe in every
+    case — the TAP stops the worker halfway through the rewrite and checks tags, twin,
+    TOAST, amcheck and generation, before and after a restart. After a crash or an
+    immediate shutdown the row still says `running`; the README says how to tell.
+    `tap/46_rotate_online_interrupted.t`.
+
+**Key operations one at a time (PSQLE-210).** Rotations and wallet operations are
+tested alone and against concurrent DML, not against each other; the README now says
+to run them one at a time per database and lists the combinations to avoid until 1.8.
+
 **New CI stage — `make ci-upgrade`.** Every other suite in this repo reads only data it
 wrote in the same run, so writer and reader always move together and a format-level
 breakage leaves the suite green while data on disk becomes unreadable. That is how the
@@ -493,6 +573,17 @@ declarations in `ci/upgrade-compat.expected`: whether old data is still readable
 whether it can be updated in place. Changing either declaration is a deliberate act that
 shows up in the diff — and the two answers are what decide whether a release needs a
 `VACUUM FULL` note or a dump-with-the-old-binary procedure.
+
+**New soak test — `make ci-soak` (PSQLE-207).** Most defects of this release needed
+several conditions at once — writes, out-of-line values, a dropped column, a rotation, a
+rewrite, a restart — and each TAP covers one combination. `tap/43_soak.t` draws them at
+random for as long as asked (30 minutes by default): rounds of 100 transactions that
+apply the same statement to an encrypted table and to a heap twin, each followed by one
+of VACUUM, VACUUM FULL, CLUSTER, REINDEX, `rotate_online()`, `rotate_kek()` or an
+immediate stop, then contents, whole rows, TOAST values, `verify_integrity()`, amcheck
+and index lookups are checked. It prints its seed; `SOAK_SEED` replays a failed run.
+Skipped in every other stage; the Bitbucket custom pipeline `soak` runs it on PG 17 and
+PG 18.
 
 ---
 

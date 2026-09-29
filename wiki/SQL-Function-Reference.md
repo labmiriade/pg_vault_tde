@@ -16,7 +16,7 @@ each function without being a superuser.
 | Function | Returns | Description |
 |---|---|---|
 | `pg_vault_tde_health_check()` | table: `version`, `enabled`, `kms_provider`, `enc_ops_available`, `checked_at` | Single-row diagnostic snapshot of the extension |
-| `pg_vault_tde_verify_integrity(rel regclass)` | record: `total_tuples`, `failed_tuples` | GCM authentication-tag scan over every tuple in a table, fetching every out-of-line value it references (since 1.7.2) — a failed tuple means tampering or corruption, not a transient error. `total_tuples` counts rows; a row is counted once in `failed_tuples` whether its own tag or one of its TOAST values failed |
+| `pg_vault_tde_verify_integrity(rel regclass)` | record: `total_tuples`, `failed_tuples` | GCM authentication-tag scan over every tuple in a table, fetching every out-of-line value it references (since 1.7.2) — a failed tuple means tampering or corruption, not a transient error. `total_tuples` counts rows; a row is counted once in `failed_tuples` whether its own tag or one of its TOAST values failed. Up to 1.7.1 it could report intact rows as failed when the table was invalidated during its scan (autovacuum): rerun it before acting on a failure there |
 | `pg_vault_tde_encrypted_size(rel regclass)` | record: `total_tuples`, `encryption_overhead_bytes` | Encryption storage overhead for a table |
 | `pg_vault_tde_hw_accel_info()` | record: `openssl_version`, `configured_provider`, `provider_loaded`, `gcm_cipher`, `siv_cipher`, `aes_ni_available` | OpenSSL provider/cipher diagnostics — confirms which hardware acceleration path is active |
 | `pg_vault_tde_vault_status()` | table: `configured`, `auth_method`, `reachable` | Vault/OpenBao connectivity diagnostics |
@@ -28,7 +28,7 @@ each function without being a superuser.
 
 | Function | Returns | Privilege | Description |
 |---|---|---|---|
-| `pg_vault_tde_reencrypt_table(rel regclass \| text, batch_size int DEFAULT 1000)` | void | `pg_monitor` + superuser | Batch re-encrypt every row, and its out-of-line values, with the current DEK; locks the table for the duration |
+| `pg_vault_tde_reencrypt_table(rel regclass \| text, batch_size int DEFAULT 1000)` | void | `EXECUTE` (granted to `pg_monitor`) **and** `MAINTAIN` on the table (since 1.7.2) | Batch re-encrypt every row, and its out-of-line values, with the current DEK; locks the table for the duration |
 | `pg_vault_tde_rotate_online(rel regclass, batch_size int DEFAULT 1000)` | void | Any role* | Online DEK rotation: reads continue, writes wait until it commits; accepts `encrypted_heap` tables and `tde_btree` indexes (see [Key Rotation](Key-Rotation)) |
 | `pg_vault_tde_check_plaintext_index_keys()` | table: `table_name`, `index_name`, `column_name`, `opclass_name`, `suggestion` | `pg_monitor` + superuser | Lists `tde_btree` indexes still using a pre-v1.6 plaintext operator class, with a ready-to-run `REINDEX` command in `suggestion` |
 
@@ -40,7 +40,7 @@ relation.
 
 | Function | Returns | Privilege | Description |
 |---|---|---|---|
-| `pg_vault_tde_wallet_init(passphrase text)` | void | `pg_monitor` + superuser | Create the local wallet and generate its KEK (first-time setup) |
+| `pg_vault_tde_wallet_init(passphrase text)` | void | superuser (the calling role, since 1.7.2; `EXECUTE` is still granted to `pg_monitor`, which the check refuses) | Create the local wallet and generate its KEK (first-time setup; refused while keys of the database are wrapped under a wallet that is missing) |
 | `pg_vault_tde_wallet_status()` | table: `wallet_exists`, `wallet_open`, `kek_algorithm`, `last_opened`, `file_perms` | `pg_monitor` + superuser | Wallet diagnostics |
 | `pg_vault_tde_wallet_unlock(passphrase text)` | void | Superuser only | Interactive wallet unlock — no server restart needed |
 | `pg_vault_tde_wallet_lock()` | void | Superuser only | Evict all DEKs from shared memory and mark the wallet closed |

@@ -148,17 +148,21 @@ stop_server
 # The point of the whole stage: 145 aborted writes through the PG_CATCH
 # handlers, with the allocator validating every pfree().
 log_info "Phase 2: error-path suite, dev passphrase UNSET ..."
-# Phase 1 left a wallet behind under a different passphrase; the error-path
-# suite calls wallet_init() and would fail on the existing file.  Both phases
-# share one PGDATA, so clear it here rather than paying for a second initdb.
-cx bash -c 'rm -f /tmp/pg.log; rm -rf /var/lib/pg_vault_tde/*'
+# Both phases share one PGDATA, rather than paying for a second initdb, and
+# phase 1's tables stay behind, encrypted under phase 1's wallet.  The suite
+# calls wallet_init(), which refuses to make a wallet next to keys wrapped
+# under another one (PSQLE-208): it gets a database of its own, and with it a
+# wallet directory of its own (/var/lib/pg_vault_tde/<db_oid>/).
+cx bash -c 'rm -f /tmp/pg.log'
 start_server ""
+q -v ON_ERROR_STOP=1 -c "CREATE DATABASE errorpath;" >/dev/null 2>&1
+q -d errorpath -v ON_ERROR_STOP=1 -c "CREATE EXTENSION pg_vault_tde;" >/dev/null 2>&1
 $RT cp "$REPO_ROOT/sql/regression_test_errorpath.sql" "$CONTAINER:/tmp/errorpath.sql"
 
 START=$(timer_start)
-if ! q -v ON_ERROR_STOP=1 -f /tmp/errorpath.sql >/dev/null 2>&1; then
+if ! q -d errorpath -v ON_ERROR_STOP=1 -f /tmp/errorpath.sql >/dev/null 2>&1; then
     log_error "CASSERT: error-path suite failed under assertions"
-    q -v ON_ERROR_STOP=1 -f /tmp/errorpath.sql 2>&1 | tail -30
+    q -d errorpath -v ON_ERROR_STOP=1 -f /tmp/errorpath.sql 2>&1 | tail -30
     RC=13
 else
     log_ok "Phase 2 passed ($(timer_fmt "$(timer_elapsed "$START")"))"

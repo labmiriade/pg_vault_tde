@@ -55,6 +55,8 @@
                                        SET_VARSIZE_COMPRESSED, VARHDRSZ_COMPRESSED */
 
 #include "access/rewriteheap.h"
+#include "commands/progress.h"       /* PROGRESS_CLUSTER_* */
+#include "pgstat.h"                   /* pgstat_progress_update_param */
 #include "commands/vacuum.h"
 
 #include "access/toast_compression.h" /* TOAST_PGLZ_COMPRESSION_ID */
@@ -2447,39 +2449,362 @@ tde_without_dropped(HeapTuple plain, TupleDesc desc)
     return out;
 }
 
+/* A plaintext copy the CLUSTER path owns: cleansed, then freed. */
+static void
+tde_cluster_release(HeapTuple tup)
+{
+    if (tup != NULL)
+    {
+        Size hdr = tup->t_data->t_hoff;
+
+        OPENSSL_cleanse((char *) tup->t_data + hdr, tup->t_len - hdr);
+        pfree(tup);
+    }
+}
+
+/*
+ * tde_cluster_write_tuple — heapam's reform_and_rewrite_tuple() for
+ * encrypted_heap.
+ *
+ * plain is the decrypted copy of a tuple the rewrite keeps.  It carries the
+ * original's header (tde_decrypt_heap_tuple() copies it), so it is also the
+ * "old" tuple rewrite_heap_tuple() maps update chains from.  Dropped columns
+ * become NULL, as core does (PSQLE-192); out-of-line values move into
+ * NewTable's TOAST relation — fetched through the TAM, stored again
+ * encrypted; a row that would cross TOAST_TUPLE_THRESHOLD once encrypted is
+ * toasted first (rewriteheap.c re-tests the threshold on what it is handed);
+ * the row is encrypted under OldTable's DEK, which is the one its relid keeps
+ * after finish_heap_swap.  Every plaintext copy made here is cleansed; plain
+ * stays the caller's.
+ */
+static void
+tde_cluster_write_tuple(RewriteState rwstate, Relation OldTable,
+                        Relation NewTable, HeapTuple plain, bool has_dropped)
+{
+    TupleDesc          tupdesc = RelationGetDescr(OldTable);
+    HeapTuple volatile reformed = NULL;
+    HeapTuple volatile flat = NULL;
+    HeapTuple volatile toasted = NULL;
+    HeapTuple volatile enc_new = NULL;
+
+    PG_TRY();
+    {
+        HeapTuple row = plain;
+
+        if (has_dropped)
+            row = reformed = tde_without_dropped(plain, tupdesc);
+
+        /* The on-disk bit is always clear: scan the plaintext. */
+        if (tde_tuple_has_external(row, OldTable))
+        {
+            flat = toast_flatten_tuple(row, tupdesc);
+            row = toasted = pg_vault_tde_toast_tuple(NewTable, flat, NULL, 0);
+            if (toasted == flat)
+                toasted = NULL;
+        }
+        else if (row->t_len + TDE_V4_OVERHEAD > TOAST_TUPLE_THRESHOLD)
+        {
+            HeapTuple small = pg_vault_tde_toast_tuple(NewTable, row, NULL, 0);
+
+            if (small != row)
+                row = toasted = small;
+        }
+
+        enc_new = tde_encrypt_heap_tuple(row, RelationGetRelid(OldTable), tupdesc);
+
+        /*
+         * rewrite_heap_tuple asserts !HeapTupleHasExternal(new).  The bit is
+         * about the plaintext; enc_new's data is ciphertext, with nothing in
+         * it for rewriteheap.c to dereference.
+         */
+        enc_new->t_data->t_infomask &= ~HEAP_HASEXTERNAL;
+
+        rewrite_heap_tuple(rwstate, plain, enc_new);
+    }
+    PG_CATCH();
+    {
+        tde_cluster_release(toasted);
+        tde_cluster_release(flat);
+        tde_cluster_release(reformed);
+        if (enc_new != NULL)
+            pfree(enc_new);
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+
+    tde_cluster_release(toasted);
+    tde_cluster_release(flat);
+    tde_cluster_release(reformed);
+    pfree(enc_new);
+}
+
+/*
+ * tde_cluster_copy — heapam_relation_copy_for_cluster (heapam_handler.c,
+ * the same in PG 17 and 18 but for index_beginscan's signature) on decrypted
+ * copies.  Must run with OldTable impersonating heapam: the scans, the slot
+ * and the index fetch then read raw tuples with their buffer pinned, which
+ * HeapTupleSatisfiesVacuum needs.
+ *
+ * Which tuples are kept, and in what order, is heapam's decision, unchanged:
+ * SnapshotAny and HeapTupleSatisfiesVacuum, rewrite_heap_dead_tuple() for the
+ * dead ones, then either an index scan in OldIndex order, a sort on OldIndex's
+ * keys (use_sort), or — VACUUM FULL — the physical order.  Up to 1.7.2's fix
+ * the TAM always read sequentially: CLUSTER compacted but did not order
+ * (PSQLE-204).  Each kept tuple is decrypted before it is sorted or written,
+ * since the sort computes the index keys from it.  Like any sort of
+ * decrypted rows, one that outgrows maintenance_work_mem spills them to
+ * temporary files in plaintext.
+ */
+static void
+tde_cluster_copy(Relation OldTable, Relation NewTable, Relation OldIndex,
+                 bool use_sort, TransactionId OldestXmin,
+                 TransactionId *xid_cutoff, MultiXactId *multi_cutoff,
+                 double *num_tuples, double *tups_vacuumed,
+                 double *tups_recently_dead)
+{
+    RewriteState    rwstate;
+    IndexScanDesc   indexScan;
+    TableScanDesc   tableScan;
+    HeapScanDesc    heapScan;
+    bool            is_system_catalog = IsSystemRelation(OldTable);
+    Tuplesortstate *tuplesort;
+    TupleDesc       oldTupDesc = RelationGetDescr(OldTable);
+    const bool      has_dropped = tde_desc_has_dropped(oldTupDesc);
+    TupleTableSlot *slot;
+    BufferHeapTupleTableSlot *hslot;
+    BlockNumber     prev_cblock = InvalidBlockNumber;
+
+    Assert(OldTable->rd_tableam == GetHeapamTableAmRoutine());
+    Assert(RelationGetTargetBlock(NewTable) == InvalidBlockNumber);
+
+    rwstate = begin_heap_rewrite(OldTable, NewTable, OldestXmin, *xid_cutoff,
+                                 *multi_cutoff);
+
+    if (use_sort)
+        tuplesort = tuplesort_begin_cluster(oldTupDesc, OldIndex,
+                                            maintenance_work_mem,
+                                            NULL, TUPLESORT_NONE);
+    else
+        tuplesort = NULL;
+
+    if (OldIndex != NULL && !use_sort)
+    {
+        const int   ci_index[] = {
+            PROGRESS_CLUSTER_PHASE,
+            PROGRESS_CLUSTER_INDEX_RELID
+        };
+        int64       ci_val[2];
+
+        ci_val[0] = PROGRESS_CLUSTER_PHASE_INDEX_SCAN_HEAP;
+        ci_val[1] = RelationGetRelid(OldIndex);
+        pgstat_progress_update_multi_param(2, ci_index, ci_val);
+
+        tableScan = NULL;
+        heapScan = NULL;
+#if PG_VERSION_NUM >= 180000
+        indexScan = index_beginscan(OldTable, OldIndex, SnapshotAny, NULL, 0, 0);
+#else
+        indexScan = index_beginscan(OldTable, OldIndex, SnapshotAny, 0, 0);
+#endif
+        index_rescan(indexScan, NULL, 0, NULL, 0);
+    }
+    else
+    {
+        pgstat_progress_update_param(PROGRESS_CLUSTER_PHASE,
+                                     PROGRESS_CLUSTER_PHASE_SEQ_SCAN_HEAP);
+
+        tableScan = table_beginscan(OldTable, SnapshotAny, 0, (ScanKey) NULL);
+        heapScan = (HeapScanDesc) tableScan;
+        indexScan = NULL;
+
+        pgstat_progress_update_param(PROGRESS_CLUSTER_TOTAL_HEAP_BLKS,
+                                     heapScan->rs_nblocks);
+    }
+
+    slot = table_slot_create(OldTable, NULL);
+    hslot = (BufferHeapTupleTableSlot *) slot;
+
+    for (;;)
+    {
+        HeapTuple   tuple;
+        HeapTuple   plain;
+        Buffer      buf;
+        bool        isdead;
+
+        CHECK_FOR_INTERRUPTS();
+
+        if (indexScan != NULL)
+        {
+            if (!index_getnext_slot(indexScan, ForwardScanDirection, slot))
+                break;
+
+            if (indexScan->xs_recheck)
+                elog(ERROR, "CLUSTER does not support lossy index conditions");
+        }
+        else
+        {
+            /* One of the two scans is always open. */
+            if (heapScan == NULL)
+                elog(ERROR, "tde_cluster_copy: no scan open");
+
+            if (!table_scan_getnextslot(tableScan, ForwardScanDirection, slot))
+            {
+                pgstat_progress_update_param(PROGRESS_CLUSTER_HEAP_BLKS_SCANNED,
+                                             heapScan->rs_nblocks);
+                break;
+            }
+
+            if (prev_cblock != heapScan->rs_cblock)
+            {
+                pgstat_progress_update_param(PROGRESS_CLUSTER_HEAP_BLKS_SCANNED,
+                                             (heapScan->rs_cblock +
+                                              heapScan->rs_nblocks -
+                                              heapScan->rs_startblock
+                                              ) % heapScan->rs_nblocks + 1);
+                prev_cblock = heapScan->rs_cblock;
+            }
+        }
+
+        tuple = ExecFetchSlotHeapTuple(slot, false, NULL);
+        buf = hslot->buffer;
+
+        LockBuffer(buf, BUFFER_LOCK_SHARE);
+
+        switch (HeapTupleSatisfiesVacuum(tuple, OldestXmin, buf))
+        {
+            case HEAPTUPLE_DEAD:
+                isdead = true;
+                break;
+            case HEAPTUPLE_RECENTLY_DEAD:
+                *tups_recently_dead += 1;
+                /* fall through */
+            case HEAPTUPLE_LIVE:
+                isdead = false;
+                break;
+            case HEAPTUPLE_INSERT_IN_PROGRESS:
+                if (!is_system_catalog &&
+                    !TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetXmin(tuple->t_data)))
+                    elog(WARNING, "concurrent insert in progress within table \"%s\"",
+                         RelationGetRelationName(OldTable));
+                isdead = false;
+                break;
+            case HEAPTUPLE_DELETE_IN_PROGRESS:
+                if (!is_system_catalog &&
+                    !TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetUpdateXid(tuple->t_data)))
+                    elog(WARNING, "concurrent delete in progress within table \"%s\"",
+                         RelationGetRelationName(OldTable));
+                *tups_recently_dead += 1;
+                isdead = false;
+                break;
+            default:
+                elog(ERROR, "unexpected HeapTupleSatisfiesVacuum result");
+                isdead = false; /* keep compiler quiet */
+                break;
+        }
+
+        LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+
+        if (isdead)
+        {
+            *tups_vacuumed += 1;
+            /* heap rewrite module still needs to see it... */
+            if (rewrite_heap_dead_tuple(rwstate, tuple))
+            {
+                /* A previous recently-dead tuple is now known dead */
+                *tups_vacuumed += 1;
+                *tups_recently_dead -= 1;
+            }
+            continue;
+        }
+
+        *num_tuples += 1;
+
+        plain = tde_decrypt_heap_tuple(tuple, RelationGetRelid(OldTable), oldTupDesc);
+        if (tuplesort != NULL)
+        {
+            /* The sort copies it and computes OldIndex's keys from it. */
+            tuplesort_putheaptuple(tuplesort, plain);
+            pgstat_progress_update_param(PROGRESS_CLUSTER_HEAP_TUPLES_SCANNED,
+                                         *num_tuples);
+        }
+        else
+        {
+            const int   ct_index[] = {
+                PROGRESS_CLUSTER_HEAP_TUPLES_SCANNED,
+                PROGRESS_CLUSTER_HEAP_TUPLES_WRITTEN
+            };
+            int64       ct_val[2];
+
+            tde_cluster_write_tuple(rwstate, OldTable, NewTable, plain, has_dropped);
+
+            ct_val[0] = *num_tuples;
+            ct_val[1] = *num_tuples;
+            pgstat_progress_update_multi_param(2, ct_index, ct_val);
+        }
+        tde_cluster_release(plain);
+    }
+
+    if (indexScan != NULL)
+        index_endscan(indexScan);
+    if (tableScan != NULL)
+        table_endscan(tableScan);
+    ExecDropSingleTupleTableSlot(slot);
+
+    if (tuplesort != NULL)
+    {
+        double      n_tuples = 0;
+
+        pgstat_progress_update_param(PROGRESS_CLUSTER_PHASE,
+                                     PROGRESS_CLUSTER_PHASE_SORT_TUPLES);
+
+        tuplesort_performsort(tuplesort);
+
+        pgstat_progress_update_param(PROGRESS_CLUSTER_PHASE,
+                                     PROGRESS_CLUSTER_PHASE_WRITE_NEW_HEAP);
+
+        for (;;)
+        {
+            HeapTuple   plain;
+
+            CHECK_FOR_INTERRUPTS();
+
+            /*
+             * The sort's own copy, with the original header: it stays in the
+             * sort's memory (the argument is "forward", not "copy"), so it
+             * is cleansed in place, not freed.
+             */
+            plain = tuplesort_getheaptuple(tuplesort, true);
+            if (plain == NULL)
+                break;
+
+            n_tuples += 1;
+            tde_cluster_write_tuple(rwstate, OldTable, NewTable, plain, has_dropped);
+            OPENSSL_cleanse((char *) plain->t_data + plain->t_data->t_hoff,
+                            plain->t_len - plain->t_data->t_hoff);
+            pgstat_progress_update_param(PROGRESS_CLUSTER_HEAP_TUPLES_WRITTEN,
+                                         n_tuples);
+        }
+
+        tuplesort_end(tuplesort);
+    }
+
+    end_heap_rewrite(rwstate);
+}
+
 /*
  * pg_vault_tde_relation_copy_for_cluster
  *
- * Called by VACUUM FULL and CLUSTER to rewrite all live tuples from OldTable
- * into NewTable.
+ * VACUUM FULL and CLUSTER.  heapam's own function cannot run on
+ * encrypted_heap: our scans decrypt and drop the buffer pin
+ * HeapTupleSatisfiesVacuum needs, and it would flatten TOAST pointers out of
+ * ciphertext.  So tde_cluster_copy() runs heapam's logic on decrypted
+ * copies, with OldTable impersonating heapam for the scans (heap_getnext()
+ * checks rd_tableam) — as in pg_vault_tde_index_build_range_scan().
  *
- * We cannot use heapam_relation_copy_for_cluster for two reasons:
- *
- *  1. Buffer-pin problem: table_beginscan dispatches to our TAM override
- *     (pg_vault_tde_scan_getnextslot), which decrypts and calls
- *     ExecForceStoreHeapTuple — releasing the buffer pin before control
- *     returns to us.  HeapTupleSatisfiesVacuum then receives InvalidBuffer
- *     and crashes when it tries to set hint bits via MarkBufferDirtyHint.
- *
- *  2. TOAST problem: heapam's implementation calls toast_flatten_tuple on
- *     enc_raw (ciphertext), which tries to dereference TOAST pointers embedded
- *     in encrypted bytes → wild-pointer dereference → crash.
- *
- * Fix: scan OldTable directly via heap_beginscan / heap_getnext, which
- * bypasses our TAM override and keeps hscan->rs_cbuf valid.
- *
- * TOAST handling: if the decrypted tuple has external TOAST pointers (into
- * OldTable's TOAST relation), we bring all values inline via
- * toast_flatten_tuple (which reads TOAST chunks through our TAM →
- * tde_index_fetch_tuple → decode_slot, so each chunk is auto-decrypted),
- * then re-TOAST into NewTable via pg_vault_tde_toast_tuple (which encrypts
- * each new chunk).
- *
- * rewrite_heap_tuple asserts !HeapTupleHasExternal(newTuple).  For re-toasted
- * tuples we clear HEAP_HASEXTERNAL from enc_new's t_infomask before the call.
- * TOAST chunk cleanup on later DELETE is still correct because
- * pg_vault_tde_tuple_delete scans the decrypted row's attributes
- * (tde_toast_delete_unshared) instead of relying on the flag.
+ * A tde_btree index is ordered by the ciphertext of its keys, which says
+ * nothing about their values: CLUSTER on one is refused rather than done in
+ * that order.  core accepts it because tde_btree inherits btree's
+ * amclusterable, which it cannot drop (see pg_vault_tde_iam.c).
  */
 static void
 pg_vault_tde_relation_copy_for_cluster(Relation OldTable,
@@ -2493,317 +2818,36 @@ pg_vault_tde_relation_copy_for_cluster(Relation OldTable,
                                         double *tups_vacuumed,
                                         double *tups_recently_dead)
 {
-    HeapScanDesc    hscan;
-    HeapTuple       enc_raw;        /* raw ciphertext, points into buffer page */
-    RewriteState    rwstate;
-    TupleDesc       tupdesc = RelationGetDescr(OldTable);
-    const bool      has_dropped = tde_desc_has_dropped(tupdesc);
+    const TableAmRoutine  *saved_am = OldTable->rd_tableam;
+    const TableAmRoutine **rdam = (const TableAmRoutine **) (void *) &OldTable->rd_tableam;
 
-    /*
-     * rd_tableam impersonation: heap_beginscan, heap_getnext, and
-     * heap_endscan all assert rel->rd_tableam == GetHeapamTableAmRoutine().
-     * We swap OldTable->rd_tableam for the duration of the entire scan and
-     * restore it in a single place — after heap_endscan — whether we succeed
-     * or not.  The outer PG_TRY guarantees restoration on any error path
-     * (including errors thrown by the inner per-tuple PG_TRY).
-     *
-     * RelationData is per-backend (local relcache copy), so the swap is safe
-     * from concurrency.
-     */
-    const TableAmRoutine       *saved_am = OldTable->rd_tableam;
-    const TableAmRoutine      **rdam =
-        (const TableAmRoutine **) (void *) &OldTable->rd_tableam;
-
-    rwstate = begin_heap_rewrite(OldTable, NewTable, OldestXmin,
-                                 *xid_cutoff, *multi_cutoff);
+    if (OldIndex != NULL && tde_iam_is_tde_btree_index(OldIndex))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("cannot cluster table \"%s\" on tde_btree index \"%s\"",
+                        RelationGetRelationName(OldTable),
+                        RelationGetRelationName(OldIndex)),
+                 errdetail("A tde_btree index is ordered by the ciphertext of its keys, not by their values."),
+                 errhint("Use VACUUM FULL to compact the table, or CLUSTER on a plain btree index; "
+                         "ALTER TABLE ... SET WITHOUT CLUSTER clears a tde_btree clustering index.")));
 
     TDE_IMPERSONATE_ENTER();
     *rdam = GetHeapamTableAmRoutine();
 
-    /*
-     * Outer PG_TRY: covers the full scan (beginscan → loop → endscan).
-     * Its sole job is to restore *rdam on any error so that subsequent
-     * operations on OldTable see the correct encrypted_heap AM again.
-     * Crypto-material cleanup is handled by the inner per-tuple PG_TRY.
-     */
     PG_TRY();
     {
-        /*
-         * PG17 introduced a mandatory async read stream in heapgettup.
-         * heap_fetch_next_buffer asserts scan->rs_read_stream != NULL, and
-         * the stream is created in heap_beginscan only when SO_TYPE_SEQSCAN
-         * is present.  Without it, every heapgettup call crashes (Assert in
-         * cassert builds, NULL-deref segfault in release builds).  This is
-         * unconditional because it already applies on PG17, the minimum
-         * supported version.
-         */
-        hscan = (HeapScanDesc) heap_beginscan(OldTable, SnapshotAny, 0, NULL,
-                                              NULL,
-                                              SO_TYPE_SEQSCAN |
-                                              SO_ALLOW_STRAT | SO_ALLOW_SYNC);
-
-        while ((enc_raw = heap_getnext((TableScanDesc) hscan,
-                                       ForwardScanDirection)) != NULL)
-        {
-            Buffer          buf = hscan->rs_cbuf;
-            HeapTuple       enc_copy = NULL;
-            /*
-             * volatile: assigned inside PG_TRY(2), read by PG_CATCH(2) after
-             * the longjmp — without it the cleanse/pfree is skipped. 
-             */
-            HeapTuple volatile plain = NULL;
-            HeapTuple volatile plain_for_write = NULL;  /* what gets re-encrypted */
-            HeapTuple volatile enc_new = NULL;
-
-            HTSV_Result     res;
-            bool volatile   had_external = false;
-
-            CHECK_FOR_INTERRUPTS();
-
-            /*
-             * HeapTupleSatisfiesVacuum may set hint bits, which means it can
-             * call MarkBufferDirtyHint — and that asserts the caller holds the
-             * buffer's content lock.  heap_getnext leaves the buffer PINNED but
-             * drops the content lock once it has read the tuple, so the pin
-             * alone is not enough: this used to dirty a shared buffer with no
-             * exclusion at all (caught by make ci-cassert).
-             *
-             * Shared mode is sufficient — LWLockHeldByMe accepts it — and this
-             * mirrors heapam_relation_copy_for_cluster, which wraps its own
-             * HeapTupleSatisfiesVacuum call in exactly the same way.  The pin
-             * still guarantees hscan->rs_cbuf is valid: heap_getnext has not
-             * advanced to the next page yet.
-             */
-            LockBuffer(buf, BUFFER_LOCK_SHARE);
-            res = HeapTupleSatisfiesVacuum(enc_raw, OldestXmin, buf);
-            LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-
-            if (res == HEAPTUPLE_DEAD)
-            {
-                *tups_vacuumed += 1;
-                continue;
-            }
-            if (res == HEAPTUPLE_RECENTLY_DEAD)
-                *tups_recently_dead += 1;
-            else if (res == HEAPTUPLE_LIVE)
-                *num_tuples += 1;
-            /* INSERT_IN_PROGRESS / DELETE_IN_PROGRESS: copy as-is */
-
-            /*
-             * Copy the encrypted tuple out of the buffer page.  heap_getnext
-             * returns a pointer directly into the pinned page; the next call
-             * may advance to a new page and unpin this one.  enc_copy also
-             * serves as the "old" argument to rewrite_heap_tuple for MVCC
-             * mapping.
-             */
-            enc_copy = heap_copytuple(enc_raw);
-
-            /*
-             * No tuple freeze here, deliberately.
-             *
-             * This used to call heap_prepare_freeze_tuple() against a
-             * hand-built VacuumCutoffs, on the reasoning that our wire format
-             * keeps the HeapTupleHeader in plaintext (only [t_hoff..t_len) is
-             * encrypted) so a freeze applied to enc_copy survives into
-             * enc_new.  That reasoning was sound; the call was not.
-             *
-             * VacuumCutoffs has six fields and only three of them —
-             * relfrozenxid, relminmxid, OldestXmin — were reachable from this
-             * call site.  FreezeLimit and MultiXactCutoff, the two the freeze
-             * decision actually turns on, were left as uninitialised stack
-             * memory: freeze/don't-freeze was being decided on garbage, which
-             * risks freezing a tuple still visible to an older snapshot in one
-             * direction and never advancing relfrozenxid in the other.
-             * (Caught by Valgrind memcheck; see make ci-valgrind.)
-             *
-             * It was also redundant.  heapam's own relation_copy_for_cluster
-             * never freezes here either: it hands the cutoffs to
-             * begin_heap_rewrite() — as we already do above — and
-             * rewrite_heap_tuple() then freezes the NEW tuple itself with
-             * state->rs_freeze_xid / rs_cutoff_multi.  enc_new's header is
-             * plaintext, so that freeze lands exactly where this block was
-             * trying to put it, with cutoffs sourced correctly.
-             */
-
-            /*
-             * Inner PG_TRY: protects crypto key material (DEK copy inside
-             * tde_decrypt/encrypt_heap_tuple).  Does NOT touch *rdam — the
-             * outer PG_CATCH owns that responsibility.  PG_RE_THROW propagates
-             * the error upward so the outer handler restores *rdam before the
-             * error reaches the caller.
-             */
-            PG_TRY(2);
-            {
-                plain = tde_decrypt_heap_tuple(enc_copy, RelationGetRelid(OldTable), tupdesc);
-
-                /*
-                 * Dropped columns are rewritten as NULL, as core does.  Copied
-                 * as they were, their out-of-line pointers would point into
-                 * the TOAST relation this rewrite replaces: every whole-row
-                 * read, and every later rotation, then fails on a missing
-                 * chunk (PSQLE-192).
-                 */
-                if (has_dropped)
-                {
-                    HeapTuple reformed = tde_without_dropped(plain, tupdesc);
-                    Size      hdr = plain->t_data->t_hoff;
-
-                    OPENSSL_cleanse((char *) plain->t_data + hdr,
-                                    plain->t_len - hdr);
-                    pfree(plain);
-                    plain = reformed;
-                }
-                plain_for_write = plain;
-
-                /* Header bit is cleared on disk (see tde_encrypt_heap_tuple);
-                 * scan the plaintext, else the re-TOAST migration below is
-                 * skipped and the rewrite keeps OldTable's TOAST pointers. */
-                if (tde_tuple_has_external(plain, OldTable))
-                {
-                    /*
-                     * External TOAST pointers in the decrypted tuple reference
-                     * OldTable's TOAST relation.  Bring all values inline first
-                     * (toast_flatten_tuple reads chunks via our TAM →
-                     * auto-decrypted), then re-TOAST into NewTable
-                     * (pg_vault_tde_toast_tuple encrypts each new chunk).
-                     */
-                    HeapTuple plain_flat;
-
-                    plain_flat = toast_flatten_tuple(plain, tupdesc);
-
-                    /* plain is no longer needed; cleanse before freeing */
-                    {
-                        Size hdr = plain->t_data->t_hoff;
-                        OPENSSL_cleanse((char *) plain->t_data + hdr,
-                                        plain->t_len - hdr);
-                        pfree(plain);
-                        plain = NULL;
-                    }
-
-                    plain_for_write = pg_vault_tde_toast_tuple(NewTable,
-                                                                plain_flat, NULL, 0);
-                    pfree(plain_flat);
-                    had_external = true;
-                }
-                else if (plain->t_len + TDE_V4_OVERHEAD > TOAST_TUPLE_THRESHOLD)
-                {
-                    /*
-                     * No external pointers to migrate, but the tuple would
-                     * cross TOAST_TUPLE_THRESHOLD once encrypted.
-                     *
-                     * rewrite_heap_tuple -> raw_heap_insert re-tests
-                     *     HeapTupleHasExternal(tup) || tup->t_len > TOAST_TUPLE_THRESHOLD
-                     * (rewriteheap.c:615) on the tuple we hand it, exactly as
-                     * heap_prepare_insert does on the insert path.  Passing an
-                     * encrypted tuple over the threshold makes core deform
-                     * ciphertext as varlena attributes and segfault.
-                     *
-                     * Shrink it ourselves first.  pg_vault_tde_toast_tuple
-                     * already reserves TDE_V4_OVERHEAD in its target (see
-                     * pg_vault_tde_toast.c), so what comes back is still under
-                     * the threshold after encryption.
-                     */
-                    HeapTuple plain_small =
-                        pg_vault_tde_toast_tuple(NewTable, plain, NULL, 0);
-
-                    if (plain_small != plain)
-                    {
-                        Size hdr = plain->t_data->t_hoff;
-                        OPENSSL_cleanse((char *) plain->t_data + hdr,
-                                        plain->t_len - hdr);
-                        pfree(plain);
-                        plain = NULL;
-                        plain_for_write = plain_small;
-                        had_external = true;
-                    }
-                }
-
-                /*
-                 * Encrypt the new tuple using OldTable's DEK, not NewTable's.
-                 * After finish_heap_swap the physical file lands under
-                 * OldTable's relid — the catalog entry for OldTable's relid
-                 * must match the DEK used here or every subsequent read will
-                 * get a GCM authentication failure.
-                 */
-                enc_new = tde_encrypt_heap_tuple(plain_for_write,
-                                                 RelationGetRelid(OldTable),
-                                                 RelationGetDescr(OldTable));
-
-                /*
-                 * rewrite_heap_tuple asserts !HeapTupleHasExternal(newTuple):
-                 * it expects TOAST to be flattened inline before the call.
-                 * For re-toasted tuples enc_new has HEAP_HASEXTERNAL set in
-                 * its plaintext header (the bit is valid in the plaintext
-                 * domain — the encrypted data region contains opaque
-                 * ciphertext, not actual TOAST pointers that
-                 * rewrite_heap_tuple could dereference).
-                 *
-                 * Clear the flag so the assertion passes.
-                 * pg_vault_tde_tuple_delete compensates via
-                 * tde_toast_delete_unshared, which does a per-attribute
-                 * VARATT_IS_EXTERNAL scan on the decrypted tuple regardless
-                 * of this flag.
-                 */
-                if (had_external)
-                    enc_new->t_data->t_infomask &= ~HEAP_HASEXTERNAL;
-
-                rewrite_heap_tuple(rwstate, enc_copy, enc_new);
-            }
-            PG_CATCH(2);
-            {
-                /* Cleanse any plaintext key mterial before re-throwing. */
-                if (plain != NULL)
-                {
-                    Size hdr = plain->t_data->t_hoff;
-                    OPENSSL_cleanse((char *) plain->t_data + hdr,
-                                    plain->t_len - hdr);
-                    pfree(plain);
-                }
-                if (plain_for_write != NULL && plain_for_write != plain)
-                {
-                    Size hdr = plain_for_write->t_data->t_hoff;
-                    OPENSSL_cleanse((char *) plain_for_write->t_data + hdr,
-                                    plain_for_write->t_len - hdr);
-                    pfree(plain_for_write);
-                }
-                if (enc_copy != NULL)
-                    pfree(enc_copy);
-                if (enc_new != NULL)
-                    pfree(enc_new);
-                PG_RE_THROW();  /* outer PG_CATCH will restore *rdam */
-            }
-            PG_END_TRY(2);
-
-            /* Cleanse and free plaintext on the success path. */
-            if (plain_for_write != NULL)
-            {
-                Size hdr = plain_for_write->t_data->t_hoff;
-                OPENSSL_cleanse((char *) plain_for_write->t_data + hdr,
-                                plain_for_write->t_len - hdr);
-                pfree(plain_for_write);
-                /* plain == plain_for_write (non-TOAST) or freed early (TOAST) */
-            }
-            pfree(enc_copy);
-            pfree(enc_new);
-        }   /* end while */
-
-        heap_endscan((TableScanDesc) hscan);
-        end_heap_rewrite(rwstate);
+        tde_cluster_copy(OldTable, NewTable, OldIndex, use_sort, OldestXmin,
+                         xid_cutoff, multi_cutoff,
+                         num_tuples, tups_vacuumed, tups_recently_dead);
     }
     PG_CATCH();
     {
-        /*
-         * Restore the AM pointer before re-throwing.  heap_endscan may not
-         * have been reached, but the relcache entry must be left consistent
-         * for any subsequent operation on OldTable in this backend.
-         */
         *rdam = saved_am;
         TDE_IMPERSONATE_EXIT();
         PG_RE_THROW();
     }
     PG_END_TRY();
 
-    /* Restore on the success path (heap_endscan completed normally). */
     *rdam = saved_am;
     TDE_IMPERSONATE_EXIT();
 }
@@ -2947,6 +2991,8 @@ pg_vault_tde_get_tableam_routine(void)
  * ================================================================ */
 #include "funcapi.h"               /* get_call_result_type, BlessTupleDesc */
 #include "utils/lsyscache.h"       /* get_rel_name */
+#include "utils/acl.h"             /* pg_class_aclcheck, aclcheck_error */
+#include "catalog/objectaddress.h" /* get_relkind_objtype */
 #include "utils/builtins.h"        /* quote_identifier */
 /*
  * pg_vault_tde_reencrypt_table(regclass [, batch_size int DEFAULT 1000])
@@ -2985,6 +3031,19 @@ PGDLLEXPORT Datum
 pg_vault_tde_reencrypt_table_sql(PG_FUNCTION_ARGS)
 {
     Oid                 relid = PG_GETARG_OID(0);
+
+    /*
+     * The rewrite takes locks, writes WAL and leaves dead versions behind, so
+     * it asks what core asks for VACUUM FULL, CLUSTER and REINDEX: MAINTAIN on
+     * the table.  EXECUTE on this function used to be enough, and it is
+     * granted to pg_monitor (PSQLE-205).  Asked of the calling role:
+     * GetOuterUserId(), because the text overload is SECURITY DEFINER and
+     * the current user inside it is the function's owner.
+     */
+    if (pg_class_aclcheck(relid, GetOuterUserId(), ACL_MAINTAIN) != ACLCHECK_OK)
+        aclcheck_error(ACLCHECK_NO_PRIV,
+                       get_relkind_objtype(get_rel_relkind(relid)),
+                       get_rel_name(relid));
 
     pg_vault_tde_reencrypt_table(relid);
 
@@ -3278,9 +3337,10 @@ tde_row_toast_readable(HeapTuple plain, TupleDesc desc, MemoryContext cxt)
  * pg_vault_tde_verify_integrity(regclass)
  *   → (total_tuples bigint, failed_tuples bigint)
  *
- * Scans all live tuples in a raw heapam scan (bypassing TAM decrypt) and
- * manually attempts GCM decryption on each.  Catches per-tuple failures
- * via PG_TRY/PG_CATCH so a single corrupted row does not abort the scan.
+ * Scans all live tuples with heapam's own scan, called directly, so they come
+ * back as stored, and attempts GCM decryption on each.  Catches per-tuple
+ * failures via PG_TRY/PG_CATCH so a single corrupted row does not abort the
+ * scan.
  *
  * A row also fails when one of its out-of-line values cannot be fetched —
  * a missing chunk, or one that does not decrypt: the row's own tag says
@@ -3298,7 +3358,6 @@ pg_vault_tde_verify_integrity(PG_FUNCTION_ARGS)
     Relation             rel;
     TupleTableSlot      *slot;
     TableScanDesc        scan;
-    const TableAmRoutine *saved_am;
     volatile int64       total = 0;
     volatile int64       failed = 0;
     MemoryContext volatile toast_cxt = NULL;
@@ -3318,65 +3377,50 @@ pg_vault_tde_verify_integrity(PG_FUNCTION_ARGS)
                                           "pg_vault_tde verify toast",
                                           ALLOCSET_DEFAULT_SIZES);
     /*
-     * Swap rd_tableam to heapam so the scan returns raw encrypted tuples
-     * without triggering our decrypt-on-read wrappers.
+     * heapam's scan, called directly: it returns the tuples as stored.  Not
+     * table_beginscan() with rd_tableam pointed at heapam — that pointer lives
+     * in the relcache entry, and an invalidation of the table processed during
+     * the scan (autovacuum's statistics, any update of its pg_class row)
+     * rebuilt the entry with the TAM in it: every later tuple came back
+     * decrypted and failed as ciphertext (PSQLE-207).
      */
-    saved_am = rel->rd_tableam;
+    slot = MakeSingleTupleTableSlot(RelationGetDescr(rel), &TTSOpsBufferHeapTuple);
+    scan = heap_beginscan(rel, GetActiveSnapshot(), 0, NULL, NULL,
+                          SO_TYPE_SEQSCAN | SO_ALLOW_STRAT | SO_ALLOW_SYNC |
+                          SO_ALLOW_PAGEMODE);
+    while (heap_getnextslot(scan, ForwardScanDirection, slot))
     {
-        const TableAmRoutine **rdam = (const TableAmRoutine **)(void *)&rel->rd_tableam;
-        TDE_IMPERSONATE_ENTER();
-        *rdam = GetHeapamTableAmRoutine();
-    }
-    PG_TRY();
-    {
-        slot = table_slot_create(rel, NULL);
-        scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL);
-        while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
-        {
-            BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) slot;
-            total++;
-            /*
-             * Try to decrypt the raw tuple.  On GCM auth failure the crypto
-             * layer raises ERROR; we catch it and count the failure.
-             * Use PG_TRY(2) to avoid variable shadowing with outer PG_TRY.
-             */
-            PG_TRY(2);
-            {
-                HeapTuple plain = tde_decrypt_heap_tuple(bslot->base.tuple,
-                                                          RelationGetRelid(rel),
-                                                          RelationGetDescr(rel));
+        BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) slot;
 
-                if (toast_cxt != NULL)
-                {
-                    if (!tde_row_toast_readable(plain, RelationGetDescr(rel), toast_cxt))
-                        failed++;
-                    MemoryContextReset(toast_cxt);
-                }
-                pfree(plain);
-            }
-            PG_CATCH(2);
+        Assert(TTS_IS_BUFFERTUPLE(slot) && BufferIsValid(bslot->buffer));
+        total++;
+        /*
+         * Try to decrypt the raw tuple.  On GCM auth failure the crypto
+         * layer raises ERROR; we catch it and count the failure.
+         */
+        PG_TRY();
+        {
+            HeapTuple plain = tde_decrypt_heap_tuple(bslot->base.tuple,
+                                                      RelationGetRelid(rel),
+                                                      RelationGetDescr(rel));
+
+            if (toast_cxt != NULL)
             {
-                failed++;
-                FlushErrorState();
+                if (!tde_row_toast_readable(plain, RelationGetDescr(rel), toast_cxt))
+                    failed++;
+                MemoryContextReset(toast_cxt);
             }
-            PG_END_TRY(2);
+            pfree(plain);
         }
-        table_endscan(scan);
-        ExecDropSingleTupleTableSlot(slot);
+        PG_CATCH();
+        {
+            failed++;
+            FlushErrorState();
+        }
+        PG_END_TRY();
     }
-    PG_CATCH();
-    {
-        const TableAmRoutine **rdam = (const TableAmRoutine **)(void *)&rel->rd_tableam;
-        *rdam = saved_am;
-        TDE_IMPERSONATE_EXIT();
-        PG_RE_THROW();
-    }
-    PG_END_TRY();
-    {
-        const TableAmRoutine **rdam = (const TableAmRoutine **)(void *)&rel->rd_tableam;
-        *rdam = saved_am;
-        TDE_IMPERSONATE_EXIT();
-    }
+    heap_endscan(scan);
+    ExecDropSingleTupleTableSlot(slot);
     table_close(rel, AccessShareLock);
     if (toast_cxt != NULL)
         MemoryContextDelete(toast_cxt);

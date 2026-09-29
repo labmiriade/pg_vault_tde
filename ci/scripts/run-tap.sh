@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ci/scripts/run-tap.sh — Run TAP tests inside the pg-test container
 #
-# Runs every tap/*.t file (39 at the time of writing); see the TAP Tests table
-# in doc/pg_vault_tde.md for what each one covers.  A few examples:
+# Runs every tap/*.t file (46 at the time of writing), or those in TAP_FILES;
+# see the TAP Tests table in doc/pg_vault_tde.md for what each one covers.  A few examples:
 #   - 01_load.t:                   Extension loading and function availability
 #   - 02_backup_local.t:           Backup round-trip, local wallet KMS provider
 #   - 03_backup_vault.t:           Backup round-trip against a real Vault Transit
@@ -85,14 +85,17 @@ START=$(timer_start)
 PROVE_OUT=$(mktemp)
 trap 'rm -f "$PROVE_OUT"; cleanup' EXIT
 
-if $RT exec -u postgres "$CONTAINER" bash -c '
+# TAP_FILES narrows the run (run-soak.sh); the soak variables reach tap/43.
+if $RT exec -u postgres \
+    -e TAP_FILES -e PG_VAULT_TDE_SOAK -e SOAK_MINUTES -e SOAK_ROUNDS -e SOAK_SEED \
+    "$CONTAINER" bash -c '
     PGV=$(pg_config --version | awk "{print \$2}" | cut -d. -f1)
     export PATH="/usr/lib/postgresql/${PGV}/bin:$PATH"
     export PGDATA="/var/lib/postgresql/data"
     export PERL5LIB="/usr/lib/postgresql/${PGV}/lib/pgxs/src/test/perl${PERL5LIB:+:$PERL5LIB}"
     export PG_REGRESS="/usr/lib/postgresql/${PGV}/lib/pgxs/src/test/regress/pg_regress"
     cd /test
-    prove -v --failures tap/*.t 
+    prove -v --failures ${TAP_FILES:-tap/*.t}
 ' 2>&1 | tee "$PROVE_OUT"; then
     ELAPSED=$(timer_elapsed "$START")
     log_ok "TAP: ALL TESTS PASSED ($(timer_fmt "$ELAPSED"))"
