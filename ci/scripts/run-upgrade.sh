@@ -66,7 +66,8 @@ fi
 EXP_READABLE="$(grep -E '^readable_after_upgrade=' "$EXPECTED_FILE" | cut -d= -f2)"
 EXP_UPDATE="$(grep -E '^update_in_place_before_vacuum=' "$EXPECTED_FILE" | cut -d= -f2)"
 EXP_WHOLEROW="$(grep -E '^whole_row_read_before_vacuum=' "$EXPECTED_FILE" | cut -d= -f2)"
-log_info "Declared: readable_after_upgrade=$EXP_READABLE update_in_place_before_vacuum=$EXP_UPDATE whole_row_read_before_vacuum=$EXP_WHOLEROW"
+EXP_PARTIAL="$(grep -E '^partial_index_results_before_reindex=' "$EXPECTED_FILE" | cut -d= -f2)"
+log_info "Declared: readable_after_upgrade=$EXP_READABLE update_in_place_before_vacuum=$EXP_UPDATE whole_row_read_before_vacuum=$EXP_WHOLEROW partial_index_results_before_reindex=$EXP_PARTIAL"
 
 # ── Images: baseline (from the tag's own tree) and current ───────────────
 BASELINE_IMAGE="pg-tde-baseline:${BASELINE}-pg${PG_MAJOR}"
@@ -137,6 +138,8 @@ SELECT md5(string_agg(x, '|' ORDER BY x)) FROM (
     SELECT 'd:' || id || ':' || v                           AS x FROM up_dropped
     UNION ALL
     SELECT 'r:' || id || ':' || v                           AS x FROM up_dropped_rot
+    UNION ALL
+    SELECT 'q:' || id || ':' || customer || ':' || status   AS x FROM up_partial
 ) s;
 SQL
 
@@ -200,6 +203,17 @@ INSERT INTO up_dropped_rot SELECT g, 'v' || g, string_agg(md5((g * 1000 + s)::te
   FROM generate_series(1, 10) g, generate_series(1, 400) s GROUP BY g;
 ALTER TABLE up_dropped_rot DROP COLUMN gone;
 VACUUM FULL up_dropped_rot;
+
+-- PSQLE-198: a partial index the baseline builds with every row in it.  Up to
+-- 1.7.1 the TAM's build scan ignored the predicate, and the planner drops the
+-- quals the predicate implies: customer 7 has no open order, yet a query
+-- through this index returns every one of its orders.
+CREATE TABLE up_partial (id int4, customer int4, status text) USING encrypted_heap;
+INSERT INTO up_partial SELECT g, g % 50, CASE WHEN g % 10 = 0 THEN 'open' ELSE 'closed' END
+  FROM generate_series(1, 2000) g;
+CREATE INDEX up_partial_open ON up_partial USING tde_btree (customer tde_int4_enc_ops)
+  WHERE status = 'open';
+ANALYZE up_partial;
 
 CHECKPOINT;
 SQL
@@ -332,6 +346,53 @@ if [[ -n "$DEL_ERR" ]]; then
     exit 2
 fi
 log_ok "PROBE E: DELETE copes with them"
+
+# ── Probe F: a partial index the baseline built with every row ───────────
+# up_partial_open was built by the baseline, whose build scan ignored the
+# predicate (PSQLE-198).  Declared, like Probe B: whether a query through it
+# answers what a sequential scan answers before any REINDEX.  Then the README
+# query must find it, and REINDEX must make it right.
+log_info "Probe F — a partial index built by $BASELINE ..."
+Q_IDX="SET enable_seqscan = off; SET enable_bitmapscan = off; SELECT count(*) FROM up_partial WHERE customer = 7 AND status = 'open'"
+Q_SEQ="SET enable_indexscan = off; SET enable_indexonlyscan = off; SET enable_bitmapscan = off; SELECT count(*) FROM up_partial WHERE customer = 7 AND status = 'open'"
+BY_SEQ="$(container_psql "$CONTAINER" -q -tAc "$Q_SEQ" 2>/dev/null | tr -d '[:space:]')"
+BY_IDX="$(container_psql "$CONTAINER" -q -tAc "$Q_IDX" 2>/dev/null | tr -d '[:space:]')"
+if [[ "$BY_IDX" == "$BY_SEQ" ]]; then
+    ACT_PARTIAL=right
+    log_ok "Probe F: the partial index answers what a sequential scan does ($BY_SEQ)"
+else
+    ACT_PARTIAL=wrong
+    log_warn "Probe F: through the partial index $BY_IDX rows, by sequential scan $BY_SEQ"
+fi
+if [[ "$ACT_PARTIAL" != "$EXP_PARTIAL" ]]; then
+    log_error "UPGRADE: partial_index_results_before_reindex is '$ACT_PARTIAL', ci/upgrade-compat.expected declares '$EXP_PARTIAL'."
+    log_error "        Either fix the change, or flip the declaration AND say so in the release notes."
+    exit 2
+fi
+
+# The query README -> "Partial indexes on encrypted tables" gives users.
+# Keep the two copies identical.
+read -r -d '' FIND_PARTIAL <<'SQL' || true
+SELECT ix.indexrelid::regclass AS index_name, ix.indrelid::regclass AS table_name
+FROM pg_index ix
+JOIN pg_class t ON t.oid = ix.indrelid
+JOIN pg_am    a ON a.oid = t.relam AND a.amname = 'encrypted_heap'
+WHERE ix.indpred IS NOT NULL
+ORDER BY 1;
+SQL
+FOUND="$(container_psql "$CONTAINER" -tA -F '|' -c "$FIND_PARTIAL" 2>&1 | cut -d'|' -f1 | tr '\n' ' ' | sed 's/ *$//')"
+if [[ "$FOUND" != "up_partial_open" ]]; then
+    log_error "PROBE F: the README detection query found '$FOUND', expected 'up_partial_open'"
+    exit 2
+fi
+container_psql "$CONTAINER" -v ON_ERROR_STOP=1 -q -c "REINDEX INDEX up_partial_open;" \
+    || { log_error "PROBE F: REINDEX of the baseline's partial index failed"; exit 2; }
+BY_IDX="$(container_psql "$CONTAINER" -q -tAc "$Q_IDX" 2>/dev/null | tr -d '[:space:]')"
+if [[ "$BY_IDX" != "$BY_SEQ" ]]; then
+    log_error "PROBE F: after REINDEX the partial index still returns $BY_IDX rows, a sequential scan $BY_SEQ"
+    exit 2
+fi
+log_ok "PROBE F: the README query finds it, and REINDEX makes it right"
 
 # ── Gate C: the documented remedy has to work ────────────────────────────
 log_info "Gate C — VACUUM FULL must migrate the rows without altering them ..."

@@ -53,7 +53,8 @@ packaged (OS, PG) combinations and what CI exercises on each in the
 > [`rotate_online()` and out-of-line values](#rotate_online-and-out-of-line-values).
 > A standby promoted while still on 1.7.1 must be restarted before its first write —
 > see [Streaming standby and `rotate_online()`](#streaming-standby-and-rotate_online).
-> Every table ever rotated needs a `REINDEX` — see [`rotate_online()` and indexes](#rotate_online-and-indexes).
+> Every table ever rotated needs a `REINDEX` — see [`rotate_online()` and indexes](#rotate_online-and-indexes) —
+> and so does every partial index on an encrypted table — see [Partial indexes on encrypted tables](#partial-indexes-on-encrypted-tables).
 > Otherwise nothing has to be done before installing 1.7.2, but existing
 > encrypted tables need one `VACUUM FULL` afterwards — see
 > [Upgrading to 1.7.2](#upgrading-to-172). Rows stay readable either way; until
@@ -1348,6 +1349,39 @@ uniqueness checks included — and still rebuilds the `tde_btree` ones. The new 
 take no lock beyond the rotation's own; only the `tde_btree` rebuild at the end locks
 its index. `tap/35_rotate_online_indexes.t`.
 
+
+### Partial indexes on encrypted tables
+
+`CREATE INDEX` and `REINDEX` on an encrypted table run the extension's own build scan,
+which decrypts each row before computing its keys. Up to 1.7.1 it never evaluated the
+index predicate, so a partial index (`CREATE INDEX ... WHERE ...`) received every row
+(PSQLE-198):
+
+- **queries through it can return wrong rows.** The planner drops the conditions the
+  predicate implies, trusting the index to hold only rows that satisfy it: with an
+  index on `(customer) WHERE status = 'open'`, `WHERE customer = 7 AND status = 'open'`
+  returned every order of customer 7;
+- a valid `CREATE UNIQUE INDEX ... WHERE ...` was refused when the key repeated outside
+  the predicate;
+- partial indexes were as large as full ones.
+
+**After installing 1.7.2:** `REINDEX` every partial index on an encrypted table. This
+lists them:
+
+```sql
+SELECT ix.indexrelid::regclass AS index_name, ix.indrelid::regclass AS table_name
+FROM pg_index ix
+JOIN pg_class t ON t.oid = ix.indrelid
+JOIN pg_am    a ON a.oid = t.relam AND a.amname = 'encrypted_heap'
+WHERE ix.indpred IS NOT NULL
+ORDER BY 1;
+```
+
+Until it is rebuilt, a partial index can answer wrongly; `REINDEX INDEX CONCURRENTLY`
+rebuilds it without blocking writes. `make ci-upgrade` builds one with 1.7.1 and checks
+that this query finds it and that `REINDEX` makes it answer what a sequential scan
+answers.
+
 ## Compatibility
 
 | Feature | Status | Notes |
@@ -1454,7 +1488,7 @@ make ci-bench BENCH_ROWS=100000  # with custom row count
 make ci-clean            # Remove test containers and images
 ```
 
-Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 689 assertions across 38 TAP files. Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
+Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 690 assertions across 38 TAP files. Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
 - Tests 1-4: extension loaded, access methods and SQL functions registered, wallet unlock
 - Tests 12-14: TAM INSERT/SELECT/UPDATE end-to-end
 - Test 15: DELETE

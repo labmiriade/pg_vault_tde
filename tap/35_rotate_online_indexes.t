@@ -15,9 +15,7 @@
 # indexes: the PRIMARY KEY, a UNIQUE constraint, a plain btree, a partial one
 # and a tde_btree.  After each step five checks: a lookup through each index,
 # a range through the plain btree that must return every row, amcheck's
-# heapallindexed on every full btree (not the partial one: the TAM's build
-# scan does not apply index predicates, which amcheck relies on — a separate
-# defect), and a duplicate key and a duplicate unique
+# heapallindexed on every btree, and a duplicate key and a duplicate unique
 # value that must be refused.  Steps: before any rotation, rotation #1,
 # VACUUM, a restart, rotation #2.
 use strict;
@@ -76,7 +74,7 @@ sub check
 
     ($rc, $out, $err) = $node->psql('postgres', q{
         SELECT bt_index_check(i, true) FROM unnest(ARRAY[
-            'ri_pkey', 'ri_u_key', 'ri_k']::regclass[]) i});
+            'ri_pkey', 'ri_u_key', 'ri_k', 'ri_k_even']::regclass[]) i});
     is($rc, 0, "$when: amcheck finds every row in every btree") or diag $err;
 
     ($rc, $out, $err) = $node->psql('postgres',

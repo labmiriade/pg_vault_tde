@@ -1,6 +1,6 @@
 # pg_vault_tde Roadmap
 
-> Last updated: 2026-09-29 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 38 TAP files / 689 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 3 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
+> Last updated: 2026-09-29 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 38 TAP files / 690 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 3 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
 
 ---
 
@@ -456,6 +456,19 @@ distinguishes the builds.
     kills the row. `tap/37_speculative_abort_toast.t` makes the race deterministic
     without injection points: an expression index filled before the unique one blocks
     on an advisory lock between the speculative insert and the unique check.
+
+18. **Partial indexes were built with every row (PSQLE-198).** The TAM's own
+    `index_build_range_scan` (it must decrypt before `FormIndexDatum`) never evaluated
+    `ii_Predicate`: a valid `UNIQUE ... WHERE` was refused, partial indexes held every
+    row, and since the planner drops the quals a predicate implies, queries through one
+    returned rows that do not satisfy it (40 instead of 0 in `ci-upgrade`). Also in
+    1.7.1. Now the scan prepares and checks the predicate as heapam does, counting
+    `reltuples` before it — that count becomes the heap's statistics. Users must
+    `REINDEX` their existing partial indexes. `tap/38_partial_index_build.t` against a
+    plain heap twin; `ci-upgrade` Probe F on an index 1.7.1 built
+    (`partial_index_results_before_reindex=wrong`); tap/35's amcheck now covers its
+    partial index too. The CREATE INDEX CONCURRENTLY validation scan already checked
+    the predicate.
 
 **New CI stage — `make ci-upgrade`.** Every other suite in this repo reads only data it
 wrote in the same run, so writer and reader always move together and a format-level

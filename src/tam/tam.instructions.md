@@ -47,6 +47,15 @@ and `tde_toast_delete_unshared()` — used by UPDATE and DELETE — counts them.
 1.7.1 left their pointers dangling, and HEAP_HASEXTERNAL must not make core follow
 them.  Regression: `tap/33_toast_lifecycle.t`, `ci-upgrade` Probe E.
 
+### The index build scan must do what heapam's does (PSQLE-198)
+
+`pg_vault_tde_index_build_range_scan` replaces heapam's so that `FormIndexDatum`
+sees plaintext.  Every part of heapam's scan that decides which rows reach the index
+has to be there too: the partial-index predicate (`ExecPrepareQual` /
+`ExecQual`, with `reltuples` counted before it), HOT root line pointers.  Still
+missing, and a known gap: heapam uses `SnapshotAny` and indexes recently-dead
+tuples, setting `ii_BrokenHotChain`; this scan uses a fresh MVCC snapshot.
+
 ### Every place heapam deletes TOAST itself needs a TAM counterpart (PSQLE-197)
 
 heapam decides to delete a row's TOAST from the on-disk `HEAP_HASEXTERNAL`, which

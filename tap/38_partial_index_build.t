@@ -6,14 +6,17 @@
 # evaluated the index predicate: a partial index received every row, so a
 # valid UNIQUE ... WHERE was refused on duplicates outside the predicate, a
 # plain partial index was as large as a full one, and amcheck's
-# heapallindexed, which relies on the same scan, reported rows "missing"
-# (PSQLE-198).
+# heapallindexed, which relies on the same scan, reported rows "missing" —
+# and queries through a partial index returned wrong rows: the planner drops
+# the quals the predicate implies, trusting the index to hold only rows that
+# satisfy it (PSQLE-198).
 #
 # A plain heap twin with the same data is the reference: after CREATE INDEX
 # and after REINDEX the encrypted table must accept the same UNIQUE partial
 # index, refuse and accept the same inserts, end up with a partial index of
-# the same size, pass amcheck, answer through a tde_btree partial index, and
-# keep the heap's reltuples a count of all its rows.
+# the same size, pass amcheck, answer through a partial index what a
+# sequential scan answers, answer through a tde_btree partial index, and keep
+# the heap's reltuples a count of all its rows.
 use strict;
 use warnings;
 use Test::More;
@@ -21,7 +24,7 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 END { system('/bin/sh', '-c', 'rm -rf /var/lib/pg_vault_tde/*') }
 
-plan tests => 10;
+plan tests => 11;
 
 system('/bin/sh', '-c', 'rm -rf /var/lib/pg_vault_tde/*');
 my $node = PostgreSQL::Test::Cluster->new('partial_index');
@@ -65,7 +68,16 @@ $node->safe_psql('postgres', q{
     CREATE INDEX ph_id_small ON ph (id) WHERE id <= 10;
     CREATE INDEX pe_id_small ON pe (id) WHERE id <= 10;
     CREATE INDEX pe_s_small ON pe USING tde_btree (s) WHERE id <= 10;
+    CREATE INDEX pe_code_live ON pe (code) WHERE active;
+    VACUUM ANALYZE pe;
 });
+is($node->safe_psql('postgres', q{
+       SET enable_seqscan = off; SET enable_bitmapscan = off;
+       SELECT count(*) FROM pe WHERE code = 3 AND active}),
+   $node->safe_psql('postgres', q{
+       SET enable_indexscan = off; SET enable_indexonlyscan = off; SET enable_bitmapscan = off;
+       SELECT count(*) FROM pe WHERE code = 3 AND active}),
+   'encrypted_heap: a query through a partial index returns what a sequential scan does');
 is($node->safe_psql('postgres', "SELECT pg_relation_size('pe_id_small')"),
    $node->safe_psql('postgres', "SELECT pg_relation_size('ph_id_small')"),
    'encrypted_heap: a partial index is the size of the heap twin\'s');

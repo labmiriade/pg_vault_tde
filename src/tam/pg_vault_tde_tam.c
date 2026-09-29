@@ -1054,6 +1054,7 @@ pg_vault_tde_index_build_range_scan(Relation heap_rel,
     Snapshot                snapshot = NULL;
     EState                 *estate;
     ExprContext            *econtext;
+    ExprState              *predicate;
     TupleTableSlot         *slot;
     double                  reltuples = 0;
     Datum                   values[INDEX_MAX_KEYS];
@@ -1078,6 +1079,8 @@ pg_vault_tde_index_build_range_scan(Relation heap_rel,
     econtext = GetPerTupleExprContext(estate);
     slot     = table_slot_create(heap_rel, NULL);
     econtext->ecxt_scantuple = slot;
+    /* A partial index takes only the rows its predicate admits (PSQLE-198). */
+    predicate = ExecPrepareQual(index_info->ii_Predicate, estate);
     /*
      * Open a table scan if the caller did not provide one.
      * The scan goes through our TableAmRoutine, so scan_getnextslot
@@ -1174,6 +1177,15 @@ pg_vault_tde_index_build_range_scan(Relation heap_rel,
              */
             if (!tupleIsAlive)
                 continue;
+
+            /*
+             * Counted before the predicate, as heapam does: this becomes the
+             * heap's reltuples, which a partial index must not shrink.
+             */
+            reltuples += 1;
+
+            if (predicate != NULL && !ExecQual(predicate, econtext))
+                continue;
             /*
              * Switch to per-tuple context for FormIndexDatum evaluation
              * and index-key encryption.  These allocations are ephemeral
@@ -1267,7 +1279,6 @@ pg_vault_tde_index_build_range_scan(Relation heap_rel,
                 callback(index_rel, &itid, values, isnull,
                          tupleIsAlive, callback_state);
             }
-            reltuples += 1;
         }
     }
     if (own_scan)
