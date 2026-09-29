@@ -33,7 +33,7 @@ written by a person - see the RFC in
 - The **integrity** of those values: damaged ciphertext is refused, never decrypted
   into a wrong value, and a ciphertext moved to another database, relation or key
   generation is refused. Integrity against someone who *writes* the data files, within
-  one relation, is not claimed ([PSQLE-177](#findings), [1.8 (v5 layout, to be opened)](#findings)).
+  one relation, is not claimed ([PSQLE-177](#findings), [PSQLE-218](#findings)).
 
 ### Attackers in scope
 
@@ -72,7 +72,7 @@ A review does not treat these as findings; the design does not defend against th
    the [accepted risks](#accepted-risks).
 2. Every ciphertext is authenticated before any byte of its plaintext is used, and a
    failure is an error, never a value. What the tag covers is exactly what
-   [PSQLE-177](#findings) and [1.8 (v5 layout, to be opened)](#findings) say.
+   [PSQLE-177](#findings) and [PSQLE-218](#findings) say.
 3. No key is written to disk unwrapped, logged, or returned by an SQL function.
 4. Key material is cleansed (`OPENSSL_cleanse`) as soon as it is no longer needed,
    on the error paths too.
@@ -110,7 +110,7 @@ its ID) or *not applicable*. File names are starting points, not limits.
 - [ ] The tag is verified before any plaintext is used; a failure raises an error and
       frees the buffers.
 - [ ] The AAD is rebuilt from the reader's context, not read from disk, and the tag
-      covers what [PSQLE-177](#findings) and [1.8 (v5 layout, to be opened)](#findings) say - no more is claimed anywhere.
+      covers what [PSQLE-177](#findings) and [PSQLE-218](#findings) say - no more is claimed anywhere.
 - [ ] AES-256-SIV for `tde_btree` keys: key length, determinism limited to equality,
       no plaintext key reaches the index page.
 - [ ] Key wrapping: AES-256 key wrap (local), transit (Vault), `CKM_AES_KEY_WRAP_PAD`
@@ -138,7 +138,7 @@ its ID) or *not applicable*. File names are starting points, not limits.
 ### SQL surface - `sql/pg_vault_tde--1.7.sql` and the C functions it binds
 
 - [ ] Every function: its `GRANT`s, and whether it is `SECURITY DEFINER`; every
-      `SECURITY DEFINER` function has a fixed `search_path` ([1.8 (search_path, to be opened)](#findings)).
+      `SECURITY DEFINER` function has a fixed `search_path` ([PSQLE-217](#findings)).
 - [ ] Every privileged function checks the calling role, not the owner
       ([PSQLE-205](#findings), [PSQLE-206](#findings)).
 - [ ] Every GUC: context (`PGC_SUSET` or `PGC_POSTMASTER`), `GUC_SUPERUSER_ONLY` on
@@ -205,15 +205,14 @@ review checks that the documentation still says what the code does.
 | **Legacy `tde_btree` operator classes store keys in plaintext** (`tde_int4_ops`, `tde_int8_ops`, `tde_uuid_ops`, `tde_date_ops`, `tde_timestamptz_ops`) | The classes are kept only for indexes already built on them, and a new index can use them only with `allow_plaintext_index = on`; 1.8 removes the classes. Native btree indexes, which the same setting allows, are not affected | [pg_vault_tde.md › Operator Class](pg_vault_tde.md#operator-class); [README › SQL Functions](../README.md#sql-functions) (`check_plaintext_index_keys`, known defect) |
 | **`PRIMARY KEY` and `UNIQUE` constraints are backed by a native btree**, with the key in plaintext | Core builds that index itself; the extension can only warn | [README › What Gets Encrypted](../README.md#what-gets-encrypted); [README › Designing encrypted tables](../README.md#designing-encrypted-tables) |
 | **Logical decoding sends plaintext**: the output plugin decrypts for subscribers | That is its purpose; the stream needs TLS and the subscriber its own encryption | [pg_vault_tde.md › Logical Decoding and Replication](pg_vault_tde.md#logical-decoding-and-replication) and [› Structural limitations](pg_vault_tde.md#structural-limitations) |
-| **The tag binds database, relation, key generation and the value bytes - not a tuple's position, its header, or the layout that divides its bytes among variable-length attributes** ([PSQLE-177](#findings), [1.8 (v5 layout, to be opened)](#findings)) | heapam chooses a tuple's place after the tuple, ciphertext included, has been formed; core rewrites the header without the key. The layout could be authenticated: 1.8 | [pg_vault_tde.md › What the authentication tag does not cover](pg_vault_tde.md#what-the-authentication-tag-does-not-cover) |
+| **The tag binds database, relation, key generation and the value bytes - not a tuple's position, its header, or the layout that divides its bytes among variable-length attributes** ([PSQLE-177](#findings), [PSQLE-218](#findings)) | heapam chooses a tuple's place after the tuple, ciphertext included, has been formed; core rewrites the header without the key. The layout could be authenticated: 1.8 | [pg_vault_tde.md › What the authentication tag does not cover](pg_vault_tde.md#what-the-authentication-tag-does-not-cover) |
 
 ---
 
 ## Findings
 
 One row per ticket, and a ticket that covers two findings lists both. Every finding
-has a ticket; the two planned for 1.8 get their number when they are opened. This table
-changes in the commit that changes a status. Findings describe what to correct, not how
+has a ticket. This table changes in the commit that changes a status. Findings describe what to correct, not how
 to exploit it.
 
 Severity: **High** — breaks a property above for an attacker in scope, or grants a
@@ -228,8 +227,8 @@ documentation gap.
 | PSQLE-180 | Supply chain | GitHub Actions pinned by tag rather than by commit; floating container images in CI (`openbao:2`, `vault:latest`) | Medium | Open |
 | PSQLE-205 | SQL surface | `pg_vault_tde_reencrypt_table()`, granted to `pg_monitor`, rewrote any table without a privilege check | Medium | Fixed in 1.7.2: requires `MAINTAIN` on the table, checked on the calling role; removing the grant is 1.8 (PSQLE-212) |
 | PSQLE-206 | SQL surface | (1) The key-management functions checked `superuser()` inside `SECURITY DEFINER`, which is the owner; `wallet_init()` is granted to `pg_monitor`; `pkcs11_keygen()` checked nothing. (2) `pg_vault_tde_seal_keys()` and `pg_vault_tde_unseal_keys()` write and read a file on the server at a path the caller chooses | High | Fixed in 1.7.2: the calling role must be a superuser — for (2) the same power as writing server files; removing the grant is 1.8 (PSQLE-212) |
-| 1.8 (search_path, to be opened) | SQL surface | The 12 `SECURITY DEFINER` functions run without a fixed `search_path`; two are `LANGUAGE SQL` (`pg_vault_tde_reencrypt_table(text, int)`, `pg_vault_tde_check_plaintext_index_keys()`). The fix changes the extension script. Until then, a superuser can run `ALTER FUNCTION … SET search_path = pg_catalog, <extension schema>` on each, and revoke `reencrypt_table()` from `pg_monitor` ([README](../README.md#who-may-call-reencrypt_table)) | Medium | Open — 1.8 |
-| 1.8 (v5 layout, to be opened) | Cryptography | The v5 layout — the null bitmap and the length headers of variable-length attributes — is outside the tag and the AAD: a writer to the data files can redistribute a row's bytes among its variable-length attributes without failing the tag, though not change or add one. Fix: authenticate the layout in a new tuple format | Low (needs write access to the data files) | Open — 1.8 |
+| PSQLE-217 | SQL surface | The 12 `SECURITY DEFINER` functions run without a fixed `search_path`; two are `LANGUAGE SQL` (`pg_vault_tde_reencrypt_table(text, int)`, `pg_vault_tde_check_plaintext_index_keys()`). The fix changes the extension script. Until then, a superuser can run `ALTER FUNCTION … SET search_path = pg_catalog, <extension schema>` on each, and revoke `reencrypt_table()` from `pg_monitor` ([README](../README.md#who-may-call-reencrypt_table)) | Medium | Open — 1.8 |
+| PSQLE-218 | Cryptography | The v5 layout — the null bitmap and the length headers of variable-length attributes — is outside the tag and the AAD: a writer to the data files can redistribute a row's bytes among its variable-length attributes without failing the tag, though not change or add one. Fix: authenticate the layout in a new tuple format | Low (needs write access to the data files) | Open — 1.8 |
 
 ---
 

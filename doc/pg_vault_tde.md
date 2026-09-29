@@ -1172,7 +1172,7 @@ is refused too. The tag does not bind:
   can write the data files can change how a row's bytes are divided among its
   variable-length attributes without failing it. No plaintext byte can be changed or
   added that way. Authenticating the layout is a change of tuple format, planned
-  for 1.8.
+  for 1.8 (PSQLE-218).
 
 Detecting a replayed or moved tuple needs integrity over pages or relations, which
 an extension cannot add; data checksums detect accidental damage only. All three are
