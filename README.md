@@ -836,7 +836,7 @@ log stream without any extension-level configuration.
 | `pg_vault_tde_get_rotation_status(regclass)` | table | Online rotation progress for one relation (status, tuples_done/total, pct_complete, timestamps) **(v1.5)** |
 | `pg_vault_tde_rotation_status` | view | All in-progress/completed rotations across the cluster; readable by `pg_monitor` **(v1.5)** |
 | `pg_vault_tde_check_plaintext_index_keys()` | table | Meant to list `tde_btree` indexes on a plaintext-key operator class. **Known defect: returns no rows in 1.7.x**, and its `REINDEX` suggestion would not change the operator class. Use the query in [Upgrading to 1.7.2](#upgrading-to-172) instead; replaced in 1.8. `pg_monitor`/superuser only |
-| `pg_vault_tde_wallet_init(text)` | void | Create local wallet and generate KEK **(v1.5)**. Superuser only — the calling role, see [Who may call the key-management functions](#who-may-call-the-key-management-functions) |
+| `pg_vault_tde_wallet_init(text)` | void | Create local wallet and generate KEK **(v1.5)**; refused while keys of the database are wrapped under a wallet that is missing. Superuser only — the calling role, see [Who may call the key-management functions](#who-may-call-the-key-management-functions) |
 | `pg_vault_tde_wallet_change_passphrase(text, text)` | void | Re-protect wallet with new passphrase and automatically rotate the KEK (`local` provider only); no separate `rotate_kek()` needed. Since 1.7.2 the new passphrase is in effect as soon as the wallet file is rewritten, even if the call then fails **(v1.6)** |
 | `pg_vault_tde_wallet_status()` | composite | Wallet existence, open state, algorithm, last opened, file perms (5 cols) **(v1.6)** |
 | `pg_vault_tde_wallet_unlock(text)` | void | Interactive wallet unlock without PG restart **(v1.6)** |
@@ -2074,7 +2074,17 @@ run against 1.7.2.
   the KEK. With the local provider the wallet lives outside `PGDATA`, at
   `/var/lib/pg_vault_tde/<db_oid>/wallet.p12`, and `DROP DATABASE` deletes it. Back up the
   wallet file and its passphrase on their own schedule: without them, every dump of that
-  database is undecryptable.
+  database is undecryptable. If the file goes missing, put it back: `wallet_init()`
+  refuses to make a new one while any key of the database is wrapped under a local
+  wallet, since a new KEK would open none of them (before 1.7.2 it made one, and the
+  tables created afterwards were lost when the real file came back).
+- **`CREATE DATABASE ... TEMPLATE` does not copy encrypted data usably.** Every row's AAD
+  names the database it was written in, so the clone's copied rows never authenticate,
+  and its catalog holds keys wrapped under the template's wallet while its own wallet
+  directory is empty. Drop the encrypted tables in the clone — or `TRUNCATE` them, after
+  copying the template's `wallet.p12` into the clone's `/var/lib/pg_vault_tde/<db_oid>/`,
+  to keep the empty tables. Copy encrypted data between databases with `pg_dump_tde` and
+  `pg_restore_tde`.
 - **Standbys** need pg_vault_tde preloaded, the id check above, and access to the KEK —
   a copy of the wallet, or the same Vault or HSM.
 - **Upgrades**: follow the notes for each release. [Upgrading to 1.7.2](#upgrading-to-172)

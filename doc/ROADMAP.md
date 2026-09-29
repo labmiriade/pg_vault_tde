@@ -518,6 +518,18 @@ distinguishes the builds.
     database's wallet through a `pg_vault_tde.wallet_admin_role` GUC (a role, or
     `owner`). `tap/42_security_definer_callers.t`.
 
+23. **With the wallet file missing, `wallet_init()` made a new one (PSQLE-208).** Its
+    KEK opens none of the database's keys, the tables created next were wrapped under
+    it, and putting the real file back lost those. It now refuses while any catalog row
+    is `local`; `vault` rows do not count, so `migrate_vault_to_wallet()` still starts
+    from `wallet_init()`. A `CREATE DATABASE ... TEMPLATE` clone is refused too: its
+    copied rows never authenticate there (the AAD names the database), and the README
+    now says so. It also wrote the file without `fsync`, the only wallet write
+    that did: the file and both directory levels are now synced. Every other damage —
+    truncated, empty, random bytes, one byte flipped, unreadable, leftover `.new` or
+    `.lock` — already ended in an ERROR without touching the file.
+    `tap/44_damaged_wallet.t`.
+
 **New CI stage — `make ci-upgrade`.** Every other suite in this repo reads only data it
 wrote in the same run, so writer and reader always move together and a format-level
 breakage leaves the suite green while data on disk becomes unreadable. That is how the

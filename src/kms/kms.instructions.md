@@ -360,6 +360,11 @@ else if (strcmp(guc_kms_provider, "kmip") == 0)
 - On `unwrap_dek()`: open wallet, derive KEK, `EVP_aes_256_unwrap()`, return plaintext
   DEK to caller's stack frame; `OPENSSL_cleanse(kek, 32)` immediately after
 - Wallet file permissions MUST be `0600` — enforced at create time and in `health_check()`
+- Every wallet write reaches the disk before anything is wrapped under it:
+  `local_write_wallet_ring()` (`.new` + `durable_rename()`), and `wallet_init()`
+  (`O_EXCL`, `pg_fsync`, both directory levels).
+- `wallet_init()` never makes a wallet while a catalog row is `local`: a new KEK
+  opens none of those keys (PSQLE-208).
 - PKCS#11 (HSM-backed keys) is a separate `pkcs11` provider — `local` is software-only
 
 ### PKCS#11 Provider Rules (`pkcs11`, v1.7)

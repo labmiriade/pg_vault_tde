@@ -67,7 +67,7 @@
 #include "src/include/pg_vault_tde_kms.h"
 #include "src/include/pg_vault_tde_guc.h"
 #include "src/include/pg_vault_tde_audit.h"
-#include "src/include/pg_vault_tde_catalog.h" /* pg_vault_tde_catalog_evict_db */
+#include "src/include/pg_vault_tde_catalog.h" /* pg_vault_tde_catalog_evict_db, _read_all_wrapped */
 #include "src/include/pg_vault_tde_catalog_d.h"
 
 /* -------------------------------------------------------------------------
@@ -1567,6 +1567,8 @@ pg_vault_tde_wallet_init_sql(PG_FUNCTION_ARGS)
     struct stat   st;
     unsigned char kek[32];
     EVP_PKEY       *pkey = NULL;
+    char          wallet_dir[MAXPGPATH];
+    bool          synced;
 
     /* Superuser check */
     if (!tde_caller_is_superuser())
@@ -1578,8 +1580,7 @@ pg_vault_tde_wallet_init_sql(PG_FUNCTION_ARGS)
         ereport(ERROR, 
                 errmsg("pg_vault_tde_wallet_init requires KMS local"));
 
-    passphrase = text_to_cstring(passphrase_t);
-    path       = local_get_wallet_path();
+    path = local_get_wallet_path();
 
     /* Refuse to overwrite an existing wallet without explicit delete */
     if (stat(path, &st) == 0)
@@ -1589,6 +1590,36 @@ pg_vault_tde_wallet_init_sql(PG_FUNCTION_ARGS)
                        "use pg_vault_tde_wallet_change_passphrase() to "
                        "rotate the passphrase, or remove the file manually "
                        "to re-initialize", path));
+    else
+    {
+        /*
+         * No wallet, yet keys of this database are wrapped under one: the
+         * file was lost, moved, or never copied to this server (PSQLE-208).
+         * A new wallet holds a new KEK that opens none of them, and the
+         * tables created next would be wrapped under it — so putting the
+         * real file back would then lose those instead.
+         */
+        TdeCatalogSealRow *rows;
+        int                nrows = pg_vault_tde_catalog_read_all_wrapped(&rows);
+        int                nlocal = 0;
+        int                i;
+
+        for (i = 0; i < nrows; i++)
+            if (strcmp(rows[i].kms_provider, "local") == 0)
+                nlocal++;
+        if (nlocal > 0)
+            ereport(ERROR,
+                    errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                    errmsg("pg_vault_tde: no wallet at \"%s\", but %d key(s) of "
+                           "this database are wrapped under a local wallet",
+                           path, nlocal),
+                    errdetail("A new wallet would hold a new KEK, which opens none of them."),
+                    errhint("Put the wallet file back from its backup; on a standby, "
+                            "copy the primary's. To start over instead, drop the "
+                            "encrypted tables first."));
+    }
+
+    passphrase = text_to_cstring(passphrase_t);
 
 
     /*
@@ -1699,8 +1730,13 @@ pg_vault_tde_wallet_init_sql(PG_FUNCTION_ARGS)
                        path));
     }
 
+    /*
+     * On disk before returning: the tables created next are wrapped under
+     * this KEK, and their commits reach the disk (PSQLE-208).
+     */
     fp = fdopen(fd, "wb");
-    if (!fp || i2d_PKCS12_fp(fp, p12) != 1)
+    if (!fp || i2d_PKCS12_fp(fp, p12) != 1 ||
+        fflush(fp) != 0 || pg_fsync(fileno(fp)) != 0)
     {
         if (fp) fclose(fp); else close(fd);
         unlink(path);   /* clean up incomplete file */
@@ -1720,6 +1756,24 @@ pg_vault_tde_wallet_init_sql(PG_FUNCTION_ARGS)
         pfree(passphrase);
         ereport(ERROR,
                 errmsg("pg_vault_tde: chmod(wallet, 0600) failed: %m"));
+    }
+
+    /*
+     * ... and so is its directory entry, and the directory's own entry in
+     * the base directory, which mkdir() above may have just made.
+     */
+    strlcpy(wallet_dir, path, sizeof(wallet_dir));
+    get_parent_directory(wallet_dir);
+    synced = fsync_fname_ext(wallet_dir, true, false, WARNING) == 0;
+    get_parent_directory(wallet_dir);
+    if (!synced || fsync_fname_ext(wallet_dir, true, true, WARNING) != 0)
+    {
+        unlink(path);
+        OPENSSL_cleanse(passphrase, strlen(passphrase));
+        pfree(passphrase);
+        ereport(ERROR,
+                errmsg("pg_vault_tde: could not sync the new wallet \"%s\" to disk",
+                       path));
     }
 
     /*

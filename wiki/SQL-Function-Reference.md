@@ -40,7 +40,7 @@ relation.
 
 | Function | Returns | Privilege | Description |
 |---|---|---|---|
-| `pg_vault_tde_wallet_init(passphrase text)` | void | superuser (the calling role, since 1.7.2; `EXECUTE` is still granted to `pg_monitor`, which the check refuses) | Create the local wallet and generate its KEK (first-time setup) |
+| `pg_vault_tde_wallet_init(passphrase text)` | void | superuser (the calling role, since 1.7.2; `EXECUTE` is still granted to `pg_monitor`, which the check refuses) | Create the local wallet and generate its KEK (first-time setup; refused while keys of the database are wrapped under a wallet that is missing) |
 | `pg_vault_tde_wallet_status()` | table: `wallet_exists`, `wallet_open`, `kek_algorithm`, `last_opened`, `file_perms` | `pg_monitor` + superuser | Wallet diagnostics |
 | `pg_vault_tde_wallet_unlock(passphrase text)` | void | Superuser only | Interactive wallet unlock — no server restart needed |
 | `pg_vault_tde_wallet_lock()` | void | Superuser only | Evict all DEKs from shared memory and mark the wallet closed |

@@ -64,11 +64,13 @@ ok(1, 'db_a has an encrypted table');
 # ── db_b: physical clone — same pg_class OIDs, same catalog row ────────────
 $node->safe_psql('postgres', 'CREATE DATABASE db_b TEMPLATE db_a;');
 
-# The wallet is per-database (/var/lib/pg_vault_tde/<dboid>/wallet.p12).  Init
-# creates db_b's directory; overwriting it with db_a's wallet gives both
-# databases the same KEK, so db_b can unwrap the DEK it inherited in the clone
-# — which the rotation below needs before it can replace it.
-$node->safe_psql('db_b', "SELECT pg_vault_tde_wallet_init('test-password')");
+# The wallet is per-database (/var/lib/pg_vault_tde/<dboid>/wallet.p12), and
+# the clone has none.  A copy of db_a's gives both databases the same KEK, so
+# db_b can unwrap the DEK it inherited in the clone — which the rotation below
+# needs before it can replace it.  wallet_init() would refuse: the clone's
+# catalog already holds a key wrapped under a local wallet (PSQLE-208).
+(my $dir_b = wallet_path('db_b')) =~ s{/wallet\.p12$}{};
+mkdir($dir_b, 0700) or die "mkdir $dir_b: $!";
 $node->command_ok(['cp', wallet_path('db_a'), wallet_path('db_b')],
     'db_b shares db_a\'s wallet KEK');
 $node->safe_psql('db_b', "SELECT pg_vault_tde_wallet_unlock('test-password')");
@@ -83,7 +85,7 @@ is($relid_b, $relid_a, "tcoll has the same relid in both databases ($relid_a)");
 # decrypted here, so leaving them would only make the rotation BGW fail.  The
 # relid survives TRUNCATE (only the relfilenode changes), which is the point.
 #
-# db_b's cache entry is cold here — wallet_init/unlock evicted, and nothing in
+# db_b's cache entry is cold here — wallet_unlock evicted, and nothing in
 # db_b has read the table yet.  That used to break the rotation on its own
 # (zero_rel_dek could not stash a prev_dek it did not have); no warm-up read is
 # needed now.  See tap/22_rotate_cold_cache.t.
