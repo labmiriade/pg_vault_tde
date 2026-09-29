@@ -57,6 +57,8 @@ use PostgreSQL::Test::Utils;
 use File::Spec;
 
 END { system('/bin/sh', '-c', 'rm -rf /var/lib/pg_vault_tde/*') }
+# A wallet left by an earlier file would make wallet_init() below fail.
+system('/bin/sh', '-c', 'rm -rf /var/lib/pg_vault_tde/*');
 
 use constant ROWS         => 300_000;
 use constant TOAST_ROWS   => 8_000;      # large values: fewer rows, same point

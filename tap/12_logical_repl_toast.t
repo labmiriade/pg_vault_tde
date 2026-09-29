@@ -34,6 +34,7 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+END { system('/bin/sh', '-c', 'rm -rf /var/lib/pg_vault_tde/*') }
 
 # ── Publisher: encrypted_heap + custom TOAST rmgr ───────────────────────────
 my $pub = PostgreSQL::Test::Cluster->new('publisher');
