@@ -580,6 +580,17 @@ Regression: `tap/29_rotate_online_concurrent_access.t` (a row lock on
 `pg_vault_tde_catalog` holds the worker inside the window);
 `tap/32_rotate_online_toast.t` for rule 5; `tap/34_standby_rotation.t` for rule 6; `tap/35_rotate_online_indexes.t` for rule 7.
 
+### Who may call: the calling role, never the current one (PSQLE-206)
+
+Most key-management functions are `SECURITY DEFINER`.  Inside them `superuser()`
+and `GetUserId()` are the function's owner — the superuser who ran `CREATE
+EXTENSION` — so a check on them lets through anyone who has been granted
+`EXECUTE`.  Check the role that called the function: `tde_caller_is_superuser()`
+(`superuser_arg(GetOuterUserId())`, `pg_vault_tde_kms.h`); a privilege on a table,
+as in `reencrypt_table()`, with `pg_class_aclcheck(..., GetOuterUserId(), ...)`.
+Every new SQL-callable function that manages keys or rewrites data needs one.
+Regression: `tap/41_reencrypt_table_privileges.t`, `tap/42_security_definer_callers.t`.
+
 ### Evicting many entries is per-database
 
 There is one entry point, `pg_vault_tde_catalog_evict_db()`, and it covers

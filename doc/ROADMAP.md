@@ -507,6 +507,17 @@ distinguishes the builds.
     `pg_monitor`, make the `text` overload `SECURITY INVOKER` and check `GetUserId()`.
     `tap/41_reencrypt_table_privileges.t`.
 
+22. **The key-management functions trusted `superuser()` inside `SECURITY DEFINER`
+    (PSQLE-206).** There it asks about the function's owner and is always true, so only
+    `REVOKE ... FROM PUBLIC` kept nine functions closed — and `wallet_init()` is granted
+    to `pg_monitor`: a monitoring role created a database's wallet with its own
+    passphrase. `pkcs11_keygen()` checked nothing. Now every one of them calls
+    `tde_caller_is_superuser()` (`superuser_arg(GetOuterUserId())`, in
+    `pg_vault_tde_kms.h`, excluded from the frontend clients). `rotate_online()` is not
+    `SECURITY DEFINER` and keeps `superuser()`. 1.8: remove the grant, and delegate a
+    database's wallet through a `pg_vault_tde.wallet_admin_role` GUC (a role, or
+    `owner`). `tap/42_security_definer_callers.t`.
+
 **New CI stage — `make ci-upgrade`.** Every other suite in this repo reads only data it
 wrote in the same run, so writer and reader always move together and a format-level
 breakage leaves the suite green while data on disk becomes unreadable. That is how the

@@ -13,6 +13,24 @@
 #include "common/base64.h"           /* pg_b64_decode */
 
 /*
+ * tde_caller_is_superuser — whether the role that called the SQL function is a
+ * superuser.  Most key-management functions are SECURITY DEFINER, and inside
+ * them superuser() asks about the function's owner — the superuser who ran
+ * CREATE EXTENSION — so it is always true: only REVOKE ... FROM PUBLIC kept
+ * them closed, and wallet_init() is granted to pg_monitor (PSQLE-206).
+ * GetOuterUserId() is the role outside every SECURITY DEFINER call.
+ */
+#ifndef FRONTEND
+#include "miscadmin.h"               /* GetOuterUserId, superuser_arg */
+
+static inline bool
+tde_caller_is_superuser(void)
+{
+    return superuser_arg(GetOuterUserId());
+}
+#endif
+
+/*
  * AES-256 DEK length in bytes: 256 bits / 8 = 32 bytes.
  * This is the single source of truth for DEK size; do NOT redefine
  * this constant in any .c file (header hygiene rule).

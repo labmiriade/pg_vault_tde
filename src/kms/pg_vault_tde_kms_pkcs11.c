@@ -1649,6 +1649,12 @@ pg_vault_tde_pkcs11_keygen_sql(PG_FUNCTION_ARGS)
     CK_OBJECT_HANDLE existing;
     CK_OBJECT_HANDLE kek;
 
+    /* The token is the cluster's; it checked nothing before (PSQLE-206). */
+    if (!tde_caller_is_superuser())
+        ereport(ERROR,
+                (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                 errmsg("pg_vault_tde_pkcs11_keygen requires superuser")));
+
     if (tde_kms_provider() == NULL ||
         strcmp(tde_active_kms_provider->name, "pkcs11") != 0)
         ereport(ERROR,

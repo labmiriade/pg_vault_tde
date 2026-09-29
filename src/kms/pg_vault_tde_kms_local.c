@@ -1569,7 +1569,7 @@ pg_vault_tde_wallet_init_sql(PG_FUNCTION_ARGS)
     EVP_PKEY       *pkey = NULL;
 
     /* Superuser check */
-    if (!superuser())
+    if (!tde_caller_is_superuser())
         ereport(ERROR,
                 errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
                 errmsg("pg_vault_tde_wallet_init requires superuser"));
@@ -1973,7 +1973,7 @@ pg_vault_tde_wallet_change_passphrase_sql(PG_FUNCTION_ARGS)
     LocalKekRing *cur;
     LocalKekRing *next;
 
-    if (!superuser())
+    if (!tde_caller_is_superuser())
         ereport(ERROR,
                 errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
                 errmsg("pg_vault_tde_wallet_change_passphrase requires superuser"));
@@ -2053,7 +2053,7 @@ pg_vault_tde_wallet_unlock_sql(PG_FUNCTION_ARGS)
     const char *path;
     LocalKekRing *ring;
 
-    if (!superuser())
+    if (!tde_caller_is_superuser())
         ereport(ERROR,
                 errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
                 errmsg("pg_vault_tde_wallet_unlock requires superuser"));
@@ -2117,7 +2117,7 @@ PG_FUNCTION_INFO_V1(pg_vault_tde_wallet_lock_sql);
 PGDLLEXPORT Datum
 pg_vault_tde_wallet_lock_sql(PG_FUNCTION_ARGS)
 {
-    if (!superuser())
+    if (!tde_caller_is_superuser())
         ereport(ERROR,
                 errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
                 errmsg("pg_vault_tde_wallet_lock requires superuser"));
@@ -2200,7 +2200,7 @@ pg_vault_tde_migrate_vault_to_wallet_sql(PG_FUNCTION_ARGS)
     MemoryContext old_ctx;
     MemoryContext tuple_ctx;
 
-    if (!superuser())
+    if (!tde_caller_is_superuser())
         ereport(ERROR,
                 errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
                 errmsg("pg_vault_tde_migrate_vault_to_wallet requires superuser"));

@@ -55,6 +55,7 @@ packaged (OS, PG) combinations and what CI exercises on each in the
 > see [Streaming standby and `rotate_online()`](#streaming-standby-and-rotate_online).
 > Every table ever rotated needs a `REINDEX` — see [`rotate_online()` and indexes](#rotate_online-and-indexes) —
 > and so does every partial index on an encrypted table — see [Partial indexes on encrypted tables](#partial-indexes-on-encrypted-tables).
+> Check who created each database's wallet — see [Who may call the key-management functions](#who-may-call-the-key-management-functions).
 > Otherwise nothing has to be done before installing 1.7.2, but existing
 > encrypted tables need one `VACUUM FULL` afterwards — see
 > [Upgrading to 1.7.2](#upgrading-to-172). Rows stay readable either way; until
@@ -835,7 +836,7 @@ log stream without any extension-level configuration.
 | `pg_vault_tde_get_rotation_status(regclass)` | table | Online rotation progress for one relation (status, tuples_done/total, pct_complete, timestamps) **(v1.5)** |
 | `pg_vault_tde_rotation_status` | view | All in-progress/completed rotations across the cluster; readable by `pg_monitor` **(v1.5)** |
 | `pg_vault_tde_check_plaintext_index_keys()` | table | Meant to list `tde_btree` indexes on a plaintext-key operator class. **Known defect: returns no rows in 1.7.x**, and its `REINDEX` suggestion would not change the operator class. Use the query in [Upgrading to 1.7.2](#upgrading-to-172) instead; replaced in 1.8. `pg_monitor`/superuser only |
-| `pg_vault_tde_wallet_init(text)` | void | Create local wallet and generate KEK **(v1.5)** |
+| `pg_vault_tde_wallet_init(text)` | void | Create local wallet and generate KEK **(v1.5)**. Superuser only — the calling role, see [Who may call the key-management functions](#who-may-call-the-key-management-functions) |
 | `pg_vault_tde_wallet_change_passphrase(text, text)` | void | Re-protect wallet with new passphrase and automatically rotate the KEK (`local` provider only); no separate `rotate_kek()` needed. Since 1.7.2 the new passphrase is in effect as soon as the wallet file is rewritten, even if the call then fails **(v1.6)** |
 | `pg_vault_tde_wallet_status()` | composite | Wallet existence, open state, algorithm, last opened, file perms (5 cols) **(v1.6)** |
 | `pg_vault_tde_wallet_unlock(text)` | void | Interactive wallet unlock without PG restart **(v1.6)** |
@@ -1439,6 +1440,32 @@ REVOKE EXECUTE ON FUNCTION pg_vault_tde_reencrypt_table(regclass, int),
 ```
 
 1.8 removes the grant from the extension script.
+
+
+### Who may call the key-management functions
+
+`wallet_init`, `wallet_unlock`, `wallet_lock`, `wallet_change_passphrase`,
+`migrate_vault_to_wallet`, `seal_keys`, `seal_keys_bytea`, `unseal_keys` and
+`rotate_kek` are `SECURITY DEFINER`, and each checked `superuser()` — which inside such
+a function asks about its owner, the superuser who ran `CREATE EXTENSION`, and is
+always true (PSQLE-206). Only `REVOKE ... FROM PUBLIC` kept them closed, and
+`wallet_init()` is granted to `pg_monitor`: up to 1.7.1 any member of it could create
+the wallet of a database that had none, with a passphrase of its own choosing, and so
+hold the KEK of every table later encrypted there. `pkcs11_keygen()` checked nothing.
+
+1.7.2 checks the role that called the function, whoever has been granted `EXECUTE`:
+all of them require a superuser. Delegating a database's wallet to its owner or to a
+tenant role is planned for 1.8.
+
+**Still on 1.7.1:** take `wallet_init()` away from `pg_monitor`, as a superuser —
+`REVOKE EXECUTE ON FUNCTION pg_vault_tde_wallet_init(text) FROM pg_monitor;` — and
+check that every database with a wallet got it from a superuser. The wallets are the
+directories under `/var/lib/pg_vault_tde/`, one per database OID; each creation left a
+`pg_vault_tde: wallet initialized at "…"` line in the server log, which names the role
+when `log_line_prefix` includes `%u` — otherwise match its time and PID against the
+connection log (`log_connections`). If a wallet may have been created by someone else,
+change its passphrase (`pg_vault_tde_wallet_change_passphrase()`) and rotate the KEK
+(`pg_vault_tde_rotate_kek()`).
 
 ## Compatibility
 
