@@ -585,6 +585,21 @@ distinguishes the builds.
     `RELEASE_TAG_SIGNERS` lists — checked there because the mirror's rewrite strips
     tag signatures.
 
+29. **Two new CI stages: ASan and the project's Semgrep rules (PSQLE-181).**
+    `make ci-asan` builds the extension with `-fsanitize=address` and preloads ASan's
+    runtime into the stock server, then runs the regression workload and the
+    error-path suite: it sees overflows of malloc'd, stack and global buffers and use
+    after free outside palloc — OpenSSL, libcurl, libc — which Valgrind sees too, at
+    ten times the cost, and the other stages do not. Before trusting a clean report it
+    checks that the runtime and the module are both mapped in a backend. `make
+    ci-semgrep` runs seven rules, each an old defect or a rule of this code base:
+    `superuser()` in a function that may be `SECURITY DEFINER` (PSQLE-206), a write to
+    `rd_tableam` (PSQLE-207), a MAC compared with `memcmp()`, a secret freed without
+    `OPENSSL_cleanse()` or put into a message, a random source other than
+    `pg_strong_random()`, a client-tool query calling the extension outside its schema
+    (PSQLE-178). Each rule has a test file of lines on which it must and must not
+    fire. Neither stage found a defect: the three `rd_tableam` writes left are PSQLE-213.
+
 **Key operations one at a time (PSQLE-210).** Rotations and wallet operations are
 tested alone and against concurrent DML, not against each other; the README now says
 to run them one at a time per database and lists the combinations to avoid until 1.8.

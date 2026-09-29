@@ -102,10 +102,15 @@ The last column is what the code is meant to check on each crossing; the
 A review goes through every item and records, for each, *verified*, *finding* (with
 its ID) or *not applicable*. File names are starting points, not limits.
 
+An item marked *(rule `tde-…`)* is also checked on every build by that rule in
+`ci/semgrep/` (`make ci-semgrep`). A rule catches the pattern it names, not every way
+of getting the item wrong: the item is still reviewed, and so is every
+`nosemgrep` comment in the code.
+
 ### Cryptography - `src/crypto/`, `src/iam/`
 
 - [ ] AES-256-GCM for tuples and TOAST chunks: a 96-bit IV per encryption from
-      `pg_strong_random()`, never reused under one DEK - including across `fork()`
+      `pg_strong_random()` (rule `tde-strong-random`), never reused under one DEK - including across `fork()`
       ([PSQLE-178](#findings)); the documented limit of encryptions per DEK.
 - [ ] The tag is verified before any plaintext is used; a failure raises an error and
       frees the buffers.
@@ -116,9 +121,9 @@ its ID) or *not applicable*. File names are starting points, not limits.
 - [ ] Key wrapping: AES-256 key wrap (local), transit (Vault), `CKM_AES_KEY_WRAP_PAD`
       (PKCS#11); each wrapped DEK carries the version of the KEK that wrapped it.
 - [ ] Derivations and MACs: PKCS#12 iteration counts, PBKDF2 of the seal passphrase,
-      HMAC compared with `CRYPTO_memcmp`.
+      HMAC compared with `CRYPTO_memcmp` (rule `tde-constant-time-compare`).
 - [ ] Every buffer that held a key, an IV batch or a passphrase is cleansed, on the
-      error paths too.
+      error paths too (rule `tde-cleanse-before-free`).
 
 ### Key management - `src/kms/`
 
@@ -127,7 +132,7 @@ its ID) or *not applicable*. File names are starting points, not limits.
 - [ ] The local wallet: permissions checked, written to a temporary file and renamed
       durably, every KEK version kept, never replaced while keys are wrapped under it.
 - [ ] Vault: TLS verification, token renewal, bounds on every response parsed, no
-      token in a log line or an error.
+      token in a log line or an error (rule `tde-no-secret-in-message`).
 - [ ] PKCS#11: the module never initialised in the postmaster, a `getpid()` guard
       after `fork()`, the PIN cleansed after login.
 - [ ] Rotations (`rotate_online()`, `rotate_kek()`, `wallet_change_passphrase()`):
@@ -140,7 +145,7 @@ its ID) or *not applicable*. File names are starting points, not limits.
 - [ ] Every function: its `GRANT`s, and whether it is `SECURITY DEFINER`; every
       `SECURITY DEFINER` function has a fixed `search_path` ([PSQLE-217](#findings)).
 - [ ] Every privileged function checks the calling role, not the owner
-      ([PSQLE-205](#findings), [PSQLE-206](#findings)).
+      ([PSQLE-205](#findings), [PSQLE-206](#findings); rule `tde-caller-superuser`).
 - [ ] Every GUC: context (`PGC_SUSET` or `PGC_POSTMASTER`), `GUC_SUPERUSER_ONLY` on
       those that name secrets or paths, `GUC_NOT_IN_SAMPLE` on secret values.
 - [ ] Functions that take a server file path ([PSQLE-206](#findings)).
@@ -153,7 +158,8 @@ its ID) or *not applicable*. File names are starting points, not limits.
       value unencrypted; the callbacks that rewrite tables (`CLUSTER`, `VACUUM FULL`,
       the index build) apply heapam's logic to decrypted copies.
 - [ ] No callback leaves the relcache entry pointing at heapam
-      (`rd_tableam`), and none trusts that pointer across an invalidation.
+      (`rd_tableam`), and none trusts that pointer across an invalidation (rule
+      `tde-rd-tableam`).
 - [ ] `ProcessUtility` and the object-access hook: the checks on `DROP`,
       `ALTER TABLE … SET ACCESS METHOD` and index creation cover every path that
       reaches them.
@@ -174,7 +180,7 @@ its ID) or *not applicable*. File names are starting points, not limits.
 ### Client tools - `src/backup/`
 
 - [ ] Each tool secures its session (`search_path`) before calling the extension, and
-      calls it schema-qualified ([PSQLE-178](#findings)).
+      calls it schema-qualified ([PSQLE-178](#findings); rule `tde-client-qualified-call`).
 - [ ] Archives and bundles read on restore are untrusted input: framing, lengths and
       the HMAC checked before any field is used.
 - [ ] Files written on the client host: permissions, and where key material ends up.
@@ -182,12 +188,13 @@ its ID) or *not applicable*. File names are starting points, not limits.
 
 ### Error paths
 
-- [ ] No error message, detail or hint carries a key, an IV or a plaintext value.
+- [ ] No error message, detail or hint carries a key, an IV or a plaintext value
+      (rule `tde-no-secret-in-message`, for secrets named as such).
 - [ ] `PG_TRY`/`PG_CATCH` blocks cleanse what they allocated; variables modified
       inside them are `volatile`.
 - [ ] Code that must run on failure does not rely on a `PG_CATCH` a `FATAL` would skip.
-- [ ] Evidence: the error-path SQL suite (tests 141–153), and the Valgrind, UBSan and
-      assertion-enabled stages of `make ci-all`.
+- [ ] Evidence: the error-path SQL suite (tests 141–153), and the Valgrind, UBSan, ASan
+      and assertion-enabled stages of `make ci-all`.
 
 ---
 
