@@ -1382,6 +1382,26 @@ rebuilds it without blocking writes. `make ci-upgrade` builds one with 1.7.1 and
 that this query finds it and that `REINDEX` makes it answer what a sequential scan
 answers.
 
+
+### Indexes built while an older snapshot is open
+
+PostgreSQL builds an index so that transactions already running when it was built can
+use it too: it also indexes row versions that are dead for everyone else but may still
+be visible to them, and when a HOT chain changed the indexed column it marks the index
+unusable for those older transactions (`pg_index.indcheckxmin`). Up to 1.7.1 the
+extension's own build scan did neither: it indexed only what a fresh snapshot saw
+(PSQLE-201). A `REPEATABLE READ` or `SERIALIZABLE` transaction that started before a
+`CREATE INDEX` and then queried through the new index missed rows deleted or updated
+after its snapshot, and could get rows whose version visible to it does not satisfy
+the query.
+
+Only those older transactions were affected, and only until they ended: for every
+transaction started after the build, an index built by 1.7.1 is correct. Nothing needs
+to be done after installing 1.7.2, which builds indexes as heapam does. If two
+rotations of the table left row versions an old snapshot can still see under a key
+that no longer exists, the index is built without them and marked unusable for older
+transactions, as PostgreSQL does for broken HOT chains.
+
 ## Compatibility
 
 | Feature | Status | Notes |

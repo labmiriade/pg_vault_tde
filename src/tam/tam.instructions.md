@@ -47,14 +47,17 @@ and `tde_toast_delete_unshared()` — used by UPDATE and DELETE — counts them.
 1.7.1 left their pointers dangling, and HEAP_HASEXTERNAL must not make core follow
 them.  Regression: `tap/33_toast_lifecycle.t`, `ci-upgrade` Probe E.
 
-### The index build scan must do what heapam's does (PSQLE-198)
+### The index build scan is heapam's, on decrypted copies (PSQLE-198, PSQLE-201)
 
-`pg_vault_tde_index_build_range_scan` replaces heapam's so that `FormIndexDatum`
-sees plaintext.  Every part of heapam's scan that decides which rows reach the index
-has to be there too: the partial-index predicate (`ExecPrepareQual` /
-`ExecQual`, with `reltuples` counted before it), HOT root line pointers.  Still
-missing, and a known gap: heapam uses `SnapshotAny` and indexes recently-dead
-tuples, setting `ii_BrokenHotChain`; this scan uses a fresh MVCC snapshot.
+`tde_index_build_heap_scan` is `heapam_index_build_range_scan`
+(`access/heap/heapam_handler.c`) with one change: each tuple heapam would index is
+decrypted before the predicate and `FormIndexDatum`, and tde_btree keys are
+encrypted.  Everything that decides which tuples reach the index — `SnapshotAny` +
+`HeapTupleSatisfiesVacuum`, recently dead tuples, `ii_BrokenHotChain`, waits on
+in-progress writers, the predicate with `reltuples` counted before it, HOT roots —
+must stay heapam's; diff it against each new PostgreSQL major.  A recently dead
+tuple that no longer decrypts is skipped with `ii_BrokenHotChain` set.  It runs
+with the relation impersonating heapam (`heap_getnext()` checks rd_tableam).
 
 ### Every place heapam deletes TOAST itself needs a TAM counterpart (PSQLE-197)
 

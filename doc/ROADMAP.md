@@ -470,6 +470,20 @@ distinguishes the builds.
     partial index too. The CREATE INDEX CONCURRENTLY validation scan already checked
     the predicate.
 
+19. **An index built while an older snapshot was open misled it (PSQLE-201).** The TAM's
+    build scan read a fresh MVCC snapshot: no recently dead tuples, no
+    `ii_BrokenHotChain`, no waiting for in-progress writers under a uniqueness check.
+    A REPEATABLE READ transaction older than the index, querying through it, missed the
+    rows deleted after its snapshot and got HOT-updated rows under their new values
+    (0, 0 and 10 where heap gives 10, 10 and 0). The scan is now a port of
+    `heapam_index_build_range_scan` (identical in PG 17 and 18) run on decrypted
+    copies, with the relation impersonating heapam as in `copy_for_cluster`. One case
+    heapam never meets: a recently dead tuple under a DEK generation nobody holds any
+    more (two rotations under an open snapshot) is left out, and the index is marked
+    unusable for older snapshots rather than failing the build. The scan also resets
+    `ii_ExpressionsState` / `ii_PredicateState`, which pointed into its freed EState.
+    `tap/39_index_build_old_snapshot.t`, with a parallel build checked by amcheck.
+
 **New CI stage — `make ci-upgrade`.** Every other suite in this repo reads only data it
 wrote in the same run, so writer and reader always move together and a format-level
 breakage leaves the suite green while data on disk becomes unreadable. That is how the
