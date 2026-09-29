@@ -16,6 +16,55 @@ Register a PGXN Manager account at
 No API token/CLI upload path is offered by PGXN Manager — every release is
 uploaded by hand through its web UI.
 
+### Signing
+
+A release is signed by a maintainer, with their own key; no signing key lives in
+CI. Two signatures: the **tag**, and the **`SHA256SUMS`** of the GitHub Release —
+the SHA-256 of every asset: the `.deb` and `.rpm` packages, the PGXN zip, its SPDX
+SBOM and the grype report. One signature over that list covers every file in it.
+
+Once, per maintainer:
+
+1. Add your public key to `packaging/RELEASE-KEYS.asc`
+   (`gpg --armor --export <fingerprint> >> packaging/RELEASE-KEYS.asc`) and your
+   fingerprint to [SECURITY.md](SECURITY.md#release-signing-keys).
+2. Add your fingerprint to the Bitbucket repository variable `RELEASE_TAG_SIGNERS`
+   (comma-separated, 40 hex digits each). The GitHub synchronization refuses to
+   mirror a `v*` tag that is not signed by one of them. It checks there because it
+   is the last point where it can: the mirror rewrites every commit, and a tag moved
+   onto a rewritten one arrives on GitHub unsigned. The keys travel with the tag;
+   the variable, which pushing a tag cannot change, says whose count.
+
+Every release, after the tag (step 6 below) has reached GitHub:
+
+1. Run *Build & Publish Packages* with the tag and the version. It always creates a
+   **draft** release, with every asset and an unsigned `SHA256SUMS`; a draft is
+   visible to the repository's maintainers only.
+2. Sign `SHA256SUMS` and publish — from the draft's page (download `SHA256SUMS`, run
+   the `gpg` line, attach `SHA256SUMS.asc`, *Publish release*), or with `gh`:
+   ```bash
+   gh release download vX.Y.Z --dir rel && cd rel
+   sha256sum --check SHA256SUMS                      # the draft holds what the list says
+   gpg --armor --detach-sign SHA256SUMS              # → SHA256SUMS.asc
+   gh release upload vX.Y.Z SHA256SUMS.asc
+   gh release edit vX.Y.Z --draft=false
+   ```
+
+### Keeping pins current
+
+GitHub Actions are pinned by commit and third-party images by digest;
+`make ci-pins` (the first stage of `make ci-all`, and a step of the GitHub
+build) fails otherwise. To move one, resolve the new target and edit the
+reference with its version:
+
+```bash
+git ls-remote https://github.com/actions/checkout 'refs/tags/v4*'   # the commit, and ^{} for an annotated tag
+podman pull docker.io/openbao/openbao:2.x.y && \
+  podman image inspect --format '{{.RepoDigests}}' docker.io/openbao/openbao:2.x.y
+```
+
+then run the stages that use it (`make ci-openbao`, `make ci-vault`, …).
+
 ### What ends up in the bundle
 
 `make dist` names the zip after `VERSION` (the three-part version `META.json`
@@ -91,8 +140,11 @@ without letting that job run.
    parses `META.json` from the zip, so double-check the version inside the
    zip matches what you intend to release before submitting — once a
    version is published it cannot be re-uploaded under the same number.
-6. **Tag the release** in git (`git tag vX.Y && git push --tags`) — this
-   repo currently has only a `v1.6` tag; `default_version` in the control
-   file had already moved on to later versions in-tree before being tagged,
-   so don't assume the control file version and the latest git tag are the
-   same thing when preparing a release.
+6. **Tag the release**, signed with your key (see [Signing](#signing)):
+   `git tag -s vX.Y.Z -m 'pg_vault_tde X.Y.Z' && git push origin vX.Y.Z` on
+   Bitbucket. The GitHub synchronization refuses a tag not signed by a key of
+   `RELEASE_TAG_SIGNERS`; the tags up
+   to `v1.7.1` are annotated but not signed. `default_version` in the control
+   file moves on in-tree before a tag is made, so don't assume the control
+   file version and the latest git tag are the same thing when preparing a
+   release.

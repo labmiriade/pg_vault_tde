@@ -77,7 +77,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Must precede `init`: CodeQL observes the build, so the toolchain has to
       # exist before it starts watching. Same PGDG setup as ci.yml.
@@ -97,7 +97,7 @@ jobs:
             libpq-dev libssl-dev libcurl4-openssl-dev pkg-config
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
+        uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
@@ -121,6 +121,6 @@ jobs:
             PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v4
+        uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         with:
           category: ${{ matrix.category }}

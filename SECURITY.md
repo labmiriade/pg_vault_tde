@@ -130,6 +130,19 @@ before reporting:
 - Denial of service through ordinary resource exhaustion (a very large query,
   an intentionally slow KMS).
 
+## Release signing keys
+
+Releases from 1.7.2 on — their tag, the `SHA256SUMS` of their assets, and their
+security review — are signed by a maintainer. The public keys are in
+[packaging/RELEASE-KEYS.asc](packaging/RELEASE-KEYS.asc); check the fingerprint of the
+one that signed against this list before trusting a signature:
+
+| Maintainer | Fingerprint |
+|---|---|
+| Matteo Durighetto `<m.durighetto@miriade.it>` | `F365 8FA1 6FBD A667 021D  8503 CD36 A301 03F3 6119` |
+
+How to verify a release: README, *Verifying a release*.
+
 ## Security Review
 
 The threat model behind the scope above, the method a code review follows, the risks

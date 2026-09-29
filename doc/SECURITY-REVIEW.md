@@ -224,7 +224,7 @@ documentation gap.
 |---|---|---|---|---|
 | PSQLE-177 | Cryptography, key management | (1) The AAD binds database, relation and key generation, not a tuple's position or its header. (2) Secrets can reach the server log or plaintext configuration: `SET` or `ALTER SYSTEM` of a secret GUC, passphrases passed as SQL arguments; `wallet_passphrase_command` runs through `popen()` | Low | (1) Accepted, documented. (2) Resolved: documented |
 | PSQLE-178 | Client tools, cryptography | (1) `pg_basebackup_tde` does not secure its session's `search_path` and calls the extension's function unqualified. (2) IVs come from a per-process batch of 256 random values, with no check that the process drawing from it is the one that filled it; there is no written limit of encryptions per DEK before rotation | Medium | Fixed in 1.7.2: the tool empties its `search_path` and calls the extension's schema; the batch is refilled by a process that did not fill it; the limit (2^32 per DEK generation) is documented |
-| PSQLE-180 | Supply chain | GitHub Actions pinned by tag rather than by commit; floating container images in CI (`openbao:2`, `vault:latest`) | Medium | Open |
+| PSQLE-180 | Supply chain | GitHub Actions pinned by tag rather than by commit; floating container images in CI (`openbao:2`, `vault:latest`); a binary downloaded without a checksum; release assets neither checksummed as a whole nor signed | Medium | Fixed in 1.7.2: actions pinned by commit, service images by digest, downloads checked, all checked by `make ci-pins`; releases carry `SHA256SUMS` signed by a maintainer, an SPDX SBOM and a vulnerability scan; a release tag reaches GitHub only signed by a maintainer |
 | PSQLE-205 | SQL surface | `pg_vault_tde_reencrypt_table()`, granted to `pg_monitor`, rewrote any table without a privilege check | Medium | Fixed in 1.7.2: requires `MAINTAIN` on the table, checked on the calling role; removing the grant is 1.8 (PSQLE-212) |
 | PSQLE-206 | SQL surface | (1) The key-management functions checked `superuser()` inside `SECURITY DEFINER`, which is the owner; `wallet_init()` is granted to `pg_monitor`; `pkcs11_keygen()` checked nothing. (2) `pg_vault_tde_seal_keys()` and `pg_vault_tde_unseal_keys()` write and read a file on the server at a path the caller chooses | High | Fixed in 1.7.2: the calling role must be a superuser — for (2) the same power as writing server files; removing the grant is 1.8 (PSQLE-212) |
 | PSQLE-217 | SQL surface | The 12 `SECURITY DEFINER` functions run without a fixed `search_path`; two are `LANGUAGE SQL` (`pg_vault_tde_reencrypt_table(text, int)`, `pg_vault_tde_check_plaintext_index_keys()`). The fix changes the extension script. Until then, a superuser can run `ALTER FUNCTION … SET search_path = pg_catalog, <extension schema>` on each, and revoke `reencrypt_table()` from `pg_monitor` ([README](../README.md#who-may-call-reencrypt_table)) | Medium | Open — 1.8 |
@@ -234,13 +234,17 @@ documentation gap.
 
 ## Workflow
 
-- **Independence.** The person who signs a review is not the author of the code it
-  covers: for a delta review, of the delta.
-- **Signature.** The review is a file, `doc/security/reviews/v<version>.md`, added in
-  a GPG-signed commit (`git commit -S`); the release tag that follows it is GPG-signed
-  (`git tag -s`) and names that commit. The file states the reviewer, the key
-  fingerprint, the tag or commit reviewed, the scope and the date. Anyone checks both
-  with `git verify-commit` and `git verify-tag`.
+- **Independence.** The person who signs a review should not be the author of the
+  code it covers — for a delta review, of the delta. While the project has a single
+  maintainer, the author writes and signs it: the review then says so in its first
+  line (*self-review*), and a review by another person replaces it when there is one.
+- **Signature.** The review is a file, `doc/security/reviews/v<version>.md`, with a
+  detached signature by its reviewer next to it, `v<version>.md.asc`
+  (`gpg --armor --detach-sign`). A file's signature, unlike a commit's or a tag's,
+  survives the GitHub mirror, which rewrites every commit; it also ships in the source
+  bundle, which the release's signed `SHA256SUMS` covers. The file states the
+  reviewer, the key fingerprint, the commit reviewed, the scope and the date. The
+  release tag, signed, comes after the commit that adds it.
 - **Scope.**
   - *Full review* - every release that changes `extversion` (1.7 → 1.8), and any
     release that changes the cryptography, the on-disk format or the handling of keys.
@@ -257,7 +261,7 @@ documentation gap.
 
 | Version | Scope | Reviewer | Commit / tag | Date |
 |---|---|---|---|---|
-| 1.7.2 | Full (first review; the on-disk format changed) | - | - | pending (PSQLE-183) |
+| 1.7.2 | Full (first review; the on-disk format changed); self-review | - | - | pending (PSQLE-183) |
 
 ---
 

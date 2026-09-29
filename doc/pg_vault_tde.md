@@ -1735,8 +1735,8 @@ above, nothing generates it.
 | Provider | Backend under test | Version under test | Suites |
 |---|---|---|---|
 | `local` | PKCS#12 wallet on local disk; no external service | — | `regress`, `wallet`, `checksums`, `isolation`, `schema`, `bench`, `tap/02_backup_local.t` |
-| `vault` | HashiCorp Vault, Transit secrets engine (`ci/dump-compose.yml`) | image tag `hashicorp/vault:latest`, **unpinned** | `vault`, `tap/03_backup_vault.t` |
-| `openbao` | OpenBao, Transit secrets engine, 3-node Raft cluster (`bao-1`…`bao-3` plus `bao-init`) | image tag `openbao/openbao:2` | `openbao` |
+| `vault` | HashiCorp Vault, Transit secrets engine (`ci/dump-compose.yml`) | 2.1.0, pinned by digest in `ci/containers/real-vault.Containerfile` | `vault`, `tap/03_backup_vault.t` |
+| `openbao` | OpenBao, Transit secrets engine, 3-node Raft cluster (`bao-1`…`bao-3` plus `bao-init`) | 2.6.2, pinned by digest in `ci/compose-openbao*.yml` | `openbao` |
 | `pkcs11` | SoftHSM2 software token, created fresh per run in a tempdir | 2.6.1-3, from the base image's Debian | `pkcs11`, `tap/16_pkcs11.t` |
 
 Two things this table is saying, and one it is not:
@@ -1746,12 +1746,12 @@ Two things this table is saying, and one it is not:
   path, but no real device, PIN policy or slot behaviour is covered here — see
   [PKCS#11 / HSM Provider](#pkcs11--hsm-provider) for what the provider expects
   of one.
-- **Both service images float**, so a new upstream release enters CI with no
-  change on our side. OpenBao's tag tracks the 2.x line and is overridable with
-  `$OPENBAO_IMAGE`. Vault's is not pinned at all and has no override: the
-  `real-vault` image is built locally from
-  `ci/containers/real-vault.Containerfile`, whose `FROM hashicorp/vault:latest`
-  is hardcoded, so pinning a Vault version means editing that file.
+- **Both service images are pinned** by version and digest (PSQLE-180), so a new
+  upstream release enters CI only when someone moves the pin — see PGXN.md,
+  *Keeping pins current*; `make ci-pins` fails on an unpinned one. OpenBao's is
+  overridable with `$OPENBAO_IMAGE` to try another version; Vault's lives in
+  `ci/containers/real-vault.Containerfile`, which builds the local `real-vault`
+  image.
 
 
 ---

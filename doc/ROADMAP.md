@@ -572,6 +572,19 @@ distinguishes the builds.
     down, with a way to estimate it. `tap/47_basebackup_tde_search_path.t`,
     `tap/48_iv_uniqueness.t`.
 
+28. **What CI and the release pipeline fetch is pinned, and releases are signed
+    (PSQLE-180).** GitHub Actions are referenced by commit SHA, the Vault and OpenBao
+    images by version and digest, and the `docker-compose` binary the Bitbucket steps
+    download is checked against its SHA-256; `make ci-pins`, the first stage of
+    `make ci-all` and a step of the GitHub build, fails on anything else. The
+    PostgreSQL, Debian, Ubuntu and Go images float on purpose, each within its
+    release. The release workflow creates a draft with `SHA256SUMS`, an SPDX SBOM of the
+    source bundle and a grype report; a maintainer signs `SHA256SUMS` with their own
+    key and publishes it, so no signing key lives in CI. A `v*` tag reaches GitHub
+    only if the Bitbucket synchronization finds it signed by a key its variable
+    `RELEASE_TAG_SIGNERS` lists — checked there because the mirror's rewrite strips
+    tag signatures.
+
 **Key operations one at a time (PSQLE-210).** Rotations and wallet operations are
 tested alone and against concurrent DML, not against each other; the README now says
 to run them one at a time per database and lists the combinations to avoid until 1.8.

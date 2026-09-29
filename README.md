@@ -1825,6 +1825,29 @@ bash packaging/build_deb.sh --no-sign
 bash packaging/build_rpm.sh
 ```
 
+### Verifying a release
+
+From 1.7.2 on, every GitHub Release carries `SHA256SUMS` — the SHA-256 of every
+asset — and `SHA256SUMS.asc`, its signature by a maintainer, whose key's fingerprint
+is in [SECURITY.md](SECURITY.md#release-signing-keys). With the release's files
+downloaded:
+
+```bash
+gpg --import packaging/RELEASE-KEYS.asc          # the maintainers' public keys
+gpg --fingerprint                                # compare with SECURITY.md
+gpg --verify SHA256SUMS.asc SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+The signed review of the release (`doc/security/reviews/`, see
+[doc/SECURITY-REVIEW.md](doc/SECURITY-REVIEW.md)) is inside the source bundle, with
+its own signature next to it.
+
+Each release also carries `pg_vault_tde-X.Y.Z.spdx.json`, an SPDX SBOM of the source
+bundle, and `pg_vault_tde-X.Y.Z.grype.txt`, a vulnerability scan of it. Both are for
+information: the extension vendors no code, and links OpenSSL, libcurl and libpq
+from the system.
+
 ---
 
 ## Encrypted Backups
