@@ -1427,7 +1427,7 @@ Starts PostgreSQL with `initdb -k` (`--data-checksums`). Verifies that:
 
 ### TAP Tests (`tap/`)
 
-41 files, run together by `make ci-tap` (which also starts the Vault container
+42 files, run together by `make ci-tap` (which also starts the Vault container
 the Vault-dependent files need; they `skip_all` when `VAULT_ADDR` is unset).
 
 | File | Coverage |
@@ -1473,6 +1473,7 @@ the Vault-dependent files need; they `skip_all` when `VAULT_ADDR` is unset).
 | `tap/39_index_build_old_snapshot.t` | An index built while an older REPEATABLE READ snapshot is open gives that snapshot what a plain heap twin gives it — rows deleted after it, HOT-updated rows by their old values only; after two rotations under an open snapshot `CREATE INDEX` still builds and marks the index `indcheckxmin`; a parallel build passes amcheck (PSQLE-201) |
 | `tap/40_cluster_order.t` | `CLUSTER` on `encrypted_heap` puts the rows in index order through both paths core can choose (index scan, sort), against a plain heap twin with out-of-line values and a dropped column; `CLUSTER` on a `tde_btree` index is refused; `VACUUM FULL` still works (PSQLE-204) |
 | `tap/41_reencrypt_table_privileges.t` | `pg_vault_tde_reencrypt_table()` rewrites a table only for a role holding `MAINTAIN` on it: a `pg_monitor` member (both overloads, one `SECURITY DEFINER`) and a role granted `EXECUTE` alone are refused; the owner, a `pg_maintain` member and a superuser succeed; `rotate_online()` is unaffected (PSQLE-205) |
+| `tap/42_security_definer_callers.t` | Every key-management function refuses any caller but a superuser, whoever holds `EXECUTE`: a `pg_monitor` member cannot create a database's wallet, and a role granted `EXECUTE` on all ten is refused by each; a superuser still succeeds (PSQLE-206) |
 
 #### `tap/19_crash_recovery_rmgr.t`
 
