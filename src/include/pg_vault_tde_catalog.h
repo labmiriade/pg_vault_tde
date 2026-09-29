@@ -80,6 +80,13 @@ typedef struct TdeRelDekMapKey
  * rotating worker encrypts with the key it generated (held in its own memory,
  * never here), and the entry only moves to the new key when that transaction
  * commits, from its commit callback.  See pg_vault_tde_catalog_zero_rel_dek().
+ *
+ * STANDBY: the commit callback runs on the primary only; a standby learns of a
+ * rotation from the replicated catalog row alone.  So a catalog read that shows
+ * a newer generation than a valid entry's replaces it (the entry is stale, not
+ * the catalog), and an entry stored during recovery is marked
+ * loaded_in_recovery: once recovery is over, the first encryption checks it
+ * against the catalog before using it (PSQLE-190).
  */
 typedef struct TdeRelDekMap
 {
@@ -90,6 +97,8 @@ typedef struct TdeRelDekMap
     bool         dek_valid;             /* true iff dek[] holds a live key */
     bool         prev_dek_valid;        /* true iff prev_dek[] is populated */
     bool         rotating;              /* an online rotation owns the entry */
+    bool         loaded_in_recovery;    /* dek[] read during recovery, not yet
+                                         * checked since; see STANDBY above */
 } TdeRelDekMap;
 
 /*

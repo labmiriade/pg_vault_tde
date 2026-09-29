@@ -405,6 +405,21 @@ distinguishes the builds.
     "UPDATE from out of line to compressed inline" fails on the commit before that fix
     and on 1.7.1).
 
+14. **A streaming standby kept the retired DEK after a rotation (PSQLE-190).** The
+    commit callback that moves the cache to the new key runs on the primary; a standby
+    only replays the catalog row, and `tde_rel_dek_cache_store()` never replaced a
+    valid entry. Every row of the new generation took the slow path (catalog read +
+    KMS unwrap), and after a promotion `get_rel_dek_gen()` encrypted new rows with the
+    cached, retired key — lost at the next restart, or, in 1.7.1 where DEK and
+    generation were not read together, unreadable at once. Now a catalog read showing a
+    newer generation replaces the entry (the old key becomes `prev_dek` only when the
+    generations are consecutive; an older one during recovery, from an older snapshot,
+    never wins), and entries stored during recovery are marked `loaded_in_recovery`:
+    after recovery the first encryption checks each against the catalog once, and the
+    rotation's commit callback clears the mark. `tap/34_standby_rotation.t`: a table
+    read after the rotation, one only written after the promotion, one rotated twice,
+    a cold control.
+
 **New CI stage — `make ci-upgrade`.** Every other suite in this repo reads only data it
 wrote in the same run, so writer and reader always move together and a format-level
 breakage leaves the suite green while data on disk becomes unreadable. That is how the

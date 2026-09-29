@@ -51,6 +51,8 @@ packaged (OS, PG) combinations and what CI exercises on each in the
 > read or written — see [`rotate_online()` with concurrent access](#rotate_online-with-concurrent-access) —
 > and run `VACUUM FULL` on a rotated table with out-of-line values — see
 > [`rotate_online()` and out-of-line values](#rotate_online-and-out-of-line-values).
+> A standby promoted while still on 1.7.1 must be restarted before its first write —
+> see [Streaming standby and `rotate_online()`](#streaming-standby-and-rotate_online).
 > Otherwise nothing has to be done before installing 1.7.2, but existing
 > encrypted tables need one `VACUUM FULL` afterwards — see
 > [Upgrading to 1.7.2](#upgrading-to-172). Rows stay readable either way; until
@@ -1285,6 +1287,30 @@ already asks for repairs all of it: it rewrites dropped columns as NULL, as core
 which removes the dangling pointers and the orphaned chunks. A rotation or an `UPDATE`
 of a row repairs that row too, and `rotate_online()` and `DELETE` work on the tables
 as they are. `make ci-upgrade` checks each of these on data written by 1.7.1.
+
+
+### Streaming standby and `rotate_online()`
+
+The rotation moves the primary's shared-memory DEK cache to the new key when it
+commits; a streaming standby learns of it only from the replicated catalog row. Up to
+1.7.1 a standby that had a table's DEK cached kept the retired one (PSQLE-190):
+
+- every row of the new generation went through the catalog and the KMS — one unwrap
+  per row, an HTTP call each with Vault — until the standby restarted;
+- after a promotion the node encrypted new rows of such a table with the retired key.
+  In 1.7.1 the table stops reading at once, at the first scan that meets a new row;
+  with the rest of 1.7.2's fixes alone the rows would have been lost at the next
+  restart.
+
+**Still on 1.7.1:** after promoting a standby, restart it before the first write —
+with the local wallet, `pg_vault_tde_wallet_unlock()` in each database does the same.
+Both empty the cache, so every key comes from the catalog again.
+
+What changes in 1.7.2: a catalog read that shows a newer generation than the cached
+one replaces it, so the standby unwraps once per rotated table rather than once per
+row; and once a node leaves recovery, the first write to each table checks the key it
+cached during recovery against the catalog. `tap/34_standby_rotation.t` covers both,
+including a table first touched by an `INSERT` after the promotion.
 
 ## Compatibility
 
