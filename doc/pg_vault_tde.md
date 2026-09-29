@@ -1427,7 +1427,7 @@ Starts PostgreSQL with `initdb -k` (`--data-checksums`). Verifies that:
 
 ### TAP Tests (`tap/`)
 
-37 files, run together by `make ci-tap` (which also starts the Vault container
+38 files, run together by `make ci-tap` (which also starts the Vault container
 the Vault-dependent files need; they `skip_all` when `VAULT_ADDR` is unset).
 
 | File | Coverage |
@@ -1469,6 +1469,7 @@ the Vault-dependent files need; they `skip_all` when `VAULT_ADDR` is unset).
 | `tap/35_rotate_online_indexes.t` | Every index keeps finding every row across `pg_vault_tde_rotate_online()` — PRIMARY KEY, UNIQUE, plain, partial and `tde_btree`: a lookup through each, a full range, amcheck `heapallindexed`, and duplicate keys refused, after two rotations, a VACUUM and a restart (PSQLE-194) |
 | `tap/36_verify_integrity_toast.t` | `pg_vault_tde_verify_integrity()` counts a row whose out-of-line value no longer decrypts: one byte flipped in a TOAST chunk's ciphertext (checksums off, as `tap/20`), the row counted once, the total still a row count, an untouched table clean, no resource left behind (PSQLE-196) |
 | `tap/37_speculative_abort_toast.t` | An `INSERT ... ON CONFLICT` that loses the race to a concurrent insert leaves no out-of-line value behind, for DO NOTHING and DO UPDATE, on `encrypted_heap` and on a plain heap: the race is made deterministic with an expression index that blocks on an advisory lock, no injection points needed (PSQLE-197) |
+| `tap/38_partial_index_build.t` | A partial index on `encrypted_heap` holds only the rows its predicate admits, against a plain heap twin: a valid `UNIQUE ... WHERE` builds and enforces, a partial btree has the heap twin's size after CREATE INDEX and REINDEX, amcheck `heapallindexed` passes, a `tde_btree` partial index answers, `reltuples` still counts every row (PSQLE-198) |
 
 #### `tap/19_crash_recovery_rmgr.t`
 
