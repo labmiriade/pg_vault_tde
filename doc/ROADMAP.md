@@ -1,6 +1,6 @@
 # pg_vault_tde Roadmap
 
-> Last updated: 2026-09-29 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 42 TAP files / 744 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 3 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
+> Last updated: 2026-09-29 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 43 TAP files / 744 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 3 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
 
 ---
 
@@ -527,6 +527,17 @@ declarations in `ci/upgrade-compat.expected`: whether old data is still readable
 whether it can be updated in place. Changing either declaration is a deliberate act that
 shows up in the diff — and the two answers are what decide whether a release needs a
 `VACUUM FULL` note or a dump-with-the-old-binary procedure.
+
+**New soak test — `make ci-soak` (PSQLE-207).** Most defects of this release needed
+several conditions at once — writes, out-of-line values, a dropped column, a rotation, a
+rewrite, a restart — and each TAP covers one combination. `tap/43_soak.t` draws them at
+random for as long as asked (30 minutes by default): rounds of 100 transactions that
+apply the same statement to an encrypted table and to a heap twin, each followed by one
+of VACUUM, VACUUM FULL, CLUSTER, REINDEX, `rotate_online()`, `rotate_kek()` or an
+immediate stop, then contents, whole rows, TOAST values, `verify_integrity()`, amcheck
+and index lookups are checked. It prints its seed; `SOAK_SEED` replays a failed run.
+Skipped in every other stage; the Bitbucket custom pipeline `soak` runs it on PG 17 and
+PG 18.
 
 ---
 
