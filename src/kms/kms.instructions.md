@@ -313,7 +313,7 @@ Rules, each paid for by a lost database in 1.7.1:
 Pruning old versions is not implemented (1.8); `LOCAL_KEK_MAX_VERSIONS` caps the
 ring.  `pg_dump_tde_kms_local.c` has its own reader with the same rules, so a
 dump taken before a rotation restores.  Regression:
-`tap/30_rotate_kek_local_atomicity.t`.
+`tap/30_rotate_kek_atomicity.t`, for every provider.
 
 ### Provider Registration
 
