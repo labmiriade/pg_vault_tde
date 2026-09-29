@@ -541,6 +541,15 @@ distinguishes the builds.
     locks that keep most invalidations out — to be replaced the same way in 1.8.
     `tap/45_verify_integrity_relcache_inval.t`.
 
+25. **A PKCS#11 KEK rotation that failed could not be retried from its session
+    (PSQLE-209).** Found by the new per-provider `tap/30`: a rotation cancelled after
+    `prepare_kek_rotation()` had made `v<N+1>` on the token left that session at
+    `kek_version = N`, and every retry asked for `v<N+1>` again ("already exists"),
+    while its hint said to retry or to remove the key. The next version is now the
+    highest on the token + 1; the message is left for a concurrent rotation, and no
+    longer suggests deleting a key that may already wrap DEKs. Local and Vault passed
+    every scenario as they were. `tap/30_rotate_kek_atomicity.t`.
+
 **New CI stage — `make ci-upgrade`.** Every other suite in this repo reads only data it
 wrote in the same run, so writer and reader always move together and a format-level
 breakage leaves the suite green while data on disk becomes unreadable. That is how the

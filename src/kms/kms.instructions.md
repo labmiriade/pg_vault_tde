@@ -400,6 +400,12 @@ else if (strcmp(guc_kms_provider, "kmip") == 0)
   resolves the right key regardless of what's current.  `commit_kek_rotation`
   is a pure in-backend cache update — no token-side promotion, hence no
   crash window.
+- The next version is the highest **on the token** + 1, never this
+  backend's `kek_version` + 1: a rotation that failed after
+  `prepare_kek_rotation` left its key there and the cache where it was, and
+  the same session asked for that label forever (PSQLE-209).  A label that
+  exists anyway means a concurrent rotation — its key may already wrap DEKs:
+  never advise removing it.
 - **Cross-backend rotation propagation**: `commit_kek_rotation` is per-
   backend cache state (`Pkcs11State`, a file-scope `static`) — without more,
   an already-connected sibling backend would keep wrapping new DEKs under
