@@ -1529,12 +1529,14 @@ Plus a regression guard on the postmaster: a cluster-level `local` provider
 must not attempt to open a wallet at startup, where there is no database and
 therefore no wallet path.
 
-### Isolation Tests (`isolation/dek_rotation.spec`)
+### Isolation Tests (`test/isolation/specs/`)
 
-Verifies:
-1. DEK rotation does not block concurrent read transactions.
-2. New inserts after rotation use the new generation.
-3. Reads that started before rotation complete without error (MVCC + local cache).
+- `per_table_dek_rotation.spec`: DEK rotation racing readers, writers and VACUUM.
+- `encrypted_rewrite_concurrency.spec`: `VACUUM FULL` / `CLUSTER` with a reader
+  holding a snapshot across the relfilenode change, and with a writer to wait for.
+- `toast_update_concurrency.spec`: an `UPDATE` replacing an out-of-line value
+  while another transaction updates or deletes the row; every permutation ends
+  with `VACUUM` and counts the values left in the TOAST relation (PSQLE-193).
 
 ### Anti-Patterns (DO NOT)
 
