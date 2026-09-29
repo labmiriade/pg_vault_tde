@@ -530,6 +530,17 @@ distinguishes the builds.
     `.lock` — already ended in an ERROR without touching the file.
     `tap/44_damaged_wallet.t`.
 
+24. **`verify_integrity()` counted intact rows as failed (PSQLE-207).** Found by the
+    soak test. It read the raw tuples by pointing the table's relcache entry at heapam
+    for its scan; a relcache invalidation processed meanwhile — autovacuum's statistics,
+    about a minute after a restart — rebuilt the entry with the TAM in it, and every
+    later tuple came back decrypted and failed as ciphertext. It now calls heapam's scan
+    directly (`heap_beginscan()` / `heap_getnextslot()`) and leaves `rd_tableam` alone.
+    `index_fetch_tuple`, the index build scan and `copy_for_cluster` still swap
+    `rd_tableam`; there an invalidation mid-scan can only end in an ERROR, and they hold
+    locks that keep most invalidations out — to be replaced the same way in 1.8.
+    `tap/45_verify_integrity_relcache_inval.t`.
+
 **New CI stage — `make ci-upgrade`.** Every other suite in this repo reads only data it
 wrote in the same run, so writer and reader always move together and a format-level
 breakage leaves the suite green while data on disk becomes unreadable. That is how the

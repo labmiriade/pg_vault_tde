@@ -3337,9 +3337,10 @@ tde_row_toast_readable(HeapTuple plain, TupleDesc desc, MemoryContext cxt)
  * pg_vault_tde_verify_integrity(regclass)
  *   → (total_tuples bigint, failed_tuples bigint)
  *
- * Scans all live tuples in a raw heapam scan (bypassing TAM decrypt) and
- * manually attempts GCM decryption on each.  Catches per-tuple failures
- * via PG_TRY/PG_CATCH so a single corrupted row does not abort the scan.
+ * Scans all live tuples with heapam's own scan, called directly, so they come
+ * back as stored, and attempts GCM decryption on each.  Catches per-tuple
+ * failures via PG_TRY/PG_CATCH so a single corrupted row does not abort the
+ * scan.
  *
  * A row also fails when one of its out-of-line values cannot be fetched —
  * a missing chunk, or one that does not decrypt: the row's own tag says
@@ -3357,7 +3358,6 @@ pg_vault_tde_verify_integrity(PG_FUNCTION_ARGS)
     Relation             rel;
     TupleTableSlot      *slot;
     TableScanDesc        scan;
-    const TableAmRoutine *saved_am;
     volatile int64       total = 0;
     volatile int64       failed = 0;
     MemoryContext volatile toast_cxt = NULL;
@@ -3377,65 +3377,50 @@ pg_vault_tde_verify_integrity(PG_FUNCTION_ARGS)
                                           "pg_vault_tde verify toast",
                                           ALLOCSET_DEFAULT_SIZES);
     /*
-     * Swap rd_tableam to heapam so the scan returns raw encrypted tuples
-     * without triggering our decrypt-on-read wrappers.
+     * heapam's scan, called directly: it returns the tuples as stored.  Not
+     * table_beginscan() with rd_tableam pointed at heapam — that pointer lives
+     * in the relcache entry, and an invalidation of the table processed during
+     * the scan (autovacuum's statistics, any update of its pg_class row)
+     * rebuilt the entry with the TAM in it: every later tuple came back
+     * decrypted and failed as ciphertext (PSQLE-207).
      */
-    saved_am = rel->rd_tableam;
+    slot = MakeSingleTupleTableSlot(RelationGetDescr(rel), &TTSOpsBufferHeapTuple);
+    scan = heap_beginscan(rel, GetActiveSnapshot(), 0, NULL, NULL,
+                          SO_TYPE_SEQSCAN | SO_ALLOW_STRAT | SO_ALLOW_SYNC |
+                          SO_ALLOW_PAGEMODE);
+    while (heap_getnextslot(scan, ForwardScanDirection, slot))
     {
-        const TableAmRoutine **rdam = (const TableAmRoutine **)(void *)&rel->rd_tableam;
-        TDE_IMPERSONATE_ENTER();
-        *rdam = GetHeapamTableAmRoutine();
-    }
-    PG_TRY();
-    {
-        slot = table_slot_create(rel, NULL);
-        scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL);
-        while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
-        {
-            BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) slot;
-            total++;
-            /*
-             * Try to decrypt the raw tuple.  On GCM auth failure the crypto
-             * layer raises ERROR; we catch it and count the failure.
-             * Use PG_TRY(2) to avoid variable shadowing with outer PG_TRY.
-             */
-            PG_TRY(2);
-            {
-                HeapTuple plain = tde_decrypt_heap_tuple(bslot->base.tuple,
-                                                          RelationGetRelid(rel),
-                                                          RelationGetDescr(rel));
+        BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) slot;
 
-                if (toast_cxt != NULL)
-                {
-                    if (!tde_row_toast_readable(plain, RelationGetDescr(rel), toast_cxt))
-                        failed++;
-                    MemoryContextReset(toast_cxt);
-                }
-                pfree(plain);
-            }
-            PG_CATCH(2);
+        Assert(TTS_IS_BUFFERTUPLE(slot) && BufferIsValid(bslot->buffer));
+        total++;
+        /*
+         * Try to decrypt the raw tuple.  On GCM auth failure the crypto
+         * layer raises ERROR; we catch it and count the failure.
+         */
+        PG_TRY();
+        {
+            HeapTuple plain = tde_decrypt_heap_tuple(bslot->base.tuple,
+                                                      RelationGetRelid(rel),
+                                                      RelationGetDescr(rel));
+
+            if (toast_cxt != NULL)
             {
-                failed++;
-                FlushErrorState();
+                if (!tde_row_toast_readable(plain, RelationGetDescr(rel), toast_cxt))
+                    failed++;
+                MemoryContextReset(toast_cxt);
             }
-            PG_END_TRY(2);
+            pfree(plain);
         }
-        table_endscan(scan);
-        ExecDropSingleTupleTableSlot(slot);
+        PG_CATCH();
+        {
+            failed++;
+            FlushErrorState();
+        }
+        PG_END_TRY();
     }
-    PG_CATCH();
-    {
-        const TableAmRoutine **rdam = (const TableAmRoutine **)(void *)&rel->rd_tableam;
-        *rdam = saved_am;
-        TDE_IMPERSONATE_EXIT();
-        PG_RE_THROW();
-    }
-    PG_END_TRY();
-    {
-        const TableAmRoutine **rdam = (const TableAmRoutine **)(void *)&rel->rd_tableam;
-        *rdam = saved_am;
-        TDE_IMPERSONATE_EXIT();
-    }
+    heap_endscan(scan);
+    ExecDropSingleTupleTableSlot(slot);
     table_close(rel, AccessShareLock);
     if (toast_cxt != NULL)
         MemoryContextDelete(toast_cxt);

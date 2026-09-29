@@ -228,6 +228,15 @@ result = heapam_cb(rel, ...);
 leaving it corrupted causes cascading failures in subsequent operations on
 the same relcache entry.
 
+**The swap does not survive a relcache rebuild.** An invalidation of the relation
+processed while it is swapped — at any lock acquisition, and a TOAST read takes
+several — rebuilds the open entry, and `rd_tableam` is the TAM again: every later
+dispatch through it decrypts.  `verify_integrity()` counted every later tuple as
+failed that way (PSQLE-207).  Where heapam's functions can be called directly
+(`heap_beginscan()`, `heap_getnextslot()`, `heap_endscan()`), call them and leave
+`rd_tableam` alone; keep the swap only around a single heapam call that processes
+no invalidations.
+
 ### TOAST Override
 
 ```c

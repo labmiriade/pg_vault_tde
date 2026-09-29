@@ -829,7 +829,7 @@ log stream without any extension-level configuration.
 | Function | Returns | Description |
 |---|---|---|
 | `pg_vault_tde_health_check()` | composite | Status (6 columns: version, build_version, enabled, kms_provider, enc_ops_available, checked_at) |
-| `pg_vault_tde_verify_integrity(regclass)` | record | GCM tag audit scan of all tuples and every out-of-line value they reference — returns `(total_tuples, failed_tuples)`, a row counted once whichever part failed |
+| `pg_vault_tde_verify_integrity(regclass)` | record | GCM tag audit scan of all tuples and every out-of-line value they reference — returns `(total_tuples, failed_tuples)`, a row counted once whichever part failed. Up to 1.7.1 it could count intact rows as failed when the table was invalidated during its scan (autovacuum updating its statistics): on 1.7.1, run it again before acting on a failure |
 | `pg_vault_tde_encrypted_size(regclass)` | record | Encryption storage overhead — returns `(total_tuples, encryption_overhead_bytes)` |
 | `pg_vault_tde_reencrypt_table(regclass, int)` | void | Batch re-encrypt with current DEK (locks table); `int` = batch size, default 1000. Requires `MAINTAIN` on the table (its owner, `pg_maintain`, superusers) since 1.7.2 — see [Who may call `reencrypt_table()`](#who-may-call-reencrypt_table) |
 | `pg_vault_tde_rotate_online(regclass, int)` | void | BGW-based online rotation: reads continue, writes wait until it commits; accepts both `encrypted_heap` tables and `tde_btree` indexes **(v1.5)** |
@@ -2061,7 +2061,9 @@ run against 1.7.2.
 - **Check integrity off-peak.** `pg_vault_tde_verify_integrity('t')` verifies the GCM
   tag of every tuple and fetches every out-of-line value it references — a full scan of
   the table and of its TOAST relation. It does not look at chunks no row references,
-  nor at dropped columns.
+  nor at dropped columns. Up to 1.7.1 a failure could be false — autovacuum updating the
+  table's statistics during the scan was enough — so on 1.7.1 run it a second time, and
+  check that the rows read, before treating a table as damaged.
 - **Check health.** `pg_vault_tde_health_check()`, `pg_vault_tde_hw_accel_info()` (is
   AES-NI in use?), and `pg_vault_tde_vault_status()` or `pg_vault_tde_wallet_status()`
   for the KMS — see [SQL Functions](#sql-functions).

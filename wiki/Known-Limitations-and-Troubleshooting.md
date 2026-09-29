@@ -84,6 +84,16 @@ result. Common causes:
   data specifically to make this fail loudly instead of silently decrypting
   as the wrong row.
 
+### `verify_integrity()` reports failed tuples, but every row reads (1.7.1)
+
+Up to 1.7.1 `pg_vault_tde_verify_integrity()` pointed the table's relcache
+entry at heapam for the length of its scan. A relcache invalidation of the
+table during the scan — autovacuum updating its statistics, an `ALTER TABLE`,
+a `GRANT` — put the encrypted access method back, and from then on every tuple
+came back already decrypted and was counted as failed ("encrypted tuple too
+short", "decryption failed"). The data was intact. Run it again, and read the
+rows (`SELECT count(*), count(md5(t::text)) FROM mytable t`); fixed in 1.7.2.
+
 ### `pg_vault_tde_wallet_init()` fails / wallet base directory error
 
 The base directory `/var/lib/pg_vault_tde/` must exist, be owned by the OS

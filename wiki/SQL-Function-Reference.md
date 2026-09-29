@@ -16,7 +16,7 @@ each function without being a superuser.
 | Function | Returns | Description |
 |---|---|---|
 | `pg_vault_tde_health_check()` | table: `version`, `enabled`, `kms_provider`, `enc_ops_available`, `checked_at` | Single-row diagnostic snapshot of the extension |
-| `pg_vault_tde_verify_integrity(rel regclass)` | record: `total_tuples`, `failed_tuples` | GCM authentication-tag scan over every tuple in a table, fetching every out-of-line value it references (since 1.7.2) — a failed tuple means tampering or corruption, not a transient error. `total_tuples` counts rows; a row is counted once in `failed_tuples` whether its own tag or one of its TOAST values failed |
+| `pg_vault_tde_verify_integrity(rel regclass)` | record: `total_tuples`, `failed_tuples` | GCM authentication-tag scan over every tuple in a table, fetching every out-of-line value it references (since 1.7.2) — a failed tuple means tampering or corruption, not a transient error. `total_tuples` counts rows; a row is counted once in `failed_tuples` whether its own tag or one of its TOAST values failed. Up to 1.7.1 it could report intact rows as failed when the table was invalidated during its scan (autovacuum): rerun it before acting on a failure there |
 | `pg_vault_tde_encrypted_size(rel regclass)` | record: `total_tuples`, `encryption_overhead_bytes` | Encryption storage overhead for a table |
 | `pg_vault_tde_hw_accel_info()` | record: `openssl_version`, `configured_provider`, `provider_loaded`, `gcm_cipher`, `siv_cipher`, `aes_ni_available` | OpenSSL provider/cipher diagnostics — confirms which hardware acceleration path is active |
 | `pg_vault_tde_vault_status()` | table: `configured`, `auth_method`, `reachable` | Vault/OpenBao connectivity diagnostics |
