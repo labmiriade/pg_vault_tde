@@ -21,6 +21,21 @@ Every write callback MUST follow this sequence:
 4. Copy physical TID back to the slot
 5. `OPENSSL_cleanse` + `pfree` the plaintext copy
 
+### TOAST deletion waits for the heap operation (PSQLE-193)
+
+The pre-TOAST runs before `heap_update()`, because the new row needs its TOAST
+pointers before it is encrypted; core toasts inside `heap_update()`, once the
+row is known to be updatable.  So the pre-TOAST may insert chunks but never
+delete any: `pg_vault_tde_toast_tuple()` clears `TOAST_NEEDS_DELETE_OLD` before
+`toast_tuple_cleanup()`.  `pg_vault_tde_tuple_update()` then calls
+`tde_toast_delete_unshared()`: on `TM_Ok` it deletes the old row's values the
+new one no longer references; on any other result it kills the chunks this
+call inserted (`heap_abort_speculative`), because READ COMMITTED may skip the
+row or retry on a newer version that still points at the old ones.  The old
+row is fetched with `SnapshotAny` — after an EvalPlanQual recheck `otid` is a
+version the statement's snapshot does not see.  Regression:
+`test/isolation/specs/toast_update_concurrency.spec`.
+
 ### Write Path PG_TRY Contract (v1.6 patch — fix #1)
 
 All four write callbacks (`pg_vault_tde_tuple_insert`,

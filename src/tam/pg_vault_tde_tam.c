@@ -1857,12 +1857,84 @@ pg_vault_tde_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
     pfree(enc_tuples);
 }
 /*
+ * tde_toast_delete_unshared — delete the out-of-line values of doomed that
+ * kept (may be NULL) does not reference in the same column.
+ *
+ * Both are plaintext tuples of rel.  Dropped columns count: their chunks stay
+ * until something deletes them.  With speculative the chunks must have been
+ * inserted by this transaction, and are killed outright
+ * (heap_abort_speculative), as core does for a failed INSERT ... ON CONFLICT.
+ */
+static void
+tde_toast_delete_unshared(Relation rel, HeapTuple doomed, HeapTuple kept,
+                          bool speculative)
+{
+    TupleDesc desc = RelationGetDescr(rel);
+    int       natts = desc->natts;
+    Datum    *dvals;
+    bool     *dnull;
+    Datum    *kvals = NULL;
+    bool     *knull = NULL;
+
+    Assert(doomed != NULL && doomed != kept);
+
+    /* No TOAST relation, no out-of-line value: every UPDATE comes through. */
+    if (!OidIsValid(rel->rd_rel->reltoastrelid))
+        return;
+
+    dvals = palloc(natts * sizeof(Datum));
+    dnull = palloc(natts * sizeof(bool));
+    heap_deform_tuple(doomed, desc, dvals, dnull);
+
+    for (int i = 0; i < natts; i++)
+    {
+        struct varlena *d = (struct varlena *) DatumGetPointer(dvals[i]);
+
+        if (dnull[i] || TupleDescAttr(desc, i)->attlen != -1 ||
+            !VARATT_IS_EXTERNAL_ONDISK(d))
+            continue;
+
+        if (kept != NULL && kvals == NULL)
+        {
+            kvals = palloc(natts * sizeof(Datum));
+            knull = palloc(natts * sizeof(bool));
+            heap_deform_tuple(kept, desc, kvals, knull);
+        }
+
+        if (kept != NULL && !knull[i])
+        {
+            struct varlena *k = (struct varlena *) DatumGetPointer(kvals[i]);
+
+            if (VARATT_IS_EXTERNAL_ONDISK(k) &&
+                memcmp(d, k, VARSIZE_EXTERNAL(d)) == 0)
+                continue;
+        }
+
+        toast_delete_datum(rel, dvals[i], speculative);
+    }
+
+    pfree(dvals);
+    pfree(dnull);
+    if (kvals != NULL)
+    {
+        pfree(kvals);
+        pfree(knull);
+    }
+}
+
+/*
  * pg_vault_tde_tuple_update
  *
  * UPDATE path: pre-TOASTs the plaintext, encrypts the (now-small) tuple,
  * then delegates to heap_update with TOAST suppressed.  heap_update may
  * return TM_Updated or other non-Ok results on concurrent modification;
  * we only propagate the new ctid to the slot on TM_Ok.
+ *
+ * The TOAST bookkeeping core does inside heap_update() happens here around
+ * it, and only after it has answered (PSQLE-193): on TM_Ok the old row's
+ * values the new one no longer references are deleted; otherwise the chunks
+ * this call inserted are, since the executor may skip the row or retry on a
+ * newer version that still points at the old ones.
  */
 static TM_Result
 pg_vault_tde_tuple_update(Relation rel, ItemPointer otid,
@@ -1888,27 +1960,37 @@ pg_vault_tde_tuple_update(Relation rel, ItemPointer otid,
 
     PG_TRY();
     {
-        bool old_has_external = false;
-        if (pg_vault_tde_tuple_fetch_row_version(rel, otid, snapshot, slot_old))
-        {
+        /*
+         * The version heap_update() will look at, visible to this statement's
+         * snapshot or not: after an EvalPlanQual recheck otid is a version
+         * committed after it was taken.
+         */
+        if (pg_vault_tde_tuple_fetch_row_version(rel, otid, SnapshotAny, slot_old))
             old_tuple = ExecFetchSlotHeapTuple(slot_old, false, NULL);
-            old_has_external = tde_tuple_has_external(old_tuple, rel);
-        }
+
+        /*
+         * The executor hands us the TID of a tuple it has just read or locked,
+         * which cannot have been pruned since.  Without it the old values
+         * could not be deleted below, only leaked.
+         */
+        Assert(old_tuple != NULL);
 
         enc = tde_prepare_encrypt_tuple(rel, plain, old_tuple, &toasted, 0);
 
         result = heap_update(rel, otid, enc, cid, crosscheck, wait,
                              tmfd, lockmode, update_indexes);
 
+        /* toasted, not enc: enc is ciphertext. */
         if (result == TM_Ok)
         {
             ItemPointerCopy(&enc->t_self, &slot->tts_tid);
             slot->tts_tableOid = enc->t_tableOid;
 
-            /* Check toasted (plaintext): enc is ciphertext with HASEXTERNAL cleared. */
-            if (old_tuple != NULL && old_has_external && !HeapTupleHasExternal(toasted))
-                heap_toast_delete(rel, old_tuple, false);
+            if (old_tuple != NULL)
+                tde_toast_delete_unshared(rel, old_tuple, toasted, false);
         }
+        else
+            tde_toast_delete_unshared(rel, toasted, old_tuple, true);
     }
     PG_CATCH();
     {

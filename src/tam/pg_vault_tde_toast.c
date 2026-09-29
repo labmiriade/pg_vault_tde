@@ -568,16 +568,17 @@ pg_vault_tde_toast_tuple(Relation rel, HeapTuple newtup, HeapTuple oldtup, int o
         toasted = newtup;
 
     /*
-     * Delete any old external TOAST chunks that were replaced by new values.
-     * toast_tuple_init (called above) marks old external attributes as
-     * TOASTCOL_NEEDS_DELETE_OLD when the new value differs; toast_tuple_cleanup
-     * calls toast_delete_datum for each such attribute.
+     * Free the temporary values, but leave the old tuple's chunks alone.
      *
-     * Without this call, the large→large UPDATE path orphans the old TOAST
-     * chunks: the fallback in pg_vault_tde_tuple_update only fires when the
-     * new tuple has NO external TOAST (!HeapTupleHasExternal), so large→large
-     * updates (where both old and new tuples are external) are not covered.
+     * Core deletes the replaced values here too, and can: it toasts inside
+     * heap_update(), once the row is known to be updatable.  This runs before
+     * heap_update(), which can still find the row updated or deleted by a
+     * concurrent transaction; READ COMMITTED then skips the row or retries on
+     * the newer version, and either one may still point at those chunks
+     * (PSQLE-193).  pg_vault_tde_tuple_update() deletes them once
+     * heap_update() has succeeded.
      */
+    ttc.ttc_flags &= ~TOAST_NEEDS_DELETE_OLD;
     toast_tuple_cleanup(&ttc);
 
     return toasted;

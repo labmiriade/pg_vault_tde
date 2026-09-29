@@ -88,13 +88,20 @@ my $probe = $node->background_psql('postgres');
 # ExecutorState seen while it was running, in bytes.  Returns undef when the
 # statement finished before a single sample landed: that is a failure to
 # measure, not a pass, and the caller says so.
+#
+# With $whole, the backend's grand total instead: a C function called from
+# SQL allocates in an ExprContext below ExecutorState, which ExecutorState's
+# own figure does not include.
 # ---------------------------------------------------------------------------
 my $run_seq = 0;
 
 sub peak_executor_state
 {
-    my ($sql) = @_;
+    my ($sql, $whole) = @_;
     my $peak    = 0;
+    my $re      = $whole
+        ? qr/Grand total: \d+ bytes in \d+ blocks; \d+ free \(\d+ chunks\); (\d+) used/
+        : qr/ExecutorState: \d+ total in \d+ blocks; \d+ free \(\d+ chunks\); (\d+) used/;
     my $samples = 0;
     my $banner  = 'TDE_MEM_DONE_' . ++$run_seq;
 
@@ -130,7 +137,7 @@ sub peak_executor_state
         my $log = PostgreSQL::Test::Utils::slurp_file($node->logfile, $off);
         # 'used', not 'total': aset grows blocks geometrically, so total
         # counts free space inside them and overstates what is live.
-        while ($log =~ /ExecutorState: \d+ total in \d+ blocks; \d+ free \(\d+ chunks\); (\d+) used/g)
+        while ($log =~ /$re/g)
         {
             $samples++;
             $peak = $1 if $1 > $peak;
@@ -168,6 +175,16 @@ my $copy_file = File::Spec->rel2abs(
 # allocate per row.
 # ---------------------------------------------------------------------------
 sub amend { my ($m) = @_; return $m eq 'enc' ? ' USING encrypted_heap' : ''; }
+
+# TOAST_ROWS rows, each with one out-of-line value.
+sub toast_table
+{
+    my ($t, $m) = @_;
+    return ("DROP TABLE IF EXISTS $t",
+            "CREATE TABLE $t (k int4, big text)" . amend($m),
+            "INSERT INTO $t SELECT g, (SELECT string_agg(md5((g*1000+s)::text), '') "
+          . "FROM generate_series(1,200) s) FROM generate_series(1,$T) g");
+}
 
 sub enc_index
 {
@@ -295,6 +312,28 @@ my @workloads = (
         run   => sub { my $t = shift;
             "INSERT INTO $t SELECT g, (SELECT string_agg(md5((g*1000+s)::text), '') "
           . "FROM generate_series(1,200) s) FROM generate_series(1,$T) g;" } },
+
+    # The UPDATE paths that do TOAST bookkeeping per row: replacing a value
+    # stores new chunks and deletes the old ones after heap_update(), keeping
+    # it reuses the pointer (PSQLE-193).
+    {   name  => 'UPDATE replacing out-of-line TOAST values',
+        setup => sub { my ($t, $m) = @_; toast_table($t, $m) },
+        run   => sub { my $t = shift; "UPDATE $t SET big = reverse(big);" } },
+
+    {   name  => 'UPDATE keeping out-of-line TOAST values',
+        setup => sub { my ($t, $m) = @_; toast_table($t, $m) },
+        run   => sub { my $t = shift; "UPDATE $t SET k = k + 1;" } },
+
+    # The rotation's rewrite, run in a session so it can be sampled: every
+    # out-of-line value is fetched back and stored again (PSQLE-189).  The
+    # plain twin gets the UPDATE of every row it performs.  Measured over the
+    # whole backend: the function allocates below ExecutorState.
+    {   name  => 'pg_vault_tde_reencrypt_table() of out-of-line TOAST values',
+        whole => 1,
+        setup => sub { my ($t, $m) = @_; toast_table($t, $m) },
+        run   => sub { my $t = shift;
+            $t =~ /_enc$/ ? "SELECT pg_vault_tde_reencrypt_table('$t');"
+                          : "UPDATE $t SET big = big || '';" } },
 );
 
 my $n = 0;
@@ -307,7 +346,7 @@ foreach my $w (@workloads)
     {
         my $tbl = "m${n}_$mode";
         $node->safe_psql('postgres', $_) for $w->{setup}->($tbl, $mode);
-        $peak{$mode} = peak_executor_state($w->{run}->($tbl));
+        $peak{$mode} = peak_executor_state($w->{run}->($tbl), $w->{whole});
 
         if (!defined $peak{$mode})
         {

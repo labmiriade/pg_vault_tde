@@ -1,6 +1,6 @@
 # pg_vault_tde Roadmap
 
-> Last updated: 2026-09-29 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 32 TAP files / 530 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 3 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
+> Last updated: 2026-09-29 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 32 TAP files / 533 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 3 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
 
 ---
 
@@ -357,6 +357,23 @@ distinguishes the builds.
     under the new key and `toast_tuple_cleanup()` deletes the old chunks; dropped
     columns are rewritten as well, so every chunk left in the TOAST relation decrypts.
     `tap/32_rotate_online_toast.t`, on every provider.
+
+11. **A concurrent `UPDATE` of an out-of-line value could lose it (PSQLE-193).** The
+    TAM toasts the new row before `heap_update()`, so it can encrypt it, and that
+    toaster also deleted the replaced values — while core does it inside
+    `heap_update()`, once the row is known to be updatable. When `heap_update()` then
+    found the row changed by a concurrent transaction, READ COMMITTED skipped it or
+    retried on the newer version, which still pointed at the deleted chunks: the value
+    broke at the next `VACUUM` (`missing chunk number 0`), the retry failed with
+    `tuple concurrently deleted`, or the unchanged values of the newer version were
+    left orphaned. Now the pre-TOAST only inserts; after `heap_update()` the old
+    row's values the new one no longer references are deleted on `TM_Ok`, and the
+    chunks the attempt inserted are killed otherwise (`heap_abort_speculative`, as
+    for a failed `INSERT ... ON CONFLICT`). The old row is read with `SnapshotAny`,
+    since after a recheck it is a version the statement's snapshot does not see.
+    The separate fallback that deleted the old values when the new row had none is
+    gone with it. `test/isolation/specs/toast_update_concurrency.spec`, whose
+    expected output is the same spec run on a plain heap table.
 
 **New CI stage — `make ci-upgrade`.** Every other suite in this repo reads only data it
 wrote in the same run, so writer and reader always move together and a format-level

@@ -1235,6 +1235,28 @@ and deletes the old chunks, dropped columns included. A rotation of a table with
 values reads and writes all of them, so it takes longer and writes more WAL than in
 1.7.1.
 
+### Concurrent `UPDATE` of out-of-line values
+
+Up to 1.7.1, an `UPDATE` that replaced an out-of-line value deleted the old value's
+chunks before it found out whether another transaction had changed the row. When one
+had — a concurrent `UPDATE` or `DELETE` of the same row, under `READ COMMITTED` — the
+waiting `UPDATE` could (PSQLE-193):
+
+- skip the row, because its `WHERE` no longer matched the newer version, which still
+  pointed at the deleted chunks: the value kept reading until the next `VACUUM`, then
+  failed with `missing chunk number 0 for toast value …`;
+- fail with `tuple concurrently deleted` when the other transaction had replaced or
+  deleted the same value;
+- go ahead on the newer version and leave the chunks of the values it did not change
+  behind, referenced by nothing.
+
+A value already lost cannot be brought back except from a backup;
+`SELECT sum(length(t::text)) FROM t` fails on a table that has one. The orphaned
+chunks only take space, and `VACUUM FULL` drops them. In 1.7.2 the old chunks are
+deleted only once the row has been updated, and an attempt that finds the row changed
+removes the chunks it had written, so the waiting `UPDATE` behaves as on a plain heap
+table.
+
 ## Compatibility
 
 | Feature | Status | Notes |
@@ -1341,7 +1363,7 @@ make ci-bench BENCH_ROWS=100000  # with custom row count
 make ci-clean            # Remove test containers and images
 ```
 
-Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 530 assertions across 32 TAP files. Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
+Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 533 assertions across 32 TAP files. Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
 - Tests 1-4: extension loaded, access methods and SQL functions registered, wallet unlock
 - Tests 12-14: TAM INSERT/SELECT/UPDATE end-to-end
 - Test 15: DELETE
