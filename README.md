@@ -1587,12 +1587,17 @@ make ci-regress          # 141 SQL regression tests (vault provider) — numbere
 make ci-errorpath        # 13 error-path tests (141-153) — exercises the PG_CATCH handlers
 make ci-matrix           # regress + TAP on the other supported PG majors (17, 19 when published)
 make ci-scan-build       # Clang static analyzer over the sources (compile only, ~1 min)
+make ci-semgrep          # the project's own Semgrep rules (ci/semgrep/), each tested on its own file, then run on src/
 make ci-ubsan            # Extension built with -fsanitize=undefined
+make ci-asan             # Extension built with -fsanitize=address, runtime preloaded into the stock server
 make ci-valgrind         # Valgrind memcheck over the full TDE workload (slow: 10-50x)
 make ci-cassert          # SQL suites + TAP files on PostgreSQL built --enable-cassert -DUSE_VALGRIND (builds PG from source)
 make ci-wallet           # SQL regression tests (local wallet provider)
 make ci-checksums        # regression tests + page checksum compatibility
-make ci-tap              # 46 TAP test files (starts a real Vault container for the Vault-dependent ones)
+make ci-tap              # 48 TAP test files (starts a real Vault container for the Vault-dependent ones)
+make ci-pins             # every GitHub Action pinned by commit, every third-party image by digest, every downloaded binary checked (first stage of ci-all)
+make ci-sbom             # SPDX SBOM of the source bundle (syft), scanned by grype — informational, as on the release
+make ci-security-report  # the stages a security review cites, on this commit → doc/security/evidence/v<VERSION>.md (doc/SECURITY-REVIEW.md › Workflow)
 make ci-soak             # tap/43_soak.t alone: 30 min of random writes, rotations and immediate stops against a heap twin (SOAK_MINUTES, SOAK_SEED)
 make ci-isolation        # 3 isolation specs: DEK rotation under load, relation rewrite under a concurrent reader, UPDATE of out-of-line values racing another transaction
 make ci-vault            # Vault integration (Compose-based)
@@ -1605,7 +1610,7 @@ make ci-bench BENCH_ROWS=100000  # with custom row count
 make ci-clean            # Remove test containers and images
 ```
 
-Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 1152 assertions across 46 TAP files (the soak test, `tap/43`, runs only under `make ci-soak`). Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
+Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 1164 assertions across 48 TAP files (the soak test, `tap/43`, runs only under `make ci-soak`). Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
 - Tests 1-4: extension loaded, access methods and SQL functions registered, wallet unlock
 - Tests 12-14: TAM INSERT/SELECT/UPDATE end-to-end
 - Test 15: DELETE
@@ -1691,18 +1696,21 @@ Every other test file exercises the success path. These exercise the `PG_CATCH` 
 - Test 152: every write path, plus VACUUM FULL and CLUSTER, healthy again after 145 longjmps
 - Test 153: core must not re-TOAST the ciphertext — sweeps 29 payload sizes across `TOAST_TUPLE_THRESHOLD` plus UPDATE, UPSERT and COPY at the boundary. Guards a segfault: `heap_toast_insert_or_update()` fires on tuple *size* as well as on external attributes, so clearing `HEAP_HASEXTERNAL` alone leaves a window as wide as the AES-GCM overhead in which core deforms ciphertext as varlena and `toast_save_datum()` crashes
 
-Deep-checking stages — four tools, four different bug classes. `run-all.sh --skip-deep` skips all of them; they are the only stages that cost more than a couple of minutes.
+Deep-checking stages — five tools, five different bug classes. `run-all.sh --skip-deep` skips all of them; they are the only stages that cost more than a couple of minutes.
 
 | stage | sees | cost |
 |---|---|---|
 | `ci-scan-build` | per-path symbolic execution: NULL deref on one branch, sizes from a length that can be zero | ~1 min, compile only |
 | `ci-ubsan` | undefined behaviour: signed overflow, oversized shifts, misaligned loads, `nonnull` violations | minutes, no PG rebuild |
+| `ci-asan` | memory errors outside palloc: overflows of malloc'd, stack and global buffers (OpenSSL, libcurl, libc), use after free | minutes, no PG rebuild |
 | `ci-valgrind` | memory ownership: invalid/double `free()` of malloc'd state, out-of-bounds, uninitialised reads | 10-50x runtime |
 | `ci-cassert` | `Assert()` calls that run nowhere else, plus `MEMORY_CONTEXT_CHECKING` — the only stage that catches a double `pfree()` of a palloc chunk | builds PostgreSQL from source |
 
 `ci-cassert` is the one worth the wall-clock. `--enable-cassert` executes the `Assert()` calls this codebase is full of — none of which run in any packaged build — and turns on `MEMORY_CONTEXT_CHECKING`, which poisons freed chunks and validates the header on every `pfree()`. A double free in a `PG_CATCH` handler becomes a loud failure instead of a silent no-op that the aborting transaction covers up moments later. Neither flag exists in a PGDG or Debian package, which is why the image builds the server from source. The stage runs the four regression files, the error-path suite and the `tap/` files (the Vault ones skip): the TAP scenarios reach paths no SQL file does — a failed rotation, a restart between two statements — and a failed rotation crashed the worker on this build until the TAP files ran here.
 
-`ci-ubsan` uses the `TDE_SANITIZE` Makefile knob (`make TDE_SANITIZE=undefined`), which instruments only our objects — the server binary stays stock, so no PostgreSQL rebuild is needed.
+`ci-ubsan` and `ci-asan` use the `TDE_SANITIZE` Makefile knob (`make TDE_SANITIZE=undefined`, `=address`), which instruments only our objects — the server binary stays stock, so no PostgreSQL rebuild is needed. ASan's runtime is preloaded into the server with `LD_PRELOAD`, and the stage checks from a backend that it and the module are mapped before trusting a clean report. palloc'd chunks carry no redzones: those stay `ci-valgrind`'s and `ci-cassert`'s.
+
+`ci-semgrep` is not a deep stage: it takes seconds. Each rule in `ci/semgrep/` encodes a mistake this code base made or must not make — `superuser()` in a function that may be `SECURITY DEFINER`, a write to `rd_tableam`, `memcmp()` on a MAC or tag, a secret freed without `OPENSSL_cleanse()` or passed to a message, a random source other than `pg_strong_random()`, a client-tool query calling the extension unqualified — and comes with a test file saying where it must and must not fire. Any finding fails the stage; a line that is right in context carries a `nosemgrep: <rule>` comment saying why.
 
 Concurrency — `make ci-isolation` (`test/isolation/specs/`):
 
@@ -1714,7 +1722,7 @@ On-disk corruption — `tap/20_ondisk_fuzz.t`:
 
 Flips 72 random bits across the heap file over 6 rounds (fixed seed, so a failure reproduces) and classifies every row afterwards. The property under test is that the layer has exactly two behaviours under arbitrary damage — correct data, or a refusal — and never hands the client a value derived from damaged ciphertext. Data page checksums are **disabled** for this test on purpose: with them on, PostgreSQL rejects the page before the extension is asked to decrypt anything, and the test would measure core's checksums instead of AES-256-GCM.
 
-A third outcome is counted separately and accepted: the row *vanishing*. Our wire format keeps the `HeapTupleHeader` in plaintext and authenticates only `[t_hoff .. t_len)`, so a flip in xmin, infomask or the null bitmap is outside the GCM tag by construction and can make the tuple invisible. That is data loss from unauthenticated-header damage, not a forged value — the test distinguishes the two rather than conflating them.
+A third outcome is counted separately and accepted: the row *vanishing*. Our wire format keeps the `HeapTupleHeader` in plaintext and authenticates only the attribute values, so a flip in xmin, infomask or the null bitmap is outside the GCM tag by construction and can make the tuple invisible (what the tag does not cover: [doc/pg_vault_tde.md](doc/pg_vault_tde.md#what-the-authentication-tag-does-not-cover)). That is data loss from unauthenticated-header damage, not a forged value — the test distinguishes the two rather than conflating them.
 
 Cross-version — `make ci-matrix`:
 
@@ -1824,6 +1832,29 @@ bash packaging/build_deb.sh --no-sign
 bash packaging/build_rpm.sh
 ```
 
+### Verifying a release
+
+From 1.7.2 on, every GitHub Release carries `SHA256SUMS` — the SHA-256 of every
+asset — and `SHA256SUMS.asc`, its signature by a maintainer, whose key's fingerprint
+is in [SECURITY.md](SECURITY.md#release-signing-keys). With the release's files
+downloaded:
+
+```bash
+gpg --import packaging/RELEASE-KEYS.asc          # the maintainers' public keys
+gpg --fingerprint                                # compare with SECURITY.md
+gpg --verify SHA256SUMS.asc SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+The signed review of the release (`doc/security/reviews/`, see
+[doc/SECURITY-REVIEW.md](doc/SECURITY-REVIEW.md)) is inside the source bundle, with
+its own signature next to it.
+
+Each release also carries `pg_vault_tde-X.Y.Z.spdx.json`, an SPDX SBOM of the source
+bundle, and `pg_vault_tde-X.Y.Z.grype.txt`, a vulnerability scan of it. Both are for
+information: the extension vendors no code, and links OpenSSL, libcurl and libpq
+from the system.
+
 ---
 
 ## Encrypted Backups
@@ -1910,7 +1941,11 @@ succeeds**, writes one bundle per database next to it:
 
 Use `--keys-dir DIR` to store the bundles elsewhere (e.g. outside `PGDATA`).
 Databases without the extension are skipped; a failed backup leaves no bundle
-files behind. The tar format (`-Ft`) is not supported — use the plain format
+files behind. Each session runs with an empty `search_path` and calls the function in
+the extension's own schema, whatever the database's settings; up to 1.7.1 it used the
+session's `search_path`, and a database with the extension in a schema off that path
+stopped the whole backup ("function pg_vault_tde_seal_keys_bytea(unknown, unknown) does
+not exist"). The tar format (`-Ft`) is not supported — use the plain format
 or run `pg_vault_tde_seal_keys()` manually.
 
 Restore stays manual, exactly as above: restore the data dir, provision the
@@ -2000,6 +2035,23 @@ run against 1.7.2.
 - **Treat the server log as sensitive.** Statement text is logged with its literals: with
   `log_statement = 'mod'` or `'all'`, and by default for every statement that fails
   (`log_min_error_statement = error`).
+- **Keep secrets out of statement text and out of `PGDATA`.**
+  - A passphrase given to `pg_vault_tde_wallet_init()`, `_wallet_unlock()`,
+    `_wallet_change_passphrase()`, `_migrate_vault_to_wallet()` or a seal function is
+    part of the statement: logged as above, and visible in `pg_stat_activity` to the same
+    role and to `pg_read_all_stats` while the call runs. Make those calls from a session
+    that has run `SET log_statement = 'none'` and `SET log_min_error_statement = 'panic'`.
+  - `vault_token`, `vault_role_id`, `vault_secret_id` and `wallet_dev_mode_passphrase`
+    hold the secret itself, and exist only as settings. Never set them with `SET`
+    (statement text), `ALTER SYSTEM` (it writes `postgresql.auto.conf`, inside `PGDATA` and
+    so inside every base backup) or `ALTER DATABASE`/`ALTER ROLE … SET` (stored in
+    `pg_db_role_setting`, and in every `pg_dumpall`). Put them in a file outside `PGDATA`,
+    readable only by the server's operating-system user, loaded with `include`. For the
+    wallet, prefer `wallet_passphrase_env`, `_file` or `_command`, which hold only where
+    the passphrase is.
+  - `wallet_passphrase_command` runs through `popen()` — a shell, as the server's
+    operating-system user — every time the wallet is opened; whatever it writes to
+    standard error reaches the server log.
 
 ### Designing encrypted tables
 
@@ -2089,6 +2141,25 @@ run against 1.7.2.
   larger than a plain btree even right after a rebuild.
 - **Rotate keys on a schedule** — see [Key Rotation](#key-rotation). Online rotations are
   tracked in the `pg_vault_tde_rotation_status` view, readable by `pg_monitor`.
+- **Rotate the DEK of write-heavy tables before it reaches 2^32 encryptions.** With
+  random 96-bit IVs, AES-GCM allows at most 2^32 (about 4.3 billion) encryptions under
+  one key (NIST SP 800-38D). Here the key is one DEK generation of one table, and every
+  tuple written counts: each `INSERT`, each `UPDATE`, each row that `VACUUM FULL`,
+  `CLUSTER` or a rotation rewrites, and each out-of-line chunk. `rotate_online()` starts
+  a new generation. At 1,000 writes a second the limit is 50 days away; at 10,000, five.
+  The statistics give an estimate — inserts and updates of the table and its TOAST
+  relation, rotations included; they miss `VACUUM FULL` and `CLUSTER` and restart from
+  zero after a crash, so note them at each rotation and keep a wide margin:
+
+  ```sql
+  SELECT s.relid::regclass AS table_name,
+         s.n_tup_ins + s.n_tup_upd + coalesce(t.n_tup_ins, 0) AS writes
+  FROM pg_stat_all_tables s
+  JOIN pg_class c ON c.oid = s.relid
+  JOIN pg_am    a ON a.oid = c.relam AND a.amname = 'encrypted_heap'
+  LEFT JOIN pg_stat_all_tables t ON t.relid = c.reltoastrelid
+  ORDER BY writes DESC;
+  ```
 - **Check integrity off-peak.** `pg_vault_tde_verify_integrity('t')` verifies the GCM
   tag of every tuple and fetches every out-of-line value it references — a full scan of
   the table and of its TOAST relation. It does not look at chunks no row references,

@@ -1,0 +1,9 @@
+rules:
+  - id: tde-caller-superuser
+    languages: [c]
+    severity: ERROR
+    message: >-
+      superuser() asks about the current user, which inside a SECURITY DEFINER
+      function is the function's owner: always a superuser. Ask about the
+      calling role with tde_caller_is_superuser() (PSQLE-206).
+    pattern: superuser()

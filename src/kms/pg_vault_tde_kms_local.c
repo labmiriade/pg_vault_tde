@@ -2077,7 +2077,9 @@ pg_vault_tde_wallet_change_passphrase_sql(PG_FUNCTION_ARGS)
 
     local_ring_free(cur);
     local_ring_free(next);
+    /* nosemgrep: tde-cleanse-before-free — cleansed in the PG_FINALLY above */
     pfree(old_pass);
+    /* nosemgrep: tde-cleanse-before-free — cleansed in the PG_FINALLY above */
     pfree(new_pass);
 
     ereport(LOG,

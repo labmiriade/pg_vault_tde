@@ -76,7 +76,11 @@ Two kinds of release, and they touch different files.
       baked in via `-DPG_VAULT_TDE_BUILD_VERSION` would stay stale
 - [ ] Verify at runtime: `SELECT pg_vault_tde_build_version()` reports the new
       version while `pg_extension.extversion` still reports the old one
-- [ ] Tag the release commit
+- [ ] On the release commit: `make ci-all` (or the Bitbucket custom pipeline
+      `test-all`) and `make ci-security-report` (or `security-report`); then the
+      signed review, committed with the evidence
+      ([doc/SECURITY-REVIEW.md › Workflow](../doc/SECURITY-REVIEW.md#workflow))
+- [ ] Tag the release commit, signed (`git tag -s`)
 
 **Minor/major release (SQL objects changed)** — e.g. 1.7.x → 1.8:
 - [ ] Everything above, plus:

@@ -1,6 +1,6 @@
 # pg_vault_tde Roadmap
 
-> Last updated: 2026-09-29 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 46 TAP files / 1152 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 3 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
+> Last updated: 2026-09-29 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 48 TAP files / 1164 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 3 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
 
 ---
 
@@ -559,6 +559,62 @@ distinguishes the builds.
     TOAST, amcheck and generation, before and after a restart. After a crash or an
     immediate shutdown the row still says `running`; the README says how to tell.
     `tap/46_rotate_online_interrupted.t`.
+
+27. **`pg_basebackup_tde` ran with the session's `search_path`, and the IV batch had no
+    owner (PSQLE-178).** The tool called `pg_vault_tde_seal_keys_bytea()` unqualified,
+    in a session whose `search_path` a database's owner sets: it now empties it right
+    after connecting, as core's client tools do, and calls the function in the
+    extension's schema — which also lets a database keep the extension in a schema off
+    its `search_path`: up to 1.7.1 that stopped the whole backup with "function …
+    does not exist". The per-process batch of 256 IVs is refilled by any process
+    that did not fill it — no PostgreSQL process forks after drawing an IV, so this is
+    defence in depth — and the limit of 2^32 encryptions per DEK generation is written
+    down, with a way to estimate it. `tap/47_basebackup_tde_search_path.t`,
+    `tap/48_iv_uniqueness.t`.
+
+28. **What CI and the release pipeline fetch is pinned, and releases are signed
+    (PSQLE-180).** GitHub Actions are referenced by commit SHA, the Vault and OpenBao
+    images by version and digest, and the `docker-compose` binary the Bitbucket steps
+    download is checked against its SHA-256; `make ci-pins`, the first stage of
+    `make ci-all` and a step of the GitHub build, fails on anything else. The
+    PostgreSQL, Debian, Ubuntu and Go images float on purpose, each within its
+    release. The release workflow creates a draft with `SHA256SUMS`, an SPDX SBOM of the
+    source bundle and a grype report; a maintainer signs `SHA256SUMS` with their own
+    key and publishes it, so no signing key lives in CI. A `v*` tag reaches GitHub
+    only if the Bitbucket synchronization finds it signed by a key its variable
+    `RELEASE_TAG_SIGNERS` lists — checked there because the mirror's rewrite strips
+    tag signatures.
+
+29. **Two new CI stages: ASan and the project's Semgrep rules (PSQLE-181).**
+    `make ci-asan` builds the extension with `-fsanitize=address` and preloads ASan's
+    runtime into the stock server, then runs the regression workload and the
+    error-path suite: it sees overflows of malloc'd, stack and global buffers and use
+    after free outside palloc — OpenSSL, libcurl, libc — which Valgrind sees too, at
+    ten times the cost, and the other stages do not. Before trusting a clean report it
+    checks that the runtime and the module are both mapped in a backend. `make
+    ci-semgrep` runs seven rules, each an old defect or a rule of this code base:
+    `superuser()` in a function that may be `SECURITY DEFINER` (PSQLE-206), a write to
+    `rd_tableam` (PSQLE-207), a MAC compared with `memcmp()`, a secret freed without
+    `OPENSSL_cleanse()` or put into a message, a random source other than
+    `pg_strong_random()`, a client-tool query calling the extension outside its schema
+    (PSQLE-178). Each rule has a test file of lines on which it must and must not
+    fire. Neither stage found a defect: the three `rd_tableam` writes left are PSQLE-213.
+    `ci-ubsan` and `ci-cassert` now stop on a failed image build; they used to run
+    on the previous image and pass.
+
+30. **`make ci-security-report` (PSQLE-182).** The evidence a security review
+    cites, in one file: `doc/security/evidence/v<version>.md` names the commit and
+    whether the tree was clean, then gives the tools, their versions and the result
+    and counts of the pin check, the Semgrep rules, the SBOM of the source bundle and
+    its vulnerability scan (`make ci-sbom`: syft and grype, one container each, pinned
+    by digest, informational as on the release), the error-path suite, scan-build,
+    UBSan, ASan, Valgrind and the assertion-enabled build, and lists every
+    `nosemgrep` in the code. It also names the system libraries the module and the
+    client tools link, by soname and so by ABI, not release: OpenSSL 3, libcurl, libpq
+    — the SBOM of the source holds none of them. With `GITHUB_TOKEN` set it counts
+    CodeQL's open alerts. The Bitbucket custom pipeline `security-report` runs it and
+    keeps the report and the raw logs as artifacts. It is part of the release checklist, on the release
+    commit.
 
 **Key operations one at a time (PSQLE-210).** Rotations and wallet operations are
 tested alone and against concurrent DML, not against each other; the README now says

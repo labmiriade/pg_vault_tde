@@ -127,7 +127,7 @@ override SHLIB_LINK += $(shell pkg-config --libs openssl libcurl) -ldl
 # TDE_SANITIZE: build the extension under a compiler sanitizer.
 #
 #   make TDE_SANITIZE=undefined      # UBSan  (used by make ci-ubsan)
-#   make TDE_SANITIZE=address        # ASan   (needs the server LD_PRELOADed)
+#   make TDE_SANITIZE=address        # ASan   (used by make ci-asan; the server LD_PRELOADs it)
 #
 # UBSan is the one that pays for itself here: it is a pure compile-time
 # instrumentation of OUR objects, so the stock server binary stays untouched
@@ -179,7 +179,7 @@ bench-cpu:
 # All targets delegate to ci/scripts/ which auto-detect podman/docker.
 # Override container runtime:  make ci-all CONTAINER_RT=docker
 # ===========================================================================
-.PHONY: ci-all ci-regress ci-matrix ci-errorpath ci-checksums ci-tap ci-soak ci-isolation ci-vault ci-openbao ci-wallet ci-pkcs11 ci-schema ci-valgrind ci-cassert ci-ubsan ci-scan-build ci-bench ci-install-test ci-clean
+.PHONY: ci-all ci-pins ci-regress ci-matrix ci-errorpath ci-checksums ci-tap ci-soak ci-isolation ci-vault ci-openbao ci-wallet ci-pkcs11 ci-schema ci-valgrind ci-cassert ci-ubsan ci-scan-build ci-asan ci-semgrep ci-sbom ci-security-report ci-bench ci-install-test ci-clean
 
 ci-all:
 	@bash ci/scripts/run-all.sh
@@ -202,14 +202,29 @@ ci-cassert:
 ci-ubsan:
 	@bash ci/scripts/run-ubsan.sh
 
+ci-asan:
+	@bash ci/scripts/run-asan.sh
+
 ci-scan-build:
 	@bash ci/scripts/run-scan-build.sh
+
+ci-semgrep:
+	@bash ci/scripts/run-semgrep.sh
+
+ci-sbom:
+	@bash ci/scripts/run-sbom.sh
+
+ci-security-report:
+	@bash ci/scripts/run-security-report.sh
 
 ci-checksums:
 	@bash ci/scripts/run-checksums.sh
 
 ci-tap:
 	@bash ci/scripts/run-tap.sh
+
+ci-pins:
+	@bash ci/scripts/run-pins.sh
 
 ci-soak:
 	@bash ci/scripts/run-soak.sh

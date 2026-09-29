@@ -906,6 +906,7 @@ pg_vault_tde_index_fetch_tuple(struct IndexFetchTableData *scan,
     const TableAmRoutine    *saved_am;
     const TableAmRoutine   **rdam;
     saved_am = scan->rel->rd_tableam;
+    /* nosemgrep: tde-rd-tableam — to be replaced by direct heapam calls, PSQLE-213 */
     rdam     = (const TableAmRoutine **) (void *) &scan->rel->rd_tableam;
     /*
      * Impersonate stock heapam so heap_hot_search_buffer's identity check
@@ -1435,6 +1436,7 @@ pg_vault_tde_index_build_range_scan(Relation heap_rel,
                                      TableScanDesc scan)
 {
     const TableAmRoutine  *saved_am = heap_rel->rd_tableam;
+    /* nosemgrep: tde-rd-tableam — to be replaced by direct heapam calls, PSQLE-213 */
     const TableAmRoutine **rdam = (const TableAmRoutine **) (void *) &heap_rel->rd_tableam;
     double volatile        reltuples = 0;
 
@@ -2819,6 +2821,7 @@ pg_vault_tde_relation_copy_for_cluster(Relation OldTable,
                                         double *tups_recently_dead)
 {
     const TableAmRoutine  *saved_am = OldTable->rd_tableam;
+    /* nosemgrep: tde-rd-tableam — to be replaced by direct heapam calls, PSQLE-213 */
     const TableAmRoutine **rdam = (const TableAmRoutine **) (void *) &OldTable->rd_tableam;
 
     if (OldIndex != NULL && tde_iam_is_tde_btree_index(OldIndex))

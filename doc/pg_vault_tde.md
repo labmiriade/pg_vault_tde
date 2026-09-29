@@ -542,14 +542,16 @@ pg_vault_tde batches 256 IVs per `pg_strong_random()` call:
 #define TDE_IV_BATCH_BYTES  (TDE_IV_BATCH_SIZE * TDE_GCM_IV_LEN)
 static char  iv_batch[TDE_IV_BATCH_BYTES];
 static int   iv_batch_pos = TDE_IV_BATCH_SIZE;  /* start empty */
+static int   iv_batch_pid = 0;                   /* the process that filled it */
 
 static void tde_next_iv(unsigned char *iv_out)
 {
-    if (iv_batch_pos >= TDE_IV_BATCH_SIZE)
+    if (iv_batch_pos >= TDE_IV_BATCH_SIZE || iv_batch_pid != MyProcPid)
     {
         if (!pg_strong_random(iv_batch, TDE_IV_BATCH_BYTES))
-            ereport(ERROR, (errmsg("[CRYPTO] pg_strong_random failed")));
+            ereport(ERROR, (errmsg("[CRYPTO] Failed to generate IV batch")));
         iv_batch_pos = 0;
+        iv_batch_pid = MyProcPid;
     }
     memcpy(iv_out, iv_batch + iv_batch_pos * TDE_GCM_IV_LEN, TDE_GCM_IV_LEN);
     iv_batch_pos++;
@@ -559,6 +561,19 @@ static void tde_next_iv(unsigned char *iv_out)
 The buffer is wiped with `OPENSSL_cleanse()` in the backend-exit cleanup.
 
 This amortises the syscall cost across 256 tuples.
+
+A batch belongs to the process that filled it. A `fork()` copies it, and two
+processes serving the same IVs under one DEK would void GCM for those tuples. No
+PostgreSQL process forks after drawing an IV — the postmaster encrypts nothing — so
+every process starts empty; the pid check keeps it so if that changes, and an Assert
+on assertion-enabled builds compares `MyProcPid` with `getpid()` (PSQLE-178).
+`tap/48_iv_uniqueness.t` reads every IV off the raw pages and checks that none repeats
+under one DEK generation.
+
+**Limit per key.** With random 96-bit IVs, NIST SP 800-38D allows at most 2^32
+encryptions under one key — here one DEK generation: every tuple written, every row
+rewritten, every TOAST chunk. `rotate_online()` starts a new generation; the README
+("Routine administration") says how to estimate where a table stands.
 
 ### Benchmark
 
@@ -1150,6 +1165,35 @@ Tuple payload bytes in WAL are the encrypted bytes written to disk —
 a WAL stream viewer sees ciphertext in DATA positions. Structural
 metadata (LSN, block numbers, relation OID, MVCC fields) is plaintext.
 
+### What the authentication tag does not cover
+
+The GCM tag of a tuple authenticates the bytes of its attribute values,
+concatenated in attribute order, and an AAD of `[MyDatabaseId | relid | generation]`.
+A ciphertext therefore does not verify in another database, another relation, or
+under another DEK generation: moved there, it is refused. Damage to the value bytes
+is refused too. The tag does not bind:
+
+- **the tuple's position** — its block and line pointer. heapam chooses where a
+  tuple goes after it has been formed, ciphertext included, so the position cannot
+  be part of the AAD. Within one relation and one generation, a tuple image written
+  back to another place, or an older image of the same table, still verifies.
+- **the tuple header** — `xmin`, `xmax`, the infomask. Core rewrites them (hint
+  bits, `xmax`, freezing) without the key. Damage there can make a row version
+  visible or invisible (`tap/20_ondisk_fuzz.t` counts that outcome apart).
+- **the layout of the values** — the null bitmap and the length headers of
+  variable-length attributes, which v5 keeps in clear (see
+  [Wire Format per Encrypted Region](#wire-format-per-encrypted-region)). They say
+  where one value ends and the next begins, and they are not part of the tag: whoever
+  can write the data files can change how a row's bytes are divided among its
+  variable-length attributes without failing it. No plaintext byte can be changed or
+  added that way. Authenticating the layout is a change of tuple format, planned
+  for 1.8 (PSQLE-218).
+
+Detecting a replayed or moved tuple needs integrity over pages or relations, which
+an extension cannot add; data checksums detect accidental damage only. All three are
+outside the threat model: the attacker it defends against reads files, and does not
+write to the data directory (see `doc/SECURITY-REVIEW.md`).
+
 ### Superuser Bypass
 
 A PostgreSQL superuser executing SQL sees plaintext (decrypted through
@@ -1427,7 +1471,7 @@ Starts PostgreSQL with `initdb -k` (`--data-checksums`). Verifies that:
 
 ### TAP Tests (`tap/`)
 
-46 files, run together by `make ci-tap` (which also starts the Vault container
+48 files, run together by `make ci-tap` (which also starts the Vault container
 the Vault-dependent files need; they `skip_all` when `VAULT_ADDR` is unset).
 `tap/43_soak.t` skips unless `PG_VAULT_TDE_SOAK=1`; `make ci-soak` runs it alone.
 
@@ -1479,6 +1523,8 @@ the Vault-dependent files need; they `skip_all` when `VAULT_ADDR` is unset).
 | `tap/44_damaged_wallet.t` | A local wallet truncated, empty, overwritten with random bytes, with one byte flipped, missing or unreadable: after a restart the server starts; reading, writing and creating an encrypted table fail with an ERROR; `wallet_unlock()`, `rotate_kek()`, `change_passphrase()` and `wallet_init()` fail and leave the file as it was; putting the file back restores every row. Leftover `wallet.p12.new` and `.lock` files are harmless; with the tables dropped, `wallet_init()` starts over (PSQLE-208) |
 | `tap/45_verify_integrity_relcache_inval.t` | `pg_vault_tde_verify_integrity()` under a relcache invalidation of the table it scans: stopped on its first tuple (the DEK load waits on a lock), the table's `pg_class` row is updated as autovacuum does, and every tuple must still verify (PSQLE-207) |
 | `tap/46_rotate_online_interrupted.t` | `rotate_online()` held halfway through its rewrite (an expression index waits on an advisory lock at row 500 of 1000), then cancelled, terminated, or the server stopped immediately: every tag verifies, the table equals its heap twin (whole rows, TOAST values), amcheck finds every row, the DEK generation is unchanged, right after and after a restart; the progress row says `failed` (still `running` after an immediate stop, as documented); a new rotation completes — once per provider (PSQLE-211) |
+| `tap/47_basebackup_tde_search_path.t` | `pg_basebackup_tde` calls the extension's own `pg_vault_tde_seal_keys_bytea()` even when a database's owner puts a schema with a function of the same name first in the database's `search_path`: that function never runs, and the bundle written is the real one; a database with the extension in a schema off its `search_path` is sealed too (PSQLE-178) |
+| `tap/48_iv_uniqueness.t` | No IV is used twice under one DEK: four sessions writing in turn, a restart and a rotation; every tuple of the heap and of its TOAST relation, dead versions included, is read off the raw pages and its (generation, IV) pair must be unique (PSQLE-178) |
 
 #### `tap/19_crash_recovery_rmgr.t`
 
@@ -1689,8 +1735,8 @@ above, nothing generates it.
 | Provider | Backend under test | Version under test | Suites |
 |---|---|---|---|
 | `local` | PKCS#12 wallet on local disk; no external service | — | `regress`, `wallet`, `checksums`, `isolation`, `schema`, `bench`, `tap/02_backup_local.t` |
-| `vault` | HashiCorp Vault, Transit secrets engine (`ci/dump-compose.yml`) | image tag `hashicorp/vault:latest`, **unpinned** | `vault`, `tap/03_backup_vault.t` |
-| `openbao` | OpenBao, Transit secrets engine, 3-node Raft cluster (`bao-1`…`bao-3` plus `bao-init`) | image tag `openbao/openbao:2` | `openbao` |
+| `vault` | HashiCorp Vault, Transit secrets engine (`ci/dump-compose.yml`) | 2.1.0, pinned by digest in `ci/containers/real-vault.Containerfile` | `vault`, `tap/03_backup_vault.t` |
+| `openbao` | OpenBao, Transit secrets engine, 3-node Raft cluster (`bao-1`…`bao-3` plus `bao-init`) | 2.6.2, pinned by digest in `ci/compose-openbao*.yml` | `openbao` |
 | `pkcs11` | SoftHSM2 software token, created fresh per run in a tempdir | 2.6.1-3, from the base image's Debian | `pkcs11`, `tap/16_pkcs11.t` |
 
 Two things this table is saying, and one it is not:
@@ -1700,12 +1746,12 @@ Two things this table is saying, and one it is not:
   path, but no real device, PIN policy or slot behaviour is covered here — see
   [PKCS#11 / HSM Provider](#pkcs11--hsm-provider) for what the provider expects
   of one.
-- **Both service images float**, so a new upstream release enters CI with no
-  change on our side. OpenBao's tag tracks the 2.x line and is overridable with
-  `$OPENBAO_IMAGE`. Vault's is not pinned at all and has no override: the
-  `real-vault` image is built locally from
-  `ci/containers/real-vault.Containerfile`, whose `FROM hashicorp/vault:latest`
-  is hardcoded, so pinning a Vault version means editing that file.
+- **Both service images are pinned** by version and digest (PSQLE-180), so a new
+  upstream release enters CI only when someone moves the pin — see PGXN.md,
+  *Keeping pins current*; `make ci-pins` fails on an unpinned one. OpenBao's is
+  overridable with `$OPENBAO_IMAGE` to try another version; Vault's lives in
+  `ci/containers/real-vault.Containerfile`, which builds the local `real-vault`
+  image.
 
 
 ---

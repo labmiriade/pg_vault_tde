@@ -1,0 +1,21 @@
+rules:
+  - id: tde-cleanse-before-free
+    languages: [c]
+    severity: ERROR
+    message: >-
+      $X holds a secret: cleanse it (OPENSSL_cleanse) before freeing it, or the
+      bytes stay in the freed memory for whatever reuses it, a core dump or swap.
+    patterns:
+      - pattern-either:
+          - pattern: pfree($X);
+          - pattern: free($X);
+          - pattern: pg_free($X);
+      - metavariable-regex:
+          metavariable: $X
+          regex: (?i)^(\w+_)?(pass|passphrase|pw|dek|kek|secret|pin)(_\w+)?$
+      - pattern-not-inside: |
+          OPENSSL_cleanse($X, ...);
+          ...
+      - pattern-not-inside: |
+          explicit_bzero($X, ...);
+          ...

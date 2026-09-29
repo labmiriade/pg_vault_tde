@@ -89,7 +89,7 @@ moderation decisions when appropriate.
 ## Reporting
 
 If you experience or witness unacceptable behaviour, or have any other
-concerns, report it to the maintainers at **supportodb@miriade.it** with
+concerns, report it to the maintainers at **codeofconduct@miriade.it** with
 `pg_vault_tde conduct` in the subject line.
 
 Include what happened, where, when, and links if the incident is on GitHub.
