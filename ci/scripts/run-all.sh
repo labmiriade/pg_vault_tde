@@ -12,8 +12,10 @@
 #   6. openbao     — OpenBao 3-node Raft integration (AppRole, KEK, BGW)
 #   7. wallet      — Local wallet full regression (kms_provider=local, tests 73-109)
 #   8. schema      — Multi-database and multi-schema isolation (SCHEMA-1..20)
-#   9. scan-build  — Clang static analyzer over the sources (compile only)
+#   9. semgrep     — the project's own Semgrep rules over src/ (ci/semgrep/)
+#   9b. scan-build — Clang static analyzer over the sources (compile only)
 #  10. ubsan       — Extension built with -fsanitize=undefined
+#  10b. asan       — Extension built with -fsanitize=address
 #  11. valgrind    — Valgrind memcheck over the full TDE workload (slow)
 #  12. cassert     — PostgreSQL built --enable-cassert -DUSE_VALGRIND (slowest)
 #  10. bench       — Performance benchmark (informational, non-blocking)
@@ -97,7 +99,7 @@ while [[ $# -gt 0 ]]; do
         --help|-h)
             echo "Usage: $0 [--skip-bench] [--skip-openbao] [--skip-wallet] [--skip-install-test] [--skip-valgrind] [--skip-deep] [--skip-matrix] [--only stage1 stage2 ...]"
             echo ""
-            echo "Stages: pins regress matrix errorpath checksums tap isolation vault openbao wallet pkcs11 schema scan-build ubsan valgrind cassert install-test bench"
+            echo "Stages: pins regress matrix errorpath checksums tap isolation vault openbao wallet pkcs11 schema upgrade semgrep scan-build ubsan asan valgrind cassert install-test bench"
             exit 0
             ;;
         *)
@@ -110,7 +112,7 @@ done
 # ---------------------------------------------------------------------------
 # Stage definitions
 # ---------------------------------------------------------------------------
-ALL_STAGES=(pins regress matrix errorpath checksums tap isolation vault openbao wallet pkcs11 schema upgrade scan-build ubsan valgrind cassert install-test bench)
+ALL_STAGES=(pins regress matrix errorpath checksums tap isolation vault openbao wallet pkcs11 schema upgrade semgrep scan-build ubsan asan valgrind cassert install-test bench)
 
 should_run() {
     local stage="$1"
@@ -142,7 +144,7 @@ should_run() {
         return 1
     fi
     if [[ "$SKIP_DEEP" == "1" ]]; then
-        case "$stage" in scan-build|ubsan|valgrind|cassert) return 1 ;; esac
+        case "$stage" in scan-build|ubsan|asan|valgrind|cassert) return 1 ;; esac
     fi
     return 0
 }

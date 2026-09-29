@@ -1,0 +1,18 @@
+rules:
+  - id: tde-client-qualified-call
+    languages: [c]
+    severity: ERROR
+    message: >-
+      A client tool calls the extension's functions in the extension's schema,
+      after emptying the session's search_path (ALWAYS_SECURE_SEARCH_PATH_SQL):
+      a database's owner sets the search_path of every session in it
+      (PSQLE-178). Build the call with the schema read from pg_extension.
+    patterns:
+      - pattern-either:
+          - pattern: PQexec($C, "$S")
+          - pattern: PQexecParams($C, "$S", ...)
+          - pattern: PQprepare($C, $N, "$S", ...)
+          - pattern: PQsendQuery($C, "$S")
+      - metavariable-regex:
+          metavariable: $S
+          regex: (?s).*(^|[^.\w%])pg_vault_tde_\w+\s*\(

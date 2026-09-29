@@ -78,6 +78,16 @@ while IFS= read -r line; do
     check_image "$where" "$img"
 done < <(grep -nE '^[[:space:]]*image:[[:space:]]' ci/*.yml bitbucket-pipelines.yml)
 
+# Images the CI scripts run by name.  A tag computed at run time (${...}) is the
+# install test choosing a distribution, which floats with it on purpose.
+while IFS= read -r line; do
+    where=${line%%:*}:$(cut -d: -f2 <<<"$line")
+    for img in $(grep -oE 'docker\.io/[a-z0-9._/-]+:[A-Za-z0-9._${#:-]+(@sha256:[0-9a-f]{64})?' <<<"${line#*:*:}"); do
+        [[ "$img" == *'${'* ]] && continue
+        check_image "$where" "$img"
+    done
+done < <(grep -nE 'docker\.io/' ci/scripts/*.sh | grep -v '^[^:]*:[0-9]*:[[:space:]]*#')
+
 # ── 3. Downloaded binaries ─────────────────────────────────────────────────
 for f in bitbucket-pipelines.yml .github/workflows/*.yml ci/containers/*.Containerfile; do
     downloads=$(grep -c 'releases/download/' "$f")

@@ -1587,7 +1587,9 @@ make ci-regress          # 141 SQL regression tests (vault provider) — numbere
 make ci-errorpath        # 13 error-path tests (141-153) — exercises the PG_CATCH handlers
 make ci-matrix           # regress + TAP on the other supported PG majors (17, 19 when published)
 make ci-scan-build       # Clang static analyzer over the sources (compile only, ~1 min)
+make ci-semgrep          # the project's own Semgrep rules (ci/semgrep/), each tested on its own file, then run on src/
 make ci-ubsan            # Extension built with -fsanitize=undefined
+make ci-asan             # Extension built with -fsanitize=address, runtime preloaded into the stock server
 make ci-valgrind         # Valgrind memcheck over the full TDE workload (slow: 10-50x)
 make ci-cassert          # SQL suites + TAP files on PostgreSQL built --enable-cassert -DUSE_VALGRIND (builds PG from source)
 make ci-wallet           # SQL regression tests (local wallet provider)
@@ -1692,18 +1694,21 @@ Every other test file exercises the success path. These exercise the `PG_CATCH` 
 - Test 152: every write path, plus VACUUM FULL and CLUSTER, healthy again after 145 longjmps
 - Test 153: core must not re-TOAST the ciphertext — sweeps 29 payload sizes across `TOAST_TUPLE_THRESHOLD` plus UPDATE, UPSERT and COPY at the boundary. Guards a segfault: `heap_toast_insert_or_update()` fires on tuple *size* as well as on external attributes, so clearing `HEAP_HASEXTERNAL` alone leaves a window as wide as the AES-GCM overhead in which core deforms ciphertext as varlena and `toast_save_datum()` crashes
 
-Deep-checking stages — four tools, four different bug classes. `run-all.sh --skip-deep` skips all of them; they are the only stages that cost more than a couple of minutes.
+Deep-checking stages — five tools, five different bug classes. `run-all.sh --skip-deep` skips all of them; they are the only stages that cost more than a couple of minutes.
 
 | stage | sees | cost |
 |---|---|---|
 | `ci-scan-build` | per-path symbolic execution: NULL deref on one branch, sizes from a length that can be zero | ~1 min, compile only |
 | `ci-ubsan` | undefined behaviour: signed overflow, oversized shifts, misaligned loads, `nonnull` violations | minutes, no PG rebuild |
+| `ci-asan` | memory errors outside palloc: overflows of malloc'd, stack and global buffers (OpenSSL, libcurl, libc), use after free | minutes, no PG rebuild |
 | `ci-valgrind` | memory ownership: invalid/double `free()` of malloc'd state, out-of-bounds, uninitialised reads | 10-50x runtime |
 | `ci-cassert` | `Assert()` calls that run nowhere else, plus `MEMORY_CONTEXT_CHECKING` — the only stage that catches a double `pfree()` of a palloc chunk | builds PostgreSQL from source |
 
 `ci-cassert` is the one worth the wall-clock. `--enable-cassert` executes the `Assert()` calls this codebase is full of — none of which run in any packaged build — and turns on `MEMORY_CONTEXT_CHECKING`, which poisons freed chunks and validates the header on every `pfree()`. A double free in a `PG_CATCH` handler becomes a loud failure instead of a silent no-op that the aborting transaction covers up moments later. Neither flag exists in a PGDG or Debian package, which is why the image builds the server from source. The stage runs the four regression files, the error-path suite and the `tap/` files (the Vault ones skip): the TAP scenarios reach paths no SQL file does — a failed rotation, a restart between two statements — and a failed rotation crashed the worker on this build until the TAP files ran here.
 
-`ci-ubsan` uses the `TDE_SANITIZE` Makefile knob (`make TDE_SANITIZE=undefined`), which instruments only our objects — the server binary stays stock, so no PostgreSQL rebuild is needed.
+`ci-ubsan` and `ci-asan` use the `TDE_SANITIZE` Makefile knob (`make TDE_SANITIZE=undefined`, `=address`), which instruments only our objects — the server binary stays stock, so no PostgreSQL rebuild is needed. ASan's runtime is preloaded into the server with `LD_PRELOAD`, and the stage checks from a backend that it and the module are mapped before trusting a clean report. palloc'd chunks carry no redzones: those stay `ci-valgrind`'s and `ci-cassert`'s.
+
+`ci-semgrep` is not a deep stage: it takes seconds. Each rule in `ci/semgrep/` encodes a mistake this code base made or must not make — `superuser()` in a function that may be `SECURITY DEFINER`, a write to `rd_tableam`, `memcmp()` on a MAC or tag, a secret freed without `OPENSSL_cleanse()` or passed to a message, a random source other than `pg_strong_random()`, a client-tool query calling the extension unqualified — and comes with a test file saying where it must and must not fire. Any finding fails the stage; a line that is right in context carries a `nosemgrep: <rule>` comment saying why.
 
 Concurrency — `make ci-isolation` (`test/isolation/specs/`):
 

@@ -1,0 +1,15 @@
+rules:
+  - id: tde-strong-random
+    languages: [c]
+    severity: ERROR
+    message: >-
+      Keys, IVs and salts come from pg_strong_random(), which is safe across
+      fork(); not from OpenSSL's RAND_bytes(), whose per-process state a fork
+      copies, nor from the libc generators (src/crypto/crypto.instructions.md).
+    pattern-either:
+      - pattern: RAND_bytes(...)
+      - pattern: RAND_priv_bytes(...)
+      - pattern: rand()
+      - pattern: random()
+      - pattern: drand48()
+      - pattern: srand(...)

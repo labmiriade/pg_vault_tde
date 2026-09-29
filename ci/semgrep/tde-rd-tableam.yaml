@@ -1,0 +1,12 @@
+rules:
+  - id: tde-rd-tableam
+    languages: [c]
+    severity: ERROR
+    message: >-
+      Writing rd_tableam points the relation's relcache entry at another access
+      method, and an invalidation processed meanwhile rebuilds it: every later
+      dispatch goes back to the TAM (PSQLE-207). Call heapam's functions
+      directly (heap_beginscan(), heap_getnextslot()) instead.
+    pattern-either:
+      - pattern: "&$R->rd_tableam"
+      - pattern: "$R->rd_tableam = $X"
