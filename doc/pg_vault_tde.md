@@ -1427,7 +1427,7 @@ Starts PostgreSQL with `initdb -k` (`--data-checksums`). Verifies that:
 
 ### TAP Tests (`tap/`)
 
-33 files, run together by `make ci-tap` (which also starts the Vault container
+34 files, run together by `make ci-tap` (which also starts the Vault container
 the Vault-dependent files need; they `skip_all` when `VAULT_ADDR` is unset).
 
 | File | Coverage |
@@ -1465,6 +1465,7 @@ the Vault-dependent files need; they `skip_all` when `VAULT_ADDR` is unset).
 | `tap/31_migrate_vault_to_wallet.t` | `pg_vault_tde_migrate_vault_to_wallet()` refuses a passphrase that does not open the wallet and leaves every migrated table readable under the local wallet — in a session opened before the migration, a new one and after a restart; the real-Vault half runs when `VAULT_ADDR` is set (PSQLE-188) |
 | `tap/32_rotate_online_toast.t` | Out-of-line values — stored uncompressed and compressed — stay readable after `pg_vault_tde_rotate_online()`, after a restart, after a second rotation and after another restart, and the TOAST relation keeps the same number of live chunks (PSQLE-189). Runs once per available provider, as `tap/29` |
 | `tap/33_toast_lifecycle.t` | Out-of-line values go through every write path as on a plain heap twin put through the same statements — UPDATEs that keep, replace, inline or drop them, DELETE, VACUUM, `DROP COLUMN`, VACUUM FULL, two rotations and a restart; after each step the contents, a read of every whole row and the number of values left in the TOAST relation must match (PSQLE-189, 191, 192) |
+| `tap/34_standby_rotation.t` | A streaming standby across `rotate_online()` on the primary: tables it had cached before the rotation read after it without an unwrap per row, and after a promotion new rows — including those of a table first touched by an `INSERT` — survive the promoted node's restart; one table rotated twice, one first read after the rotation as the control (PSQLE-190) |
 
 #### `tap/19_crash_recovery_rmgr.t`
 

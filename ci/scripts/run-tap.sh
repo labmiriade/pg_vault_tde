@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ci/scripts/run-tap.sh — Run TAP tests inside the pg-test container
 #
-# Runs every tap/*.t file (33 at the time of writing); see the TAP Tests table
+# Runs every tap/*.t file (34 at the time of writing); see the TAP Tests table
 # in doc/pg_vault_tde.md for what each one covers.  A few examples:
 #   - 01_load.t:                   Extension loading and function availability
 #   - 02_backup_local.t:           Backup round-trip, local wallet KMS provider
