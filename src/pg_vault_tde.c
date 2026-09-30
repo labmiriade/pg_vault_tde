@@ -350,6 +350,56 @@ tde_kms_config_assign_string(const char *newval, void *extra)
     tde_kms_provider_invalidate();
 }
 
+/*
+ * Show hooks of the settings that hold a secret (PSQLE-224).
+ *
+ * GUC_SUPERUSER_ONLY does not keep a value from members of
+ * pg_read_all_settings, which PostgreSQL grants to pg_monitor.  These hooks
+ * give SHOW and current_setting() the value only when the current user is a
+ * superuser — the client tools read these settings with SHOW — and a mask to
+ * everyone else; GUC_NO_SHOW_ALL keeps the settings out of pg_settings, whose
+ * reset_val and boot_val columns do not go through a show hook.  An unset
+ * secret reads as empty: whether one is set is not hidden.  The server keeps
+ * using the variables themselves.
+ */
+static const char *
+tde_show_secret(const char *value)
+{
+    if (value == NULL || value[0] == '\0')
+        return "";
+    /*
+     * The current user, as core's own GUC visibility (GetUserId()): code of a
+     * lesser role's SECURITY DEFINER function, even when a superuser runs it,
+     * reads the mask.  The session role would hand it the value.
+     */
+    /* nosemgrep: tde-caller-superuser — the reader is the current user, as for core GUC visibility */
+    return superuser() ? value : "********";
+}
+
+static const char *
+tde_show_vault_token(void)
+{
+    return tde_show_secret(pg_vault_tde_vault_token);
+}
+
+static const char *
+tde_show_vault_role_id(void)
+{
+    return tde_show_secret(pg_vault_tde_vault_role_id);
+}
+
+static const char *
+tde_show_vault_secret_id(void)
+{
+    return tde_show_secret(pg_vault_tde_vault_secret_id);
+}
+
+static const char *
+tde_show_wallet_dev_mode_passphrase(void)
+{
+    return tde_show_secret(pg_vault_tde_wallet_dev_mode_passphrase);
+}
+
 static void
 tde_kms_config_assign_bool(bool newval, void *extra)
 {
@@ -1503,11 +1553,12 @@ _PG_init(void)
         NULL, &pg_vault_tde_vault_namespace, "", PGC_SUSET,
         GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
-    /* Vault token — secret, not shown in pg_settings (GUC_NOT_IN_SAMPLE) */
+    /* Vault token — secret: shown only to a superuser (tde_show_secret) */
     DefineCustomStringVariable("pg_vault_tde.vault_token",
         "Vault token for authentication",
         NULL, &pg_vault_tde_vault_token, "", PGC_SUSET,
-        GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+        GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE | GUC_NO_SHOW_ALL,
+        NULL, NULL, tde_show_vault_token);
 
     /*
      * vault_transit_mount — PGC_SUSET so databases can use dedicated Transit
@@ -1577,19 +1628,22 @@ _PG_init(void)
         GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /*
-     * vault_role_id / vault_secret_id — PGC_SUSET + GUC_NOT_IN_SAMPLE so each
-     * database can supply its own AppRole credentials without the secrets
-     * appearing in pg_settings, pg_file_settings, or config file samples.
+     * vault_role_id / vault_secret_id — PGC_SUSET so each database can supply
+     * its own AppRole credentials.  GUC_NOT_IN_SAMPLE only keeps them out of
+     * postgresql.conf.sample; GUC_NO_SHOW_ALL and the show hook keep them from
+     * roles that are not superusers (PSQLE-224).
      */
     DefineCustomStringVariable("pg_vault_tde.vault_role_id",
         "Vault AppRole role_id for authentication",
         NULL, &pg_vault_tde_vault_role_id, "", PGC_SUSET,
-        GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+        GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE | GUC_NO_SHOW_ALL,
+        NULL, NULL, tde_show_vault_role_id);
 
     DefineCustomStringVariable("pg_vault_tde.vault_secret_id",
         "Vault AppRole secret_id for authentication",
         NULL, &pg_vault_tde_vault_secret_id, "", PGC_SUSET,
-        GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+        GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE | GUC_NO_SHOW_ALL,
+        NULL, NULL, tde_show_vault_secret_id);
 
     /* AppRole role name (v1.4) — used for secret_id rotation after login */
     DefineCustomStringVariable("pg_vault_tde.vault_role_name",
@@ -1796,8 +1850,9 @@ _PG_init(void)
         "Convenience for CI pipelines.  Never set in production.  "
         "Emits a WARNING on every use.  Ignored when dev_mode = off.",
         &pg_vault_tde_wallet_dev_mode_passphrase, "",
-        PGC_SUSET, GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE,
-        NULL, tde_kms_config_assign_string, NULL);
+        PGC_SUSET, GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE | GUC_NO_SHOW_ALL,
+        NULL, tde_kms_config_assign_string,
+        tde_show_wallet_dev_mode_passphrase);
 
     /*
      * dev_mode — enable development conveniences (v1.6).

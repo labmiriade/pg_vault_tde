@@ -1322,9 +1322,9 @@ value; no shared state is changed.
 | `vault_url` | string | `''` | suset | Vault / OpenBao base URL |
 | `vault_namespace` | string | `''` | suset | Vault namespace (enterprise; empty for community) |
 | `vault_auth_method` | string | `token` | suset | Vault auth method: `token`, `approle`, or `kubernetes` |
-| `vault_token` | string | `''` | suset | Auth token — hidden from `pg_settings` (`GUC_NOT_IN_SAMPLE`) |
-| `vault_role_id` | string | `''` | suset | AppRole role_id UUID — hidden from `pg_settings` |
-| `vault_secret_id` | string | `''` | suset | AppRole secret_id — hidden from `pg_settings` |
+| `vault_token` | string | `''` | suset | Auth token — shown only to a superuser (others read `********`), not in `pg_settings` (v1.7.2, PSQLE-224) |
+| `vault_role_id` | string | `''` | suset | AppRole role_id UUID — shown only to a superuser (others read `********`), not in `pg_settings` (v1.7.2, PSQLE-224) |
+| `vault_secret_id` | string | `''` | suset | AppRole secret_id — shown only to a superuser (others read `********`), not in `pg_settings` (v1.7.2, PSQLE-224) |
 | `vault_role_name` | string | `''` | suset | AppRole role name for secret_id rotation **(v1.4)** — calls `secret-id/destroy` after login |
 | `vault_k8s_role` | string | `''` | suset | Kubernetes JWT auth role name |
 | `vault_k8s_mount` | string | `kubernetes` | suset | Kubernetes auth engine mount path |
@@ -1338,7 +1338,7 @@ value; no shared state is changed.
 | `wallet_passphrase_command` | string | `''` | suset | Shell command whose stdout is the passphrase (highest priority) |
 | `wallet_auto_open` | boolean | `on` | suset | Auto-open wallet at startup if passphrase env var is set |
 | `dev_mode` | boolean | `off` | suset | Enable development-only conveniences (insecure in production) |
-| `wallet_dev_mode_passphrase` | string | `''` | suset | Inline dev passphrase, used only when `dev_mode = on`; emits a `WARNING` on every use — hidden from `pg_settings` |
+| `wallet_dev_mode_passphrase` | string | `''` | suset | Inline dev passphrase, used only when `dev_mode = on`; emits a `WARNING` on every use — shown only to a superuser (others read `********`), not in `pg_settings` (v1.7.2, PSQLE-224) |
 | `dek_cache_ttl` | integer | `0` | suset | Per-backend DEK cache TTL in seconds (0 = no expiry; range 0–86400). When > 0, each backend re-reads the DEK from shmem after this interval even without rotation |
 | `toast_encryption` | boolean | `on` | suset | **No effect since 1.7.2** (PSQLE-223): the TOAST table of an `encrypted_heap` table is always `encrypted_heap` and its chunks always encrypted with the parent relation's DEK; setting it `off` only raises a `WARNING` when a TOAST table is created. Removed in 1.8 |
 | `allow_plaintext_index` | boolean | `off` | suset | When `off` (default), `CREATE INDEX`/`CREATE UNIQUE INDEX` with a non-`tde_btree` access method on an `encrypted_heap` table is rejected with `ERROR`. When `on`, the same statement is allowed after a `WARNING` — the indexed column's plaintext value is then stored unencrypted on disk. Does not affect `PRIMARY KEY`/`UNIQUE` table constraints, which PostgreSQL core always backs with a native btree index regardless of this setting (that case already warns unconditionally). |
@@ -1360,7 +1360,7 @@ and included by any translation unit that needs them (`tam.c`, `kms.c`).
 ```
 _PG_init()
   ├── DefineCustomStringVariable("pg_vault_tde.vault_url", ...)      [PGC_SUSET]
-  ├── DefineCustomStringVariable("pg_vault_tde.vault_token", ...)    [PGC_SUSET, GUC_NOT_IN_SAMPLE]
+  ├── DefineCustomStringVariable("pg_vault_tde.vault_token", ...)    [PGC_SUSET, GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE | GUC_NO_SHOW_ALL, show hook]
   ├── ... ~20 more GUC parameters (all PGC_SUSET except max_encrypted_relations/crypto_provider/enabled) ...
   ├── install shmem_request_hook  → pg_vault_tde_shmem_request()
   │       ├── pg_vault_tde_kms_shmem_request()

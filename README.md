@@ -738,7 +738,7 @@ startup.
 | `wallet_passphrase_env` | string | `''` | suset | Env var name holding wallet passphrase — env var NAME only, never the value |
 | `wallet_passphrase_file` | string | `''` | suset | File path containing wallet passphrase (trimmed; `0400` permission enforced) **(v1.6)** |
 | `wallet_passphrase_command` | string | `''` | suset | Shell command to retrieve passphrase (analogous to PG's `ssl_passphrase_command`) **(v1.6)** |
-| `wallet_dev_mode_passphrase` | string | `''` | suset | Convenience passphrase for dev/CI (only honoured when `dev_mode = on`) **(v1.6)** |
+| `wallet_dev_mode_passphrase` | string | `''` | suset | Convenience passphrase for dev/CI (only honoured when `dev_mode = on`) — shown only to a superuser (others read `********`), not in `pg_settings` (v1.7.2, PSQLE-224) **(v1.6)** |
 | `dev_mode` | boolean | `off` | suset | Enable development mode features (wallet_dev_mode_passphrase) **(v1.6)** |
 | `wallet_auto_open` | boolean | `on` | suset | Auto-open wallet on startup if passphrase env var is set |
 | `preload_keys` | boolean | `off` | suset | Warm this database's DEK cache at startup: a background worker per database unwraps every DEK in `pg_vault_tde_catalog` once the server accepts connections, so the first query on a table does not pay a KMS round-trip. Needs a KMS usable without an interactive unlock (`wallet_passphrase_command` / `wallet_passphrase_env`). Stops at `max_encrypted_relations`. Scope it with `ALTER DATABASE SET`. |
@@ -754,9 +754,9 @@ All parameters are `suset` — settable per-database with `ALTER DATABASE SET`.
 |---|---|---|---|---|
 | `vault_url` | string | `''` | suset | Vault / OpenBao base URL |
 | `vault_namespace` | string | `''` | suset | Vault namespace (enterprise; empty for community) |
-| `vault_token` | string | `''` | suset | Auth token — hidden from `pg_settings` (superuser only) |
-| `vault_role_id` | string | `''` | suset | AppRole role_id UUID |
-| `vault_secret_id` | string | `''` | suset | AppRole secret_id — hidden from `pg_settings` (superuser only) |
+| `vault_token` | string | `''` | suset | Auth token — shown only to a superuser (others read `********`), not in `pg_settings` (v1.7.2, PSQLE-224) |
+| `vault_role_id` | string | `''` | suset | AppRole role_id UUID — shown only to a superuser (others read `********`), not in `pg_settings` (v1.7.2, PSQLE-224) |
+| `vault_secret_id` | string | `''` | suset | AppRole secret_id — shown only to a superuser (others read `********`), not in `pg_settings` (v1.7.2, PSQLE-224) |
 | `vault_role_name` | string | `''` | suset | AppRole role name for secret_id rotation after login **(v1.4)** |
 | `vault_k8s_role` | string | `''` | suset | Kubernetes JWT auth role name |
 | `vault_transit_mount` | string | `transit` | suset | Transit secrets engine mount path |
@@ -1921,6 +1921,9 @@ pg_restore_tde -h localhost -U postgres -d mydb -i /backup/mydb.tde
 
 >All other `pg_dump` options are fed directly to it.
 
+With the `vault` provider both tools read the Vault credentials of the server with
+`SHOW`, which since 1.7.2 returns them only to a superuser: connect as one (PSQLE-224).
+
 ### `pg_basebackup`
 It's possible to use `pg_basebackup` to create a base backup of the cluster and use it for a standby creation.
 
@@ -2095,7 +2098,10 @@ run against 1.7.2.
     `pg_db_role_setting`, and in every `pg_dumpall`). Put them in a file outside `PGDATA`,
     readable only by the server's operating-system user, loaded with `include`. For the
     wallet, prefer `wallet_passphrase_env`, `_file` or `_command`, which hold only where
-    the passphrase is.
+    the passphrase is. Up to 1.7.1 every member of `pg_read_all_settings` — which
+    PostgreSQL grants to `pg_monitor` — read these four with `SHOW`, `current_setting()`
+    and `pg_settings`; since 1.7.2 a role that is not a superuser reads `********`, and
+    `pg_settings` lists none of them (PSQLE-224).
   - `wallet_passphrase_command` runs through `popen()` — a shell, as the server's
     operating-system user — every time the wallet is opened; whatever it writes to
     standard error reaches the server log.
