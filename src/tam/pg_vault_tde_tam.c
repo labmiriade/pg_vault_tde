@@ -3156,6 +3156,22 @@ pg_vault_tde_reencrypt_table_sql(PG_FUNCTION_ARGS)
     Oid                 relid = PG_GETARG_OID(0);
 
     /*
+     * In a security-restricted operation the session role is not the caller:
+     * ANALYZE, VACUUM and REINDEX run as the table's owner, and the index
+     * expressions they evaluate are that owner's code, while GetOuterUserId()
+     * stays the session role and would lend its MAINTAIN to it (PSQLE-225).
+     * A rewrite has no business inside one.
+     */
+    if (InSecurityRestrictedOperation())
+        ereport(ERROR,
+                (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                 errmsg("pg_vault_tde_reencrypt_table cannot run in a "
+                        "security-restricted operation"),
+                 errdetail("ANALYZE, VACUUM, REINDEX and the index expressions "
+                           "they evaluate run as the table's owner; the "
+                           "calling role cannot be established there.")));
+
+    /*
      * The rewrite takes locks, writes WAL and leaves dead versions behind, so
      * it asks what core asks for VACUUM FULL, CLUSTER and REINDEX: MAINTAIN on
      * the table.  EXECUTE on this function used to be enough, and it is

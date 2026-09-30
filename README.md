@@ -1472,6 +1472,13 @@ REVOKE EXECUTE ON FUNCTION pg_vault_tde_reencrypt_table(regclass, int),
 
 1.8 removes the grant from the extension script.
 
+Since 1.7.2 the function also refuses to run inside a **security-restricted
+operation**. `ANALYZE`, `VACUUM` and `REINDEX` run as the table's owner, and so does
+any index expression they evaluate; the role the check asks about — the session role —
+is not that owner's, so a table owner's code evaluated during a superuser's maintenance
+would have been checked against the superuser (PSQLE-225). A rewrite has no business
+inside an index expression, so it is refused there outright.
+
 
 ### Who may call the key-management functions
 
@@ -1487,6 +1494,17 @@ hold the KEK of every table later encrypted there. `pkcs11_keygen()` checked not
 1.7.2 checks the role that called the function, whoever has been granted `EXECUTE`:
 all of them require a superuser. Delegating a database's wallet to its owner or to a
 tenant role is planned for 1.8.
+
+They also refuse inside a **security-restricted operation** — `ANALYZE`, `VACUUM`,
+`REINDEX` and the index expressions they evaluate, which run as the table's owner —
+because the session role the check asks about is not the caller there (PSQLE-225).
+
+One gap remains until 1.8: a role that holds `EXECUTE` can still reach these functions
+through code of its own that a superuser runs, such as a `SECURITY DEFINER` function it
+owns. The check cannot see past its own `SECURITY DEFINER` wrapper to that role; 1.8
+removes both the wrapper and the `pg_monitor` grants (the same `REVOKE` above is the
+mitigation meanwhile). Treat calling another role's function as a superuser the way
+PostgreSQL does in general: as running that role's code.
 
 **Still on 1.7.1:** take `wallet_init()` away from `pg_monitor`, as a superuser —
 `REVOKE EXECUTE ON FUNCTION pg_vault_tde_wallet_init(text) FROM pg_monitor;` — and
