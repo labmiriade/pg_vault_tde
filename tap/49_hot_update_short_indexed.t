@@ -9,7 +9,8 @@
 # probability 256^-L.  For a 1-byte value that is one UPDATE in 256: it goes
 # HOT, the index keeps the old key only, a lookup of the new value misses the
 # row, one of the old value returns it, and UNIQUE lets a duplicate in
-# (PSQLE-219).  1.7.1 never took a HOT update here.
+# (PSQLE-219).  1.7.1 took them too, on the bool: v4 put a random blob where
+# the attributes are, and a fixed-length value is read at a fixed offset.
 #
 # Each table holds one row whose indexed value alternates between two 1-byte
 # values, one UPDATE per transaction so that pruning keeps room on the page

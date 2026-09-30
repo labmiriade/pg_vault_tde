@@ -2283,8 +2283,10 @@ See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
    coherent without a `REINDEX`.
    **How:** `heap_update` decides whether an update is HOT by comparing the indexed columns
    between the old and the new tuple, on disk. Both images are encrypted under a fresh
-   random GCM IV, so no attribute is byte-stable across an update: `heap_update` sees the
-   indexed column as modified and skips the HOT path. The constant `[VERSION | GENERATION]`
+   random GCM IV, so an attribute is byte-stable across an update only by chance (once in
+   256^L for a value of L bytes); when the chance hits a value that changed, the row is
+   encrypted again under another IV (PSQLE-219). `heap_update` sees every changed indexed
+   column as modified and skips the HOT path. The constant `[VERSION | GENERATION]`
    bytes sit at the **end** of the region, outside every attribute, so they cannot create a
    byte-stable window. See [doc/pg_vault_tde.md](doc/pg_vault_tde.md) § Known Limitations for
    the full analysis (including the v3 and v4 bugs this resolved).

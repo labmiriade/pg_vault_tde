@@ -1073,9 +1073,11 @@ follows the row to its new key, with no `REINDEX` needed.
 **Mechanism.** `heap_update` decides whether an update can be HOT by comparing the
 indexed columns between the old and the new tuple image, on disk. On an
 `encrypted_heap` table both images are encrypted, and every version of a row is
-encrypted under a fresh random GCM IV, so no attribute is ever byte-stable across
-an update: `heap_update` always sees the indexed column as modified and skips the
-HOT path. The constant `[VERSION | GENERATION]` bytes sit at the **end** of the
+encrypted under a fresh random GCM IV, so an attribute is byte-stable across an
+update only by chance — once in 256^L for a value of L bytes. When the chance hits a
+value that changed, `pg_vault_tde_tuple_update()` encrypts the row again under
+another IV (PSQLE-219), so `heap_update` sees every changed indexed column as modified
+and skips the HOT path. The constant `[VERSION | GENERATION]` bytes sit at the **end** of the
 region, outside every attribute, so they cannot create a byte-stable window.
 
 > **Historical note (v3 bug, fixed in v4).** The v3 format placed a constant
@@ -1093,6 +1095,13 @@ region, outside every attribute, so they cannot create a byte-stable window.
 > the page it compared garbage, and an updated indexed column could come out
 > *unchanged* — the v3 failure mode again, by a different route. v5 keeps the
 > attribute layout intact, so the comparison reads real per-attribute ciphertext.
+>
+> **Short values, fixed in 1.7.2 (PSQLE-219).** Real per-attribute ciphertext is short
+> when the value is: a `bool` or a one-character text repeated its old ciphertext on one
+> `UPDATE` in 256, and when its value had changed that `UPDATE` went HOT — the index kept
+> the old key, lookups missed the row and UNIQUE let a duplicate in. v4 had it too for
+> short fixed-length columns, read at a fixed offset inside its random blob. Hence the
+> re-encryption above; `tap/49_hot_update_short_indexed.t` covers it.
 
 ### Historical Limitations (v1.0) — Many Resolved Since
 

@@ -43,6 +43,7 @@
 #include "catalog/catalog.h"        /* GetNewOidWithIndex */
 #include "commands/defrem.h"        /* get_table_am_oid — used by toast_am */
 #include "utils/rel.h"              /* RelationGetRelid */
+#include "utils/datum.h"            /* datumIsEqual */
 #include "access/xact.h"           /* RegisterXactCallback (impersonation check) */
 #include "utils/memutils.h"
 #include "utils/tuplesort.h"        /* tuplesort_getdatum (index_validate_scan)*/
@@ -2113,6 +2114,59 @@ tde_toast_delete_unshared(Relation rel, HeapTuple doomed, HeapTuple kept,
 }
 
 /*
+ * tde_change_hidden — true when some attribute in attrs (indexed attributes,
+ * offset by FirstLowInvalidHeapAttributeNumber) differs between old_plain and
+ * new_plain but not between their encrypted forms old_enc and new_enc,
+ * compared as heap_update() compares them (heap_attr_equals).
+ *
+ * Only the indexed attributes: they are all heap_update() compares, and each
+ * changed value of L bytes in the set makes a re-encryption 256^-L likelier.
+ * Whole-row and system references heap_update() already counts as changed.
+ */
+static bool
+tde_change_hidden(TupleDesc desc, Bitmapset *attrs,
+                  HeapTuple old_enc, HeapTuple new_enc,
+                  HeapTuple old_plain, HeapTuple new_plain)
+{
+    int     natts = desc->natts;
+    Datum  *v = palloc(4 * natts * sizeof(Datum));
+    bool   *n = palloc(4 * natts * sizeof(bool));
+    bool    hidden = false;
+    int     k = -1;
+
+    heap_deform_tuple(old_enc, desc, v, n);
+    heap_deform_tuple(new_enc, desc, v + natts, n + natts);
+    heap_deform_tuple(old_plain, desc, v + 2 * natts, n + 2 * natts);
+    heap_deform_tuple(new_plain, desc, v + 3 * natts, n + 3 * natts);
+
+    while (!hidden && (k = bms_next_member(attrs, k)) >= 0)
+    {
+        int     i = k + FirstLowInvalidHeapAttributeNumber - 1;
+        int     p = 2 * natts + i;
+        int     q = 3 * natts + i;
+        Form_pg_attribute att;
+        bool    enc_equal;
+        bool    plain_equal;
+
+        if (i < 0)
+            continue;
+
+        att = TupleDescAttr(desc, i);
+        enc_equal = n[i] == n[natts + i] &&
+            (n[i] || datumIsEqual(v[i], v[natts + i], att->attbyval, att->attlen));
+        plain_equal = n[p] == n[q] &&
+            (n[p] || datumIsEqual(v[p], v[q], att->attbyval, att->attlen));
+
+        hidden = enc_equal && !plain_equal;
+    }
+
+    OPENSSL_cleanse(v, 4 * natts * sizeof(Datum));
+    pfree(v);
+    pfree(n);
+    return hidden;
+}
+
+/*
  * pg_vault_tde_tuple_update
  *
  * UPDATE path: pre-TOASTs the plaintext, encrypts the (now-small) tuple,
@@ -2137,6 +2191,8 @@ pg_vault_tde_tuple_update(Relation rel, ItemPointer otid,
     bool       shouldFree = true;
     HeapTuple  plain = NULL;
     HeapTuple  volatile old_tuple = NULL;
+    HeapTuple  volatile old_enc = NULL;
+    Bitmapset *volatile idx_attrs = NULL;
     HeapTuple  volatile toasted = NULL;
     HeapTuple  volatile enc = NULL;
     TM_Result  result;
@@ -2155,8 +2211,34 @@ pg_vault_tde_tuple_update(Relation rel, ItemPointer otid,
          * snapshot or not: after an EvalPlanQual recheck otid is a version
          * committed after it was taken.
          */
-        if (pg_vault_tde_tuple_fetch_row_version(rel, otid, SnapshotAny, slot_old))
+        if (heapam_tuple_fetch_row_version_cb(rel, otid, SnapshotAny, slot_old))
+        {
+            /*
+             * The attributes and the ciphertext heap_update() will compare
+             * the new tuple with.  A v4 tuple cannot be walked (PSQLE-165):
+             * leave it alone.
+             */
+            if (rel->rd_rel->relhasindex && pg_vault_tde_enabled)
+            {
+                Bitmapset  *summarized =
+                    RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_SUMMARIZED);
+
+                idx_attrs = bms_add_members(
+                    RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_HOT_BLOCKING),
+                    summarized);
+                bms_free(summarized);
+
+                old_enc = ExecCopySlotHeapTuple(slot_old);
+                if (((unsigned char *) old_enc->t_data)[old_enc->t_len - TDE_V4_GEN_LEN - 1]
+                    != TDE_TUPLE_V5_VERSION_BYTE)
+                {
+                    pfree(old_enc);
+                    old_enc = NULL;
+                }
+            }
+            pg_vault_tde_decode_slot(slot_old);
             old_tuple = ExecFetchSlotHeapTuple(slot_old, false, NULL);
+        }
 
         /*
          * The executor hands us the TID of a tuple it has just read or locked,
@@ -2166,6 +2248,26 @@ pg_vault_tde_tuple_update(Relation rel, ItemPointer otid,
         Assert(old_tuple != NULL);
 
         enc = tde_prepare_encrypt_tuple(rel, plain, old_tuple, &toasted, 0);
+
+        /*
+         * heap_update() decides HOT, the tuple lock mode and whether to log
+         * the old replica identity by comparing the indexed attributes on
+         * disk, which are ciphertext.  A changed value of L bytes encrypts to
+         * its old ciphertext once in 256^L: for a 1-byte key the UPDATE went
+         * HOT and the index never got the new value (PSQLE-219).  Draw a
+         * fresh IV until every change shows on disk.
+         */
+        while (old_enc != NULL &&
+               tde_change_hidden(RelationGetDescr(rel), idx_attrs, old_enc, enc,
+                                 old_tuple, toasted))
+        {
+            CHECK_FOR_INTERRUPTS();
+            pfree(enc);
+            enc = NULL;
+            enc = tde_encrypt_heap_tuple(toasted, RelationGetRelid(rel),
+                                         RelationGetDescr(rel));
+            enc->t_tableOid = plain->t_tableOid;
+        }
 
         result = heap_update(rel, otid, enc, cid, crosscheck, wait,
                              tmfd, lockmode, update_indexes);
@@ -2193,6 +2295,9 @@ pg_vault_tde_tuple_update(Relation rel, ItemPointer otid,
 
         if (enc != NULL)
             pfree(enc);
+        if (old_enc != NULL)
+            pfree(old_enc);
+        bms_free(idx_attrs);
 
         if (slot_old != NULL)
             ExecDropSingleTupleTableSlot(slot_old);
@@ -2207,6 +2312,9 @@ pg_vault_tde_tuple_update(Relation rel, ItemPointer otid,
     if (toasted != plain)
         pfree(toasted);
     pfree(enc);
+    if (old_enc != NULL)
+        pfree(old_enc);
+    bms_free(idx_attrs);
 
     if (slot_old != NULL)
         ExecDropSingleTupleTableSlot(slot_old);

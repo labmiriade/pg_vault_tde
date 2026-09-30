@@ -616,6 +616,22 @@ distinguishes the builds.
     keeps the report and the raw logs as artifacts. It is part of the release checklist, on the release
     commit.
 
+31. **A short indexed value that changed could miss its index (PSQLE-219).**
+    `heap_update()` decides HOT by comparing the indexed columns on disk, and under v5
+    each value is encrypted in place: a changed value of L bytes repeats its old
+    ciphertext once in 256^L, one `UPDATE` in 256 for a `bool`, a `"char"` or a
+    one-character text. 1.7.1 had it for short fixed-length columns (`tap/49` on the
+    1.7.1 build: 17 HOT updates of 4000 on the `bool`), v5 extended it to short
+    variable-length ones. That `UPDATE` went HOT: the index kept the old
+    key, lookups of the new value missed the row, lookups of the old one returned it,
+    and UNIQUE let a duplicate in. The same comparison chooses the tuple lock and
+    whether the old replica identity is logged. `tuple_update` now encrypts again
+    under another IV until every changed value looks changed on disk; `tap/49` runs
+    4000 such UPDATEs per index. The first `UPDATE` of a row still in v4 is not
+    covered (a v4 row cannot be walked): the `VACUUM FULL` the upgrade already
+    requires removes those, and rebuilds the indexes 1.7.1 may have left short of an
+    entry.
+
 **Key operations one at a time (PSQLE-210).** Rotations and wallet operations are
 tested alone and against concurrent DML, not against each other; the README now says
 to run them one at a time per database and lists the combinations to avoid until 1.8.
