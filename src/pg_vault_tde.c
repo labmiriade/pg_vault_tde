@@ -1727,12 +1727,16 @@ _PG_init(void)
         TDE_REL_DEK_CACHE_DEFAULT, 64, 1048576,
         PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
-    /* TOAST encryption switch (v1.5) */
+    /*
+     * TOAST encryption switch (v1.5).  No effect since 1.7.2 (PSQLE-223):
+     * chunks are always encrypted, so the TOAST relation is always
+     * encrypted_heap; kept so configurations that set it still load.
+     */
     DefineCustomBoolVariable("pg_vault_tde.toast_encryption",
-        "Encrypt TOAST chunks for encrypted_heap tables",
-        "When true (default in v1.5), TOAST tables for encrypted_heap "
-        "relations use encrypted_heap AM and encrypt each chunk with "
-        "AES-256-GCM.  Set to false only for debugging or migration.",
+        "No effect since 1.7.2; TOAST of encrypted_heap tables is always encrypted",
+        "TOAST chunks of encrypted_heap tables are always encrypted with "
+        "AES-256-GCM.  Setting this off only raises a WARNING when a TOAST "
+        "table is created; the parameter is removed in 1.8.",
         &pg_vault_tde_toast_encryption, true, PGC_SUSET,
         0, NULL, NULL, NULL);
 

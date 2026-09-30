@@ -88,7 +88,7 @@ All `suset`, superuser-only in `pg_settings`, settable per-database.
 
 | Parameter | Type | Default | Context | Description |
 |---|---|---|---|---|
-| `toast_encryption` | boolean | `on` | suset | Encrypts TOAST chunks for `encrypted_heap` tables using the parent relation's DEK. Set `off` only for debugging or migration — see [Encrypted Tables and Indexes](Encrypted-Tables-and-Indexes). |
+| `toast_encryption` | boolean | `on` | suset | **No effect since 1.7.2** (PSQLE-223): the TOAST table of an `encrypted_heap` table is always `encrypted_heap` and its chunks always encrypted with the parent relation's DEK; setting it `off` only raises a `WARNING` when a TOAST table is created. Removed in 1.8 — see [Encrypted Tables and Indexes](Encrypted-Tables-and-Indexes). |
 | `toast_custom_rmgr` | boolean | `off` | postmaster | Enables the custom WAL resource manager that lets encrypted TOAST chunks be published over logical replication. Requires `pg_vault_tde` in `shared_preload_libraries` (already true) and a full restart — see [Logical Replication](Logical-Replication). |
 
 ## See Also

@@ -2971,15 +2971,15 @@ pg_vault_tde_relation_copy_for_cluster(Relation OldTable,
  *
  * Selects the AM for TOAST tables created for encrypted_heap relations.
  *
- * When pg_vault_tde.toast_encryption = on (default), we return the OID of
- * the encrypted_heap AM so that TOAST chunks are stored encrypted.
+ * We return the OID of the encrypted_heap AM so that TOAST chunks are stored
+ * encrypted, whatever pg_vault_tde.toast_encryption says (PSQLE-223).
  * Each chunk passes through our tuple_insert hook (tde_gcm_encrypt) and is
  * read back via our scan_getnextslot (tde_gcm_decrypt).  The external TOAST
  * pointer in the main table is unencrypted (it carries only OIDs and sequence
  * numbers, no payload).
  *
- * When toast_encryption = off, or when the encrypted_heap AM cannot be found
- * (e.g. during bootstrap), we fall back to HEAP_TABLE_AM_OID.  This keeps
+ * Only when the encrypted_heap AM cannot be found (e.g. during bootstrap) do
+ * we fall back to HEAP_TABLE_AM_OID.  This keeps
  * the PG18 guard in heap_getnext() from triggering: without impersonation,
  * the TOAST index build calls heap_getnext() on the TOAST table which asserts
  * rd_tableam == GetHeapamTableAmRoutine().  Our pg_vault_tde_index_build_range_scan
@@ -2989,23 +2989,36 @@ pg_vault_tde_relation_copy_for_cluster(Relation OldTable,
 static Oid
 pg_vault_tde_toast_am(Relation rel)
 {
+    Oid encheap_oid;
+
     (void) rel;
-    if (pg_vault_tde_toast_encryption)
-    {
-        /*
-         * Look up the registered encrypted_heap AM OID from the catalog.
-         * missing_ok = true so that if the AM is somehow unregistered (e.g.
-         * during extension drop) we degrade gracefully to plain TOAST storage
-         * rather than ERROR-ing out at CREATE TABLE time.
-         */
-        Oid encheap_oid = get_table_am_oid("encrypted_heap", true);
-        if (OidIsValid(encheap_oid))
-            return encheap_oid;
+
+    /*
+     * The TOAST pipeline encrypts every chunk it writes, whatever the TOAST
+     * relation's access method, and only an encrypted_heap TOAST relation
+     * decrypts them on read.  Returning heap when toast_encryption was off
+     * gave a relation of encrypted chunks read back undecrypted: every
+     * out-of-line value of the table failed (PSQLE-223).  The setting is
+     * ignored; it is removed in 1.8.
+     */
+    if (!pg_vault_tde_toast_encryption)
         ereport(WARNING,
-                (errmsg("[TDE] encrypted_heap AM not found; TOAST will use standard heap"),
-                 errhint("Ensure pg_vault_tde is installed and pg_vault_tde.toast_encryption=on is intentional.")));
-    }
-    /* Fallback: standard heap AM for TOAST (unencrypted chunks) */
+                (errmsg("pg_vault_tde.toast_encryption = off has no effect"),
+                 errdetail("The TOAST table of an encrypted_heap table is "
+                           "always encrypted since 1.7.2; the setting is "
+                           "removed in 1.8.")));
+
+    /*
+     * missing_ok = true: if the AM is somehow unregistered (e.g. during
+     * extension drop) degrade to plain TOAST storage rather than ERROR-ing
+     * out at CREATE TABLE time.
+     */
+    encheap_oid = get_table_am_oid("encrypted_heap", true);
+    if (OidIsValid(encheap_oid))
+        return encheap_oid;
+    ereport(WARNING,
+            (errmsg("[TDE] encrypted_heap AM not found; TOAST will use standard heap"),
+             errhint("Ensure pg_vault_tde is installed.")));
     return HEAP_TABLE_AM_OID;
 }
 /* ============================================================
@@ -3070,8 +3083,7 @@ pg_vault_tde_tam_init(void)
      * chunk reads go through our TAM callbacks (tde_index_fetch_tuple →
      * decode_slot → tde_decrypt_heap_tuple).  The custom TOAST writer in
      * pg_vault_tde_toast_save_datum handles the write side.
-     * When toast_encryption = off or the AM is not found, we fall back to
-     * HEAP_TABLE_AM_OID (large column values work but are stored unencrypted).
+     * Only when the AM is not found do we fall back to HEAP_TABLE_AM_OID.
      */
     tde_methods.relation_toast_am           = pg_vault_tde_toast_am;
     /* All other callbacks (scan_begin/end/rescan,

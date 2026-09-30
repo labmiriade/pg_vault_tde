@@ -744,7 +744,7 @@ startup.
 | `preload_keys` | boolean | `off` | suset | Warm this database's DEK cache at startup: a background worker per database unwraps every DEK in `pg_vault_tde_catalog` once the server accepts connections, so the first query on a table does not pay a KMS round-trip. Needs a KMS usable without an interactive unlock (`wallet_passphrase_command` / `wallet_passphrase_env`). Stops at `max_encrypted_relations`. Scope it with `ALTER DATABASE SET`. |
 | `preload_max_failures` | integer | `5` | suset | Consecutive DEK unwrap failures the startup preload tolerates in one database before giving up on it. Consecutive, so a missing passphrase stops the pass at once while a one-off does not. Relevant to the local wallet too: the KEK is re-derived from the wallet file on every unwrap rather than cached, so a wallet on NFS or SMB is reopened once per relation. `0` stops at the first failure. |
 | `max_encrypted_relations` | integer | `1024` | postmaster | Maximum number of per-table DEK entries in shmem (64–65536), **cluster-wide**: entries are keyed by `(dbid, relid)`, so budget for the sum across all databases. Enforced since 1.7.2 — before that the cache silently grew past it (ShmemInitHash's size is not a cap), so count your encrypted relations across all databases before upgrading. ~112 bytes per relation, reserved at startup. Max 1048576. Requires restart. |
-| `toast_encryption` | boolean | `on` | suset | Encrypt TOAST chunks with the parent relation's DEK (v1.5) |
+| `toast_encryption` | boolean | `on` | suset | **No effect since 1.7.2** (PSQLE-223): the TOAST table of an `encrypted_heap` table is always `encrypted_heap` and its chunks always encrypted with the parent relation's DEK; setting it `off` only raises a `WARNING` when a TOAST table is created. Removed in 1.8. Up to 1.7.1, a table created or rewritten with it `off` got a heap TOAST table of encrypted chunks and could not read its out-of-line values — see [Tables created with `toast_encryption = off`](#tables-created-with-toast_encryption--off) to repair one |
 
 ### Vault / OpenBao (`kms_provider = 'vault'`)
 
@@ -942,9 +942,9 @@ WHERE  a.amname = 'encrypted_heap'
 
 No rows means nothing to do — install 1.7.1 and carry on.
 
-This only applies with `pg_vault_tde.toast_encryption = on`, which is the
-default. If it was turned off, TOAST chunks were never encrypted by this
-extension and the upgrade is unaffected either way.
+A table whose TOAST table was created while `pg_vault_tde.toast_encryption` was
+`off` could not read its out-of-line values before the upgrade either (PSQLE-223):
+its chunks were encrypted but its TOAST table was a plain heap one.
 
 ### Step 2 — dump those tables, still on 1.7.0
 
@@ -1497,6 +1497,51 @@ when `log_line_prefix` includes `%u` — otherwise match its time and PID agains
 connection log (`log_connections`). If a wallet may have been created by someone else,
 change its passphrase (`pg_vault_tde_wallet_change_passphrase()`) and rotate the KEK
 (`pg_vault_tde_rotate_kek()`).
+
+### Tables created with `toast_encryption = off`
+
+Up to 1.7.1, `pg_vault_tde.toast_encryption = off` did not store TOAST in plaintext, as
+documented. A table created while it was off — or rewritten by `VACUUM FULL`, `CLUSTER`
+or `SET ACCESS METHOD` — got a plain heap TOAST table whose chunks were still
+encrypted, and read them back undecrypted: every out-of-line value of the table fails
+with `unexpected chunk number … for toast value …`, and so does a `VACUUM FULL` or
+`CLUSTER` of it (PSQLE-223). 1.7.2 always gives an encrypted table an `encrypted_heap`
+TOAST table; the setting has no effect and only raises a `WARNING`.
+
+The values are not lost: the chunks are encrypted with the table's key, and only the
+access method of its TOAST table is wrong. In each database, as a superuser:
+
+1. Find the tables:
+
+   ```sql
+   SELECT c.oid::regclass AS table_name, t.oid::regclass AS toast_table
+   FROM   pg_class c
+   JOIN   pg_am    ca ON ca.oid = c.relam
+   JOIN   pg_class t  ON t.oid  = c.reltoastrelid
+   JOIN   pg_am    ta ON ta.oid = t.relam
+   WHERE  ca.amname = 'encrypted_heap' AND ta.amname <> 'encrypted_heap';
+   ```
+
+2. Check that the table is affected — reading every value of every row fails:
+
+   ```sql
+   SELECT sum(length(t::text)) FROM <table_name> t;
+   ```
+
+   If this succeeds, the table is not affected (its TOAST chunks are plaintext, from a
+   release before 1.6): leave it as it is.
+
+3. Give its TOAST table the `encrypted_heap` access method:
+
+   ```sql
+   UPDATE pg_class
+   SET    relam = (SELECT oid FROM pg_am WHERE amname = 'encrypted_heap')
+   WHERE  oid = '<toast_table>'::regclass;
+   ```
+
+4. Check: the query of step 2 now succeeds, and
+   `SELECT * FROM pg_vault_tde_verify_integrity('<table_name>')` reports
+   `failed_tuples = 0`.
 
 ## Compatibility
 
