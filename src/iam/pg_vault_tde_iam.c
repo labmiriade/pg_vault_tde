@@ -1477,11 +1477,35 @@ PG_FUNCTION_INFO_V1(tde_enc_bytea_cmp);
 Datum
 tde_enc_bytea_cmp(PG_FUNCTION_ARGS)
 {
-    bytea  *a   = PG_GETARG_BYTEA_PP(0);
-    bytea  *b   = PG_GETARG_BYTEA_PP(1);
-    int     la  = VARSIZE_ANY_EXHDR(a);
-    int     lb  = VARSIZE_ANY_EXHDR(b);
-    int     cmp = memcmp(VARDATA_ANY(a), VARDATA_ANY(b), Min(la, lb));
+    bytea  *a;
+    bytea  *b;
+    int     la, lb, cmp;
+
+    /*
+     * This is btree support function 1 for the tde_btree operator classes.
+     * The index machinery calls it with the stored bytea SIV ciphertext and
+     * no expression info.  The per-type wrappers (tde_int4_enc_cmp(int4,int4),
+     * ...) bind this same C function under non-bytea argument types and keep
+     * EXECUTE to PUBLIC: called straight from SQL, reading a by-value datum as
+     * a varlena pointer dereferenced it and crashed the backend, reachable by
+     * any role (PSQLE-221).  Refuse any call whose argument type is known and
+     * is not bytea; a call from the index AM has no expression info, so the
+     * type is InvalidOid and the comparison proceeds.
+     */
+    if (OidIsValid(get_fn_expr_argtype(fcinfo->flinfo, 0)) &&
+        get_fn_expr_argtype(fcinfo->flinfo, 0) != BYTEAOID)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("tde_btree comparator cannot be called directly"),
+                 errdetail("It is a btree support function for encrypted "
+                           "index keys and is used only by the index "
+                           "machinery.")));
+
+    a   = PG_GETARG_BYTEA_PP(0);
+    b   = PG_GETARG_BYTEA_PP(1);
+    la  = VARSIZE_ANY_EXHDR(a);
+    lb  = VARSIZE_ANY_EXHDR(b);
+    cmp = memcmp(VARDATA_ANY(a), VARDATA_ANY(b), Min(la, lb));
 
     if (cmp != 0)
         PG_RETURN_INT32(cmp > 0 ? 1 : -1);
