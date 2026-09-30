@@ -858,8 +858,8 @@ log stream without any extension-level configuration.
 | Function | Returns | Description |
 |---|---|---|
 | `pg_vault_tde_health_check()` | composite | Status (6 columns: version, build_version, enabled, kms_provider, enc_ops_available, checked_at) |
-| `pg_vault_tde_verify_integrity(regclass)` | record | GCM tag audit scan of all tuples and every out-of-line value they reference — returns `(total_tuples, failed_tuples)`, a row counted once whichever part failed. Up to 1.7.1 it could count intact rows as failed when the table was invalidated during its scan (autovacuum updating its statistics): on 1.7.1, run it again before acting on a failure |
-| `pg_vault_tde_encrypted_size(regclass)` | record | Encryption storage overhead — returns `(total_tuples, encryption_overhead_bytes)` |
+| `pg_vault_tde_verify_integrity(regclass)` | record | GCM tag audit scan of all tuples and every out-of-line value they reference — returns `(total_tuples, failed_tuples)`, a row counted once whichever part failed. Up to 1.7.1 it could count intact rows as failed when the table was invalidated during its scan (autovacuum updating its statistics): on 1.7.1, run it again before acting on a failure. Requires `SELECT` on the table (v1.7.2; up to 1.7.1 any role could call it on any table) |
+| `pg_vault_tde_encrypted_size(regclass)` | record | Encryption storage overhead — returns `(total_tuples, encryption_overhead_bytes)`. Requires `SELECT` on the table (v1.7.2; up to 1.7.1 any role could call it on any table) |
 | `pg_vault_tde_reencrypt_table(regclass, int)` | void | Batch re-encrypt with current DEK (locks table); `int` = batch size, default 1000. Requires `MAINTAIN` on the table (its owner, `pg_maintain`, superusers) since 1.7.2 — see [Who may call `reencrypt_table()`](#who-may-call-reencrypt_table) |
 | `pg_vault_tde_rotate_online(regclass, int)` | void | BGW-based online rotation: reads continue, writes wait until it commits; accepts both `encrypted_heap` tables and `tde_btree` indexes **(v1.5)** |
 | `pg_vault_tde_get_rotation_status(regclass)` | table | Online rotation progress for one relation (status, tuples_done/total, pct_complete, timestamps) **(v1.5)** |
@@ -876,8 +876,8 @@ log stream without any extension-level configuration.
 | `pg_vault_tde_seal_keys_bytea(text, text)` | bytea | Same signed bundle as `pg_vault_tde_seal_keys()`, returned as `bytea` instead of written server-side — used by `pg_basebackup_tde` to store the bundle on the client host **(v1.7)** |
 | `pg_vault_tde_unseal_keys(text, text)` | void | Verify (HMAC) and re-import a bundle written by `pg_vault_tde_seal_keys()`; rejects a tampered file or wrong passphrase before writing anything **(v1.7)** |
 | `pg_vault_tde_migrate_vault_to_wallet(text)` | void | Online Vault→local wallet migration: pass the passphrase of the wallet created with `wallet_init()`; re-wraps every Vault DEK under the wallet's KEK and switches the database to the `local` provider. Broken before 1.7.2 — see [Upgrading to 1.7.2](#migrate_vault_to_wallet-before-172) **(v1.6)** |
-| `pg_vault_tde_vault_status()` | table | Vault provider diagnostics — `(configured, auth_method, reachable)` |
-| `pg_vault_tde_refresh_token()` | boolean | Manually renew the current Vault token lease |
+| `pg_vault_tde_vault_status()` | table | Vault provider diagnostics — `(configured, auth_method, reachable)`. Superuser only (v1.7.2; up to 1.7.1 open to any role) |
+| `pg_vault_tde_refresh_token()` | boolean | Manually renew the current Vault token lease. Superuser only (v1.7.2; up to 1.7.1 open to any role) |
 | `pg_vault_tde_hw_accel_info()` | record | OpenSSL provider/cipher diagnostics — `(openssl_version, configured_provider, provider_loaded, gcm_cipher, siv_cipher, aes_ni_available)` |
 
 ---
@@ -1515,6 +1515,23 @@ when `log_line_prefix` includes `%u` — otherwise match its time and PID agains
 connection log (`log_connections`). If a wallet may have been created by someone else,
 change its passphrase (`pg_vault_tde_wallet_change_passphrase()`) and rotate the KEK
 (`pg_vault_tde_rotate_kek()`).
+
+### Who may call the read-only functions
+
+`pg_vault_tde_verify_integrity()` and `pg_vault_tde_encrypted_size()` open, scan and
+decrypt a whole relation; `pg_vault_tde_vault_status()` reports the server's KMS
+configuration and probes Vault, and `pg_vault_tde_refresh_token()` makes it renew its
+Vault lease. All four keep `EXECUTE` to `PUBLIC` and checked nothing up to 1.7.1, so any
+role could ask them about a table it may not read, or act on the cluster's KMS
+(PSQLE-226).
+
+1.7.2 checks the role whose code is running: the two scans require `SELECT` on the
+relation — what a `count(*)` over it would need — and the two KMS functions require a
+superuser. Nothing else changes, and a superuser is unaffected.
+
+**If you monitor with them:** a `pg_monitor` membership is not `SELECT`. Give the
+monitoring role `SELECT` on the tables it checks, or `pg_read_all_data` for all of them;
+move `vault_status()` and `refresh_token()` to a superuser connection.
 
 ### Tables created with `toast_encryption = off`
 

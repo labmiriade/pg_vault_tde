@@ -3504,6 +3504,19 @@ pg_vault_tde_verify_integrity(PG_FUNCTION_ARGS)
     Datum                values[2];
     bool                 nulls[2] = {false, false};
     HeapTuple            result_tup;
+
+    /*
+     * The scan opens and decrypts every tuple of the relation, so it answers
+     * about data the caller may not read: it asks for SELECT on it, as a
+     * count(*) over the table would.  EXECUTE is granted to PUBLIC and this
+     * checked nothing (PSQLE-226).  Not SECURITY DEFINER, so GetUserId() is
+     * the role whose code is running.
+     */
+    if (pg_class_aclcheck(relid, GetUserId(), ACL_SELECT) != ACLCHECK_OK)
+        aclcheck_error(ACLCHECK_NO_PRIV,
+                       get_relkind_objtype(get_rel_relkind(relid)),
+                       get_rel_name(relid));
+
     if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
         ereport(ERROR,
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -3593,6 +3606,16 @@ pg_vault_tde_encrypted_size(PG_FUNCTION_ARGS)
     Datum           values[2];
     bool            nulls[2] = {false, false};
     HeapTuple       result_tup;
+
+    /*
+     * Scans the relation, as verify_integrity() does, and reports its exact
+     * live-tuple footprint: SELECT on it (PSQLE-226).  Not SECURITY DEFINER,
+     * so GetUserId() is the role whose code is running.
+     */
+    if (pg_class_aclcheck(relid, GetUserId(), ACL_SELECT) != ACLCHECK_OK)
+        aclcheck_error(ACLCHECK_NO_PRIV,
+                       get_relkind_objtype(get_rel_relkind(relid)),
+                       get_rel_name(relid));
 
     if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
         ereport(ERROR,

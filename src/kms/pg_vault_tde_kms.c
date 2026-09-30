@@ -842,6 +842,18 @@ vault_refresh_token_internal(void)
 Datum
 pg_vault_tde_refresh_token(PG_FUNCTION_ARGS)
 {
+    /*
+     * Makes the server log in to Vault and renew its lease with the cluster's
+     * own credentials: the operator's business, not every role's.  EXECUTE is
+     * granted to PUBLIC and this checked nothing (PSQLE-226).  Not SECURITY
+     * DEFINER, so superuser() asks about the role whose code is running.
+     */
+    /* nosemgrep: tde-caller-superuser — not SECURITY DEFINER: superuser() is the caller */
+    if (!superuser())
+        ereport(ERROR,
+                (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                 errmsg("pg_vault_tde_refresh_token requires superuser")));
+
     PG_RETURN_BOOL(vault_refresh_token_internal());
 }
 
@@ -1510,6 +1522,19 @@ pg_vault_tde_vault_status(PG_FUNCTION_ARGS)
     /* State variables */
     bool    vault_configured    = false;
     bool    reachable   = false;
+
+    /*
+     * Reports the server's KMS configuration and probes Vault from the
+     * backend: the operator's business, and the settings it reports are
+     * superuser-only themselves.  EXECUTE is granted to PUBLIC and this
+     * checked nothing (PSQLE-226).  Not SECURITY DEFINER, so superuser() asks
+     * about the role whose code is running.
+     */
+    /* nosemgrep: tde-caller-superuser — not SECURITY DEFINER: superuser() is the caller */
+    if (!superuser())
+        ereport(ERROR,
+                (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                 errmsg("pg_vault_tde_vault_status requires superuser")));
 
     if(get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
         ereport(ERROR,
