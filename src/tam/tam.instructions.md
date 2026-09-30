@@ -36,6 +36,18 @@ row is fetched with `SnapshotAny` — after an EvalPlanQual recheck `otid` is a
 version the statement's snapshot does not see.  Regression:
 `test/isolation/specs/toast_update_concurrency.spec`.
 
+### A changed value must look changed on disk (PSQLE-219)
+
+`heap_update()` decides HOT, the tuple lock mode and whether to log the old replica
+identity by comparing attributes on disk: ciphertext.  Under v5 a changed value of L
+bytes repeats its old ciphertext once in 256^L, and the UPDATE would go HOT with the
+index missing the new value.  `pg_vault_tde_tuple_update()` asks `tde_change_hidden()`
+about the indexed attributes and encrypts again under a fresh IV until no change is
+hidden: each try is an independent draw that has to avoid one value per changed
+column, so it ends after 1 + Σ 256^-L tries on average.  Only the indexed attributes:
+with every attribute counted, 300 changed `bool` columns would cost 3 encryptions per
+UPDATE.  v4 rows are skipped: they cannot be walked.  Regression: `tap/49_hot_update_short_indexed.t`.
+
 ### Dropped columns keep their values until the row is rewritten (PSQLE-192)
 
 Core nulls dropped columns whenever it rewrites a row (the executor's UPDATE

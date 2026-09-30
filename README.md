@@ -1594,7 +1594,7 @@ make ci-valgrind         # Valgrind memcheck over the full TDE workload (slow: 1
 make ci-cassert          # SQL suites + TAP files on PostgreSQL built --enable-cassert -DUSE_VALGRIND (builds PG from source)
 make ci-wallet           # SQL regression tests (local wallet provider)
 make ci-checksums        # regression tests + page checksum compatibility
-make ci-tap              # 48 TAP test files (starts a real Vault container for the Vault-dependent ones)
+make ci-tap              # 49 TAP test files (starts a real Vault container for the Vault-dependent ones)
 make ci-pins             # every GitHub Action pinned by commit, every third-party image by digest, every downloaded binary checked (first stage of ci-all)
 make ci-sbom             # SPDX SBOM of the source bundle (syft), scanned by grype — informational, as on the release
 make ci-security-report  # the stages a security review cites, on this commit → doc/security/evidence/v<VERSION>.md (doc/SECURITY-REVIEW.md › Workflow)
@@ -1610,7 +1610,7 @@ make ci-bench BENCH_ROWS=100000  # with custom row count
 make ci-clean            # Remove test containers and images
 ```
 
-Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 1164 assertions across 48 TAP files (the soak test, `tap/43`, runs only under `make ci-soak`). Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
+Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 1173 assertions across 49 TAP files (the soak test, `tap/43`, runs only under `make ci-soak`). Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
 - Tests 1-4: extension loaded, access methods and SQL functions registered, wallet unlock
 - Tests 12-14: TAM INSERT/SELECT/UPDATE end-to-end
 - Test 15: DELETE
@@ -2283,8 +2283,10 @@ See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
    coherent without a `REINDEX`.
    **How:** `heap_update` decides whether an update is HOT by comparing the indexed columns
    between the old and the new tuple, on disk. Both images are encrypted under a fresh
-   random GCM IV, so no attribute is byte-stable across an update: `heap_update` sees the
-   indexed column as modified and skips the HOT path. The constant `[VERSION | GENERATION]`
+   random GCM IV, so an attribute is byte-stable across an update only by chance (once in
+   256^L for a value of L bytes); when the chance hits a value that changed, the row is
+   encrypted again under another IV (PSQLE-219). `heap_update` sees every changed indexed
+   column as modified and skips the HOT path. The constant `[VERSION | GENERATION]`
    bytes sit at the **end** of the region, outside every attribute, so they cannot create a
    byte-stable window. See [doc/pg_vault_tde.md](doc/pg_vault_tde.md) § Known Limitations for
    the full analysis (including the v3 and v4 bugs this resolved).

@@ -1,6 +1,6 @@
 # pg_vault_tde Roadmap
 
-> Last updated: 2026-09-29 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 48 TAP files / 1164 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 3 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
+> Last updated: 2026-09-29 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 49 TAP files / 1173 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 3 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
 
 ---
 
@@ -615,6 +615,22 @@ distinguishes the builds.
     CodeQL's open alerts. The Bitbucket custom pipeline `security-report` runs it and
     keeps the report and the raw logs as artifacts. It is part of the release checklist, on the release
     commit.
+
+31. **A short indexed value that changed could miss its index (PSQLE-219).**
+    `heap_update()` decides HOT by comparing the indexed columns on disk, and under v5
+    each value is encrypted in place: a changed value of L bytes repeats its old
+    ciphertext once in 256^L, one `UPDATE` in 256 for a `bool`, a `"char"` or a
+    one-character text. 1.7.1 had it for short fixed-length columns (`tap/49` on the
+    1.7.1 build: 17 HOT updates of 4000 on the `bool`), v5 extended it to short
+    variable-length ones. That `UPDATE` went HOT: the index kept the old
+    key, lookups of the new value missed the row, lookups of the old one returned it,
+    and UNIQUE let a duplicate in. The same comparison chooses the tuple lock and
+    whether the old replica identity is logged. `tuple_update` now encrypts again
+    under another IV until every changed value looks changed on disk; `tap/49` runs
+    4000 such UPDATEs per index. The first `UPDATE` of a row still in v4 is not
+    covered (a v4 row cannot be walked): the `VACUUM FULL` the upgrade already
+    requires removes those, and rebuilds the indexes 1.7.1 may have left short of an
+    entry.
 
 **Key operations one at a time (PSQLE-210).** Rotations and wallet operations are
 tested alone and against concurrent DML, not against each other; the README now says

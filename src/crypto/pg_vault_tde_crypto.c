@@ -31,11 +31,11 @@
  * PostgreSQL memory/resource model.
  *
  * The fresh IV per row version is what keeps HOT off: heap_update compares
- * indexed columns byte by byte over ciphertext, so an indexed column always
- * looks changed, no HOT update is chosen, and tde_btree stays coherent.  Under
- * v4 the argument was "IV first, so the blob differs from byte 0"; in v5 the
- * leading bytes are structural and in clear, and it is the value bytes that
- * differ.  Same conclusion, different mechanism.
+ * indexed columns byte by byte over ciphertext, so an indexed column looks
+ * changed even when it is not, and no HOT update is chosen.  Not always: in v5
+ * a value of L bytes repeats its old ciphertext once in 256^L, and when the
+ * value did change that UPDATE went HOT and the index missed it.
+ * pg_vault_tde_tuple_update() re-encrypts until every change shows (PSQLE-219).
  */
 #include "postgres.h"
 #include "miscadmin.h"          /* MyDatabaseId (AAD), MyProcPid (IV batch) */
