@@ -1390,6 +1390,15 @@ tde_iam_init(void)
     tde_btree_methods.amcanreturn = NULL;
 
     /*
+     * No INCLUDE columns.  An included column is a non-key payload that
+     * tde_iam_encrypt_index_datum never encrypts, so it would reach the leaf
+     * page in plaintext, bypassing allow_plaintext_index (PSQLE-222).  With
+     * amcanreturn NULL there is no index-only scan to benefit from one either,
+     * so core rejects INCLUDE on a tde_btree index outright.
+     */
+    tde_btree_methods.amcaninclude = false;
+
+    /*
      * Disable parallel index build.  pg_vault_tde_ambuild delegates to
      * btree's ambuild by impersonating index->rd_rel->relam = BTREE_AM_OID
      * for the duration of the call — but that impersonation only mutates

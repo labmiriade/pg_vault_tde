@@ -1523,6 +1523,8 @@ change its passphrase (`pg_vault_tde_wallet_change_passphrase()`) and rotate the
 | Logical replication (TOAST columns) | ✅ Full (v1.7) | Custom WAL rmgr (`toast_custom_rmgr`) routes encrypted chunks past the reorder buffer; stitched in `change_cb`. UPDATE/DELETE need `REPLICA IDENTITY FULL` + PK. Same publisher requirement as above |
 | Range scans / ordering on TDE indexes | ⚠️ Equality only (by design) | `tde_btree` serves `=`, `IN`, `= ANY`; ranges, `ORDER BY`, `min`/`max` and merge joins run as sequential scans. `numeric` and nondeterministic-collation columns cannot be indexed with it — see [Limitation 2](#limitations-v17) |
 | `CREATE INDEX USING gin/gist/hash/brin/btree` on `encrypted_heap` | ⚠️ `ERROR` by default | Not encrypted AMs; rejected unless `pg_vault_tde.allow_plaintext_index = on` (then allowed with `WARNING`) |
+| `EXCLUDE` constraint, native index cloned onto an encrypted partition, or native index kept through `SET ACCESS METHOD encrypted_heap` | ⛔ Not supported (→ v1.8) | Build plaintext keys past the guard above, with no check and no warning — do not use on encrypted tables; see [Limitation 11](#limitations-v17) |
+| `tde_btree ... INCLUDE (col)` | ⚠️ `ERROR` (v1.7.2) | The included payload is not encrypted; `tde_btree` rejects `INCLUDE` |
 | Column-level encryption | 🔜 v1.8 | Per-column `ENABLE COLUMN ENCRYPTION` DDL |
 
 ### Logical replication on PostgreSQL 17.11 / 18.x and newer
@@ -2331,6 +2333,27 @@ See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
     **Mitigation:** always use `pg_dump_tde`/`pg_restore_tde` instead of plain
     `pg_dump`/`pg_restore` for logical backups of encrypted tables — see
     [Encrypted Backups](#encrypted-backups).
+
+11. **Three index paths are not supported on `encrypted_heap` in 1.7.2** (→ v1.8): they
+    slip past the `CREATE INDEX` guard of Limitation 9 and build a native index whose
+    keys sit in plaintext on disk, **without the `allow_plaintext_index` check and
+    without a `WARNING`**. Until 1.8 rejects them, **do not use them** on an encrypted
+    table:
+    - an **`EXCLUDE` constraint** backed by a native access method (e.g.
+      `EXCLUDE USING gist (c WITH &&)`) — it is a constraint, so it does not go through
+      the index guard;
+    - a **native index cloned onto an encrypted partition** — `CREATE TABLE … PARTITION
+      OF … USING encrypted_heap` (or `ATTACH PARTITION`) under a partitioned parent that
+      already carries a native index; the clone is created internally and skips the
+      check;
+    - a **native index carried over by `ALTER TABLE … SET ACCESS METHOD
+      encrypted_heap`** — indexes that already existed on the table stay as they were.
+
+    **Mitigation:** index encrypted tables only with `tde_btree` (equality), and add a
+    partition's indexes or convert a table to `encrypted_heap` *before* creating native
+    indexes on it; if you must keep one, do so knowingly with
+    `pg_vault_tde.allow_plaintext_index = on`. `INCLUDE` columns on a `tde_btree` index
+    had the same effect and are now rejected outright (v1.7.2).
 
 ---
 
