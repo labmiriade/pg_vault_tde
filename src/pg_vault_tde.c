@@ -930,7 +930,18 @@ tde_process_utility_hook(PlannedStmt *pstmt,
                 AlterTableCmd* cmd = lfirst_node(AlterTableCmd, lc);
 
                 if(cmd->subtype == AT_SetAccessMethod) {
-                    if(strcmp(cmd->name, "encrypted_heap") == 0)
+                    /*
+                     * SET ACCESS METHOD DEFAULT (PG17+) leaves cmd->name
+                     * NULL: the target is default_table_access_method,
+                     * resolved by core later.  strcmp(NULL, ...) here
+                     * crashed the backend before any permission check
+                     * (PSQLE-220).  Resolve it now, so DEFAULT is treated
+                     * as the explicit form of the same access method.
+                     */
+                    const char *am = cmd->name ? cmd->name
+                                               : default_table_access_method;
+
+                    if(strcmp(am, "encrypted_heap") == 0)
                         alter_tam_into = true;
                     else
                         alter_tam_away = true;
