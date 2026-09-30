@@ -1511,7 +1511,7 @@ change its passphrase (`pg_vault_tde_wallet_change_passphrase()`) and rotate the
 | INSERT / COPY | ✅ Full | `tuple_insert` + `multi_insert` override |
 | UPDATE | ✅ Full | `tuple_update` override + ctid preservation |
 | DELETE | ✅ Full | No-op (heapam header-only delete, no column data touched) |
-| HOT updates | ❌ Disabled by design | A fresh IV per row version makes every indexed column look changed, so `heap_update` never chooses HOT; every `UPDATE` writes all indexes. See [Limitation 7](#limitations-v17) and [Running in Production](#running-pg_vault_tde-in-production) |
+| HOT updates | ❌ Disabled by design | A changed indexed column is re-encrypted under a fresh IV so its on-disk bytes always differ (PSQLE-219), so `heap_update` never chooses HOT when an indexed column changed; the index stays coherent. See [Limitation 7](#limitations-v17) and [Running in Production](#running-pg_vault_tde-in-production) |
 | VACUUM | ✅ Full | Inherited from heapam (dead-tuple header only) |
 | CTAS   | ✅ Full | Per-table DEK registration before SELECT is executed |
 | `pg_dump` (plain) | ⚠️ Dump is plaintext | pg_dump reads via scan_getnextslot → decrypted. Use `pg_dump_tde` to re-encrypt the output. |
