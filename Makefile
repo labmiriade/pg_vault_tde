@@ -113,6 +113,20 @@ dist:
 # incremental `make` — a `make clean` is needed after bumping VERSION for the
 # embedded build-version string to update (accepted limitation, not solved
 # via fancier Make dependency tracking).
+#
+# TDE_HAVE_VM_CLEAR_LOCKED: visibilitymap_clear_locked() arrived with the fix
+# for "WAL logging of operations that clear bits in tables' visibility maps"
+# (PG 18.6 and the 17 minor of 2026-07-15), which the custom TOAST rmgr's clone
+# of heap_insert has to follow to keep registering the visibility-map buffer in
+# its record (PSQLE-227).  Probed rather than keyed to a version number: on a
+# minor without it, core's own heap_insert does not register the buffer either,
+# and the clone matching that core is what we want.
+TDE_HAVE_VM_CLEAR_LOCKED := $(shell grep -lq visibilitymap_clear_locked \
+    "$(shell $(PG_CONFIG) --includedir-server)/access/visibilitymap.h" 2>/dev/null && echo yes)
+ifeq ($(TDE_HAVE_VM_CLEAR_LOCKED),yes)
+override CFLAGS += -DTDE_HAVE_VM_CLEAR_LOCKED
+endif
+
 override CFLAGS  += -Wall -Wextra -std=c99 \
                     -Wno-unused-parameter \
                     -I$(srcdir)/src \
