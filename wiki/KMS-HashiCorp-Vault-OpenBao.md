@@ -47,9 +47,12 @@ SET`, with no restart required (`enabled` is the one exception — see the
 warning in [Encrypted Tables and Indexes](Encrypted-Tables-and-Indexes) and
 [GUC Reference](GUC-Reference)).
 
-`vault_token`, `vault_secret_id`, and the wallet passphrase GUCs are hidden
-from `pg_settings` (only visible to a superuser) so they don't leak through
-`SHOW ALL` or monitoring queries that read the catalog.
+`vault_token`, `vault_role_id`, `vault_secret_id` and
+`wallet_dev_mode_passphrase` are shown only to a superuser: any other role,
+`pg_monitor` members included, reads `********` from `SHOW` and
+`current_setting()`, and `pg_settings` does not list them (since 1.7.2).
+`pg_dump_tde`/`pg_restore_tde` with the `vault` provider read them with `SHOW`,
+so they must connect as a superuser.
 
 ## Authentication Methods
 

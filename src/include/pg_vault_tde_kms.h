@@ -26,6 +26,15 @@
 static inline bool
 tde_caller_is_superuser(void)
 {
+    /*
+     * In a security-restricted operation the session role is not the caller:
+     * ANALYZE, VACUUM and REINDEX run as the table's owner, and the index
+     * expressions they evaluate are that owner's code, while GetOuterUserId()
+     * stays the session role and would lend its privilege to it (PSQLE-225).
+     * No key operation belongs in such a context.
+     */
+    if (InSecurityRestrictedOperation())
+        return false;
     return superuser_arg(GetOuterUserId());
 }
 #endif

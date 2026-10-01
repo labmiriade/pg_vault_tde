@@ -36,11 +36,11 @@ ALTER TABLE mytable SET ACCESS METHOD heap;              -- encrypted → plain 
 
 ### TOAST (Large Column Values)
 
-Controlled by `pg_vault_tde.toast_encryption` (default `on`): TOAST chunks
-for large column values are encrypted per-chunk with the parent table's DEK,
-using the same `encrypted_heap` machinery. Set it to `off` only if you
-specifically need plaintext TOAST storage for performance reasons and have
-already accepted the confidentiality trade-off for large values.
+TOAST chunks for large column values are always encrypted per-chunk with the
+parent table's DEK, using the same `encrypted_heap` machinery.
+`pg_vault_tde.toast_encryption` has no effect since 1.7.2 (PSQLE-223): `off` never
+gave plaintext TOAST — it left a table unable to read its out-of-line values — and now
+only raises a `WARNING`. It is removed in 1.8.
 
 ## `tde_btree` — Index Access Method
 

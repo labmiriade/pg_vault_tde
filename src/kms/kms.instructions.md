@@ -607,7 +607,17 @@ EXTENSION` — so a check on them lets through anyone who has been granted
 (`superuser_arg(GetOuterUserId())`, `pg_vault_tde_kms.h`); a privilege on a table,
 as in `reencrypt_table()`, with `pg_class_aclcheck(..., GetOuterUserId(), ...)`.
 Every new SQL-callable function that manages keys or rewrites data needs one.
-Regression: `tap/41_reencrypt_table_privileges.t`, `tap/42_security_definer_callers.t`.
+
+`GetOuterUserId()` is the session role, so it is **not** the caller inside a
+security-restricted operation: `ANALYZE`, `VACUUM`, `REINDEX` and the index
+expressions they evaluate run as the table's owner while the session role stays
+what it was (PSQLE-225).  `tde_caller_is_superuser()` returns false there, and
+`reencrypt_table()` raises; a new check needs the same
+`InSecurityRestrictedOperation()` guard.  It cannot see past its own `SECURITY
+DEFINER` wrapper either — a granted role reaches these functions through code a
+superuser runs — which is why 1.8 removes the wrapper and the grants.
+Regression: `tap/41_reencrypt_table_privileges.t`, `tap/42_security_definer_callers.t`,
+`tap/55_restricted_operation_caller.t`.
 
 ### Evicting many entries is per-database
 

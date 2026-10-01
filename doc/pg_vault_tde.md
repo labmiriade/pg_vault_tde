@@ -263,7 +263,7 @@ buffer-backed `HeapTuple` MUST call `pg_vault_tde_decode_slot()`.
 | Callback | Trigger | Notes |
 |---|---|---|
 | `relation_copy_for_cluster` | `VACUUM FULL`, `CLUSTER` | Reads each tuple via `heap_getnext` (with `rd_tableam` impersonation), decrypts, re-encrypts into the new heap via `rewrite_heap_tuple`. Clears `HEAP_HASEXTERNAL` on the encrypted copy before writing; `tde_tuple_has_external_slow` (per-attribute varlena scan) is used on subsequent DELETE to locate TOAST chunks regardless of the infomask flag. |
-| `relation_toast_am` | TOAST table creation | Selects `encrypted_heap` as the TOAST AM when `pg_vault_tde.toast_encryption = on` (default), so TOAST chunks are encrypted through the same `tuple_insert`/`scan_getnextslot` hooks as the main table. |
+| `relation_toast_am` | TOAST table creation | Always selects `encrypted_heap` as the TOAST AM (since 1.7.2 regardless of `pg_vault_tde.toast_encryption`, PSQLE-223), so the encrypted chunks are decrypted through the same `index_fetch_tuple`/`scan_getnextslot` hooks as the main table. |
 
 ### pg_vault_tde_decode_slot
 
@@ -358,28 +358,28 @@ restore in a single-threaded backend.
 ```c
 static Oid pg_vault_tde_toast_am(Relation rel)
 {
-    (void) rel;
-    if (pg_vault_tde_toast_encryption)
-    {
-        Oid encheap_oid = get_table_am_oid("encrypted_heap", true);
-        if (OidIsValid(encheap_oid))
-            return encheap_oid;
-    }
-    return HEAP_TABLE_AM_OID;
+    if (!pg_vault_tde_toast_encryption)
+        ereport(WARNING, ... "has no effect" ...);   /* PSQLE-223 */
+    encheap_oid = get_table_am_oid("encrypted_heap", true);
+    if (OidIsValid(encheap_oid))
+        return encheap_oid;
+    return HEAP_TABLE_AM_OID;       /* only if the AM is missing */
 }
 ```
 
-When `pg_vault_tde.toast_encryption = on` (the default), TOAST tables are
-created with the `encrypted_heap` AM so that every TOAST chunk is encrypted
-individually using the parent relation's DEK.  On PG 18 the `heap_getnext`
+TOAST tables are created with the `encrypted_heap` AM so that every TOAST chunk is
+encrypted individually using the parent relation's DEK.  On PG 18 the `heap_getnext`
 identity assertion inside the TOAST index build would reject `encrypted_heap`;
 the `rd_tableam` impersonation workaround is applied during
 `index_build_range_scan` to satisfy this assertion.
 
-When `pg_vault_tde.toast_encryption = off`, TOAST tables fall back to standard
-`heap` AM, leaving large column values stored unencrypted — a configuration
-intentionally supported for performance-sensitive workloads where only the
-tuple body (not TOAST chunks) needs confidentiality protection.
+`pg_vault_tde.toast_encryption` has had no effect since 1.7.2 (PSQLE-223). The TOAST
+pipeline encrypts every chunk it writes whatever the TOAST table's AM, so `off` never
+gave plaintext TOAST: up to 1.7.1 it gave a heap TOAST table of encrypted chunks, read
+back undecrypted, and every out-of-line value of the table failed. Setting it `off` now
+only raises a `WARNING`; the parameter is removed in 1.8. A table left unreadable by
+1.7.1 is repaired by giving its TOAST table the `encrypted_heap` access method — see
+README.md › Upgrading to 1.7.2 › Tables created with `toast_encryption = off`.
 
 ### PG18-Specific API Notes
 
@@ -1052,16 +1052,17 @@ where the `softhsm2` package is installed; it skips itself otherwise.
 
 | # | Limitation | Fix Version |
 |---|-----------|-------------|
-| 1 | **TOAST chunk-level storage encryption** — ✅ **Resolved in v1.6**: large values round-trip fully encrypted via `pg_vault_tde_toast_am` returning `encrypted_heap` AM. Disable with `pg_vault_tde.toast_encryption = off` for legacy behaviour. | v1.6 ✅ |
+| 1 | **TOAST chunk-level storage encryption** — ✅ **Resolved in v1.6**: large values round-trip fully encrypted via `pg_vault_tde_toast_am` returning `encrypted_heap` AM. `pg_vault_tde.toast_encryption` has no effect since 1.7.2 (PSQLE-223). | v1.6 ✅ |
 | 2 | **tde_btree fixed-size types plaintext index keys** — ✅ **Resolved in v1.7**: `int4`, `int8`, `uuid`, `date`, `timestamptz` btree index keys are now encrypted with AES-256-SIV, matching varlena type behaviour. | v1.7 ✅ |
 | 3 | **Logical replication of TOAST columns** — ✅ **Resolved in v1.7** via the custom WAL resource manager (enable `pg_vault_tde.toast_custom_rmgr`). UPDATE/DELETE require `REPLICA IDENTITY FULL` + a primary key; `REPLICA IDENTITY DEFAULT` and PK-less tables remain unsupported. See [Logical Decoding and Replication](#logical-decoding-and-replication). | v1.7 ✅ |
 | 4 | **WAL unencrypted** — requires `XLogInsert()` hook unavailable in extension API | Permanently deferred |
 | 5 | **All-or-nothing table encryption** — no per-column granularity | v1.8 |
 | 6 | **tde_btree answers equality only** — ranges, `ORDER BY`, `min`/`max` run as sequential scans; `numeric` and nondeterministic collations refused (AES-SIV not order-preserving) | By design, permanent |
 | 7 | **BRIN on encrypted columns** — min/max of AES-SIV ciphertexts is meaningless | By design, permanent |
-| 8 | **HOT updates disabled** — `heap_update` reject to use HOT updates because the wire format portion considerd by TupDesc for the comparison between old and new tuple is non-deterministic aka changes at every encryption | By design, permanent |
+| 8 | **HOT updates disabled** — `heap_update` decides HOT by comparing the indexed columns' on-disk bytes between old and new tuple. A changed indexed value could re-encrypt to the same bytes (once in 256^L for L bytes), so `pg_vault_tde_tuple_update()` re-encrypts a changed indexed column under a fresh IV (PSQLE-219); `heap_update` then always sees it as modified and skips HOT, keeping the index coherent. See the section below. | By design, permanent |
 | 9 | **`WITH HOLD` cursor plaintext temp file** — a held cursor's result set is materialized into a tuplestore at `COMMIT` and spills to a plain temp file on disk past `work_mem`, bypassing the TAM entirely; no extension hook exists anywhere in the `WITH HOLD` cursor lifecycle to intercept it. See README.md § Limitations item 6. | Permanently deferred |
 | 10 | **Plain `COPY <table> TO` / `pg_dump` produce a plaintext dump, with no warning** — encryption lives entirely in the TAM's read callbacks (`scan_getnextslot` and friends), which decrypt unconditionally and cannot distinguish a `COPY TO` from a `SELECT`; `pg_dump`'s default table-data path is exactly this form of `COPY`. No `ProcessUtility_hook` guard or GUC-gated `WARNING` exists yet (designed, never implemented). Use `pg_dump_tde`/`pg_restore_tde` instead. See README.md § Limitations item 10. | v1.8 |
+| 11 | **Three index paths store plaintext keys past the `allow_plaintext_index` guard, with no check and no warning — not supported in 1.7.2**: an `EXCLUDE` constraint on a native access method (it is a constraint, so it skips the `CREATE INDEX` guard); a native index cloned onto an encrypted partition (`PARTITION OF`/`ATTACH PARTITION`, created internally with `is_internal`); a native index carried over by `ALTER TABLE … SET ACCESS METHOD encrypted_heap`. Do not use them on encrypted tables; index with `tde_btree`, and create native indexes before converting a table or attaching a partition. `INCLUDE` columns on a `tde_btree` index had the same effect and are rejected outright since v1.7.2. See README.md § Limitations item 11. | v1.8 |
 
 ### HOT updates are disabled by design
 
@@ -1108,8 +1109,8 @@ region, outside every attribute, so they cannot create a byte-stable window.
 1. **TOAST encryption** (ticket #1) — ✅ **Resolved in 6**  
    `pg_vault_tde_toast_am` now returns `encrypted_heap` AM when
    `pg_vault_tde.toast_encryption = on` (default). Every TOAST chunk is
-   encrypted individually using the parent relation's DEK.  The v1.0 behaviour
-   (forced `HEAP_TABLE_AM_OID`) is available via `toast_encryption = off`.
+   encrypted individually using the parent relation's DEK.  `toast_encryption = off`
+   no longer restores the v1.0 behaviour: it has no effect since 1.7.2 (PSQLE-223).
 
 2. **Row re-encryption after rotation** (ticket #2) — ✅ **Resolved**  
    `pg_vault_tde_rotate_online(relname, batch_size)` promotes the current DEK to
@@ -1321,9 +1322,9 @@ value; no shared state is changed.
 | `vault_url` | string | `''` | suset | Vault / OpenBao base URL |
 | `vault_namespace` | string | `''` | suset | Vault namespace (enterprise; empty for community) |
 | `vault_auth_method` | string | `token` | suset | Vault auth method: `token`, `approle`, or `kubernetes` |
-| `vault_token` | string | `''` | suset | Auth token — hidden from `pg_settings` (`GUC_NOT_IN_SAMPLE`) |
-| `vault_role_id` | string | `''` | suset | AppRole role_id UUID — hidden from `pg_settings` |
-| `vault_secret_id` | string | `''` | suset | AppRole secret_id — hidden from `pg_settings` |
+| `vault_token` | string | `''` | suset | Auth token — shown only to a superuser (others read `********`), not in `pg_settings` (v1.7.2, PSQLE-224) |
+| `vault_role_id` | string | `''` | suset | AppRole role_id UUID — shown only to a superuser (others read `********`), not in `pg_settings` (v1.7.2, PSQLE-224) |
+| `vault_secret_id` | string | `''` | suset | AppRole secret_id — shown only to a superuser (others read `********`), not in `pg_settings` (v1.7.2, PSQLE-224) |
 | `vault_role_name` | string | `''` | suset | AppRole role name for secret_id rotation **(v1.4)** — calls `secret-id/destroy` after login |
 | `vault_k8s_role` | string | `''` | suset | Kubernetes JWT auth role name |
 | `vault_k8s_mount` | string | `kubernetes` | suset | Kubernetes auth engine mount path |
@@ -1337,9 +1338,9 @@ value; no shared state is changed.
 | `wallet_passphrase_command` | string | `''` | suset | Shell command whose stdout is the passphrase (highest priority) |
 | `wallet_auto_open` | boolean | `on` | suset | Auto-open wallet at startup if passphrase env var is set |
 | `dev_mode` | boolean | `off` | suset | Enable development-only conveniences (insecure in production) |
-| `wallet_dev_mode_passphrase` | string | `''` | suset | Inline dev passphrase, used only when `dev_mode = on`; emits a `WARNING` on every use — hidden from `pg_settings` |
+| `wallet_dev_mode_passphrase` | string | `''` | suset | Inline dev passphrase, used only when `dev_mode = on`; emits a `WARNING` on every use — shown only to a superuser (others read `********`), not in `pg_settings` (v1.7.2, PSQLE-224) |
 | `dek_cache_ttl` | integer | `0` | suset | Per-backend DEK cache TTL in seconds (0 = no expiry; range 0–86400). When > 0, each backend re-reads the DEK from shmem after this interval even without rotation |
-| `toast_encryption` | boolean | `on` | suset | Encrypt TOAST chunks with the parent relation's DEK |
+| `toast_encryption` | boolean | `on` | suset | **No effect since 1.7.2** (PSQLE-223): the TOAST table of an `encrypted_heap` table is always `encrypted_heap` and its chunks always encrypted with the parent relation's DEK; setting it `off` only raises a `WARNING` when a TOAST table is created. Removed in 1.8 |
 | `allow_plaintext_index` | boolean | `off` | suset | When `off` (default), `CREATE INDEX`/`CREATE UNIQUE INDEX` with a non-`tde_btree` access method on an `encrypted_heap` table is rejected with `ERROR`. When `on`, the same statement is allowed after a `WARNING` — the indexed column's plaintext value is then stored unencrypted on disk. Does not affect `PRIMARY KEY`/`UNIQUE` table constraints, which PostgreSQL core always backs with a native btree index regardless of this setting (that case already warns unconditionally). |
 | `bgw_enabled` | boolean | `off` | suset | Enable background worker for automatic token renewal. **Requires cluster restart**: the BGW is registered via `RegisterBackgroundWorker()` at postmaster startup; changing via `pg_reload_conf()` updates the value but does not start/stop the worker dynamically. |
 | `token_renewal_interval` | integer | `3600` | suset | Token renewal interval in seconds (60–86400) |
@@ -1359,7 +1360,7 @@ and included by any translation unit that needs them (`tam.c`, `kms.c`).
 ```
 _PG_init()
   ├── DefineCustomStringVariable("pg_vault_tde.vault_url", ...)      [PGC_SUSET]
-  ├── DefineCustomStringVariable("pg_vault_tde.vault_token", ...)    [PGC_SUSET, GUC_NOT_IN_SAMPLE]
+  ├── DefineCustomStringVariable("pg_vault_tde.vault_token", ...)    [PGC_SUSET, GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE | GUC_NO_SHOW_ALL, show hook]
   ├── ... ~20 more GUC parameters (all PGC_SUSET except max_encrypted_relations/crypto_provider/enabled) ...
   ├── install shmem_request_hook  → pg_vault_tde_shmem_request()
   │       ├── pg_vault_tde_kms_shmem_request()

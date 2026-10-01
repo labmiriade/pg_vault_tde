@@ -632,6 +632,9 @@ distinguishes the builds.
     requires removes those, and rebuilds the indexes 1.7.1 may have left short of an
     entry.
 
+32. **Fix Visibility Map WAL logging for custom TOAST rmgr (PSQLE-227):** 
+    Ensured `tde_toast_wal_insert` registers visibility map buffers in WAL records when `toast_custom_rmgr = on`. This prevents VM page corruption during crash recovery and resolves issues with incremental backups.
+
 **Key operations one at a time (PSQLE-210).** Rotations and wallet operations are
 tested alone and against concurrent DML, not against each other; the README now says
 to run them one at a time per database and lists the combinations to avoid until 1.8.

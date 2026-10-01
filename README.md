@@ -738,13 +738,13 @@ startup.
 | `wallet_passphrase_env` | string | `''` | suset | Env var name holding wallet passphrase — env var NAME only, never the value |
 | `wallet_passphrase_file` | string | `''` | suset | File path containing wallet passphrase (trimmed; `0400` permission enforced) **(v1.6)** |
 | `wallet_passphrase_command` | string | `''` | suset | Shell command to retrieve passphrase (analogous to PG's `ssl_passphrase_command`) **(v1.6)** |
-| `wallet_dev_mode_passphrase` | string | `''` | suset | Convenience passphrase for dev/CI (only honoured when `dev_mode = on`) **(v1.6)** |
+| `wallet_dev_mode_passphrase` | string | `''` | suset | Convenience passphrase for dev/CI (only honoured when `dev_mode = on`) — shown only to a superuser (others read `********`), not in `pg_settings` (v1.7.2, PSQLE-224) **(v1.6)** |
 | `dev_mode` | boolean | `off` | suset | Enable development mode features (wallet_dev_mode_passphrase) **(v1.6)** |
 | `wallet_auto_open` | boolean | `on` | suset | Auto-open wallet on startup if passphrase env var is set |
 | `preload_keys` | boolean | `off` | suset | Warm this database's DEK cache at startup: a background worker per database unwraps every DEK in `pg_vault_tde_catalog` once the server accepts connections, so the first query on a table does not pay a KMS round-trip. Needs a KMS usable without an interactive unlock (`wallet_passphrase_command` / `wallet_passphrase_env`). Stops at `max_encrypted_relations`. Scope it with `ALTER DATABASE SET`. |
 | `preload_max_failures` | integer | `5` | suset | Consecutive DEK unwrap failures the startup preload tolerates in one database before giving up on it. Consecutive, so a missing passphrase stops the pass at once while a one-off does not. Relevant to the local wallet too: the KEK is re-derived from the wallet file on every unwrap rather than cached, so a wallet on NFS or SMB is reopened once per relation. `0` stops at the first failure. |
 | `max_encrypted_relations` | integer | `1024` | postmaster | Maximum number of per-table DEK entries in shmem (64–65536), **cluster-wide**: entries are keyed by `(dbid, relid)`, so budget for the sum across all databases. Enforced since 1.7.2 — before that the cache silently grew past it (ShmemInitHash's size is not a cap), so count your encrypted relations across all databases before upgrading. ~112 bytes per relation, reserved at startup. Max 1048576. Requires restart. |
-| `toast_encryption` | boolean | `on` | suset | Encrypt TOAST chunks with the parent relation's DEK (v1.5) |
+| `toast_encryption` | boolean | `on` | suset | **No effect since 1.7.2** (PSQLE-223): the TOAST table of an `encrypted_heap` table is always `encrypted_heap` and its chunks always encrypted with the parent relation's DEK; setting it `off` only raises a `WARNING` when a TOAST table is created. Removed in 1.8. Up to 1.7.1, a table created or rewritten with it `off` got a heap TOAST table of encrypted chunks and could not read its out-of-line values — see [Tables created with `toast_encryption = off`](#tables-created-with-toast_encryption--off) to repair one |
 
 ### Vault / OpenBao (`kms_provider = 'vault'`)
 
@@ -754,9 +754,9 @@ All parameters are `suset` — settable per-database with `ALTER DATABASE SET`.
 |---|---|---|---|---|
 | `vault_url` | string | `''` | suset | Vault / OpenBao base URL |
 | `vault_namespace` | string | `''` | suset | Vault namespace (enterprise; empty for community) |
-| `vault_token` | string | `''` | suset | Auth token — hidden from `pg_settings` (superuser only) |
-| `vault_role_id` | string | `''` | suset | AppRole role_id UUID |
-| `vault_secret_id` | string | `''` | suset | AppRole secret_id — hidden from `pg_settings` (superuser only) |
+| `vault_token` | string | `''` | suset | Auth token — shown only to a superuser (others read `********`), not in `pg_settings` (v1.7.2, PSQLE-224) |
+| `vault_role_id` | string | `''` | suset | AppRole role_id UUID — shown only to a superuser (others read `********`), not in `pg_settings` (v1.7.2, PSQLE-224) |
+| `vault_secret_id` | string | `''` | suset | AppRole secret_id — shown only to a superuser (others read `********`), not in `pg_settings` (v1.7.2, PSQLE-224) |
 | `vault_role_name` | string | `''` | suset | AppRole role name for secret_id rotation after login **(v1.4)** |
 | `vault_k8s_role` | string | `''` | suset | Kubernetes JWT auth role name |
 | `vault_transit_mount` | string | `transit` | suset | Transit secrets engine mount path |
@@ -858,8 +858,8 @@ log stream without any extension-level configuration.
 | Function | Returns | Description |
 |---|---|---|
 | `pg_vault_tde_health_check()` | composite | Status (6 columns: version, build_version, enabled, kms_provider, enc_ops_available, checked_at) |
-| `pg_vault_tde_verify_integrity(regclass)` | record | GCM tag audit scan of all tuples and every out-of-line value they reference — returns `(total_tuples, failed_tuples)`, a row counted once whichever part failed. Up to 1.7.1 it could count intact rows as failed when the table was invalidated during its scan (autovacuum updating its statistics): on 1.7.1, run it again before acting on a failure |
-| `pg_vault_tde_encrypted_size(regclass)` | record | Encryption storage overhead — returns `(total_tuples, encryption_overhead_bytes)` |
+| `pg_vault_tde_verify_integrity(regclass)` | record | GCM tag audit scan of all tuples and every out-of-line value they reference — returns `(total_tuples, failed_tuples)`, a row counted once whichever part failed. Up to 1.7.1 it could count intact rows as failed when the table was invalidated during its scan (autovacuum updating its statistics): on 1.7.1, run it again before acting on a failure. Requires `SELECT` on the table (v1.7.2; up to 1.7.1 any role could call it on any table) |
+| `pg_vault_tde_encrypted_size(regclass)` | record | Encryption storage overhead — returns `(total_tuples, encryption_overhead_bytes)`. Requires `SELECT` on the table (v1.7.2; up to 1.7.1 any role could call it on any table) |
 | `pg_vault_tde_reencrypt_table(regclass, int)` | void | Batch re-encrypt with current DEK (locks table); `int` = batch size, default 1000. Requires `MAINTAIN` on the table (its owner, `pg_maintain`, superusers) since 1.7.2 — see [Who may call `reencrypt_table()`](#who-may-call-reencrypt_table) |
 | `pg_vault_tde_rotate_online(regclass, int)` | void | BGW-based online rotation: reads continue, writes wait until it commits; accepts both `encrypted_heap` tables and `tde_btree` indexes **(v1.5)** |
 | `pg_vault_tde_get_rotation_status(regclass)` | table | Online rotation progress for one relation (status, tuples_done/total, pct_complete, timestamps) **(v1.5)** |
@@ -876,8 +876,8 @@ log stream without any extension-level configuration.
 | `pg_vault_tde_seal_keys_bytea(text, text)` | bytea | Same signed bundle as `pg_vault_tde_seal_keys()`, returned as `bytea` instead of written server-side — used by `pg_basebackup_tde` to store the bundle on the client host **(v1.7)** |
 | `pg_vault_tde_unseal_keys(text, text)` | void | Verify (HMAC) and re-import a bundle written by `pg_vault_tde_seal_keys()`; rejects a tampered file or wrong passphrase before writing anything **(v1.7)** |
 | `pg_vault_tde_migrate_vault_to_wallet(text)` | void | Online Vault→local wallet migration: pass the passphrase of the wallet created with `wallet_init()`; re-wraps every Vault DEK under the wallet's KEK and switches the database to the `local` provider. Broken before 1.7.2 — see [Upgrading to 1.7.2](#migrate_vault_to_wallet-before-172) **(v1.6)** |
-| `pg_vault_tde_vault_status()` | table | Vault provider diagnostics — `(configured, auth_method, reachable)` |
-| `pg_vault_tde_refresh_token()` | boolean | Manually renew the current Vault token lease |
+| `pg_vault_tde_vault_status()` | table | Vault provider diagnostics — `(configured, auth_method, reachable)`. Superuser only (v1.7.2; up to 1.7.1 open to any role) |
+| `pg_vault_tde_refresh_token()` | boolean | Manually renew the current Vault token lease. Superuser only (v1.7.2; up to 1.7.1 open to any role) |
 | `pg_vault_tde_hw_accel_info()` | record | OpenSSL provider/cipher diagnostics — `(openssl_version, configured_provider, provider_loaded, gcm_cipher, siv_cipher, aes_ni_available)` |
 
 ---
@@ -942,9 +942,9 @@ WHERE  a.amname = 'encrypted_heap'
 
 No rows means nothing to do — install 1.7.1 and carry on.
 
-This only applies with `pg_vault_tde.toast_encryption = on`, which is the
-default. If it was turned off, TOAST chunks were never encrypted by this
-extension and the upgrade is unaffected either way.
+A table whose TOAST table was created while `pg_vault_tde.toast_encryption` was
+`off` could not read its out-of-line values before the upgrade either (PSQLE-223):
+its chunks were encrypted but its TOAST table was a plain heap one.
 
 ### Step 2 — dump those tables, still on 1.7.0
 
@@ -1472,6 +1472,13 @@ REVOKE EXECUTE ON FUNCTION pg_vault_tde_reencrypt_table(regclass, int),
 
 1.8 removes the grant from the extension script.
 
+Since 1.7.2 the function also refuses to run inside a **security-restricted
+operation**. `ANALYZE`, `VACUUM` and `REINDEX` run as the table's owner, and so does
+any index expression they evaluate; the role the check asks about — the session role —
+is not that owner's, so a table owner's code evaluated during a superuser's maintenance
+would have been checked against the superuser (PSQLE-225). A rewrite has no business
+inside an index expression, so it is refused there outright.
+
 
 ### Who may call the key-management functions
 
@@ -1488,6 +1495,17 @@ hold the KEK of every table later encrypted there. `pkcs11_keygen()` checked not
 all of them require a superuser. Delegating a database's wallet to its owner or to a
 tenant role is planned for 1.8.
 
+They also refuse inside a **security-restricted operation** — `ANALYZE`, `VACUUM`,
+`REINDEX` and the index expressions they evaluate, which run as the table's owner —
+because the session role the check asks about is not the caller there (PSQLE-225).
+
+One gap remains until 1.8: a role that holds `EXECUTE` can still reach these functions
+through code of its own that a superuser runs, such as a `SECURITY DEFINER` function it
+owns. The check cannot see past its own `SECURITY DEFINER` wrapper to that role; 1.8
+removes both the wrapper and the `pg_monitor` grants (the same `REVOKE` above is the
+mitigation meanwhile). Treat calling another role's function as a superuser the way
+PostgreSQL does in general: as running that role's code.
+
 **Still on 1.7.1:** take `wallet_init()` away from `pg_monitor`, as a superuser —
 `REVOKE EXECUTE ON FUNCTION pg_vault_tde_wallet_init(text) FROM pg_monitor;` — and
 check that every database with a wallet got it from a superuser. The wallets are the
@@ -1497,6 +1515,68 @@ when `log_line_prefix` includes `%u` — otherwise match its time and PID agains
 connection log (`log_connections`). If a wallet may have been created by someone else,
 change its passphrase (`pg_vault_tde_wallet_change_passphrase()`) and rotate the KEK
 (`pg_vault_tde_rotate_kek()`).
+
+### Who may call the read-only functions
+
+`pg_vault_tde_verify_integrity()` and `pg_vault_tde_encrypted_size()` open, scan and
+decrypt a whole relation; `pg_vault_tde_vault_status()` reports the server's KMS
+configuration and probes Vault, and `pg_vault_tde_refresh_token()` makes it renew its
+Vault lease. All four keep `EXECUTE` to `PUBLIC` and checked nothing up to 1.7.1, so any
+role could ask them about a table it may not read, or act on the cluster's KMS
+(PSQLE-226).
+
+1.7.2 checks the role whose code is running: the two scans require `SELECT` on the
+relation — what a `count(*)` over it would need — and the two KMS functions require a
+superuser. Nothing else changes, and a superuser is unaffected.
+
+**If you monitor with them:** a `pg_monitor` membership is not `SELECT`. Give the
+monitoring role `SELECT` on the tables it checks, or `pg_read_all_data` for all of them;
+move `vault_status()` and `refresh_token()` to a superuser connection.
+
+### Tables created with `toast_encryption = off`
+
+Up to 1.7.1, `pg_vault_tde.toast_encryption = off` did not store TOAST in plaintext, as
+documented. A table created while it was off — or rewritten by `VACUUM FULL`, `CLUSTER`
+or `SET ACCESS METHOD` — got a plain heap TOAST table whose chunks were still
+encrypted, and read them back undecrypted: every out-of-line value of the table fails
+with `unexpected chunk number … for toast value …`, and so does a `VACUUM FULL` or
+`CLUSTER` of it (PSQLE-223). 1.7.2 always gives an encrypted table an `encrypted_heap`
+TOAST table; the setting has no effect and only raises a `WARNING`.
+
+The values are not lost: the chunks are encrypted with the table's key, and only the
+access method of its TOAST table is wrong. In each database, as a superuser:
+
+1. Find the tables:
+
+   ```sql
+   SELECT c.oid::regclass AS table_name, t.oid::regclass AS toast_table
+   FROM   pg_class c
+   JOIN   pg_am    ca ON ca.oid = c.relam
+   JOIN   pg_class t  ON t.oid  = c.reltoastrelid
+   JOIN   pg_am    ta ON ta.oid = t.relam
+   WHERE  ca.amname = 'encrypted_heap' AND ta.amname <> 'encrypted_heap';
+   ```
+
+2. Check that the table is affected — reading every value of every row fails:
+
+   ```sql
+   SELECT sum(length(t::text)) FROM <table_name> t;
+   ```
+
+   If this succeeds, the table is not affected (its TOAST chunks are plaintext, from a
+   release before 1.6): leave it as it is.
+
+3. Give its TOAST table the `encrypted_heap` access method:
+
+   ```sql
+   UPDATE pg_class
+   SET    relam = (SELECT oid FROM pg_am WHERE amname = 'encrypted_heap')
+   WHERE  oid = '<toast_table>'::regclass;
+   ```
+
+4. Check: the query of step 2 now succeeds, and
+   `SELECT * FROM pg_vault_tde_verify_integrity('<table_name>')` reports
+   `failed_tuples = 0`.
 
 ## Compatibility
 
@@ -1511,7 +1591,7 @@ change its passphrase (`pg_vault_tde_wallet_change_passphrase()`) and rotate the
 | INSERT / COPY | ✅ Full | `tuple_insert` + `multi_insert` override |
 | UPDATE | ✅ Full | `tuple_update` override + ctid preservation |
 | DELETE | ✅ Full | No-op (heapam header-only delete, no column data touched) |
-| HOT updates | ❌ Disabled by design | A fresh IV per row version makes every indexed column look changed, so `heap_update` never chooses HOT; every `UPDATE` writes all indexes. See [Limitation 7](#limitations-v17) and [Running in Production](#running-pg_vault_tde-in-production) |
+| HOT updates | ❌ Disabled by design | A changed indexed column is re-encrypted under a fresh IV so its on-disk bytes always differ (PSQLE-219), so `heap_update` never chooses HOT when an indexed column changed; the index stays coherent. See [Limitation 7](#limitations-v17) and [Running in Production](#running-pg_vault_tde-in-production) |
 | VACUUM | ✅ Full | Inherited from heapam (dead-tuple header only) |
 | CTAS   | ✅ Full | Per-table DEK registration before SELECT is executed |
 | `pg_dump` (plain) | ⚠️ Dump is plaintext | pg_dump reads via scan_getnextslot → decrypted. Use `pg_dump_tde` to re-encrypt the output. |
@@ -1523,6 +1603,8 @@ change its passphrase (`pg_vault_tde_wallet_change_passphrase()`) and rotate the
 | Logical replication (TOAST columns) | ✅ Full (v1.7) | Custom WAL rmgr (`toast_custom_rmgr`) routes encrypted chunks past the reorder buffer; stitched in `change_cb`. UPDATE/DELETE need `REPLICA IDENTITY FULL` + PK. Same publisher requirement as above |
 | Range scans / ordering on TDE indexes | ⚠️ Equality only (by design) | `tde_btree` serves `=`, `IN`, `= ANY`; ranges, `ORDER BY`, `min`/`max` and merge joins run as sequential scans. `numeric` and nondeterministic-collation columns cannot be indexed with it — see [Limitation 2](#limitations-v17) |
 | `CREATE INDEX USING gin/gist/hash/brin/btree` on `encrypted_heap` | ⚠️ `ERROR` by default | Not encrypted AMs; rejected unless `pg_vault_tde.allow_plaintext_index = on` (then allowed with `WARNING`) |
+| `EXCLUDE` constraint, native index cloned onto an encrypted partition, or native index kept through `SET ACCESS METHOD encrypted_heap` | ⛔ Not supported (→ v1.8) | Build plaintext keys past the guard above, with no check and no warning — do not use on encrypted tables; see [Limitation 11](#limitations-v17) |
+| `tde_btree ... INCLUDE (col)` | ⚠️ `ERROR` (v1.7.2) | The included payload is not encrypted; `tde_btree` rejects `INCLUDE` |
 | Column-level encryption | 🔜 v1.8 | Per-column `ENABLE COLUMN ENCRYPTION` DDL |
 
 ### Logical replication on PostgreSQL 17.11 / 18.x and newer
@@ -1874,6 +1956,9 @@ pg_restore_tde -h localhost -U postgres -d mydb -i /backup/mydb.tde
 
 >All other `pg_dump` options are fed directly to it.
 
+With the `vault` provider both tools read the Vault credentials of the server with
+`SHOW`, which since 1.7.2 returns them only to a superuser: connect as one (PSQLE-224).
+
 ### `pg_basebackup`
 It's possible to use `pg_basebackup` to create a base backup of the cluster and use it for a standby creation.
 
@@ -2048,7 +2133,10 @@ run against 1.7.2.
     `pg_db_role_setting`, and in every `pg_dumpall`). Put them in a file outside `PGDATA`,
     readable only by the server's operating-system user, loaded with `include`. For the
     wallet, prefer `wallet_passphrase_env`, `_file` or `_command`, which hold only where
-    the passphrase is.
+    the passphrase is. Up to 1.7.1 every member of `pg_read_all_settings` — which
+    PostgreSQL grants to `pg_monitor` — read these four with `SHOW`, `current_setting()`
+    and `pg_settings`; since 1.7.2 a role that is not a superuser reads `********`, and
+    `pg_settings` lists none of them (PSQLE-224).
   - `wallet_passphrase_command` runs through `popen()` — a shell, as the server's
     operating-system user — every time the wallet is opened; whatever it writes to
     standard error reaches the server log.
@@ -2331,6 +2419,27 @@ See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
     **Mitigation:** always use `pg_dump_tde`/`pg_restore_tde` instead of plain
     `pg_dump`/`pg_restore` for logical backups of encrypted tables — see
     [Encrypted Backups](#encrypted-backups).
+
+11. **Three index paths are not supported on `encrypted_heap` in 1.7.2** (→ v1.8): they
+    slip past the `CREATE INDEX` guard of Limitation 9 and build a native index whose
+    keys sit in plaintext on disk, **without the `allow_plaintext_index` check and
+    without a `WARNING`**. Until 1.8 rejects them, **do not use them** on an encrypted
+    table:
+    - an **`EXCLUDE` constraint** backed by a native access method (e.g.
+      `EXCLUDE USING gist (c WITH &&)`) — it is a constraint, so it does not go through
+      the index guard;
+    - a **native index cloned onto an encrypted partition** — `CREATE TABLE … PARTITION
+      OF … USING encrypted_heap` (or `ATTACH PARTITION`) under a partitioned parent that
+      already carries a native index; the clone is created internally and skips the
+      check;
+    - a **native index carried over by `ALTER TABLE … SET ACCESS METHOD
+      encrypted_heap`** — indexes that already existed on the table stay as they were.
+
+    **Mitigation:** index encrypted tables only with `tde_btree` (equality), and add a
+    partition's indexes or convert a table to `encrypted_heap` *before* creating native
+    indexes on it; if you must keep one, do so knowingly with
+    `pg_vault_tde.allow_plaintext_index = on`. `INCLUDE` columns on a `tde_btree` index
+    had the same effect and are now rejected outright (v1.7.2).
 
 ---
 

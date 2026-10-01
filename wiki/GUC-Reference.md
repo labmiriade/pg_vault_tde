@@ -8,9 +8,12 @@ restart**. Parameters marked `postmaster` require a full server restart
 (`postgresql.conf` or `ALTER SYSTEM`, then restart).
 
 Parameters holding secrets (`vault_token`, `vault_role_id`,
-`vault_secret_id`, `wallet_dev_mode_passphrase`) are hidden from
-non-superusers in `pg_settings` and excluded from configuration file
-samples.
+`vault_secret_id`, `wallet_dev_mode_passphrase`) are shown only to a
+superuser: any other role — `pg_monitor` and `pg_read_all_settings` members
+included — reads `********` from `SHOW` and `current_setting()`, and
+`pg_settings` does not list them (since 1.7.2; up to 1.7.1
+`pg_read_all_settings` read the values). They are also excluded from
+configuration file samples.
 
 ## General
 
@@ -39,9 +42,9 @@ All `suset`, superuser-only in `pg_settings`, settable per-database.
 | `vault_url` | string | `''` | Vault/OpenBao base URL (e.g. `https://vault.example.com:8200`) |
 | `vault_namespace` | string | `''` | Vault Enterprise namespace; leave empty for Community Edition |
 | `vault_auth_method` | string | `token` | Authentication method: `token`, `approle`, or `kubernetes` |
-| `vault_token` | string | `''` | Auth token for the `token` method — hidden from `pg_settings` |
-| `vault_role_id` | string | `''` | AppRole `role_id` — hidden from `pg_settings` |
-| `vault_secret_id` | string | `''` | AppRole `secret_id` — hidden from `pg_settings` |
+| `vault_token` | string | `''` | Auth token for the `token` method — shown only to a superuser |
+| `vault_role_id` | string | `''` | AppRole `role_id` — shown only to a superuser |
+| `vault_secret_id` | string | `''` | AppRole `secret_id` — shown only to a superuser |
 | `vault_role_name` | string | `''` | AppRole role name; when set, the used `secret_id` is destroyed after a successful login (single-use pattern) |
 | `vault_k8s_role` | string | `''` | Kubernetes auth role name |
 | `vault_k8s_mount` | string | `kubernetes` | Kubernetes auth engine mount path |
@@ -67,7 +70,7 @@ All `suset`, superuser-only in `pg_settings`, settable per-database.
 | `wallet_passphrase_command` | string | `''` | suset | Shell command whose stdout is the passphrase (highest priority of the three ingestion methods; analogous to `ssl_passphrase_command`) |
 | `wallet_auto_open` | boolean | `on` | suset | Auto-open the wallet during startup if a passphrase is available via one of the above; if `off`, opening is deferred until first access |
 | `dev_mode` | boolean | `off` | suset | Enables development-only conveniences. **Never set `on` in production.** |
-| `wallet_dev_mode_passphrase` | string | `''` | suset | Inline plaintext passphrase, used only when `dev_mode = on`; emits a `WARNING` on every use — hidden from `pg_settings` |
+| `wallet_dev_mode_passphrase` | string | `''` | suset | Inline plaintext passphrase, used only when `dev_mode = on`; emits a `WARNING` on every use — shown only to a superuser |
 
 Passphrase source priority when more than one is configured:
 `wallet_passphrase_command` > `wallet_passphrase_file` > `wallet_passphrase_env`.
@@ -88,7 +91,7 @@ All `suset`, superuser-only in `pg_settings`, settable per-database.
 
 | Parameter | Type | Default | Context | Description |
 |---|---|---|---|---|
-| `toast_encryption` | boolean | `on` | suset | Encrypts TOAST chunks for `encrypted_heap` tables using the parent relation's DEK. Set `off` only for debugging or migration — see [Encrypted Tables and Indexes](Encrypted-Tables-and-Indexes). |
+| `toast_encryption` | boolean | `on` | suset | **No effect since 1.7.2** (PSQLE-223): the TOAST table of an `encrypted_heap` table is always `encrypted_heap` and its chunks always encrypted with the parent relation's DEK; setting it `off` only raises a `WARNING` when a TOAST table is created. Removed in 1.8 — see [Encrypted Tables and Indexes](Encrypted-Tables-and-Indexes). |
 | `toast_custom_rmgr` | boolean | `off` | postmaster | Enables the custom WAL resource manager that lets encrypted TOAST chunks be published over logical replication. Requires `pg_vault_tde` in `shared_preload_libraries` (already true) and a full restart — see [Logical Replication](Logical-Replication). |
 
 ## See Also
