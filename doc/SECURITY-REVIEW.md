@@ -16,7 +16,7 @@ written by a person - see the RFC in
 | | |
 |---|---|
 | Version under review | 1.7.2 |
-| Reviews signed so far | none - the first is [Reviews](#reviews), row 1.7.2 |
+| Reviews signed so far | [1.7.2](security/reviews/v1.7.2.md) (self-review) |
 | Reporting a vulnerability | [SECURITY.md](../SECURITY.md) |
 
 ---
@@ -277,7 +277,7 @@ documentation gap.
 
 | Version | Scope | Reviewer | Commit / tag | Date |
 |---|---|---|---|---|
-| 1.7.2 | Full (first review; the on-disk format changed); self-review | - | - | pending (PSQLE-183) |
+| 1.7.2 | Full (first review; the on-disk format changed); self-review | Matteo Durighetto | `02bcf69f6a0d22cc9a81686f7113e6ef80ad1cd4` | 2026-10-02 |
 
 ---
 
