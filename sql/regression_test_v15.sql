@@ -8,11 +8,34 @@
 --   - Documents the expected pass/fail boundary
 --   - Uses ONLY public SQL API (no C internals)
 --
--- Run sequence:
---   psql -f sql/pg_vault_tde--1.0.sql   (base install)
---   psql -f sql/pg_vault_tde--1.4--1.5.sql  (upgrade)
---   psql -f sql/regression_test.sql     (v1.4 tests 1-52)
---   psql -f sql/regression_test_v15.sql (v1.5 tests 53-72)
+-- Not standalone: `make ci-regress` (ci/scripts/run-regress.sh) sets all of this
+-- up. To run the files by hand, start the server with
+--
+--   shared_preload_libraries = 'pg_vault_tde'
+--   pg_vault_tde.dev_mode = on
+--   pg_vault_tde.kms_provider = local
+--   pg_vault_tde.wallet_auto_open = off
+--   pg_vault_tde.wallet_dev_mode_passphrase = tde_regression_pass_2026
+--
+-- then, as superuser:
+--
+--   CREATE EXTENSION pg_vault_tde;   -- installs 1.7, the only version shipped
+--   SELECT pg_vault_tde_wallet_init('tde_regression_pass_2026');
+--
+-- Without the wallet, TEST 4 (wallet unlock) is the first thing that fails.
+--
+-- Run sequence — the four files share cluster state and run in this order:
+--
+--   psql -f sql/regression_test.sql      (tests 1-52)
+--   psql -f sql/regression_test_v15.sql  (tests 53-72)
+--   psql -f sql/regression_test_v16.sql  (tests 73-110)
+--   psql -f sql/regression_test_v17.sql  (tests 111-140, 154-164)
+--
+-- There are no pg_vault_tde--1.x--1.y.sql upgrade scripts. 1.7 is the only
+-- version installed (DATA in the Makefile, default_version in the .control),
+-- so CREATE EXTENSION lands on 1.7 directly and no ALTER EXTENSION is needed.
+-- The vN in a filename is the release that introduced those tests, not an
+-- extension version you have to reach first.
 --
 -- Exit-on-error: any failed assertion aborts the script.
 \set ON_ERROR_STOP on
@@ -245,12 +268,13 @@ BEGIN
         RAISE EXCEPTION 'TEST 60 FAILED: expected 10 rows, got %', cnt;
     END IF;
 
+    -- The value itself, not length(), which may not read it (PSQLE-202).
     SELECT count(*) INTO mismatch
     FROM tde_toast_copy_test
-    WHERE length(val) <> length(repeat('toast_copy_row_', 210));
+    WHERE val IS DISTINCT FROM repeat('toast_copy_row_', 210);
 
     IF mismatch > 0 THEN
-        RAISE EXCEPTION 'TEST 60 FAILED: % rows have wrong payload length',
+        RAISE EXCEPTION 'TEST 60 FAILED: % rows have a wrong payload',
                         mismatch;
     END IF;
 
@@ -498,8 +522,12 @@ DECLARE
     result_val  text;
 BEGIN
     CREATE TABLE tde_btree_int4_test (id int4, label text) USING encrypted_heap;
+    -- v1.5 plaintext-key operator class: refused by default since 1.7.2
+    -- (PSQLE-173), still supported for indexes that already use it.
+    SET pg_vault_tde.allow_plaintext_index = on;
     CREATE INDEX tde_btree_int4_idx
         ON tde_btree_int4_test USING tde_btree (id tde_int4_ops);
+    RESET pg_vault_tde.allow_plaintext_index;
 
     INSERT INTO tde_btree_int4_test VALUES (100, 'hundred'),
                                            (200, 'two_hundred'),
@@ -531,8 +559,12 @@ DECLARE
     result_id  int;
 BEGIN
     CREATE TABLE tde_btree_uuid_test (id int, token uuid) USING encrypted_heap;
+    -- v1.5 plaintext-key operator class: refused by default since 1.7.2
+    -- (PSQLE-173), still supported for indexes that already use it.
+    SET pg_vault_tde.allow_plaintext_index = on;
     CREATE INDEX tde_btree_uuid_idx
         ON tde_btree_uuid_test USING tde_btree (token tde_uuid_ops);
+    RESET pg_vault_tde.allow_plaintext_index;
 
     INSERT INTO tde_btree_uuid_test VALUES
         (1, '550e8400-e29b-41d4-a716-446655440000'::uuid),

@@ -1,6 +1,6 @@
 # pg_vault_tde Roadmap
 
-> Last updated: 2026-09-05 — **v1.7.1 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.1 from 1.7.0 at runtime). 140 regression tests (52 v1.4 + 20 v1.5 + 38 v1.6 + 30 v1.7), 17 TAP files / 212 assertions (including the `tap/12_logical_repl_toast.t` end-to-end logical replication test), 20 schema-isolation tests, the `per_table_dek_rotation` isolation spec and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18. Key v1.7 changes: all KMS GUCs promoted to PGC_SUSET (per-database KMS via `ALTER DATABASE SET`); `pg_restore_tde` decrypt-and-pipe loop completed; logical replication of `encrypted_heap` TOAST columns via a custom WAL resource manager (`pg_vault_tde.toast_custom_rmgr`); documentation updated throughout. v1.7.1 patches two data-visible defects — see below.
+> Last updated: 2026-09-29 — **v1.7.2 current** (a binary patch release: `pg_extension.extversion` stays at `1.7`, use `pg_vault_tde_build_version()` to tell 1.7.2 from 1.7.1 and 1.7.0 at runtime). 154 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), 49 TAP files / 1173 assertions (including crash recovery of the custom WAL resource manager and an on-disk corruption fuzz), 20 schema-isolation tests, 3 isolation specs and a SoftHSM2 PKCS#11 suite — green on PG 17 + PG 18, with `make ci-regress-matrix` running the SQL suite on every supported major. CI additionally runs the extension under Valgrind memcheck, UBSan, the Clang static analyzer and a PostgreSQL built `--enable-cassert -DUSE_VALGRIND`. v1.7.2 fixes a segfault on values that cross `TOAST_TUPLE_THRESHOLD` only once encrypted, plus a run of correctness defects those new stages surfaced — see below.
 
 ---
 
@@ -72,7 +72,9 @@ the `RELKIND_TOASTVALUE` read-path bypass so real TOAST chunks round-trip correc
 ## v1.7 — TOAST Chunks + KEK Hierarchy + HSM + Audit
 
 > Status: ✅ Completed — patched by v1.7.1 (below)
-> **Delivered**: 137 regression tests at release, 140 with v1.7.1 (target was ~100) —
+> **Delivered**: tests numbered up to 137 at release, 140 with v1.7.1, 164 with v1.7.2
+> (154 of them present and run in 1.7.2 — the numbering has gaps)
+> (target was ~100) —
 > PG 17 + PG 18; the PG 19 audit moves to that release.
 
 **Theme**: Close the TOAST data-leak gap, formalize the KEK/DEK wrap hierarchy across
@@ -214,6 +216,452 @@ earlier minors have no such GUC and must not carry the line. See README → Comp
 
 ---
 
+## v1.7.2 — Patch: on-disk tuple layout v5 + TOAST threshold crash + hardening
+
+> **154 tests** (141 regression + 13 error-path; tests 154–164 added here) —
+> PG 17 + PG 18, zero compiler warnings.
+
+Carries the TOAST-threshold segfault fix and the correctness hardening summarised in
+the release table, plus the two data-visible defects below. No SQL changes:
+`pg_extension.extversion` stays at `1.7` and `pg_vault_tde_build_version()` is what
+distinguishes the builds.
+
+1. **The on-disk tuple was not physically valid (PSQLE-165).** The encrypted region was
+   one opaque blob, while the header — plaintext, because MVCC and VACUUM need it — kept
+   declaring `natts` attributes laid out per the tuple descriptor. Every core path that
+   deforms a raw on-disk tuple believes that header, and `heap_update()` does it on every
+   `UPDATE`: it reads the indexed attributes off the page to decide HOT and index
+   maintenance. Past the first variable-length column the offset is not cached, so the
+   read walks the row — through ciphertext. A four-byte varlena header of random bytes
+   gives a length of up to 1 GB, the cursor leaves the page, SIGSEGV. Any index on such a
+   column triggers it, `tde_btree` included: the trigger is the index attribute bitmap,
+   not the access method. Measured 6/6 crashes with an index on the third column, 0/6
+   with no index.
+
+   Fixed by **wire format v5**, which keeps the row walkable: every attribute at its own
+   offset with its own length, only the values replaced by ciphertext. The AEAD is
+   untouched — same cipher, tag and AAD, same `TDE_V4_OVERHEAD` (37 bytes) per tuple, so
+   a v5 tuple is exactly as long as the v4 tuple for the same row.
+
+   **Security trade-off, deliberate**: the structural bytes stay in clear, because they
+   are what makes the walk possible. The exact byte length of every variable-length
+   column is therefore visible in the heap file, along with whether the value is
+   compressed or out of line. Fixed-length columns leak nothing (their length is in the
+   catalog), and the row length and null bitmap were already visible under v4. Attribute
+   values are never in clear; regression test 157 reads the raw heap file and asserts it.
+
+   **Needs a rewrite, not an export**: v4 rows keep reading, but keep their old layout,
+   and no layout can be made walkable after the fact — so `UPDATE` on them still crashes
+   until they are rewritten. One `VACUUM FULL` per encrypted table migrates it. Procedure
+   in README → "Upgrading to 1.7.2"; verified byte-identical by `make ci-upgrade`.
+
+2. **An all-NULL row made its table unreadable.** Present in every release up to 1.7.1. A
+   row whose columns are all NULL has no user data, so its encrypted region is the AEAD
+   framing and nothing else — a well-formed encoding of a zero-length plaintext that
+   `tde_gcm_decrypt()` rejected as too short. One such row was enough to make any
+   sequential scan of the table fail from that `INSERT` on. Nothing is lost; 1.7.2 reads
+   those rows with no migration step.
+
+3. **Custom WAL resource manager id moved from 128 to 161 (PSQLE-172).** 128 is
+   `RM_EXPERIMENTAL_ID`, which upstream documents for experimentation; 161 is registered
+   for pg_vault_tde on the PostgreSQL *Custom WAL Resource Managers* wiki. Transparent
+   with `pg_vault_tde.toast_custom_rmgr` off, the default. With it on, WAL written under
+   128 cannot be replayed by 1.7.2, so the upgrade needs a clean shutdown and primary and
+   standbys upgraded together — no rolling upgrade. Procedure in README → "Upgrading to
+   1.7.2".
+
+4. **DEK-cache shared-memory names prefixed (PSQLE-172).** The shmem hash table and its
+   LWLock tranche were both `TdeRelDekMap`; both are cluster-wide namespaces where
+   PostgreSQL reports no clash — `GetNamedLWLockTranche()` returns the first match, and
+   `ShmemInitHash()` attaches to an existing table of the same name. Now
+   `pg_vault_tde_rel_dek_map`. Nothing on disk; only monitoring that matches the old name
+   in `pg_stat_activity.wait_event` or `pg_shmem_allocations.name` is affected.
+
+5. **`tde_btree` answers equality only (PSQLE-173).** AES-SIV preserves equality and
+   nothing else, yet the planner used `tde_btree` for ranges, `ORDER BY`, `min`/`max` and
+   merge joins — the `text`/`bytea`/`numeric` operator classes declare `<` `<=` `>=` `>` —
+   and returned wrong rows in ciphertext order; `IN (…)` failed with `cache lookup failed
+   for type …` on every `tde_btree` index; on `numeric` even `=` missed rows. Enforced in C,
+   with no catalog change: `amsearcharray = false` (IN expands to scalar lookups), a
+   `get_relation_info_hook` that removes the index's sort order and drops `numeric` and
+   nondeterministic-collation indexes from the planner's view, a prohibitive
+   `amcostestimate` for non-equality paths, and an error in `amrescan` for a range key a
+   forced plan still delivers. Every index creation — `CREATE INDEX`, `EXCLUDE`
+   constraints, the rebuild behind `ALTER COLUMN … TYPE` — is checked at `OAT_POST_CREATE`
+   and refuses `numeric`, nondeterministic collations and, unless `allow_plaintext_index`,
+   the v1.5 plaintext-key operator classes; that matters beyond queries, because `UNIQUE`
+   and `EXCLUDE` checks read the index directly (1164 and 1332 exact duplicates of 2,000
+   accepted before the fix). `REINDEX`, `CONCURRENTLY` included, is exempt. Removing those
+   classes and correct `numeric` support need a catalog change and are planned for 1.8.
+   Tests 160–164; `ci-upgrade` Probe D covers an index the baseline built.
+
+6. **`rotate_online()` lost tables accessed during the rotation (PSQLE-184).** The
+   rotation demoted the shared-memory DEK and rewrote the catalog in one transaction, but
+   any backend touching the table in between — a `SELECT` was enough — reloaded the cache
+   from the catalog its snapshot saw and put the outgoing DEK back as current. The worker
+   then re-encrypted the table with it, and that key survived only in shared memory:
+   rows broke at once or at the next restart (all 1,000 of 1,000 after one `SELECT`).
+   Writers committed during the rotation hit the same hole directly. Now the worker takes
+   `ShareRowExclusiveLock` on the heap before its snapshot (reads continue, writes and a
+   second rotation wait), encrypts with keys held in its own memory, nothing installs a
+   current key while the entry is marked `rotating`, and a transaction callback moves the
+   cache to the new key at commit — before the locks are released — or back at abort.
+   DEK and generation are now always read together. `tap/29_rotate_online_concurrent_access.t`.
+   Found testing the fix on a `--enable-cassert` server: any failed rotation crashed the
+   worker, because its `PG_CATCH` called `CopyErrorData()` while still in `ErrorContext`
+   (on a release build the copy was read after `FlushErrorState()` had freed it).
+
+7. **Logical decoding drifted the reorder buffer's memory accounting (PSQLE-186).** The
+   output plugin decrypts each change, and stitches its TOAST values, in place — the
+   copy-back is deliberate — and left the shorter `t_len` behind. The reorder buffer
+   sizes a change from `t_len` when it queues it and again when it frees it, so every
+   decoded encrypted row left its encryption overhead (about 37 bytes) in `rb->size`
+   until the walsender restarted; past `logical_decoding_work_mem` every transaction was
+   spilled or streamed. On an assert-enabled build the walsender died on
+   `Assert(txn->size == 0)`. The change callbacks now put the original lengths back once
+   pgoutput has serialized the row. Found when `ci-cassert` began running the TAP files
+   (`tap/12_logical_repl_toast.t`).
+
+8. **A local-wallet KEK rotation that did not commit lost the database (PSQLE-185).**
+   `rotate_kek()` and `wallet_change_passphrase()` replaced the wallet's only KEK before
+   their transaction committed; a rollback, a later error in the statement or a crash
+   left every DEK wrapped under a KEK that existed nowhere. A session that had run
+   `wallet_unlock()` also kept the old KEK: it could not read after another session's
+   rotation, and wrapped new tables with the old key. The wallet now keeps every KEK
+   version (one PKCS#12 key bag each, current first, written with `durable_rename()`
+   before any re-wrap, under a file lock), unwrap tries them newest first — the AES key
+   wrap's integrity check picks the right one, wrapped DEKs are unchanged — and a stale
+   session reloads the wallet. `pg_dump_tde` / `pg_restore_tde` read every version too,
+   so dumps taken before a rotation restore again. Vault and PKCS#11 already versioned
+   their keys. `tap/30_rotate_kek_atomicity.t` (local only until PSQLE-209).
+
+9. **`migrate_vault_to_wallet()` made every migrated table unreadable (PSQLE-188).** It
+   wrapped the DEKs under a KEK derived from its passphrase argument
+   (`local_derive_kek_from_pass()`), while the wallet `wallet_init()` creates — which
+   the migration requires — holds a random one; it accepted any passphrase, evicted the
+   DEK cache, and left the database on the Vault provider, which cannot unwrap the new
+   wrapping. Now it opens the wallet with the passphrase (a wrong one is refused before
+   anything changes), wraps under the wallet's current KEK, leaves the cache alone (the
+   DEKs themselves do not change), and switches the database to `kms_provider = 'local'`
+   in the session and through a database-level setting. The derivation helper is gone.
+   `tap/31_migrate_vault_to_wallet.t`, with a real-Vault half.
+
+10. **`rotate_online()` left out-of-line values under the outgoing key (PSQLE-189).**
+    The worker rewrites each row with `tuple_update()`, whose pre-TOAST hands the old
+    tuple to `toast_tuple_init()`: an unchanged external value was reused as it was, so
+    its chunks kept DEK N while the row moved to N+1. N then lived only in the
+    shared-memory cache, and the values broke at the next restart or the next rotation —
+    no concurrency needed, and `verify_integrity()` does not read TOAST chunks. A
+    `DELETE` of such a row failed too. Now `reencrypt_table()` fetches every on-disk
+    external value back (still compressed) before the update, so the toaster stores it
+    under the new key and the old chunks are deleted; dropped columns become NULL, as in
+    any `UPDATE` (see item 12).
+    `tap/32_rotate_online_toast.t`, on every provider.
+
+11. **A concurrent `UPDATE` of an out-of-line value could lose it (PSQLE-193).** The
+    TAM toasts the new row before `heap_update()`, so it can encrypt it, and that
+    toaster also deleted the replaced values — while core does it inside
+    `heap_update()`, once the row is known to be updatable. When `heap_update()` then
+    found the row changed by a concurrent transaction, READ COMMITTED skipped it or
+    retried on the newer version, which still pointed at the deleted chunks: the value
+    broke at the next `VACUUM` (`missing chunk number 0`), the retry failed with
+    `tuple concurrently deleted`, or the unchanged values of the newer version were
+    left orphaned. Now the pre-TOAST only inserts; after `heap_update()` the old
+    row's values the new one no longer references are deleted on `TM_Ok`, and the
+    chunks the attempt inserted are killed otherwise (`heap_abort_speculative`, as
+    for a failed `INSERT ... ON CONFLICT`). The old row is read with `SnapshotAny`,
+    since after a recheck it is a version the statement's snapshot does not see.
+    The separate fallback that deleted the old values when the new row had none is
+    gone with it. `test/isolation/specs/toast_update_concurrency.spec`, whose
+    expected output is the same spec run on a plain heap table.
+
+12. **Dropped columns' out-of-line values: leaked, and dangling after `VACUUM FULL`
+    (PSQLE-192).** `DELETE` decided whether to delete TOAST with
+    `tde_tuple_has_external()`, which skips dropped columns, so a row whose only
+    out-of-line value sat in one left its chunks behind; it also read the row with the
+    statement's snapshot, which after an EvalPlanQual recheck does not see the version
+    being deleted, so a `DELETE` waiting on an `UPDATE` left every value behind.
+    `copy_for_cluster` did not null dropped columns as core's
+    `reform_and_rewrite_tuple()` does: it copied such a pointer as it was into the
+    rewritten table, pointing into the TOAST relation the rewrite replaced, and a
+    whole-row read (`SELECT t`, `t::text`) failed with `missing chunk number 0` — on
+    1.7.1 too. The item-10 fix, which fetched dropped values back, made the next
+    rotation fail on them. Now `DELETE` reads the row with `SnapshotAny` and deletes
+    through the same helper as `UPDATE`, dropped columns included; `VACUUM FULL` and
+    `CLUSTER` rewrite dropped columns as NULL; the rotation sets them to NULL.
+    `tap/33_toast_lifecycle.t` puts a plain heap twin through the same statements and
+    compares contents, whole rows and TOAST values after each; the isolation spec gains
+    a `DELETE` waiting on an `UPDATE`; `ci-upgrade` Probe E reads a table whose
+    dropped column 1.7.1 left dangling (`whole_row_read_before_vacuum=no`), rotates
+    and deletes from it, and Gate C's `VACUUM FULL` must repair it.
+
+13. **An `UPDATE` from out of line to compressed inline failed (PSQLE-191).** With a
+    tuple over the threshold the pre-TOAST ran and `toast_tuple_cleanup()` deleted the
+    old chunks; the compressed value then stayed inline, so the new row had no external
+    value and `tuple_update()`'s fallback deleted the same chunks again —
+    `tuple already updated by self`, the statement rolled back. The same cause as item
+    11: two places deleting TOAST. The item-11 restructure, which deletes in one place
+    after `heap_update()`, fixed it; `tap/33_toast_lifecycle.t` covers it (the step
+    "UPDATE from out of line to compressed inline" fails on the commit before that fix
+    and on 1.7.1).
+
+14. **A streaming standby kept the retired DEK after a rotation (PSQLE-190).** The
+    commit callback that moves the cache to the new key runs on the primary; a standby
+    only replays the catalog row, and `tde_rel_dek_cache_store()` never replaced a
+    valid entry. Every row of the new generation took the slow path (catalog read +
+    KMS unwrap), and after a promotion `get_rel_dek_gen()` encrypted new rows with the
+    cached, retired key — lost at the next restart, or, in 1.7.1 where DEK and
+    generation were not read together, unreadable at once. Now a catalog read showing a
+    newer generation replaces the entry (the old key becomes `prev_dek` only when the
+    generations are consecutive; an older one during recovery, from an older snapshot,
+    never wins), and entries stored during recovery are marked `loaded_in_recovery`:
+    after recovery the first encryption checks each against the catalog once, and the
+    rotation's commit callback clears the mark. `tap/34_standby_rotation.t`: a table
+    read after the rotation, one only written after the promotion, one rotated twice,
+    a cold control.
+
+15. **`rotate_online()` left the indexes without entries for the rewritten rows
+    (PSQLE-194).** `reencrypt_table()` calls `tuple_update()` — `heap_update()`
+    underneath, which leaves index maintenance to its caller — and ignored
+    `update_indexes`. Its rewrite is never HOT on a full page, so every index but the
+    `tde_btree` ones it rebuilt pointed at the retired versions only: after a rotation
+    lookups through a `PRIMARY KEY`, a `UNIQUE` constraint (standard btrees by default
+    on an encrypted table) or any plain index found nothing, and duplicates were
+    accepted. Also in 1.7.1. Now each rewritten row gets its entries through
+    `ExecInsertIndexTuples()`, as the executor's `UPDATE` does, in a per-row memory
+    context; the tde_btree rebuild stays. Users must `REINDEX` tables rotated before.
+    `tap/35_rotate_online_indexes.t` (lookups through each index, a full range,
+    amcheck `heapallindexed`, duplicates refused); tap/28 measures the rewrite with a
+    `PRIMARY KEY`. Found while testing it: partial indexes on encrypted tables are
+    built with every row — a separate defect, not fixed here.
+
+16. **`verify_integrity()` did not look at TOAST (PSQLE-196).** It checked the GCM tag
+    of every row and never read the TOAST relation, so a value lost under a retired
+    DEK (item 10) or a damaged chunk left it reporting `N|0` while `SELECT` failed. Now
+    a row also counts as failed when one of its out-of-line values cannot be fetched —
+    a missing chunk or one that does not decrypt — each fetched in its own
+    subtransaction (an error halfway through a TOAST read holds pins and locks only an
+    abort releases), in a memory context reset per row. The result keeps its shape,
+    since a patch release cannot change the SQL: `total_tuples` is still a row count
+    and a row is counted once whichever part failed. Chunks no row references and
+    dropped columns are not checked. `tap/36_verify_integrity_toast.t` (one byte
+    flipped in one chunk's ciphertext).
+
+17. **An `INSERT ... ON CONFLICT` that lost the race left its TOAST chunks
+    (PSQLE-197).** The row was killed by heapam's `complete_speculative` with
+    `heap_abort_speculative()`, which deletes TOAST only when the on-disk tuple has
+    `HEAP_HASEXTERNAL` — never set on an encrypted tuple. The TAM now wraps
+    `complete_speculative`: on failure it reads the row back and kills its chunks
+    through `tde_toast_delete_unshared(..., speculative)`, as core does, before heapam
+    kills the row. `tap/37_speculative_abort_toast.t` makes the race deterministic
+    without injection points: an expression index filled before the unique one blocks
+    on an advisory lock between the speculative insert and the unique check.
+
+18. **Partial indexes were built with every row (PSQLE-198).** The TAM's own
+    `index_build_range_scan` (it must decrypt before `FormIndexDatum`) never evaluated
+    `ii_Predicate`: a valid `UNIQUE ... WHERE` was refused, partial indexes held every
+    row, and since the planner drops the quals a predicate implies, queries through one
+    returned rows that do not satisfy it (40 instead of 0 in `ci-upgrade`). Also in
+    1.7.1. Now the scan prepares and checks the predicate as heapam does, counting
+    `reltuples` before it — that count becomes the heap's statistics. Users must
+    `REINDEX` their existing partial indexes. `tap/38_partial_index_build.t` against a
+    plain heap twin; `ci-upgrade` Probe F on an index 1.7.1 built
+    (`partial_index_results_before_reindex=wrong`); tap/35's amcheck now covers its
+    partial index too. The CREATE INDEX CONCURRENTLY validation scan already checked
+    the predicate.
+
+19. **An index built while an older snapshot was open misled it (PSQLE-201).** The TAM's
+    build scan read a fresh MVCC snapshot: no recently dead tuples, no
+    `ii_BrokenHotChain`, no waiting for in-progress writers under a uniqueness check.
+    A REPEATABLE READ transaction older than the index, querying through it, missed the
+    rows deleted after its snapshot and got HOT-updated rows under their new values
+    (0, 0 and 10 where heap gives 10, 10 and 0). The scan is now a port of
+    `heapam_index_build_range_scan` (identical in PG 17 and 18) run on decrypted
+    copies, with the relation impersonating heapam as in `copy_for_cluster`. One case
+    heapam never meets: a recently dead tuple under a DEK generation nobody holds any
+    more (two rotations under an open snapshot) is left out, and the index is marked
+    unusable for older snapshots rather than failing the build. The scan also resets
+    `ii_ExpressionsState` / `ii_PredicateState`, which pointed into its freed EState.
+    `tap/39_index_build_old_snapshot.t`, with a parallel build checked by amcheck.
+
+20. **`CLUSTER` did not order the rows (PSQLE-204).** The TAM's `copy_for_cluster` read
+    the table sequentially and ignored `OldIndex` and `use_sort`: `CLUSTER` compacted,
+    kept every row, marked the index clustered, and left the order unchanged. It is now
+    a port of `heapam_relation_copy_for_cluster` on decrypted copies: an index scan in
+    `OldIndex` order or a tuplesort of decrypted rows, `rewrite_heap_dead_tuple()` for
+    the dead ones, heapam's counters and `pg_stat_progress_cluster` phases; the write
+    of each row (dropped columns NULL, TOAST moved, encryption) is one helper for both
+    paths. `CLUSTER` on a `tde_btree` index, ordered by ciphertext, is refused.
+    `tap/40_cluster_order.t` forces both paths and checks `CLUSTER (VERBOSE)` said
+    which ran. In PG 18 `enable_sort = off` does not steer `plan_cluster_use_sort()`,
+    which compares costs only.
+
+21. **`reencrypt_table()` rewrote any table for any role that could call it
+    (PSQLE-205).** The script grants `EXECUTE` on both overloads to `pg_monitor` (the
+    `text` one is `SECURITY DEFINER`) and the C code checked nothing: a monitoring role
+    rewrote tables it could not even `SELECT`. Now the SQL entry point requires
+    `MAINTAIN` on the table — core's privilege for `VACUUM FULL`, `CLUSTER` and
+    `REINDEX` — of the calling role, `GetOuterUserId()`, since inside the
+    `SECURITY DEFINER` overload the current user is the function's owner. The rotation
+    worker calls the rewrite directly and is unaffected. 1.8: drop the grant to
+    `pg_monitor`, make the `text` overload `SECURITY INVOKER` and check `GetUserId()`.
+    `tap/41_reencrypt_table_privileges.t`.
+
+22. **The key-management functions trusted `superuser()` inside `SECURITY DEFINER`
+    (PSQLE-206).** There it asks about the function's owner and is always true, so only
+    `REVOKE ... FROM PUBLIC` kept nine functions closed — and `wallet_init()` is granted
+    to `pg_monitor`: a monitoring role created a database's wallet with its own
+    passphrase. `pkcs11_keygen()` checked nothing. Now every one of them calls
+    `tde_caller_is_superuser()` (`superuser_arg(GetOuterUserId())`, in
+    `pg_vault_tde_kms.h`, excluded from the frontend clients). `rotate_online()` is not
+    `SECURITY DEFINER` and keeps `superuser()`. 1.8: remove the grant, and delegate a
+    database's wallet through a `pg_vault_tde.wallet_admin_role` GUC (a role, or
+    `owner`). `tap/42_security_definer_callers.t`.
+
+23. **With the wallet file missing, `wallet_init()` made a new one (PSQLE-208).** Its
+    KEK opens none of the database's keys, the tables created next were wrapped under
+    it, and putting the real file back lost those. It now refuses while any catalog row
+    is `local`; `vault` rows do not count, so `migrate_vault_to_wallet()` still starts
+    from `wallet_init()`. A `CREATE DATABASE ... TEMPLATE` clone is refused too: its
+    copied rows never authenticate there (the AAD names the database), and the README
+    now says so. It also wrote the file without `fsync`, the only wallet write
+    that did: the file and both directory levels are now synced. Every other damage —
+    truncated, empty, random bytes, one byte flipped, unreadable, leftover `.new` or
+    `.lock` — already ended in an ERROR without touching the file.
+    `tap/44_damaged_wallet.t`.
+
+24. **`verify_integrity()` counted intact rows as failed (PSQLE-207).** Found by the
+    soak test. It read the raw tuples by pointing the table's relcache entry at heapam
+    for its scan; a relcache invalidation processed meanwhile — autovacuum's statistics,
+    about a minute after a restart — rebuilt the entry with the TAM in it, and every
+    later tuple came back decrypted and failed as ciphertext. It now calls heapam's scan
+    directly (`heap_beginscan()` / `heap_getnextslot()`) and leaves `rd_tableam` alone.
+    `index_fetch_tuple`, the index build scan and `copy_for_cluster` still swap
+    `rd_tableam`; there an invalidation mid-scan can only end in an ERROR, and they hold
+    locks that keep most invalidations out — to be replaced the same way in 1.8.
+    `tap/45_verify_integrity_relcache_inval.t`.
+
+25. **A PKCS#11 KEK rotation that failed could not be retried from its session
+    (PSQLE-209).** Found by the new per-provider `tap/30`: a rotation cancelled after
+    `prepare_kek_rotation()` had made `v<N+1>` on the token left that session at
+    `kek_version = N`, and every retry asked for `v<N+1>` again ("already exists"),
+    while its hint said to retry or to remove the key. The next version is now the
+    highest on the token + 1; the message is left for a concurrent rotation, and no
+    longer suggests deleting a key that may already wrap DEKs. Local and Vault passed
+    every scenario as they were. `tap/30_rotate_kek_atomicity.t`.
+
+26. **A terminated `rotate_online()` stayed `running` for good (PSQLE-211).** The worker
+    handled SIGTERM with `die()`: `pg_terminate_backend()`, or a smart or fast shutdown,
+    ended it with a FATAL, which its PG_CATCH never sees, so nothing recorded `failed`.
+    It now takes SIGTERM as a cancel (`StatementCancelHandler`), and the rotation
+    aborts through the same path as `pg_cancel_backend()`. The data was safe in every
+    case — the TAP stops the worker halfway through the rewrite and checks tags, twin,
+    TOAST, amcheck and generation, before and after a restart. After a crash or an
+    immediate shutdown the row still says `running`; the README says how to tell.
+    `tap/46_rotate_online_interrupted.t`.
+
+27. **`pg_basebackup_tde` ran with the session's `search_path`, and the IV batch had no
+    owner (PSQLE-178).** The tool called `pg_vault_tde_seal_keys_bytea()` unqualified,
+    in a session whose `search_path` a database's owner sets: it now empties it right
+    after connecting, as core's client tools do, and calls the function in the
+    extension's schema — which also lets a database keep the extension in a schema off
+    its `search_path`: up to 1.7.1 that stopped the whole backup with "function …
+    does not exist". The per-process batch of 256 IVs is refilled by any process
+    that did not fill it — no PostgreSQL process forks after drawing an IV, so this is
+    defence in depth — and the limit of 2^32 encryptions per DEK generation is written
+    down, with a way to estimate it. `tap/47_basebackup_tde_search_path.t`,
+    `tap/48_iv_uniqueness.t`.
+
+28. **What CI and the release pipeline fetch is pinned, and releases are signed
+    (PSQLE-180).** GitHub Actions are referenced by commit SHA, the Vault and OpenBao
+    images by version and digest, and the `docker-compose` binary the Bitbucket steps
+    download is checked against its SHA-256; `make ci-pins`, the first stage of
+    `make ci-all` and a step of the GitHub build, fails on anything else. The
+    PostgreSQL, Debian, Ubuntu and Go images float on purpose, each within its
+    release. The release workflow creates a draft with `SHA256SUMS`, an SPDX SBOM of the
+    source bundle and a grype report; a maintainer signs `SHA256SUMS` with their own
+    key and publishes it, so no signing key lives in CI. A `v*` tag reaches GitHub
+    only if the Bitbucket synchronization finds it signed by a key its variable
+    `RELEASE_TAG_SIGNERS` lists — checked there because the mirror's rewrite strips
+    tag signatures.
+
+29. **Two new CI stages: ASan and the project's Semgrep rules (PSQLE-181).**
+    `make ci-asan` builds the extension with `-fsanitize=address` and preloads ASan's
+    runtime into the stock server, then runs the regression workload and the
+    error-path suite: it sees overflows of malloc'd, stack and global buffers and use
+    after free outside palloc — OpenSSL, libcurl, libc — which Valgrind sees too, at
+    ten times the cost, and the other stages do not. Before trusting a clean report it
+    checks that the runtime and the module are both mapped in a backend. `make
+    ci-semgrep` runs seven rules, each an old defect or a rule of this code base:
+    `superuser()` in a function that may be `SECURITY DEFINER` (PSQLE-206), a write to
+    `rd_tableam` (PSQLE-207), a MAC compared with `memcmp()`, a secret freed without
+    `OPENSSL_cleanse()` or put into a message, a random source other than
+    `pg_strong_random()`, a client-tool query calling the extension outside its schema
+    (PSQLE-178). Each rule has a test file of lines on which it must and must not
+    fire. Neither stage found a defect: the three `rd_tableam` writes left are PSQLE-213.
+    `ci-ubsan` and `ci-cassert` now stop on a failed image build; they used to run
+    on the previous image and pass.
+
+30. **`make ci-security-report` (PSQLE-182).** The evidence a security review
+    cites, in one file: `doc/security/evidence/v<version>.md` names the commit and
+    whether the tree was clean, then gives the tools, their versions and the result
+    and counts of the pin check, the Semgrep rules, the SBOM of the source bundle and
+    its vulnerability scan (`make ci-sbom`: syft and grype, one container each, pinned
+    by digest, informational as on the release), the error-path suite, scan-build,
+    UBSan, ASan, Valgrind and the assertion-enabled build, and lists every
+    `nosemgrep` in the code. It also names the system libraries the module and the
+    client tools link, by soname and so by ABI, not release: OpenSSL 3, libcurl, libpq
+    — the SBOM of the source holds none of them. With `GITHUB_TOKEN` set it counts
+    CodeQL's open alerts. The Bitbucket custom pipeline `security-report` runs it and
+    keeps the report and the raw logs as artifacts. It is part of the release checklist, on the release
+    commit.
+
+31. **A short indexed value that changed could miss its index (PSQLE-219).**
+    `heap_update()` decides HOT by comparing the indexed columns on disk, and under v5
+    each value is encrypted in place: a changed value of L bytes repeats its old
+    ciphertext once in 256^L, one `UPDATE` in 256 for a `bool`, a `"char"` or a
+    one-character text. 1.7.1 had it for short fixed-length columns (`tap/49` on the
+    1.7.1 build: 17 HOT updates of 4000 on the `bool`), v5 extended it to short
+    variable-length ones. That `UPDATE` went HOT: the index kept the old
+    key, lookups of the new value missed the row, lookups of the old one returned it,
+    and UNIQUE let a duplicate in. The same comparison chooses the tuple lock and
+    whether the old replica identity is logged. `tuple_update` now encrypts again
+    under another IV until every changed value looks changed on disk; `tap/49` runs
+    4000 such UPDATEs per index. The first `UPDATE` of a row still in v4 is not
+    covered (a v4 row cannot be walked): the `VACUUM FULL` the upgrade already
+    requires removes those, and rebuilds the indexes 1.7.1 may have left short of an
+    entry.
+
+32. **Fix Visibility Map WAL logging for custom TOAST rmgr (PSQLE-227):** 
+    Ensured `tde_toast_wal_insert` registers visibility map buffers in WAL records when `toast_custom_rmgr = on`. This prevents VM page corruption during crash recovery and resolves issues with incremental backups.
+
+**Key operations one at a time (PSQLE-210).** Rotations and wallet operations are
+tested alone and against concurrent DML, not against each other; the README now says
+to run them one at a time per database and lists the combinations to avoid until 1.8.
+
+**New CI stage — `make ci-upgrade`.** Every other suite in this repo reads only data it
+wrote in the same run, so writer and reader always move together and a format-level
+breakage leaves the suite green while data on disk becomes unreadable. That is how the
+1.7.1 AAD change shipped. This stage writes a fixture with the build at the most recent
+`v*` tag, reads it back with the working tree, and checks the outcome against the
+declarations in `ci/upgrade-compat.expected`: whether old data is still readable, and
+whether it can be updated in place. Changing either declaration is a deliberate act that
+shows up in the diff — and the two answers are what decide whether a release needs a
+`VACUUM FULL` note or a dump-with-the-old-binary procedure.
+
+**New soak test — `make ci-soak` (PSQLE-207).** Most defects of this release needed
+several conditions at once — writes, out-of-line values, a dropped column, a rotation, a
+rewrite, a restart — and each TAP covers one combination. `tap/43_soak.t` draws them at
+random for as long as asked (30 minutes by default): rounds of 100 transactions that
+apply the same statement to an encrypted table and to a heap twin, each followed by one
+of VACUUM, VACUUM FULL, CLUSTER, REINDEX, `rotate_online()`, `rotate_kek()` or an
+immediate stop, then contents, whole rows, TOAST values, `verify_integrity()`, amcheck
+and index lookups are checked. It prints its seed; `SOAK_SEED` replays a failed run.
+Skipped in every other stage; the Bitbucket custom pipeline `soak` runs it on PG 17 and
+PG 18.
+
+---
+
 ## v1.8 — KMIP + Column-Level + GIN/Hash/GiST/BRIN + HA + Dual-Control (Q2 2027)
 
 > Status: 📋 Defined
@@ -228,11 +676,11 @@ regulated-industry features.
 `pg_vault_tde_columns` catalog. `src/tam/pg_vault_tde_column.c`.
 
 **Feasibility (verified against the current TAM architecture, see
-`tam.instructions.md`)**: `encrypted_heap` today encrypts the whole tuple as
-one opaque AES-256-GCM blob (`tde_encrypt_heap_tuple`, wire format v4) —
-there is no per-Datum boundary. Column-level encryption needs the write
-path to operate around `heap_deform_tuple`/`heap_form_tuple` for specific
-attributes instead of the raw tuple bytes:
+`tam.instructions.md`)**: since wire format v5 `encrypted_heap` already walks
+the tuple attribute by attribute and encrypts each value in place
+(`tde_encrypt_heap_tuple` / `tde_value_ranges`), so the per-Datum boundary
+this feature needs now exists — what is missing is the per-column policy and
+the per-column DEK, not the layout. The remaining per-type questions:
 - **Varlena columns** (`text`, `bytea`, `jsonb`, `numeric`, arrays):
   straightforward — store `[IV|ciphertext|GCM-tag]` as the Datum's own
   varlena payload, the same shape already used at the tuple level, just
@@ -366,7 +814,7 @@ These gaps **cannot be closed without modifying PostgreSQL core**.
 
 ## Version Summary
 
-| Version | Theme | Completed | Tests | Key Features |
+| Version | Theme | Completed | Highest test # | Key Features |
 |---------|-------|-----------|-------|-----------------------|
 | **v1.1** | KMS/Vault + Key Rotation + HW Accel | ✅ 2026 | 41 | Vault Transit, AppRole, prev_dek fallback, OpenSSL 3.x HW dispatch |
 | **v1.2** | Logical Decoding | ✅ 2026 | — | `pg_vault_tde_pgoutput` output plugin |
@@ -376,4 +824,5 @@ These gaps **cannot be closed without modifying PostgreSQL core**.
 | **v1.6** | Local Wallet KMS (production-ready) + write-path / catalog bugfix patch | ✅ 2026-07-20 (patched 2026-05-08) | 109 | Wallet unlock/lock, passphrase flexibility, KEK rotation, export/import, Vault→wallet migration; PG_TRY widening; TOAST relid auto-registration; STORAGE EXTERNAL TAM read bypass; all-read-paths TOAST coverage; forensic helpers; tests 73–109 |
 | **v1.7** | Per-database KMS + pg_restore_tde + PGC_SUSET + PKCS#11 + HSM + v1.4 removal | ✅ 2026-06-29 | 137 | All KMS GUCs PGC_SUSET → per-database KMS via `ALTER DATABASE SET`; `pg_restore_tde` full decrypt-and-pipe restore loop; removed v1.4 global-DEK backward compat (`TdeShmemData`, `rotate_key`, `key_generation`, `clear_prev_dek`, `encrypt_test`, `decrypt_test`); PKCS#11/HSM provider with cross-backend KEK-rotation propagation; documentation overhaul |
 | **v1.7.1** | Patch: AAD relid resolution + HEAP_HASEXTERNAL on decrypt | ✅ 2026-09-05 | 140 | AEAD tag bound to the effective relid (fixes `ALTER TABLE ... SET ACCESS METHOD` on populated tables); `HEAP_HASEXTERNAL` recomputed on decrypt (fixes CTAS / `INSERT ... SELECT` copying a dangling TOAST pointer); DETAIL/HINT on OID-mismatch decrypt failures; tests 138–140. Breaking for out-of-line TOAST written by ≤ 1.7.0 — dump before upgrading |
+| **v1.7.2** | Patch: tuple layout v5 + TOAST threshold crash + correctness hardening | ✅ 2026-09-28 | 164 | On-disk tuple layout **v5**, structure preserving: the v4 blob left the header describing a data area the core could not walk, so `heap_update()` segfaulted on any table with an index behind a variable-length column (PSQLE-165). An all-NULL row no longer makes its table unreadable. Segfault fixed when a value crosses `TOAST_TUPLE_THRESHOLD` only after encryption (gate and TOAST writer now both account for `TDE_V4_OVERHEAD`); assert-enabled startup, unregistered catalog snapshots, lock-less `relation_open`, hint bits without the content lock, uninitialised `VacuumCutoffs`, missing `volatile` across `longjmp`. New CI stages: errorpath, scan-build, ubsan, valgrind, cassert, regress-matrix, upgrade. **Needs one `VACUUM FULL` per encrypted table after upgrading** — v4 rows stay readable but cannot be updated until rewritten |
 | **v1.8** | KMIP + Column-Level + GIN/Hash/GiST/BRIN + HA + Dual-Control | Q2 2027 | ~130 | KMIP 1.2 client, per-column encryption, GIN/Hash/GiST(equality)/BRIN(bloom) index AMs, streaming replication standby DEK distribution, M-of-N key ceremony, pg_dump/COPY TO plaintext-leak WARNING (carried over from v1.7) |

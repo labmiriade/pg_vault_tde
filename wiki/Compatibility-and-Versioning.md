@@ -33,6 +33,26 @@ See [Installation](Installation) for install commands.
 
 ## Upgrading pg_vault_tde Itself
 
+> **Upgrading to 1.7.2 — one `VACUUM FULL` per encrypted table.** 1.7.2 changes
+> the on-disk tuple layout to **v5**. Nothing has to be exported first: every
+> row written by an earlier release keeps reading, byte for byte. But rows keep
+> the layout they were written in until something rewrites them, and on the old
+> layout `UPDATE` can take the backend down when the table has an index on a
+> column that sits behind a variable-length one. `VACUUM FULL` (or `CLUSTER`)
+> on each `encrypted_heap` table migrates it; tables created after the upgrade
+> need nothing. Full explanation and the query that lists the tables: README →
+> "Upgrading to 1.7.2".
+>
+> 1.7.2 also fixes a row whose columns are **all** NULL making its table
+> unreadable (`Ciphertext too short for AES-256-GCM` on any sequential scan).
+> That one needs no migration — upgrading is the whole fix.
+
+> **Upgrading from 1.7.0 or earlier — export first.** 1.7.1 rebound the AEAD
+> tag for TOAST relations to the parent table's OID, so out-of-line TOAST values
+> written by 1.7.0 or earlier do not authenticate afterwards and `pg_dump` of an
+> affected table stops working. The dump has to be taken *before* the new binary
+> is installed. Procedure: README → "Upgrading to 1.7.1".
+
 - Read the limitations table for the version you're upgrading **to** in
   [Known Limitations and Troubleshooting](Known-Limitations-and-Troubleshooting)
   before upgrading — several past limitations (TOAST encryption, fixed-size

@@ -1,0 +1,81 @@
+Parsed test spec with 3 sessions
+
+starting permutation: r_begin r_read w_vacfull r_read r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step r_read: SELECT count(*) AS rows,
+                          count(*) FILTER (WHERE payload =
+                              repeat('payload_' || id || '_', 400)) AS intact
+                   FROM tde_rw;
+rows|intact
+----+------
+  50|    50
+(1 row)
+
+step w_vacfull: VACUUM FULL tde_rw; <waiting ...>
+step r_read: SELECT count(*) AS rows,
+                          count(*) FILTER (WHERE payload =
+                              repeat('payload_' || id || '_', 400)) AS intact
+                   FROM tde_rw;
+rows|intact
+----+------
+  50|    50
+(1 row)
+
+step r_commit: COMMIT;
+step w_vacfull: <... completed>
+
+starting permutation: r_begin r_read w_cluster r_read r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step r_read: SELECT count(*) AS rows,
+                          count(*) FILTER (WHERE payload =
+                              repeat('payload_' || id || '_', 400)) AS intact
+                   FROM tde_rw;
+rows|intact
+----+------
+  50|    50
+(1 row)
+
+step w_cluster: CLUSTER tde_rw USING tde_rw_pkey; <waiting ...>
+step r_read: SELECT count(*) AS rows,
+                          count(*) FILTER (WHERE payload =
+                              repeat('payload_' || id || '_', 400)) AS intact
+                   FROM tde_rw;
+rows|intact
+----+------
+  50|    50
+(1 row)
+
+step r_commit: COMMIT;
+step w_cluster: <... completed>
+
+starting permutation: i_begin i_insert w_vacfull i_commit r_read
+step i_begin: BEGIN;
+step i_insert: INSERT INTO tde_rw VALUES (1000, repeat('late_', 400));
+step w_vacfull: VACUUM FULL tde_rw; <waiting ...>
+step i_commit: COMMIT;
+step w_vacfull: <... completed>
+step r_read: SELECT count(*) AS rows,
+                          count(*) FILTER (WHERE payload =
+                              repeat('payload_' || id || '_', 400)) AS intact
+                   FROM tde_rw;
+rows|intact
+----+------
+  51|    50
+(1 row)
+
+
+starting permutation: i_begin i_insert w_vacfull i_abort r_read
+step i_begin: BEGIN;
+step i_insert: INSERT INTO tde_rw VALUES (1000, repeat('late_', 400));
+step w_vacfull: VACUUM FULL tde_rw; <waiting ...>
+step i_abort: ROLLBACK;
+step w_vacfull: <... completed>
+step r_read: SELECT count(*) AS rows,
+                          count(*) FILTER (WHERE payload =
+                              repeat('payload_' || id || '_', 400)) AS intact
+                   FROM tde_rw;
+rows|intact
+----+------
+  50|    50
+(1 row)
+

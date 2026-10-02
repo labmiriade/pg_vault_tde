@@ -19,7 +19,7 @@
  * ----------
  * @SecurityKMS owns this header.  The signature of every entry in
  * TdeKmsProvider is FROZEN once the v1.5 branch merges.  Any change
- * requires updating ALL providers and ALL call sites (Rule 2, AGENTS.md).
+ * requires updating ALL providers and ALL call sites.
  *
  * DEPENDENCY:
  * -----------

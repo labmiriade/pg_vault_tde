@@ -41,11 +41,12 @@ ci/
 └── scripts/
     ├── lib.sh                   ← Shared utilities (runtime detection, logging)
     ├── run-all.sh               ← Master orchestrator (all stages)
-    ├── run-regress.sh           ← pg_regress (24 tests)
+    ├── run-regress.sh           ← SQL regression suite
     ├── run-checksums.sh         ← Page-checksum compatibility
     ├── run-tap.sh               ← TAP tests with mock Vault
     ├── run-isolation.sh         ← Isolation / concurrency tests
     ├── run-vault.sh             ← Vault integration tests (compose)
+    ├── run-upgrade.sh           ← Upgrade compat vs the previous release tag
     └── run-bench.sh             ← Performance benchmark
 ```
 
@@ -54,11 +55,12 @@ ci/
 | Stage | Script | Container(s) | What It Tests |
 |-------|--------|--------------|---------------|
 | **build** | (embedded) | `pg-test` | Zero-warning compile gate |
-| **regress** | `run-regress.sh` | `pg-test` | 24 SQL regression tests |
+| **regress** | `run-regress.sh` | `pg-test` | SQL regression suite |
 | **checksums** | `run-checksums.sh` | `pg-test` | Page checksum compatibility |
 | **tap** | `run-tap.sh` | `pg-test` | TAP tests (extension load, backup) |
 | **isolation** | `run-isolation.sh` | `pg-test` | MVCC + DEK rotation concurrency |
 | **vault** | `run-vault.sh` | `pg-test` + `vault-mock` | Vault Transit API integration |
+| **upgrade** | `run-upgrade.sh` | `pg-test` + `pg-tde-baseline` | Data written by the previous release tag still reads; declared in `ci/upgrade-compat.expected` |
 | **bench** | `run-bench.sh` | `pg-test` | Performance vs plain heap |
 
 ## Container Runtime
@@ -100,13 +102,14 @@ make ci-clean
 
 ## Environment Variables
 
-Configurable via `ci/.env` or shell override. Key variables:
+Set them in the shell. `ci/scripts/lib.sh` also sources `ci/.env` if that file
+exists, so local overrides can live there; the file is not tracked in the repo.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CONTAINER_RT` | (auto) | `podman` or `docker` |
 | `PG_VERSION` | `18` | PostgreSQL major version for container builds |
-| `PG_SUPPORTED_VERSIONS` | `"17 18"` | All versions tested in multi-version runs |
+| `PG_MAJORS` | `"17 19"` | Majors exercised by `make ci-matrix` (regress + tap) |
 | `PG_TEST_IMAGE` | `pg-tde-test` | Name of the test container image |
 | `VAULT_MOCK_TOKEN` | `test-token` | Vault mock authentication token |
 | `PG_TEST_PORT` | `15432` | Host port for regression container |
@@ -134,14 +137,18 @@ for v in 17 18; do
 done
 ```
 
-### Adding PG 19 Support
+### Adding a New Major Version
 
-When PostgreSQL 19 is released:
+PG 19 is already wired in: `TDE_PG_MAX` in the `Makefile` covers 17..19 and
+`PG_MAJORS` defaults to `"17 19"`.  `make ci-matrix` skips a major whose base
+image is not on Docker Hub yet, so nothing is needed until `postgres:19` ships
+— at that point only the packaging matrix has to follow.
 
-1. Update `ci/.env`: add `19` to `PG_SUPPORTED_VERSIONS`
-2. Verify `postgres:19` image exists on Docker Hub
-3. Run `PG_VERSION=19 make ci-regress` to validate
-4. If tests pass, update `TDE_PG_MAX` in `Makefile` to `19`
-5. Update `PG_SUPPORTED_VERSIONS` in `ci/.env`
-6. Add PG 19 steps to `bitbucket-pipelines.yml`
-7. Add PG 19 row to the Version Registry in `copilot-instructions.md`
+For a major beyond that range:
+
+1. Verify the `postgres:N` base image exists on Docker Hub
+2. Run `PG_VERSION=N make ci-regress` to validate
+3. Raise `TDE_PG_MAX` in the `Makefile`
+4. Add `N` to the `PG_MAJORS` default in `ci/scripts/run-matrix.sh`
+5. Add the matching rows to `packaging/build-matrix.json`
+6. Add the PG N steps to `bitbucket-pipelines.yml`

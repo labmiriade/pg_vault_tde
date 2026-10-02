@@ -12,27 +12,6 @@
 #include "access/toast_helper.h"
 
 /*
- * Encrypt a single TOAST chunk using AES-256-GCM.
- * parent_relid: OID of the heap relation that owns this TOAST table;
- *   used for per-table DEK selection (InvalidOid = unscoped compatibility path).
- * Each chunk gets its own random IV so identical chunks produce different ciphertexts.
- * Returns a palloc'd [VERSION|GEN|IV|CT|TAG] buffer; caller must pfree.
- */
-char *tde_toast_encrypt_chunk(Oid parent_relid,
-                              const char *chunk_data, Size chunk_len,
-                              Size *out_len);
-
-/*
- * Decrypt a previously encrypted TOAST chunk, verifying the GCM tag.
- * parent_relid: OID of the heap relation that owns this TOAST table.
- * Returns palloc'd plaintext; caller must pfree.
- * Aborts via ereport(ERROR) on authentication failure.
- */
-char *tde_toast_decrypt_chunk(Oid parent_relid,
-                              const char *enc_data, Size enc_len,
-                              Size *out_len);
-
-/*
  * pg_vault_tde_toast_tuple_externalize
  *
  * Custom externalize hook called by the TOAST helper infrastructure during
@@ -56,8 +35,8 @@ void pg_vault_tde_toast_tuple_externalize(ToastTupleContext *ttc, int attribute,
  * value has not changed (UPDATE pass-through optimisation).
  *
  * When rel->rd_rel->reltoastrelid references an encrypted_heap TOAST table,
- * each stored chunk passes through tde_toast_encrypt_chunk() so the TOAST
- * relation never contains plaintext.
+ * each stored chunk is written as an ordinary tuple of that AM and is encrypted
+ * by the tuple path, so the TOAST relation never contains plaintext.
  *
  * Returns a compressed or external varlena Datum that replaces the original
  * in the main-table tuple; caller owns the result (no explicit pfree needed

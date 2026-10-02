@@ -5,8 +5,10 @@
 # Guard-rail: the pgxn-bundle job in .github/workflows/build-packages.yml
 # unpacks the zip and compiles it — one line too many fails there, not at upload.
 
-# Internal CI. Also the two paths git-filter-repo strips from the GitHub mirror:
-# without this, the bundle's content depended on which clone produced it.
+# Internal CI. Out of the release bundle, but NOT out of the GitHub mirror: the
+# mirror publishes ci/ because CONTRIBUTING.md asks external contributors to run
+# `make ci-regress`. What the mirror does strip is bitbucket-pipelines.yml plus
+# the internal tooling paths; the list lives in that file's filter-repo call.
 /ci                                export-ignore
 /bitbucket-pipelines.yml           export-ignore
 /.github                           export-ignore

@@ -131,11 +131,19 @@ tde_tuple_looks_encrypted(HeapTuple tup)
 
     data_len = tup->t_len - hdr_len;
     if (data_len < (Size) TDE_V4_OVERHEAD)
-        return false;           /* too short to be a v4 encrypted region */
+        return false;           /* too short to be an encrypted region */
 
-    /* v4 is IV-first: version byte lives in the trailer [.. | TAG | VERSION(1) | GEN(8)] */
+    /*
+     * Both layouts end with the same trailer [.. | TAG | VERSION(1) | GEN(8)],
+     * so the version byte sits at the same offset from the end whether the
+     * region is a v4 blob or a v5 structure-preserving tuple.  Recognising
+     * only one of them here does not produce an error: the tuple is taken for
+     * plaintext and handed to pgoutput as-is, which then reads a varlena
+     * length out of ciphertext ("invalid memory alloc request size" in the
+     * change callback, replication stuck).
+     */
     ver = *((unsigned char *) tup->t_data + tup->t_len - (TDE_V4_GEN_LEN + 1));
-    return (ver == TDE_V4_VERSION_BYTE);
+    return (ver == TDE_V4_VERSION_BYTE || ver == TDE_TUPLE_V5_VERSION_BYTE);
 }
 
 /*
@@ -168,6 +176,8 @@ tde_maybe_decrypt(HeapTuple tup, Oid relid, TupleDesc tupdesc, const char *which
      * "pfree invalid pointer" / segfault under streaming).  The decrypted
      * content is always <= the encrypted content (shorter by TDE_V2_OVERHEAD),
      * so it always fits.  Mirrors core's ReorderBufferToastReplace() copy-back.
+     * The shorter t_len is put back by the change callback (TdeTupleLens) once
+     * pgoutput is done: the reorder buffer's memory accounting reads it.
      */
     plain = tde_decrypt_heap_tuple(tup, relid, tupdesc);
     Assert(plain->t_len <= tup->t_len);
@@ -243,12 +253,59 @@ tde_decrypt_change(Relation relation, ReorderBufferChange *change,
 }
 
 /*
+ * The reorder buffer charges each change to logical_decoding_work_mem by its
+ * tuples' t_len when it queues the change, and credits the same computation
+ * back when it frees it.  Decrypting and stitching in place shorten t_len, so
+ * the credit came out smaller than the charge: txn->size never returned to zero
+ * (an Assert in ReorderBufferFreeTXN on a cassert build) and rb->size grew with
+ * every encrypted row until decoding spilled every transaction.  The lengths
+ * are put back once pgoutput has serialized the row; nothing reads the tuples
+ * after that.  On ERROR the decoding context is discarded wholesale, so only
+ * the success path has to square the accounts.
+ */
+typedef struct TdeTupleLens
+{
+    uint32 newlen;
+    uint32 oldlen;
+} TdeTupleLens;
+
+static bool
+tde_change_has_tuples(ReorderBufferChange *change)
+{
+    return change->action == REORDER_BUFFER_CHANGE_INSERT ||
+           change->action == REORDER_BUFFER_CHANGE_UPDATE ||
+           change->action == REORDER_BUFFER_CHANGE_DELETE;
+}
+
+static void
+tde_tuple_lens_save(ReorderBufferChange *change, TdeTupleLens *lens)
+{
+    lens->newlen = change->data.tp.newtuple ? change->data.tp.newtuple->t_len : 0;
+    lens->oldlen = change->data.tp.oldtuple ? change->data.tp.oldtuple->t_len : 0;
+}
+
+static void
+tde_tuple_lens_restore(ReorderBufferChange *change, const TdeTupleLens *lens)
+{
+    if (change->data.tp.newtuple)
+        change->data.tp.newtuple->t_len = lens->newlen;
+    if (change->data.tp.oldtuple)
+        change->data.tp.oldtuple->t_len = lens->oldlen;
+}
+
+/*
  * tde_output_change_cb — decrypt (+ stitch TOAST) then delegate to pgoutput.
  */
 static void
 tde_output_change_cb(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
                      Relation relation, ReorderBufferChange *change)
 {
+    TdeTupleLens lens = {0};
+    bool         tuples = tde_change_has_tuples(change);
+
+    if (tuples)
+        tde_tuple_lens_save(change, &lens);
+
     tde_decrypt_change(relation, change, txn->xid);
 
     if (pgoutput_change_cb != NULL)
@@ -256,6 +313,9 @@ tde_output_change_cb(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 
     /* pgoutput has serialized the row; free any reconstructed TOAST values */
     tde_toast_stitch_reset();
+
+    if (tuples)
+        tde_tuple_lens_restore(change, &lens);
 }
 
 /*
@@ -265,6 +325,12 @@ static void
 tde_output_stream_change_cb(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
                             Relation relation, ReorderBufferChange *change)
 {
+    TdeTupleLens lens = {0};
+    bool         tuples = tde_change_has_tuples(change);
+
+    if (tuples)
+        tde_tuple_lens_save(change, &lens);
+
     tde_decrypt_change(relation, change, txn->xid);
 
     if (pgoutput_stream_change_cb != NULL)
@@ -272,6 +338,9 @@ tde_output_stream_change_cb(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 
     /* pgoutput has serialized the row; free any reconstructed TOAST values */
     tde_toast_stitch_reset();
+
+    if (tuples)
+        tde_tuple_lens_restore(change, &lens);
 }
 
 /*

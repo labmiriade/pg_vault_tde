@@ -39,7 +39,7 @@ pg_vault_tde_catalog (on-disk table)
         │
         ▼  unwrap on cache miss
 Shared-memory DEK cache (TdeRelDekMap)
-        │  one entry per relation; single LWLock; per-relation generation counter
+        │  one entry per (dbid, relid); single LWLock; generation counter
         │
         ▼
 AES-256-GCM tuple encryption / AES-256-SIV index-key encryption
@@ -90,7 +90,10 @@ for the context of every parameter.
 
 Every encrypt/decrypt call looks up the relation's DEK in a shared-memory
 hash table (`TdeRelDekMap`, capacity controlled by `max_encrypted_relations`,
-default 1024, restart required to change). A cache hit is an O(1)
+default 1024, restart required to change). Entries are keyed by
+**`(dbid, relid)`**: a relid is unique only within a database, while this
+table is one segment shared by the backends of every database in the cluster,
+so the capacity budget is the sum across all databases. A cache hit is an O(1)
 shared-lock lookup; a cache miss reads the wrapped DEK from
 `pg_vault_tde_catalog` and unwraps it through the active KMS provider (one
 network round-trip for Vault, one local unwrap for the wallet or HSM), then
@@ -107,6 +110,36 @@ online operations with no exclusive table lock. See [Key Rotation](Key-Rotation)
 for the full runbook, and each provider-specific page for provider-specific
 rotation details (e.g. PKCS#11 KEK generations that never expire from the
 token).
+
+### KEK rotation is per-database
+
+`pg_vault_tde_rotate_kek()` and `pg_vault_tde_wallet_change_passphrase()`
+rewrap the DEKs listed in `pg_vault_tde_catalog` — and that is a per-database
+table, created by `CREATE EXTENSION` in each database, which no backend can
+read across a database boundary. A rotation therefore covers exactly the
+database it runs in, and then replaces the wallet file.
+
+With the default `wallet_path` (`/var/lib/pg_vault_tde/<DB_OID>/wallet.p12`)
+those two scopes are the same file, so this is invisible and safe. **Point
+several databases at one wallet file and it stops being safe**: the first
+database to rotate rewraps its own DEKs under the new KEK and overwrites the
+shared wallet, leaving every other database's wrapped DEKs under a KEK that
+no longer exists. Their data becomes permanently unreadable, and rotating
+them afterwards cannot recover it. Share a wallet only across databases whose
+KEK you will never rotate.
+
+Since `pg_vault_tde_wallet_init()` persists the resolved path per database
+(`ALTER DATABASE ... SET FROM CURRENT`), and a database-level setting wins
+over `postgresql.conf`, sharing a wallet is something you have to ask for
+explicitly on each database rather than something you fall into. When the
+effective wallet is not this database's own default file, both rotation
+paths emit a `WARNING` naming the database they actually covered.
+
+This concerns the KEK only. Per-table **DEKs** never collide across
+databases, even with a shared wallet: each DEK is 32 independent random bytes
+stored in its own database's catalog row, and the GCM AAD binds
+`MyDatabaseId`, so a key belonging to one database can never silently decrypt
+another database's rows.
 
 ## See Also
 - [KMS: HashiCorp Vault / OpenBao](KMS-HashiCorp-Vault-OpenBao)

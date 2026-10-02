@@ -323,8 +323,24 @@ apt-get install -y -q \
 # ── Build package from source ──────────────────────────────────────────
 echo '--- Building DEB ---'
 mkdir -p /build
-tar -C /src --exclude=./.git --exclude=./test/tap --exclude=./ci/docker-data -cf - . | tar -C /build -xf -
+tar -C /src --exclude=./.git --exclude=./test/tap --exclude=./ci/docker-data \
+    --exclude='./tmp_*' --exclude=./results --exclude=./log --exclude=./output_iso \
+    --exclude=./regression.diffs --exclude=./regression.out \
+    --exclude='*.o' --exclude='*.bc' --exclude='*.so' \
+    --exclude=./pg_dump_tde --exclude=./pg_restore_tde \
+    --exclude=./pg_basebackup_tde \
+    -cf - . | tar -C /build -xf -
 cd /build
+
+# Never build on top of whatever the copy brought in.  The tar above takes the
+# live working tree, so a developer building on the host — or the tail end of a
+# long "make ci-all", where this stage runs last — leaves objects and linked
+# binaries behind that make would consider up to date.  Packaging those ships a
+# binary linked against the HOST's glibc and libcurl: on this machine that meant
+# RPMs requiring GLIBC_2.38 and CURL_OPENSSL_4, which no EL9 can install.  The
+# excludes above catch *.o/*.bc/*.so; the frontend binaries have no extension,
+# so clean is the guarantee rather than the enumeration.
+make clean >/dev/null 2>&1 || true
 bash packaging/build_deb.sh --no-sign --pg-version ${pg}
 DEB=\$(ls /build/../postgresql-${pg}-pg-vault-tde_*.deb | head -1)
 echo \"Built: \$(basename \$DEB)\"
@@ -393,7 +409,14 @@ dnf -y module disable postgresql 2>/dev/null || true
 # Must satisfy every BuildRequires in packaging/rpm/pg_vault_tde.spec, since
 # rpmbuild refuses to start otherwise: chrpath, plus clang and llvm-devel for
 # the LLVM bitcode targets, which postgresqlNN-devel does not pull in.
-dnf install -y -q \
+#
+# --nobest: a vendor repo may publish a -devel rebuild into AppStream before
+# the matching runtime lands in BaseOS.  Since -devel pins the runtime to an
+# exact version, the newest -devel is then uninstallable and dnf fails outright
+# rather than stepping back.  AlmaLinux 10 did this with libcurl-devel
+# 8.12.1-4.el10_2.6 against libcurl 8.12.1-4.el10_2.4.  We build against
+# whatever pair the distro can actually resolve, not against the newest tag.
+dnf install -y -q --nobest \
     perl-IPC-Run postgresql${pg}-devel postgresql${pg}-server \
     openssl-devel libcurl-devel pkgconfig gcc make rsync rpm-build \
     chrpath clang llvm-devel
@@ -402,8 +425,24 @@ dnf install -y -q \
 echo '--- Building RPM ---'
 export PATH=\"/usr/pgsql-${pg}/bin:\$PATH\"
 mkdir -p /build
-tar -C /src --exclude=./.git --exclude=./test/tap --exclude=./ci/docker-data -cf - . | tar -C /build -xf -
+tar -C /src --exclude=./.git --exclude=./test/tap --exclude=./ci/docker-data \
+    --exclude='./tmp_*' --exclude=./results --exclude=./log --exclude=./output_iso \
+    --exclude=./regression.diffs --exclude=./regression.out \
+    --exclude='*.o' --exclude='*.bc' --exclude='*.so' \
+    --exclude=./pg_dump_tde --exclude=./pg_restore_tde \
+    --exclude=./pg_basebackup_tde \
+    -cf - . | tar -C /build -xf -
 cd /build
+
+# Never build on top of whatever the copy brought in.  The tar above takes the
+# live working tree, so a developer building on the host — or the tail end of a
+# long "make ci-all", where this stage runs last — leaves objects and linked
+# binaries behind that make would consider up to date.  Packaging those ships a
+# binary linked against the HOST's glibc and libcurl: on this machine that meant
+# RPMs requiring GLIBC_2.38 and CURL_OPENSSL_4, which no EL9 can install.  The
+# excludes above catch *.o/*.bc/*.so; the frontend binaries have no extension,
+# so clean is the guarantee rather than the enumeration.
+make clean >/dev/null 2>&1 || true
 bash packaging/build_rpm.sh --pg-version ${pg}
 RPM=\$(find ~/rpmbuild/RPMS -name \"postgresql${pg}-pg_vault_tde-*.rpm\" \
            ! -name '*debuginfo*' ! -name '*debugsource*' | head -1)

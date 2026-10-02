@@ -36,11 +36,11 @@ ALTER TABLE mytable SET ACCESS METHOD heap;              -- encrypted → plain 
 
 ### TOAST (Large Column Values)
 
-Controlled by `pg_vault_tde.toast_encryption` (default `on`): TOAST chunks
-for large column values are encrypted per-chunk with the parent table's DEK,
-using the same `encrypted_heap` machinery. Set it to `off` only if you
-specifically need plaintext TOAST storage for performance reasons and have
-already accepted the confidentiality trade-off for large values.
+TOAST chunks for large column values are always encrypted per-chunk with the
+parent table's DEK, using the same `encrypted_heap` machinery.
+`pg_vault_tde.toast_encryption` has no effect since 1.7.2 (PSQLE-223): `off` never
+gave plaintext TOAST — it left a table unable to read its out-of-line values — and now
+only raises a `WARNING`. It is removed in 1.8.
 
 ## `tde_btree` — Index Access Method
 
@@ -52,9 +52,9 @@ CREATE INDEX ON secrets USING tde_btree (id);
 |---|---|
 | Algorithm | AES-256-SIV (deterministic, misuse-resistant authenticated encryption) |
 | Equality | Preserved — the same plaintext always produces the same ciphertext under the same DEK, so `=` lookups work |
-| Ordering | **Not preserved** — range predicates (`>`, `<`, `BETWEEN`) return empty results |
-| Use case | Equality predicates only: `=`, `IN`, `ON CONFLICT` |
-| Column types | Both varlena (`text`, `bytea`, `numeric`) and fixed-size (`int4`, `int8`, `uuid`, `date`, `timestamptz`) — all encrypted since v1.7 |
+| Ordering | **Not preserved** — range predicates (`>`, `<`, `BETWEEN`), `ORDER BY` and `min`/`max` never use the index; they run as sequential scans |
+| Use case | Equality predicates only: `=`, `IN`, `= ANY`, `ON CONFLICT` |
+| Column types | Varlena `text`, `bytea` and fixed-size `int4`, `int8`, `uuid`, `date`, `timestamptz` — all encrypted since v1.7. `numeric` and nondeterministic collations are refused since 1.7.2 (`numeric` support planned for 1.8) |
 
 ### Operator Classes
 
@@ -74,12 +74,13 @@ CREATE INDEX ON employees USING tde_btree (id);         -- tde_int4_enc_ops (def
 CREATE INDEX ON employees USING tde_btree (username);   -- tde_text_ops (default)
 
 SELECT salary FROM employees WHERE id = 1;              -- uses the index
-SELECT * FROM employees WHERE id > 1;                   -- seq scan — index returns empty by design
+SELECT * FROM employees WHERE id > 1;                   -- seq scan: tde_btree answers equality only
 ```
 
-Legacy non-encrypted opclasses (`tde_int4_ops`, etc.) still exist for
-backward compatibility but are **not** the default — prefer the `enc_ops`
-classes so index keys stay encrypted.
+Legacy opclasses (`tde_int4_ops`, etc.) store their keys **in plaintext** and
+exist only for indexes already built on them: since 1.7.2 `CREATE INDEX`
+refuses them unless `pg_vault_tde.allow_plaintext_index = on`, and 1.8
+removes them.
 
 ### Index-Only Scans Are Not Supported (By Design)
 
@@ -202,7 +203,7 @@ the `CREATE UNIQUE INDEX ... USING btree` step so it actually succeeds.
 | Page checksums | ✅ Full | Checksums cover the encrypted bytes |
 | Logical replication (non-TOAST) | ✅ Full | See [Logical Replication](Logical-Replication) |
 | Logical replication (TOAST columns) | ✅ Full (opt-in) | Requires `REPLICA IDENTITY FULL` + primary key — see [Logical Replication](Logical-Replication) |
-| Range scans on `tde_btree` | ⚠️ By design, empty results | Use sequential scan, or a plain (unencrypted) index if range queries are required on that column |
+| Range scans on `tde_btree` | ⚠️ Equality only, by design | Ranges, `ORDER BY` and `min`/`max` run as sequential scans; use a plain (unencrypted) index if they must be index-assisted on that column |
 | HOT **updates** | ⚠️ Disabled by design | See below |
 | Column-level encryption | 🔜 Planned (v1.8) | Currently all-or-nothing per table |
 | GIN / Hash / GiST index encryption | 🔜 Planned (v1.8) | Only `tde_btree` exists today; a plaintext GIN/GiST/Hash/BRIN/btree index is available meanwhile via `allow_plaintext_index = on` |

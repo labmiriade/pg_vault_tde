@@ -8,9 +8,12 @@ restart**. Parameters marked `postmaster` require a full server restart
 (`postgresql.conf` or `ALTER SYSTEM`, then restart).
 
 Parameters holding secrets (`vault_token`, `vault_role_id`,
-`vault_secret_id`, `wallet_dev_mode_passphrase`) are hidden from
-non-superusers in `pg_settings` and excluded from configuration file
-samples.
+`vault_secret_id`, `wallet_dev_mode_passphrase`) are shown only to a
+superuser: any other role — `pg_monitor` and `pg_read_all_settings` members
+included — reads `********` from `SHOW` and `current_setting()`, and
+`pg_settings` does not list them (since 1.7.2; up to 1.7.1
+`pg_read_all_settings` read the values). They are also excluded from
+configuration file samples.
 
 ## General
 
@@ -18,7 +21,9 @@ samples.
 |---|---|---|---|---|
 | `enabled` | boolean | `on` | postmaster | Master switch for AES-256-GCM encryption on `encrypted_heap` tables. Fixed at server startup — see the warning in [Encrypted Tables and Indexes](Encrypted-Tables-and-Indexes) about why this can never be safely toggled on a database with existing encrypted data. |
 | `crypto_provider` | string | `''` | postmaster | OpenSSL 3.x provider name for hardware crypto offload. Empty (default) uses built-in AES-NI/ARM CE auto-dispatch; set to `qatprovider` for Intel QAT, `fips` for FIPS mode. |
-| `max_encrypted_relations` | integer | `1024` | postmaster | Maximum number of independently-keyed `encrypted_heap` relations in the shared-memory DEK cache (range 64–65536). Increase if you have more than 1024 encrypted tables. |
+| `preload_keys` | boolean | `off` | suset | Load this database's DEKs into the shared cache at startup instead of on first access. One background worker per database — both the catalog and the wallet are per-database, and a worker can only connect once. Requires a KMS that opens without an interactive unlock. Scope it with `ALTER DATABASE SET`. |
+| `preload_max_failures` | integer | `5` | suset | Consecutive DEK unwrap failures the startup preload tolerates in one database before giving up on it. Consecutive, so a missing passphrase stops the pass at once while a one-off does not. Relevant to the local wallet too: the KEK is re-derived from the wallet file on every unwrap rather than cached, so a wallet on NFS or SMB is reopened once per relation. `0` stops at the first failure. |
+| `max_encrypted_relations` | integer | `1024` | postmaster | Maximum number of independently-keyed `encrypted_heap` relations in the shared-memory DEK cache (range 64–65536), **cluster-wide**: entries are keyed by `(dbid, relid)`, so this is the sum across all databases. Enforced since 1.7.2 — before that the cache silently grew past it (ShmemInitHash's size is not a cap), so count your encrypted relations across all databases before upgrading. ~112 bytes per relation, reserved at startup. Max 1048576. |
 | `dek_cache_ttl` | integer | `0` | suset | Per-backend DEK cache time-to-live in seconds (range 0–86400). `0` = no expiry. When set, each backend re-reads the DEK from shared memory after this interval, even without a rotation. |
 | `allow_plaintext_index` | boolean | `off` | suset | When `off` (default), `CREATE INDEX`/`CREATE UNIQUE INDEX` with a non-`tde_btree` access method (`btree`, `gin`, `gist`, `hash`, `brin`) against an `encrypted_heap` table is rejected with `ERROR`. When `on`, allowed after a `WARNING` — the indexed value is then stored in plaintext on disk in that index. Does not affect `PRIMARY KEY`/`UNIQUE` table constraints, which always warn-and-allow regardless — see [Encrypted Tables and Indexes](Encrypted-Tables-and-Indexes). |
 
@@ -37,9 +42,9 @@ All `suset`, superuser-only in `pg_settings`, settable per-database.
 | `vault_url` | string | `''` | Vault/OpenBao base URL (e.g. `https://vault.example.com:8200`) |
 | `vault_namespace` | string | `''` | Vault Enterprise namespace; leave empty for Community Edition |
 | `vault_auth_method` | string | `token` | Authentication method: `token`, `approle`, or `kubernetes` |
-| `vault_token` | string | `''` | Auth token for the `token` method — hidden from `pg_settings` |
-| `vault_role_id` | string | `''` | AppRole `role_id` — hidden from `pg_settings` |
-| `vault_secret_id` | string | `''` | AppRole `secret_id` — hidden from `pg_settings` |
+| `vault_token` | string | `''` | Auth token for the `token` method — shown only to a superuser |
+| `vault_role_id` | string | `''` | AppRole `role_id` — shown only to a superuser |
+| `vault_secret_id` | string | `''` | AppRole `secret_id` — shown only to a superuser |
 | `vault_role_name` | string | `''` | AppRole role name; when set, the used `secret_id` is destroyed after a successful login (single-use pattern) |
 | `vault_k8s_role` | string | `''` | Kubernetes auth role name |
 | `vault_k8s_mount` | string | `kubernetes` | Kubernetes auth engine mount path |
@@ -59,13 +64,13 @@ All `suset`, superuser-only in `pg_settings`, settable per-database.
 
 | Parameter | Type | Default | Context | Description |
 |---|---|---|---|---|
-| `wallet_path` | string | `''` (resolves at runtime to `/var/lib/pg_vault_tde/<DB_OID>/wallet.p12`) | suset | Absolute path to the PKCS#12 wallet file. `SHOW` always returns the effective path, even when this is unset in `postgresql.conf`. |
+| `wallet_path` | string | `''` (resolves at runtime to `/var/lib/pg_vault_tde/<DB_OID>/wallet.p12`) | suset | Absolute path to the PKCS#12 wallet file. `SHOW` always returns the effective path, even when this is unset in `postgresql.conf`. Setting it cluster-wide makes every database share one KEK, which makes KEK rotation destructive — see [Key Management Overview](Key-Management-Overview). |
 | `wallet_passphrase_env` | string | `''` | suset | Name of the environment variable holding the wallet passphrase — never the passphrase value itself |
 | `wallet_passphrase_file` | string | `''` | suset | Path to a file containing the passphrase; the file must be mode `0400` or `0600` |
 | `wallet_passphrase_command` | string | `''` | suset | Shell command whose stdout is the passphrase (highest priority of the three ingestion methods; analogous to `ssl_passphrase_command`) |
 | `wallet_auto_open` | boolean | `on` | suset | Auto-open the wallet during startup if a passphrase is available via one of the above; if `off`, opening is deferred until first access |
 | `dev_mode` | boolean | `off` | suset | Enables development-only conveniences. **Never set `on` in production.** |
-| `wallet_dev_mode_passphrase` | string | `''` | suset | Inline plaintext passphrase, used only when `dev_mode = on`; emits a `WARNING` on every use — hidden from `pg_settings` |
+| `wallet_dev_mode_passphrase` | string | `''` | suset | Inline plaintext passphrase, used only when `dev_mode = on`; emits a `WARNING` on every use — shown only to a superuser |
 
 Passphrase source priority when more than one is configured:
 `wallet_passphrase_command` > `wallet_passphrase_file` > `wallet_passphrase_env`.
@@ -86,7 +91,7 @@ All `suset`, superuser-only in `pg_settings`, settable per-database.
 
 | Parameter | Type | Default | Context | Description |
 |---|---|---|---|---|
-| `toast_encryption` | boolean | `on` | suset | Encrypts TOAST chunks for `encrypted_heap` tables using the parent relation's DEK. Set `off` only for debugging or migration — see [Encrypted Tables and Indexes](Encrypted-Tables-and-Indexes). |
+| `toast_encryption` | boolean | `on` | suset | **No effect since 1.7.2** (PSQLE-223): the TOAST table of an `encrypted_heap` table is always `encrypted_heap` and its chunks always encrypted with the parent relation's DEK; setting it `off` only raises a `WARNING` when a TOAST table is created. Removed in 1.8 — see [Encrypted Tables and Indexes](Encrypted-Tables-and-Indexes). |
 | `toast_custom_rmgr` | boolean | `off` | postmaster | Enables the custom WAL resource manager that lets encrypted TOAST chunks be published over logical replication. Requires `pg_vault_tde` in `shared_preload_libraries` (already true) and a full restart — see [Logical Replication](Logical-Replication). |
 
 ## See Also

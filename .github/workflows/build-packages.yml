@@ -2,7 +2,9 @@ name: Build & Publish Packages
 
 # Manually-triggered release pipeline: builds .deb/.rpm packages for every
 # currently-supported OS (see packaging/build_in_container.sh) from an
-# existing git tag, then attaches them to a GitHub Release.
+# existing git tag, then attaches them to a *draft* GitHub Release with their
+# SHA256SUMS. A maintainer signs SHA256SUMS on the draft and publishes it by
+# hand (PGXN.md, "Signing").
 #
 # Prerequisite: the version bump + `packaging/` Release Checklist
 # (packaging/packaging.instructions.md) must already be committed and
@@ -20,11 +22,6 @@ on:
         description: "Version expected at that tag (e.g. 1.7.0) — sanity-checked against VERSION before any build runs"
         required: true
         type: string
-      draft:
-        description: "Create the release as a draft (review assets before publishing)"
-        required: false
-        type: boolean
-        default: true
 
 permissions:
   contents: write
@@ -41,9 +38,13 @@ jobs:
     outputs:
       include: ${{ steps.matrix.outputs.include }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ inputs.tag }}
+
+      # The tag's signature is checked before it reaches GitHub, by the
+      # Bitbucket synchronization: the mirror rewrites every commit, and a tag
+      # moved onto a rewritten one arrives here unsigned (PSQLE-180).
 
       - name: Load the build matrix
         id: matrix
@@ -127,7 +128,7 @@ jobs:
         # dev channels drift apart silently.
         include: ${{ fromJSON(needs.validate.outputs.include) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ inputs.tag }}
 
@@ -153,7 +154,7 @@ jobs:
           done
           ls -la
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: pkg-${{ matrix.format }}-pg${{ matrix.pg }}-${{ matrix.slug }}
           path: dist/*
@@ -179,7 +180,7 @@ jobs:
       PG_MAJOR: "17"
       BUNDLE: pg_vault_tde-${{ inputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ inputs.tag }}
 
@@ -246,7 +247,7 @@ jobs:
           sha256sum "${BUNDLE}.zip" > "${BUNDLE}.zip.sha256"
           cat "${BUNDLE}.zip.sha256"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: pgxn-bundle
           path: dist/pg_vault_tde-*.zip*
@@ -256,7 +257,7 @@ jobs:
     needs: [build, pgxn-bundle]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: artifacts
 
@@ -268,10 +269,49 @@ jobs:
             -o -name '*.zip' -o -name '*.zip.sha256' \) -exec cp {} dist/ \;
           ls -la dist
 
+      - name: Unpack the source bundle for its SBOM
+        run: |
+          set -euo pipefail
+          mkdir -p sbom-src
+          unzip -q "dist/pg_vault_tde-${{ inputs.version }}.zip" -d sbom-src
+
+      - name: SBOM of the source release
+        # Informational: the extension vendors no code, and links OpenSSL,
+        # libcurl and libpq from the system. Published with the release and
+        # covered by SHA256SUMS, so not uploaded by the action itself.
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          path: sbom-src
+          format: spdx-json
+          output-file: dist/pg_vault_tde-${{ inputs.version }}.spdx.json
+          syft-version: v1.52.0
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Vulnerability scan of the SBOM
+        # Informational as well: a report attached to the release, never a
+        # reason by itself to hold one back.
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          sbom: dist/pg_vault_tde-${{ inputs.version }}.spdx.json
+          grype-version: v0.119.0
+          fail-build: false
+          output-format: table
+          output-file: dist/pg_vault_tde-${{ inputs.version }}.grype.txt
+
+      - name: SHA256SUMS
+        # A maintainer signs it on the draft, with their own key, and only then
+        # publishes the release: no signing key lives in CI. See PGXN.md, "Signing".
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+
       - name: Create/update GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: ${{ inputs.tag }}
           name: pg_vault_tde ${{ inputs.version }}
-          draft: ${{ inputs.draft }}
+          draft: true               # published by hand, once SHA256SUMS is signed
           files: dist/*

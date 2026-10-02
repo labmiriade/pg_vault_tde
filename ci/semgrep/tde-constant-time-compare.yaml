@@ -1,0 +1,17 @@
+rules:
+  - id: tde-constant-time-compare
+    languages: [c]
+    severity: ERROR
+    message: >-
+      A MAC, tag or digest is compared in constant time with CRYPTO_memcmp():
+      memcmp() and strcmp() stop at the first byte that differs, and how long
+      they take says where it was.
+    patterns:
+      - pattern-either:
+          - pattern: memcmp($...ARGS)
+          - pattern: strcmp($...ARGS)
+          - pattern: strncmp($...ARGS)
+          - pattern: bcmp($...ARGS)
+      - metavariable-regex:
+          metavariable: $...ARGS
+          regex: (?i).*(mac|tag|hmac|digest|signature)

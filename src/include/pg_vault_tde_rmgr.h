@@ -33,24 +33,29 @@
 #define PG_VAULT_TDE_RMGR_H
 
 #include "access/heapam.h"      /* BulkInsertState, HeapTuple */
-#include "access/rmgr.h"        /* RM_EXPERIMENTAL_ID */
+#include "access/rmgr.h"        /* RM_MIN_CUSTOM_ID .. RM_MAX_CUSTOM_ID */
 #include "replication/reorderbuffer.h"  /* ReorderBufferChange */
 #include "utils/rel.h"          /* Relation */
 
 /*
  * Custom resource manager id.
  *
- * RM_EXPERIMENTAL_ID (128) is the first id of the custom-rmgr range
- * (RM_CUSTOM_MIN_ID 128 .. RM_CUSTOM_MAX_ID 255) and is documented for
- * experimentation.  pg_vault_tde keeps it for now: the feature is gated off by
- * default and there is no GA release that pins it yet.
+ * 161 is reserved for pg_vault_tde on the PostgreSQL "Custom WAL Resource
+ * Managers" wiki page, which is what keeps us out of the way of other
+ * extensions loaded in the same cluster.  Valid custom ids run from
+ * RM_MIN_CUSTOM_ID (128) to RM_MAX_CUSTOM_ID (255); 128 is RM_EXPERIMENTAL_ID,
+ * the id upstream documents for experimentation, so every prototype in
+ * circulation uses it and it must not be shipped.
  *
- * TODO(follow-up): before GA, reserve a stable custom rmid for pg_vault_tde and
- * register it on the PostgreSQL "Custom WAL Resource Managers" wiki to avoid
- * collisions with other extensions loaded in the same cluster.  Changing the id
- * is a single edit here — it is the only place the value is defined.
+ * This is the only place the value is defined, so changing it is a one-line
+ * edit — but never a silent one.  WAL carries the number, not the name, so any
+ * record already written under the previous id becomes unreadable: replay hits
+ * "resource manager with ID <old> not registered", which is FATAL in the
+ * startup process and stops the cluster from coming up.  Before changing it,
+ * the upgrade needs a clean shutdown, physical standbys caught up, logical
+ * slots drained, and no unreplayed archive still needed for PITR.
  */
-#define TDE_RMGR_ID  RM_EXPERIMENTAL_ID
+#define TDE_RMGR_ID  161
 
 /* Register the custom rmgr.  MUST be called from _PG_init (preload time). */
 extern void tde_rmgr_register(void);

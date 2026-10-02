@@ -22,9 +22,12 @@ By contributing, you agree that your work is licensed under the
 
 - Build cleanly against **both PostgreSQL 17 and 18**, with no compiler
   warnings. Every push and pull request is compile-checked on both by CI.
-- Run at least `make ci-regress` locally before opening a PR; see
-  [ci/README.md](ci/README.md) for the full set of suites (TAP, isolation,
-  Vault, wallet, memcheck).
+- Run the full local pipeline, `make ci-all`, before opening a PR, and paste
+  the PIPELINE SUMMARY table it prints at the end into the PR. The suites do
+  not run automatically on a pull request, so that run is what reviewers go
+  by. It needs `podman` or `docker` and pulls container images; `valgrind` and
+  `cassert` are the slow stages (`cassert` builds PostgreSQL from source the
+  first time). See [ci/README.md](ci/README.md) for what each stage covers.
 - Add tests that fail without your change.
 - If you change `packaging/build-matrix.json`, run
   `bash packaging/gen-support-matrix.sh` and commit the regenerated Support

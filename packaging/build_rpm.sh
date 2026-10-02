@@ -16,7 +16,7 @@
 set -e
 cd "$(dirname "$0")/.."  # move to project root
 
-VERSION="1.7.1"
+VERSION="1.7.2"
 RELEASE="1"
 PG_MAJOR="18"  # default; override with --pg-version
 SPEC="packaging/rpm/pg_vault_tde.spec"
@@ -62,8 +62,15 @@ mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
 echo "Creating source tarball..."
 TMPDIR=$(mktemp -d)
 mkdir -p "$TMPDIR/pg_vault_tde-${VERSION}"
+# tmp_* covers every scratch directory the test stages produce: tmp_check and
+# tmp_check_iso (pg_regress), tmp_pgext, and tmp_valgrind / tmp_ubsan /
+# tmp_scanbuild (the instrumented CI stages).  Some of those hold files written
+# inside a container under a mapped uid, which the packaging build cannot even
+# read -- so leaving them in does not merely bloat the tarball, it fails it.
 rsync -a --exclude='.git' --exclude='*.o' --exclude='*.so' --exclude='*.bc' \
-         --exclude='packaging' --exclude='tmp_pgext' \
+         --exclude='packaging' --exclude='tmp_*' \
+         --exclude='results' --exclude='log' --exclude='output_iso' \
+         --exclude='regression.diffs' --exclude='regression.out' \
          . "$TMPDIR/pg_vault_tde-${VERSION}/"
 tar -czf ~/rpmbuild/SOURCES/"$TARBALL" \
     -C "$TMPDIR" "pg_vault_tde-${VERSION}"

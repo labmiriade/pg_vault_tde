@@ -2,19 +2,28 @@
 # ci/scripts/run-all.sh — Master orchestrator for the local CI pipeline
 #
 # Runs all test stages in sequence:
-#   1. regress     — 109-test SQL regression suite (52 v1.4 + 20 v1.5 + 37 v1.6)
+#   1. regress     — 141-test SQL regression suite (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7)
+#   1b. matrix      — regress + tap on the other supported PG majors
+#   1c. errorpath  — 13-test error-path suite: the PG_CATCH handlers (141-153)
 #   2. checksums   — Page checksum compatibility
 #   3. tap         — Perl TAP tests (extension load, backup hooks)
 #   4. isolation   — Concurrency/MVCC isolation specs
 #   5. vault       — Vault mock integration (via Compose)
 #   6. openbao     — OpenBao 3-node Raft integration (AppRole, KEK, BGW)
-#   7. wallet      — Local wallet full regression (kms_provider=local, tests 74-80)
+#   7. wallet      — Local wallet full regression (kms_provider=local, tests 73-109)
 #   8. schema      — Multi-database and multi-schema isolation (SCHEMA-1..20)
-#   9. bench       — Performance benchmark (informational, non-blocking)
+#   9. semgrep     — the project's own Semgrep rules over src/ (ci/semgrep/)
+#   9b. scan-build — Clang static analyzer over the sources (compile only)
+#  10. ubsan       — Extension built with -fsanitize=undefined
+#  10b. asan       — Extension built with -fsanitize=address
+#  11. valgrind    — Valgrind memcheck over the full TDE workload (slow)
+#  12. cassert     — PostgreSQL built --enable-cassert -DUSE_VALGRIND (slowest)
+#  10. bench       — Performance benchmark (informational, non-blocking)
 #
 # Usage:
 #   bash ci/scripts/run-all.sh                    # run all stages
 #   bash ci/scripts/run-all.sh --skip-bench       # skip benchmark
+#   bash ci/scripts/run-all.sh --skip-valgrind    # skip memcheck (slow)
 #   bash ci/scripts/run-all.sh --skip-openbao     # skip OpenBao stage
 #   bash ci/scripts/run-all.sh --skip-wallet      # skip local wallet stage
 #   bash ci/scripts/run-all.sh --skip-schema      # skip schema isolation stage
@@ -38,6 +47,9 @@ SKIP_OPENBAO=0
 SKIP_WALLET=0
 SKIP_SCHEMA=0
 SKIP_INSTALL_TEST=0
+SKIP_VALGRIND=0
+SKIP_DEEP=0
+SKIP_MATRIX=0
 ONLY_STAGES=()
 
 while [[ $# -gt 0 ]]; do
@@ -62,6 +74,21 @@ while [[ $# -gt 0 ]]; do
             SKIP_INSTALL_TEST=1
             shift
             ;;
+        --skip-valgrind)
+            SKIP_VALGRIND=1
+            shift
+            ;;
+        --skip-matrix)
+            # the other PostgreSQL majors: one full image build each
+            SKIP_MATRIX=1
+            shift
+            ;;
+        --skip-deep)
+            # scan-build, ubsan, valgrind, cassert: the slow instrumented
+            # stages.  Everything else is a few minutes; these are not.
+            SKIP_DEEP=1
+            shift
+            ;;
         --only)
             shift
             while [[ $# -gt 0 && ! "$1" =~ ^-- ]]; do
@@ -70,9 +97,9 @@ while [[ $# -gt 0 ]]; do
             done
             ;;
         --help|-h)
-            echo "Usage: $0 [--skip-bench] [--skip-openbao] [--skip-wallet] [--skip-install-test] [--only stage1 stage2 ...]"
+            echo "Usage: $0 [--skip-bench] [--skip-openbao] [--skip-wallet] [--skip-install-test] [--skip-valgrind] [--skip-deep] [--skip-matrix] [--only stage1 stage2 ...]"
             echo ""
-            echo "Stages: regress checksums tap isolation vault openbao wallet schema install-test bench"
+            echo "Stages: pins regress matrix errorpath checksums tap isolation vault openbao wallet pkcs11 schema upgrade semgrep scan-build ubsan asan valgrind cassert install-test bench"
             exit 0
             ;;
         *)
@@ -85,7 +112,7 @@ done
 # ---------------------------------------------------------------------------
 # Stage definitions
 # ---------------------------------------------------------------------------
-ALL_STAGES=(regress checksums tap isolation vault openbao wallet pkcs11 schema install-test bench)
+ALL_STAGES=(pins regress matrix errorpath checksums tap isolation vault openbao wallet pkcs11 schema upgrade semgrep scan-build ubsan asan valgrind cassert install-test bench)
 
 should_run() {
     local stage="$1"
@@ -109,6 +136,15 @@ should_run() {
     fi
     if [[ "$stage" == "install-test" && "$SKIP_INSTALL_TEST" == "1" ]]; then
         return 1
+    fi
+    if [[ "$stage" == "valgrind" && "$SKIP_VALGRIND" == "1" ]]; then
+        return 1
+    fi
+    if [[ "$stage" == "matrix" && "$SKIP_MATRIX" == "1" ]]; then
+        return 1
+    fi
+    if [[ "$SKIP_DEEP" == "1" ]]; then
+        case "$stage" in scan-build|ubsan|asan|valgrind|cassert) return 1 ;; esac
     fi
     return 0
 }

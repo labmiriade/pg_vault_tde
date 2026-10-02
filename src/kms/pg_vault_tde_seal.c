@@ -32,7 +32,8 @@
 #include <openssl/evp.h>            /* PKCS5_PBKDF2_HMAC */
 #include <openssl/crypto.h>         /* OPENSSL_cleanse, CRYPTO_memcmp */
 
-#include "src/include/pg_vault_tde_catalog.h"  /* pg_vault_tde_catalog_evict_all  pg_vault_tde_catalog_read_all_wrapped*/
+#include "src/include/pg_vault_tde_catalog.h"
+#include "src/include/pg_vault_tde_kms.h"      /* tde_caller_is_superuser */  /* pg_vault_tde_catalog_evict_db, pg_vault_tde_catalog_read_all_wrapped */
 
 
 /* --- Bundle format constants (independent from the local-wallet bundle) --- */
@@ -42,7 +43,7 @@
 #define SEAL_LABEL_LEN    63            /* NUL-padded */
 #define SEAL_HMAC_SALT    "tde-seal-hmac-v1"
 #define SEAL_HMAC_LEN     32            /* HMAC-SHA256 */
-#define SEAL_PBKDF2_ITERS 600000        /* match LOCAL_PBKDF2_ITERS */
+#define SEAL_PBKDF2_ITERS 600000        /* NIST SP 800-132 minimum is 210000 */
 
 /*
  * Derive the 32-byte HMAC key from the seal passphrase (PBKDF2-SHA256).
@@ -171,7 +172,7 @@ pg_vault_tde_seal_keys_sql(PG_FUNCTION_ARGS)
     size_t  bundle_len;
     int     nrows;
 
-    if (!superuser())
+    if (!tde_caller_is_superuser())
         ereport(ERROR,
                 errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
                 errmsg("pg_vault_tde_seal_keys requires superuser"));
@@ -234,7 +235,7 @@ pg_vault_tde_seal_keys_bytea_sql(PG_FUNCTION_ARGS)
     bytea  *bundle;
     int     nrows;
 
-    if (!superuser())
+    if (!tde_caller_is_superuser())
         ereport(ERROR,
                 errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
                 errmsg("pg_vault_tde_seal_keys_bytea requires superuser"));
@@ -275,7 +276,7 @@ pg_vault_tde_unseal_keys_sql(PG_FUNCTION_ARGS)
     uint32  i;
     int     imported = 0;
 
-    if (!superuser())
+    if (!tde_caller_is_superuser())
         ereport(ERROR,
                 errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
                 errmsg("pg_vault_tde_unseal_keys requires superuser"));
@@ -406,7 +407,7 @@ pg_vault_tde_unseal_keys_sql(PG_FUNCTION_ARGS)
 
     pfree(buf);
 
-    pg_vault_tde_catalog_evict_all();
+    pg_vault_tde_catalog_evict_db();
 
     ereport(LOG,
             errmsg("pg_vault_tde: unsealed %d wrapped DEK(s) from \"%s\"", imported, src));

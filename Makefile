@@ -26,7 +26,7 @@ endif
 # PostgreSQL version validation
 #
 # Supported range: PG 17 .. PG 19.  Update TDE_PG_MAX when adding a new
-# major version (see .github/copilot-instructions.md § 0.5).
+# major version.
 # ---------------------------------------------------------------------------
 TDE_PG_MIN := 17
 TDE_PG_MAX := 19
@@ -50,6 +50,7 @@ OBJS = \
 	src/kms/pg_vault_tde_kms_pkcs11.o \
 	src/kms/pg_vault_tde_catalog.o \
 	src/kms/pg_vault_tde_rotation_bgw.o \
+	src/kms/pg_vault_tde_preload_bgw.o \
 	src/kms/pg_vault_tde_seal.o \
 	src/crypto/pg_vault_tde_crypto.o \
 	src/crypto/pg_vault_tde_hw_accel.o \
@@ -105,13 +106,27 @@ dist:
 # append to PGXS defaults rather than being overwritten by them.
 #
 # OpenSSL 3.x and libcurl are required. pkg-config locates them.
-# -std=c99 enforces the language standard mandated by copilot-instructions.md.
+# -std=c99 enforces the language standard.
 # -Wall -Wextra catch common PostgreSQL extension pitfalls early.
 # VERSION must be a single line with no trailing content; note that changing
 # VERSION does not force a rebuild of already-compiled .o files under plain
 # incremental `make` — a `make clean` is needed after bumping VERSION for the
 # embedded build-version string to update (accepted limitation, not solved
 # via fancier Make dependency tracking).
+#
+# TDE_HAVE_VM_CLEAR_LOCKED: visibilitymap_clear_locked() arrived with the fix
+# for "WAL logging of operations that clear bits in tables' visibility maps"
+# (PG 18.6 and the 17 minor of 2026-07-15), which the custom TOAST rmgr's clone
+# of heap_insert has to follow to keep registering the visibility-map buffer in
+# its record (PSQLE-227).  Probed rather than keyed to a version number: on a
+# minor without it, core's own heap_insert does not register the buffer either,
+# and the clone matching that core is what we want.
+TDE_HAVE_VM_CLEAR_LOCKED := $(shell grep -lq visibilitymap_clear_locked \
+    "$(shell $(PG_CONFIG) --includedir-server)/access/visibilitymap.h" 2>/dev/null && echo yes)
+ifeq ($(TDE_HAVE_VM_CLEAR_LOCKED),yes)
+override CFLAGS += -DTDE_HAVE_VM_CLEAR_LOCKED
+endif
+
 override CFLAGS  += -Wall -Wextra -std=c99 \
                     -Wno-unused-parameter \
                     -I$(srcdir)/src \
@@ -121,6 +136,32 @@ override CFLAGS  += -Wall -Wextra -std=c99 \
 # -ldl: dlopen() of the vendor PKCS#11 module (pkcs11 KMS provider).
 # No-op on glibc >= 2.34 (dlopen lives in libc) but required for portability.
 override SHLIB_LINK += $(shell pkg-config --libs openssl libcurl) -ldl
+
+# ---------------------------------------------------------------------------
+# TDE_SANITIZE: build the extension under a compiler sanitizer.
+#
+#   make TDE_SANITIZE=undefined      # UBSan  (used by make ci-ubsan)
+#   make TDE_SANITIZE=address        # ASan   (used by make ci-asan; the server LD_PRELOADs it)
+#
+# UBSan is the one that pays for itself here: it is a pure compile-time
+# instrumentation of OUR objects, so the stock server binary stays untouched
+# and no PostgreSQL rebuild is needed.  It catches the undefined behaviour a
+# crypto/wire-format layer actually hits — signed overflow in length
+# arithmetic, shifts past the width of the type, misaligned loads out of a
+# packed on-disk tuple, pointer arithmetic that leaves the object.
+#
+# The .so gains a DT_NEEDED on the sanitizer runtime, so libubsan must be
+# present at run time (ci/containers/pg-ubsan.Containerfile installs it).
+# Reports are non-fatal by default and go wherever UBSAN_OPTIONS=log_path
+# points; run-ubsan.sh collects and greps them.
+#
+# ASan is listed for completeness but is NOT wired into CI: it needs its
+# runtime loaded before libc in the postmaster itself, which means an
+# LD_PRELOAD on a server this Makefile does not build.
+ifdef TDE_SANITIZE
+override CFLAGS     += -fsanitize=$(TDE_SANITIZE) -fno-omit-frame-pointer -g
+override SHLIB_LINK += -fsanitize=$(TDE_SANITIZE)
+endif
 
 # ---------------------------------------------------------------------------
 # check-cpu: print CPU hardware encryption capabilities. This does not affect
@@ -152,7 +193,7 @@ bench-cpu:
 # All targets delegate to ci/scripts/ which auto-detect podman/docker.
 # Override container runtime:  make ci-all CONTAINER_RT=docker
 # ===========================================================================
-.PHONY: ci-all ci-regress ci-checksums ci-tap ci-isolation ci-vault ci-wallet ci-pkcs11 ci-schema ci-bench ci-install-test ci-clean
+.PHONY: ci-all ci-pins ci-regress ci-matrix ci-errorpath ci-checksums ci-tap ci-soak ci-isolation ci-vault ci-openbao ci-wallet ci-pkcs11 ci-schema ci-valgrind ci-cassert ci-ubsan ci-scan-build ci-asan ci-semgrep ci-sbom ci-security-report ci-bench ci-install-test ci-clean
 
 ci-all:
 	@bash ci/scripts/run-all.sh
@@ -160,17 +201,56 @@ ci-all:
 ci-regress:
 	@bash ci/scripts/run-regress.sh
 
+ci-matrix:
+	@bash ci/scripts/run-matrix.sh
+
+ci-errorpath:
+	@bash ci/scripts/run-errorpath.sh
+
+ci-valgrind:
+	@bash ci/scripts/run-valgrind.sh
+
+ci-cassert:
+	@bash ci/scripts/run-cassert.sh
+
+ci-ubsan:
+	@bash ci/scripts/run-ubsan.sh
+
+ci-asan:
+	@bash ci/scripts/run-asan.sh
+
+ci-scan-build:
+	@bash ci/scripts/run-scan-build.sh
+
+ci-semgrep:
+	@bash ci/scripts/run-semgrep.sh
+
+ci-sbom:
+	@bash ci/scripts/run-sbom.sh
+
+ci-security-report:
+	@bash ci/scripts/run-security-report.sh
+
 ci-checksums:
 	@bash ci/scripts/run-checksums.sh
 
 ci-tap:
 	@bash ci/scripts/run-tap.sh
 
+ci-pins:
+	@bash ci/scripts/run-pins.sh
+
+ci-soak:
+	@bash ci/scripts/run-soak.sh
+
 ci-isolation:
 	@bash ci/scripts/run-isolation.sh
 
 ci-vault:
 	@bash ci/scripts/run-vault.sh
+
+ci-openbao:
+	@bash ci/scripts/run-openbao.sh
 
 ci-wallet:
 	@bash ci/scripts/run-wallet.sh
@@ -185,6 +265,9 @@ ci-bench:
 	@bash ci/scripts/run-bench.sh; rc=$$?; \
 	if [ $$rc -eq 7 ]; then echo "ci-bench: avg overhead above threshold (non-fatal WARN, matches run-all.sh)"; exit 0; fi; \
 	exit $$rc
+
+ci-upgrade:
+	@bash ci/scripts/run-upgrade.sh
 
 ci-install-test:
 	@bash ci/scripts/run-install-test.sh --all

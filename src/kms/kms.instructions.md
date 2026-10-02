@@ -8,7 +8,7 @@
 
 Manages the Data Encryption Key (DEK) lifecycle:
 1. **Shared-memory cache** — per-relation DEK cache (`TdeRelDekMap`, an `HTAB`
-   keyed by relid), guarded by a single `LWLock`. Lives in
+   keyed by **`(dbid, relid)`**), guarded by a single `LWLock`. Lives in
    `src/kms/pg_vault_tde_catalog.c`.
 2. **Vault token cache** — fixed-size `pg_vault_tde_kms_cache` shmem struct in
    `pg_vault_tde_kms.c` holding the shared Vault auth token (dynamic tranche).
@@ -33,10 +33,10 @@ Two distinct shmem objects, two distinct (both correct) tranche strategies:
 # 1. TdeRelDekMap HTAB — DEK cache (named tranche) — in pg_vault_tde_catalog.c
 shmem_request_hook (pg_vault_tde_catalog_shmem_request):
   ├── RequestAddinShmemSpace(hash_estimate_size(capacity, sizeof(TdeRelDekMap)))
-  └── RequestNamedLWLockTranche("TdeRelDekMap", 1)   ← named-tranche request OK here
+  └── RequestNamedLWLockTranche("pg_vault_tde_rel_dek_map", 1)   ← named-tranche request OK here
 shmem_startup_hook (pg_vault_tde_catalog_shmem_init):
-  ├── rel_dek_lock = &GetNamedLWLockTranche("TdeRelDekMap")[0].lock
-  └── ShmemInitHash("TdeRelDekMap", capacity, capacity, &info, HASH_ELEM | HASH_BLOBS)
+  ├── rel_dek_lock = &GetNamedLWLockTranche("pg_vault_tde_rel_dek_map")[0].lock
+  └── ShmemInitHash("pg_vault_tde_rel_dek_map", capacity, capacity, &info, HASH_ELEM | HASH_BLOBS)
 
 # 2. pg_vault_tde_kms_cache — Vault token (dynamic tranche) — in pg_vault_tde_kms.c
 shmem_request_hook:
@@ -247,6 +247,14 @@ Two other historical occurrences of the same bug were fixed in
 `src/kms/pg_vault_tde_kms_local.c` (lines ~1413 in `change_passphrase` and
 ~1706 in `rotate_kek` — both used `int new_len = sizeof(new_wrapped);`).
 
+This contract applies symmetrically to `unwrap_dek(wrapped, wrapped_len, dek_out, dek_len)`:
+`dek_len` here is **input-only capacity** because the unwrapped output is
+always exactly `TDE_DEK_LEN`. Providers MAY assert `dek_len >= TDE_DEK_LEN`.
+
+When implementing a new provider, call sites that allocate with
+`palloc(TDE_WRAPPED_DEK_MAX)` MUST still set `*out_len = TDE_WRAPPED_DEK_MAX`
+before the call — the same bidirectional contract holds for heap buffers.
+
 ### `change_passphrase` / `rotate_kek` SPI re-wrap contract (v1.6 patch)
 
 Both functions iterate over `pg_vault_tde_catalog` and re-wrap each DEK.
@@ -269,40 +277,43 @@ The required pattern is **two-phase**: snapshot the SELECT into caller-
 owned arrays in `TopTransactionContext` BEFORE issuing any UPDATE, then
 iterate the local arrays.
 
-### `change_passphrase` KEK derivation (v1.6 patch)
+### Local wallet: KEK versions (PSQLE-185)
 
-`local_open_wallet(path, NEW_pass, kek)` runs `PKCS12_verify_mac`, which
-fails on a wallet file still authenticated under the OLD passphrase.  The
-correct sequence is:
+The wallet keeps **every KEK version** in one PKCS#12 file: one shrouded key bag
+per version, friendlyName `pg_vault_tde_kek.v<N>`, current (highest) first.  A
+wallet written before 1.7.2 has a single bag `pg_vault_tde_kek`, read as
+version 1.  In memory: `LocalKekRing`, `kek[0]` current.
 
-1. `local_open_wallet(path, OLD_pass, old_kek)` — verifies on-disk MAC.
-2. `local_derive_kek_from_pass(NEW_pass, new_kek)` — PBKDF2-only with the
-   fixed `"pg_vault_tde_kek_v1"` salt; no file I/O, no MAC check.
-3. Re-wrap each DEK with `local_wrap_dek_with_kek(...new_kek)`.
-4. Rewrite the wallet file under `NEW_pass` via `local_create_wallet_file`.
+Rules, each paid for by a lost database in 1.7.1:
 
-`local_derive_kek_from_pass()` is the helper that decouples KEK
-derivation from MAC verification.  Use it instead of
-`local_wrap_dek_with_pass()` whenever the wallet file's MAC does not yet
-match the target passphrase.
+1. **Add, never replace, and do it first.**  `local_prepare_kek_rotation()` and
+   `pg_vault_tde_wallet_change_passphrase()` write the file with the new version
+   in front (`local_write_wallet_ring()`, `durable_rename()`) **before**
+   `pg_vault_tde_catalog_rewrap_all()` touches a row.  The file is not
+   transactional; if it changes only after the re-wrap, a rollback, a later
+   error in the statement or a crash leaves the catalog under a KEK that exists
+   nowhere.
+2. **Unwrap with every version** (`local_unwrap_dek_with_ring()`), newest first.
+   Wrapped DEKs carry no version tag: the RFC 3394 integrity check rejects a
+   wrong KEK.  `local_unwrap_dek_with_kek()` is silent on failure for that
+   reason — report once, after the last version.
+3. **Read-modify-write under the file lock** (`local_wallet_lock_file()`,
+   `<wallet>.lock`, `flock`).  Two rotations reading the same versions would
+   each write back a file missing the other's new one.
+4. **A cached ring can be stale.**  `wallet_unlock()` caches the ring per
+   backend; after another session adds a version, `local_unwrap_dek()` reloads
+   from the passphrase source, or tells the session to unlock again.  Wrapping
+   with an older cached `kek[0]` is safe because versions are never removed.
+5. **Rotation needs the passphrase from a source**, not a cached ring: the file
+   is re-encrypted under it.
+6. **Everything local is wrapped under a KEK the file holds.**  Nothing derives a
+   KEK from the passphrase: `migrate_vault_to_wallet()` did, and every table it
+   migrated was lost (PSQLE-188).  It now opens the wallet and uses `kek[0]`.
 
-### `rotate_kek` / `export_bundle` dual-source KEK (v1.6 patch, unified in v1.7)
-
-`pg_vault_tde_rotate_kek()` (v1.7, unified; replaced the local-wallet-only
-`pg_vault_tde_wallet_rotate_kek()` from v1.6) prefers
-`local_wallet_state->kek` (set by a prior `wallet_unlock`) over
-`local_get_passphrase()` when running under the `local` provider.  This means
-tests that already called `wallet_unlock` no longer need to configure
-`pg_vault_tde.wallet_passphrase_env` to call `rotate_kek`.  Under the `vault`
-provider the function calls Vault Transit key rotation and re-wraps all DEKs.
-
-This contract applies symmetrically to `unwrap_dek(wrapped, wrapped_len, dek_out, dek_len)`:
-`dek_len` here is **input-only capacity** because the unwrapped output is
-always exactly `TDE_DEK_LEN`. Providers MAY assert `dek_len >= TDE_DEK_LEN`.
-
-When implementing a new provider, call sites that allocate with
-`palloc(TDE_WRAPPED_DEK_MAX)` MUST still set `*out_len = TDE_WRAPPED_DEK_MAX`
-before the call — the same bidirectional contract holds for heap buffers.
+Pruning old versions is not implemented (1.8); `LOCAL_KEK_MAX_VERSIONS` caps the
+ring.  `pg_dump_tde_kms_local.c` has its own reader with the same rules, so a
+dump taken before a rotation restores.  Regression:
+`tap/30_rotate_kek_atomicity.t`, for every provider.
 
 ### Provider Registration
 
@@ -337,6 +348,13 @@ else if (strcmp(guc_kms_provider, "kmip") == 0)
 > registration happens in the GUC **assign hook**
 > `tde_kms_provider_assign()` in `pg_vault_tde.c` — NOT in `_PG_init`.
 
+### Rotation worker signals (PSQLE-211)
+
+The rotation worker takes SIGTERM as a cancel (`StatementCancelHandler`), never
+`die()`: its progress row is recorded `failed` only by its PG_CATCH, which a FATAL
+skips.  A crash or an immediate shutdown leaves the row `running` with no worker —
+documented, not detectable from the row alone.
+
 ### Local Wallet Provider Rules (`local`)
 
 - Wallet file: `/var/lib/pg_vault_tde/<DB_OID>/wallet.p12` (default; GUC `pg_vault_tde.wallet_path`)
@@ -349,6 +367,11 @@ else if (strcmp(guc_kms_provider, "kmip") == 0)
 - On `unwrap_dek()`: open wallet, derive KEK, `EVP_aes_256_unwrap()`, return plaintext
   DEK to caller's stack frame; `OPENSSL_cleanse(kek, 32)` immediately after
 - Wallet file permissions MUST be `0600` — enforced at create time and in `health_check()`
+- Every wallet write reaches the disk before anything is wrapped under it:
+  `local_write_wallet_ring()` (`.new` + `durable_rename()`), and `wallet_init()`
+  (`O_EXCL`, `pg_fsync`, both directory levels).
+- `wallet_init()` never makes a wallet while a catalog row is `local`: a new KEK
+  opens none of those keys (PSQLE-208).
 - PKCS#11 (HSM-backed keys) is a separate `pkcs11` provider — `local` is software-only
 
 ### PKCS#11 Provider Rules (`pkcs11`, v1.7)
@@ -384,6 +407,12 @@ else if (strcmp(guc_kms_provider, "kmip") == 0)
   resolves the right key regardless of what's current.  `commit_kek_rotation`
   is a pure in-backend cache update — no token-side promotion, hence no
   crash window.
+- The next version is the highest **on the token** + 1, never this
+  backend's `kek_version` + 1: a rotation that failed after
+  `prepare_kek_rotation` left its key there and the cache where it was, and
+  the same session asked for that label forever (PSQLE-209).  A label that
+  exists anyway means a concurrent rotation — its key may already wrap DEKs:
+  never advise removing it.
 - **Cross-backend rotation propagation**: `commit_kek_rotation` is per-
   backend cache state (`Pkcs11State`, a file-scope `static`) — without more,
   an already-connected sibling backend would keep wrapping new DEKs under
@@ -448,23 +477,171 @@ the very first `wrap_dek` call after `wallet_init`.  Always use `PKCS12_DEFAULT_
 ```c
 /*
  * Each encrypted relation has its own DEK entry, stored as the value type of
- * the TdeRelDekMap HTAB (ShmemInitHash, HASH_BLOBS) keyed by relid.
+ * the TdeRelDekMap HTAB (ShmemInitHash, HASH_BLOBS) keyed by (dbid, relid).
  * There is NO per-entry lock — a single file-scope `rel_dek_lock` (named
- * tranche "TdeRelDekMap") guards the whole table.
+ * tranche "pg_vault_tde_rel_dek_map") guards the whole table.
  */
+typedef struct TdeRelDekMapKey {
+    Oid          dbid;                   /* always MyDatabaseId */
+    Oid          relid;                  /* effective relid */
+} TdeRelDekMapKey;
+
 typedef struct TdeRelDekMap {
-    Oid          relid;                  /* hash key */
+    TdeRelDekMapKey key;                 /* hash key */
     char         dek[TDE_DEK_LEN];       /* current AES-256 DEK, 32 bytes */
     char         prev_dek[TDE_DEK_LEN];  /* previous DEK (valid during rotation) */
     uint64       generation;             /* rotation epoch for this relation */
     bool         dek_valid;              /* true iff dek[] holds a live key */
     bool         prev_dek_valid;         /* true iff prev_dek[] is populated */
+    bool         rotating;               /* an online rotation owns the entry */
 } TdeRelDekMap;
 ```
 
 Defined in `src/include/pg_vault_tde_catalog.h`. The v1.4 global DEK
 (`TdeShmemData`, `relid = 0` sentinel) was removed in v1.7. All relations must
 have a `pg_vault_tde_catalog` entry.
+
+### The cache key MUST include the dbid
+
+**A relid is unique only within a database** — not across databases, not
+cluster-wide.  `CREATE DATABASE` physically copies the template's directory,
+so a clone hands out pg_class OIDs identical to its template's; colliding
+relids between unrelated databases are normal.  `TdeRelDekMap` is a single
+shmem segment read by the backends of every database, so a relid-only key
+lets one database's DEK be served to another, and a `DROP TABLE` in one
+database evict another's live entry.  Regression: `tap/21_cache_key_cross_db.t`.
+
+Never add a `dbid` parameter to the accessors in
+`src/include/pg_vault_tde_catalog.h`.  Build the key with the file-scope
+helper instead:
+
+```c
+static inline void tde_rel_dek_key(TdeRelDekMapKey *key, Oid relid);
+```
+
+It fills `dbid` from `MyDatabaseId`, which is correct on every path that can
+reach the cache — a regular backend, the rotation BGW after
+`BackgroundWorkerInitializeConnectionByOid()`, a walsender during logical
+decoding — and it `MemSet`s the struct first because `HASH_BLOBS` hashes
+padding bytes too.  One derivation point cannot be given the wrong value;
+fourteen call sites can.
+
+### The cached `generation` belongs to the cached DEK
+
+`TdeRelDekMap.generation` mirrors a value whose home is the
+`pg_vault_tde_catalog` row.  The row rolls back with its transaction; shared
+memory rolls back with nothing.  Two rules keep them from diverging:
+
+1. **Write it only alongside the DEK it describes.**  `tde_rel_dek_cache_store()`
+   sets `dek[]` and `generation` from the same catalog read.  The only other
+   writers are a rotation's `pg_vault_tde_catalog_zero_rel_dek()`, which keeps
+   the *outgoing* key's generation, and its commit/abort callback.  The bump to
+   N+1 is `pg_vault_tde_catalog_update_rel_dek()`'s job, and it is
+   transactional.
+2. **Read DEK and generation in one call.**  `pg_vault_tde_kms_get_rel_dek_gen()`
+   to encrypt, `pg_vault_tde_kms_get_rel_dek_for_gen()` to decrypt the
+   generation a ciphertext carries.  Two calls can straddle a rotation and tag
+   a ciphertext with a generation its key does not have.
+
+Breaking either rule reproduces the PSQLE-158 failure: an aborted rotation
+strands shared memory at N+1 while the catalog is back at N, rows written
+afterwards are tagged N+1 but encrypted under DEK N, and the next rotation
+moves to N+2 where the oldest rows match neither `generation` nor
+`generation - 1` — they stop decrypting.  Regression:
+`tap/23_rotation_generation_drift.t`.
+
+### An online rotation owns its cache entry
+
+`pg_vault_tde_rotate_online()` demotes the shared entry and rewrites the
+catalog row in the worker's transaction, which nobody else sees until it
+commits.  Up to 1.7.1 any backend touching the table in between — a `SELECT`
+was enough — reloaded the cache from the catalog *its* snapshot showed and put
+the outgoing DEK back as current; the worker then re-encrypted the whole table
+with it, and that key existed only in shared memory.  All 1,000 rows of 1,000
+were gone at the next restart (PSQLE-184).  The rules now:
+
+1. **The worker locks writers out first.**  `ShareRowExclusiveLock` on the
+   heap, then the snapshot — in that order, or the rows of the writers it
+   waited for are left out of the re-encryption.
+2. **The worker's keys never enter shared memory.**  `TdeRotationState` in
+   `pg_vault_tde_catalog.c` holds the outgoing and the new DEK; both accessors
+   answer the worker from it before looking at the cache.
+3. **Nothing installs a current key while `rotating` is set.**
+   `tde_rel_dek_cache_store()` returns without storing; everyone else gets the
+   outgoing key from `prev_dek[]` under the entry's unchanged `generation`.
+4. **The switch happens in `tde_rotation_xact_callback()`.**  `XACT_EVENT_COMMIT`
+   runs after the commit is visible and before locks are released, so the
+   queued writers wake up to the new key; `XACT_EVENT_ABORT` restores the old
+   one.  The callback must not raise an error.
+5. **The rewrite covers the TOAST relation.**  A row handed to
+   `tuple_update()` as scanned keeps its external pointers, and the toaster
+   reuses unchanged ones: the chunks would stay under the outgoing key, which
+   no catalog row holds once the rotation commits (PSQLE-189).
+   `reencrypt_table()` fetches on-disk external values back first
+   (`tde_fetch_back_external()`); dropped columns become NULL instead, as in any
+   UPDATE — a VACUUM FULL up to 1.7.1 may have left their pointers dangling
+   (PSQLE-192).
+
+6. **A standby only sees the catalog.**  Nothing but the replicated row tells a
+   standby's cache about a rotation, so `tde_rel_dek_cache_store()` replaces a
+   valid entry when the catalog shows a newer generation, and entries stored during
+   recovery carry `loaded_in_recovery` until checked: after recovery,
+   `pg_vault_tde_kms_get_rel_dek_gen()` does not encrypt with one before the slow
+   path has compared it with the catalog (PSQLE-190).
+
+7. **The rewrite maintains every index.**  `heap_update()` leaves index entries
+   to its caller; `reencrypt_table()` inserts them with `ExecInsertIndexTuples()`
+   for every rewrite that is not HOT, and rebuilds only the tde_btree indexes,
+   whose keys depend on the DEK (PSQLE-194).
+
+Regression: `tap/29_rotate_online_concurrent_access.t` (a row lock on
+`pg_vault_tde_catalog` holds the worker inside the window);
+`tap/32_rotate_online_toast.t` for rule 5; `tap/34_standby_rotation.t` for rule 6; `tap/35_rotate_online_indexes.t` for rule 7.
+
+### Who may call: the calling role, never the current one (PSQLE-206)
+
+Most key-management functions are `SECURITY DEFINER`.  Inside them `superuser()`
+and `GetUserId()` are the function's owner — the superuser who ran `CREATE
+EXTENSION` — so a check on them lets through anyone who has been granted
+`EXECUTE`.  Check the role that called the function: `tde_caller_is_superuser()`
+(`superuser_arg(GetOuterUserId())`, `pg_vault_tde_kms.h`); a privilege on a table,
+as in `reencrypt_table()`, with `pg_class_aclcheck(..., GetOuterUserId(), ...)`.
+Every new SQL-callable function that manages keys or rewrites data needs one.
+
+`GetOuterUserId()` is the session role, so it is **not** the caller inside a
+security-restricted operation: `ANALYZE`, `VACUUM`, `REINDEX` and the index
+expressions they evaluate run as the table's owner while the session role stays
+what it was (PSQLE-225).  `tde_caller_is_superuser()` returns false there, and
+`reencrypt_table()` raises; a new check needs the same
+`InSecurityRestrictedOperation()` guard.  It cannot see past its own `SECURITY
+DEFINER` wrapper either — a granted role reaches these functions through code a
+superuser runs — which is why 1.8 removes the wrapper and the grants.
+Regression: `tap/41_reencrypt_table_privileges.t`, `tap/42_security_definer_callers.t`,
+`tap/55_restricted_operation_caller.t`.
+
+### Evicting many entries is per-database
+
+There is one entry point, `pg_vault_tde_catalog_evict_db()`, and it covers
+`MyDatabaseId` only.  Every caller — `wallet_lock`, `wallet_unlock`,
+`wallet_change_passphrase`, `migrate_vault_to_wallet`, `unseal_keys`,
+`rotate_kek` — acts on per-database state, so none of them can invalidate
+another database's keys.  Do not reintroduce a cluster-wide variant unless
+something actually calls it; it is this function minus the `MyDatabaseId` test.
+
+**The on-disk side needs no dbid.**  `pg_vault_tde_catalog` is an ordinary
+table created by `CREATE EXTENSION` in the extension's schema, so it exists
+once per database and its `relid` primary key is unambiguous there; every
+access goes through `table_open()` in the current backend's database.  The
+local wallet is per-database for the same reason
+(`/var/lib/pg_vault_tde/<db_oid>/wallet.p12`).  Shared memory is the one place
+where per-database namespaces meet.
+
+A consequence for any **startup preload BGW**: it cannot read every database's
+DEKs from one connection.  Both the catalog table and the wallet are
+per-database, so it must connect to each database in turn
+(`BackgroundWorkerInitializeConnectionByOid(dboid, ...)`) and call
+`pg_vault_tde_kms_get_rel_dek()` there — the cache store then picks up the
+right dbid on its own.
 
 ---
 

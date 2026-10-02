@@ -1,6 +1,33 @@
--- regression_test.sql
--- Comprehensive integration tests for pg_vault_tde
--- Run inside the podman container after CREATE EXTENSION
+-- regression_test.sql — TDE tests 1-52 for pg_vault_tde (v1.4 baseline)
+--
+-- Not standalone: `make ci-regress` (ci/scripts/run-regress.sh) sets all of this
+-- up. To run the files by hand, start the server with
+--
+--   shared_preload_libraries = 'pg_vault_tde'
+--   pg_vault_tde.dev_mode = on
+--   pg_vault_tde.kms_provider = local
+--   pg_vault_tde.wallet_auto_open = off
+--   pg_vault_tde.wallet_dev_mode_passphrase = tde_regression_pass_2026
+--
+-- then, as superuser:
+--
+--   CREATE EXTENSION pg_vault_tde;   -- installs 1.7, the only version shipped
+--   SELECT pg_vault_tde_wallet_init('tde_regression_pass_2026');
+--
+-- Without the wallet, TEST 4 (wallet unlock) is the first thing that fails.
+--
+-- Run sequence — the four files share cluster state and run in this order:
+--
+--   psql -f sql/regression_test.sql      (tests 1-52)
+--   psql -f sql/regression_test_v15.sql  (tests 53-72)
+--   psql -f sql/regression_test_v16.sql  (tests 73-110)
+--   psql -f sql/regression_test_v17.sql  (tests 111-140, 154-164)
+--
+-- There are no pg_vault_tde--1.x--1.y.sql upgrade scripts. 1.7 is the only
+-- version installed (DATA in the Makefile, default_version in the .control),
+-- so CREATE EXTENSION lands on 1.7 directly and no ALTER EXTENSION is needed.
+-- The vN in a filename is the release that introduced those tests, not an
+-- extension version you have to reach first.
 --
 -- Exit-on-error: any failed assertion aborts the script.
 \set ON_ERROR_STOP on
@@ -63,36 +90,6 @@ DO $$
 BEGIN
     PERFORM pg_vault_tde_wallet_unlock('tde_regression_pass_2026');
     RAISE NOTICE 'TEST 4 PASSED: wallet unlocked';
-END;
-$$;
-
-
--- ================================================================
--- TEST 10: Backup status function works
--- ================================================================
-DO $$
-DECLARE
-    status text;
-BEGIN
-    status := 'backup encryption active';
-    IF status IS NULL OR position('backup encryption active' IN status) = 0 THEN
-        RAISE EXCEPTION 'TEST 10 FAILED: unexpected backup status: %', status;
-    END IF;
-    RAISE NOTICE 'TEST 10 PASSED: backup status = %', status;
-END;
-$$;
-
-
--- ================================================================
--- SUMMARY
--- ================================================================
-DO $$
-BEGIN
-    RAISE NOTICE '================================================';
-    RAISE NOTICE 'CRYPTO PRIMITIVE TESTS: 3 passed (tests 1, 2, 3), 6 removed (5,6,7,9,11,49 — relied on global DEK which was removed)';
-    RAISE NOTICE '  PASSED : 1, 2, 3, 4, 10';
-    RAISE NOTICE '  REMOVED: 5, 6, 7, 8, 9, 11, 49 — encrypt_test/decrypt_test/rotate_key/key_generation (global DEK removed)';
-    RAISE NOTICE '================================================';
 END;
 $$;
 
@@ -848,9 +845,15 @@ BEGIN
     -- Insert a 4000-byte value (typically triggers TOAST compression)
     INSERT INTO tde_large VALUES (2, repeat('Y', 4000));
 
+    -- The value itself: length() of a compressed or out-of-line value may not
+    -- read it at all in a single-byte encoding (PSQLE-202).
     SELECT length(payload) INTO vlen FROM tde_large WHERE id = 2;
     IF vlen IS DISTINCT FROM 4000 THEN
         RAISE EXCEPTION 'TEST 32b FAILED: 4000B payload returned length %', vlen;
+    END IF;
+    SELECT payload INTO v FROM tde_large WHERE id = 2;
+    IF v IS DISTINCT FROM repeat('Y', 4000) THEN
+        RAISE EXCEPTION 'TEST 32b FAILED: 4000B payload content mismatch';
     END IF;
 
     -- Verify round-trip fidelity
@@ -1175,8 +1178,8 @@ BEGIN
     IF (SELECT payload FROM tde_hw_test WHERE id = 1) != 'hardware acceleration test payload' THEN
         RAISE EXCEPTION 'TEST 43 FAILED: short payload mismatch';
     END IF;
-    IF (SELECT length(payload) FROM tde_hw_test WHERE id = 2) != 4096 THEN
-        RAISE EXCEPTION 'TEST 43 FAILED: 4KB payload length mismatch';
+    IF (SELECT payload FROM tde_hw_test WHERE id = 2) IS DISTINCT FROM repeat('x', 4096) THEN
+        RAISE EXCEPTION 'TEST 43 FAILED: 4KB payload mismatch';
     END IF;
     IF (SELECT payload FROM tde_hw_test WHERE id = 3) IS NOT NULL THEN
         RAISE EXCEPTION 'TEST 43 FAILED: NULL payload not NULL';
@@ -1284,6 +1287,14 @@ $$;
 --
 -- Ensures that TIDs are correctly propagated from heap_multi_insert
 -- back to slots, so that index entries point to the right heap tuples.
+--
+-- DO NOT SHRINK THE ROW COUNT BELOW.  This test doubles as the only thing
+-- standing between a regression in pg_vault_tde_aminsert's relam swap and a
+-- silent release.  nbtree checks rd_rel->relam == BTREE_AM_OID inside
+-- BTGetDeduplicateItems (nbtinsert.c) and BTGetFillFactor (nbtsplitloc.c),
+-- and neither macro is reached until a leaf page fills.  A handful of rows
+-- never gets there: 500 does.  Verified by removing the swap and watching
+-- `make ci-cassert` fail here.
 -- ================================================================
 DO $$
 DECLARE
@@ -1587,11 +1598,11 @@ $$;
 DO $$
 BEGIN
     RAISE NOTICE '====================================================';
-    RAISE NOTICE 'TESTS SUMMARY: 46 passed, 6 skipped (LEGACY) — pg_vault_tde v1.4';
-    RAISE NOTICE '   Crypto primitives ........... tests  1-11  (5 skipped: 5,6,7,9,11)';
+    RAISE NOTICE 'TESTS SUMMARY: 44 tests — pg_vault_tde v1.4 (numbered 1-52, with gaps)';
+    RAISE NOTICE '   Registration, wallet ........ tests  1-4';
     RAISE NOTICE '   TAM basic I/O ............... tests 12-14';
     RAISE NOTICE '   DELETE, NULL, index scan .... tests 15-17';
-    RAISE NOTICE '   COPY, multi-col, rotation ... tests 18-20';
+    RAISE NOTICE '   COPY, multi-col, DEK isol. .. tests 18-20';
     RAISE NOTICE '   ANALYZE, FOR UPDATE ......... tests 21-22';
     RAISE NOTICE '   BitmapHeapScan, TABLESAMPLE . tests 23-24';
     RAISE NOTICE '   UPSERT, MERGE ............... tests 25-26';
@@ -1605,8 +1616,9 @@ BEGIN
     RAISE NOTICE '   v1.1: HW accel info, round  . tests 42-43';
     RAISE NOTICE '   v1.3: health_check, batch ... tests 44-47';
     RAISE NOTICE '   v1.2: logical decoding ...... test  48';
-    RAISE NOTICE '   v1.4: wire fmt v2 (SKIP 49), tde_btree  tests 50-52';
-    RAISE NOTICE '   SKIPPED (LEGACY): 5,6,7,9,11,49 — encrypt_test/decrypt_test use global DEK';
+    RAISE NOTICE '   v1.4: tde_btree ............. tests 50-52';
+    RAISE NOTICE '   REMOVED: 5-9, 11, 49 — legacy global-DEK tests, dropped together in 2026-06';
+    RAISE NOTICE '   REMOVED: 10 — pg_vault_tde_backup_status(), removed in 2026-05';
     RAISE NOTICE '====================================================';
 END;
 $$;

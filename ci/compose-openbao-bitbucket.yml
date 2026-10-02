@@ -42,7 +42,7 @@ services:
 
   # ── OpenBao node 1 ─────────────────────────────────────────────────────
   bao-1:
-    image: ${OPENBAO_IMAGE:-docker.io/openbao/openbao:2}
+    image: ${OPENBAO_IMAGE:-docker.io/openbao/openbao:2.6.2@sha256:11fd73a2102cda9c55d5d881a8c3210303146a7ec1e8ac76f526e175c6d24641}
     container_name: bao-1
     hostname: bao-1
     command: ["bao", "server", "-config=/openbao/config/main.hcl"]
@@ -66,7 +66,7 @@ services:
 
   # ── OpenBao node 2 ─────────────────────────────────────────────────────
   bao-2:
-    image: ${OPENBAO_IMAGE:-docker.io/openbao/openbao:2}
+    image: ${OPENBAO_IMAGE:-docker.io/openbao/openbao:2.6.2@sha256:11fd73a2102cda9c55d5d881a8c3210303146a7ec1e8ac76f526e175c6d24641}
     container_name: bao-2
     hostname: bao-2
     command: ["bao", "server", "-config=/openbao/config/main.hcl"]
@@ -93,7 +93,7 @@ services:
 
   # ── OpenBao node 3 ─────────────────────────────────────────────────────
   bao-3:
-    image: ${OPENBAO_IMAGE:-docker.io/openbao/openbao:2}
+    image: ${OPENBAO_IMAGE:-docker.io/openbao/openbao:2.6.2@sha256:11fd73a2102cda9c55d5d881a8c3210303146a7ec1e8ac76f526e175c6d24641}
     container_name: bao-3
     hostname: bao-3
     command: ["bao", "server", "-config=/openbao/config/main.hcl"]
@@ -123,7 +123,7 @@ services:
   # then enable transit + AppRole and publish AppRole creds to a shared volume.
   # Exits 0 when complete.
   bao-init:
-    image: ${OPENBAO_IMAGE:-docker.io/openbao/openbao:2}
+    image: ${OPENBAO_IMAGE:-docker.io/openbao/openbao:2.6.2@sha256:11fd73a2102cda9c55d5d881a8c3210303146a7ec1e8ac76f526e175c6d24641}
     container_name: bao-init
     environment:
       BAO_ADDR: http://bao-1:8200

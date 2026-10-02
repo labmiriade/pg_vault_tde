@@ -13,6 +13,33 @@
 #include "common/base64.h"           /* pg_b64_decode */
 
 /*
+ * tde_caller_is_superuser — whether the role that called the SQL function is a
+ * superuser.  Most key-management functions are SECURITY DEFINER, and inside
+ * them superuser() asks about the function's owner — the superuser who ran
+ * CREATE EXTENSION — so it is always true: only REVOKE ... FROM PUBLIC kept
+ * them closed, and wallet_init() is granted to pg_monitor (PSQLE-206).
+ * GetOuterUserId() is the role outside every SECURITY DEFINER call.
+ */
+#ifndef FRONTEND
+#include "miscadmin.h"               /* GetOuterUserId, superuser_arg */
+
+static inline bool
+tde_caller_is_superuser(void)
+{
+    /*
+     * In a security-restricted operation the session role is not the caller:
+     * ANALYZE, VACUUM and REINDEX run as the table's owner, and the index
+     * expressions they evaluate are that owner's code, while GetOuterUserId()
+     * stays the session role and would lend its privilege to it (PSQLE-225).
+     * No key operation belongs in such a context.
+     */
+    if (InSecurityRestrictedOperation())
+        return false;
+    return superuser_arg(GetOuterUserId());
+}
+#endif
+
+/*
  * AES-256 DEK length in bytes: 256 bits / 8 = 32 bytes.
  * This is the single source of truth for DEK size; do NOT redefine
  * this constant in any .c file (header hygiene rule).
@@ -50,5 +77,6 @@ void pg_vault_tde_kms_pkcs11_shmem_init(void);
  * Must be called from _PG_init() before postmaster fork.
  */
 void   pg_vault_tde_register_bgw(void);
+void   pg_vault_tde_register_preload_bgw(void);
 
 #endif /* PG_VAULT_TDE_KMS_H */

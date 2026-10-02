@@ -21,8 +21,8 @@
  * relation ALSO uses the pg_vault_tde Table AM.  PostgreSQL creates TOAST
  * tables via heap_create_with_catalog; we hook this via the
  * relation_set_new_filelocator TAM callback to set the correct AM Oid before
- * the first write.  When TOAST chunks are inserted into the TOAST table they
- * pass through our tuple_insert hook, which calls tde_toast_encrypt_chunk.
+ * the first write.  TOAST chunks are then ordinary tuples of an encrypted_heap
+ * relation: they are encrypted by the same tuple path as any other tuple.
  *
  * This approach means:
  *  - TOAST chunk encryption is transparent: no changes to query planner.
@@ -53,66 +53,6 @@
 #include "src/include/pg_vault_tde_toast.h"
 #include "src/include/pg_vault_tde_guc.h"      /* pg_vault_tde_toast_custom_rmgr */
 #include "src/include/pg_vault_tde_rmgr.h"     /* tde_toast_wal_insert */
-/*
- * tde_toast_encrypt_chunk
- *
- * Encrypts one raw TOAST chunk (up to TDE_TOAST_CHUNK_SIZE bytes) using
- * AES-256-GCM.  Called from the TAM tuple_insert hook when inserting into a
- * TOAST table that has been assigned the pg_vault_tde AM.
- *
- * Each chunk gets a fresh random IV (generated inside tde_gcm_encrypt via
- * pg_strong_random).  This is intentional: even if two chunks contain the
- * same data (unlikely after pglz/lz4, but possible for sparse data), they
- * produce different ciphertexts.
- *
- * @param chunk_data   raw TOAST chunk bytes
- * @param chunk_len    number of bytes in this chunk
- * @param out_len      set to encrypted output length
- * @returns            palloc'd encrypted buffer; caller cleans up
- */
-char *
-tde_toast_encrypt_chunk(Oid parent_relid, const char *chunk_data, Size chunk_len, Size *out_len)
-{
-    Assert(chunk_data != NULL);
-    Assert(chunk_len > 0 && chunk_len <= TOAST_MAX_CHUNK_SIZE);
-
-    /*
-     * Delegate to the shared AES-256-GCM primitive with the parent
-     * relation's DEK.  The [IV|CT|TAG|VERSION|GEN] wire format is
-     * self-contained: each chunk carries its own IV.
-     */
-    return tde_gcm_encrypt(parent_relid, chunk_data, chunk_len, out_len);
-}
-
-/*
- * tde_toast_decrypt_chunk
- *
- * Decrypts a TOAST chunk previously encrypted by tde_toast_encrypt_chunk.
- * Verifies the GCM authentication tag before returning plaintext; any
- * tampering aborts via ereport(ERROR).
- *
- * @param enc_data     [IV|CT|TAG|VERSION|GEN] encrypted chunk
- * @param enc_len      total encrypted length
- * @param out_len      set to decrypted chunk length
- * @returns            palloc'd plaintext chunk; caller cleans up
- */
-char *
-tde_toast_decrypt_chunk(Oid parent_relid, const char *enc_data, Size enc_len, Size *out_len)
-{
-    char *out;
-
-    Assert(enc_data != NULL);
-    Assert(enc_len > TDE_V4_OVERHEAD);
-
-    /* Chunk path (not the hot seq-scan): palloc the plaintext destination. */
-    out = (char *) palloc(enc_len - TDE_V4_OVERHEAD);
-    if (!tde_gcm_decrypt(parent_relid, enc_data, enc_len, out, out_len))
-    {
-        pfree(out);
-        return NULL;
-    }
-    return out;
-}
 
 /*
  * TOAST read path note:
@@ -214,8 +154,29 @@ Datum pg_vault_tde_toast_save_datum(Relation rel, Datum value,
         toast_pointer.va_rawsize = VARDATA_COMPRESSED_GET_EXTSIZE(dval) + VARHDRSZ;
         VARATT_EXTERNAL_SET_SIZE_AND_COMPRESS_METHOD(toast_pointer, data_todo, 
                                                      VARDATA_COMPRESSED_GET_COMPRESS_METHOD(dval));
-
+        /*
+         * The comparison lives entirely inside PostgreSQL's own macro:
+         *     varatt.h:354  VARATT_EXTERNAL_IS_COMPRESSED(toast_pointer)
+         *       (VARATT_EXTERNAL_GET_EXTSIZE(tp) < (tp).va_rawsize - VARHDRSZ)
+         * Left side is uint32 (va_extinfo & mask), right side is int
+         * (va_rawsize is int32), so -Wsign-compare fires.  We see it and core
+         * does not for two reasons that must BOTH hold: our Makefile adds
+         * -Wextra (core builds with -Wall only), and Assert() expands to
+         * nothing without --enable-cassert, so the macro is only instantiated
+         * in the cassert build.
+         *
+         * Safe on this path: va_rawsize was set two lines above to
+         * VARDATA_COMPRESSED_GET_EXTSIZE(dval) + VARHDRSZ, so the subtraction
+         * yields that extsize back and can never be negative.
+         *
+         * Scoped to this one statement on purpose.  A global -Wno-sign-compare
+         * would also silence signed/unsigned mistakes in the length arithmetic
+         * of tde_gcm_encrypt/decrypt, which is where they would be dangerous.
+         */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wsign-compare"
         Assert(VARATT_EXTERNAL_IS_COMPRESSED(toast_pointer));
+#pragma GCC diagnostic pop
     }
     else {
         data_p = VARDATA(dval);
@@ -317,11 +278,12 @@ Datum pg_vault_tde_toast_save_datum(Relation rel, Datum value,
             * PG_TRY ensures toast_enc is pfree'd on error; the outer PG_TRY in
             * pg_vault_tde_toast_tuple handles toast_rel / idx cleanup.
             */
-            HeapTuple chunk_enc = NULL;
+            HeapTuple volatile chunk_enc = NULL;
             
             PG_TRY();
             {
-                chunk_enc = tde_encrypt_heap_tuple(toast_tup, toast_tup->t_tableOid);
+                chunk_enc = tde_encrypt_heap_tuple(toast_tup, toast_tup->t_tableOid,
+                                                   toast_tup_desc);
 
                 /*
                  * Normally heap_insert (logs under RM_HEAP_ID).  With the
@@ -470,7 +432,23 @@ pg_vault_tde_toast_tuple(Relation rel, HeapTuple newtup, HeapTuple oldtup, int o
 		hoff += BITMAPLEN(natts);
 	hoff = MAXALIGN(hoff);
 	/* now convert to a limit on the tuple data size */
-	maxDataLen = (Size) RelationGetToastTupleTarget(rel, (int) TOAST_TUPLE_TARGET) - hoff;
+	/*
+	 * Reserve room for the encryption overhead.
+	 *
+	 * This loop shrinks the tuple until it fits TOAST_TUPLE_TARGET, but the
+	 * tuple handed to core is not this one: tde_encrypt_heap_tuple() then adds
+	 * TDE_V4_OVERHEAD bytes (IV + tag + version + generation).  Targeting the
+	 * bare TOAST_TUPLE_TARGET therefore produces a tuple that is under the
+	 * threshold here and over it by the time heap_prepare_insert() re-tests it
+	 * (heapam.c:2334) -- whereupon core tries to TOAST opaque ciphertext and
+	 * segfaults in toast_save_datum().
+	 *
+	 * Subtracting the overhead here makes the guarantee hold end to end: what
+	 * this function returns, once encrypted, is still <= TOAST_TUPLE_TARGET.
+	 * See TEST 153, which sweeps the boundary.
+	 */
+	maxDataLen = (Size) RelationGetToastTupleTarget(rel, (int) TOAST_TUPLE_TARGET)
+	             - hoff - TDE_V4_OVERHEAD;
 
     /*
         * 1. Inline compress of the biggest, the largest attribute & 
@@ -590,16 +568,17 @@ pg_vault_tde_toast_tuple(Relation rel, HeapTuple newtup, HeapTuple oldtup, int o
         toasted = newtup;
 
     /*
-     * Delete any old external TOAST chunks that were replaced by new values.
-     * toast_tuple_init (called above) marks old external attributes as
-     * TOASTCOL_NEEDS_DELETE_OLD when the new value differs; toast_tuple_cleanup
-     * calls toast_delete_datum for each such attribute.
+     * Free the temporary values, but leave the old tuple's chunks alone.
      *
-     * Without this call, the large→large UPDATE path orphans the old TOAST
-     * chunks: the fallback in pg_vault_tde_tuple_update only fires when the
-     * new tuple has NO external TOAST (!HeapTupleHasExternal), so large→large
-     * updates (where both old and new tuples are external) are not covered.
+     * Core deletes the replaced values here too, and can: it toasts inside
+     * heap_update(), once the row is known to be updatable.  This runs before
+     * heap_update(), which can still find the row updated or deleted by a
+     * concurrent transaction; READ COMMITTED then skips the row or retries on
+     * the newer version, and either one may still point at those chunks
+     * (PSQLE-193).  pg_vault_tde_tuple_update() deletes them once
+     * heap_update() has succeeded.
      */
+    ttc.ttc_flags &= ~TOAST_NEEDS_DELETE_OLD;
     toast_tuple_cleanup(&ttc);
 
     return toasted;

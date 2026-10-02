@@ -244,24 +244,6 @@ tde_hw_accel_siv_cipher(void)
     return tde_fetched_siv;  /* may be NULL */
 }
 
-/*
- * tde_hw_accel_provider_name -- Name of the loaded provider (or "").
- */
-const char *
-tde_hw_accel_provider_name(void)
-{
-    return tde_loaded_provider_name;
-}
-
-/*
- * tde_hw_accel_is_loaded -- True if an explicit provider was loaded.
- */
-bool
-tde_hw_accel_is_loaded(void)
-{
-    return tde_provider_loaded;
-}
-
 
 /* ================================================================
  * SQL-callable diagnostic function

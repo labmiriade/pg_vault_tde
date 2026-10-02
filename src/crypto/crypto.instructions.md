@@ -91,6 +91,11 @@ static int           iv_batch_pos = TDE_IV_BATCH_SIZE;  /* starts empty */
 Amortizes one `pg_strong_random()` syscall across 256 tuples.
 The `iv_batch` array MUST be `OPENSSL_cleanse`d in the `on_proc_exit` cleanup.
 
+The batch belongs to the process that filled it (`iv_batch_pid`): a process that did
+not fill it refills before drawing, so a `fork()` can never hand one IV out twice
+(PSQLE-178). At most 2^32 encryptions per DEK generation (NIST SP 800-38D, random
+IVs); keep the README's rotation guidance in step with any change to what counts.
+
 ---
 
 ## GCM Authentication — MANDATORY

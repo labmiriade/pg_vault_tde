@@ -93,6 +93,8 @@ SELECT pg_vault_tde_wallet_change_passphrase('old-passphrase', 'new-passphrase')
 
 This function **automatically rotates the KEK** as part of the passphrase
 change — a separate `pg_vault_tde_rotate_kek()` call afterward is unnecessary.
+Since 1.7.2 the wallet keeps every KEK version, and the new passphrase is in
+effect as soon as the file is rewritten, even if the call fails afterwards.
 Rationale: if an attacker already has the old passphrase, they already have
 the old KEK; changing only the passphrase without rotating the key
 underneath it would provide no additional protection.
@@ -118,6 +120,11 @@ key-escrow mechanism. Plan explicitly for this:
   [Backup and Restore](Backup-and-Restore)).
 - For multi-server topologies, transport the wallet to standbys explicitly —
   see [Backup and Restore](Backup-and-Restore).
+- If `wallet.p12` goes missing, restore it rather than creating a new one.
+  `pg_vault_tde_wallet_init()` refuses while any key of the database is wrapped
+  under a local wallet: a new wallet holds a new KEK, which opens none of them.
+  Up to 1.7.1 it created one, and the tables created afterwards were wrapped
+  under it — restoring the real file then lost those.
 
 ## See Also
 - [Key Management Overview](Key-Management-Overview)

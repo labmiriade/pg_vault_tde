@@ -58,15 +58,4 @@ const EVP_CIPHER *tde_hw_accel_gcm_cipher(void);
  */
 const EVP_CIPHER *tde_hw_accel_siv_cipher(void);
 
-/*
- * tde_hw_accel_provider_name -- Return the name of the loaded provider.
- * Returns "" if no explicit provider was loaded (using defaults).
- */
-const char *tde_hw_accel_provider_name(void);
-
-/*
- * tde_hw_accel_is_loaded -- Return true if an explicit provider was loaded.
- */
-bool tde_hw_accel_is_loaded(void);
-
 #endif /* PG_VAULT_TDE_HW_ACCEL_H */

@@ -9,7 +9,7 @@
 #        local_wrap_dek() to fail with "wrap_dek failed for relid=N"
 #        when no wallet_passphrase_env/file/command GUC was configured.
 #
-# Tests 74-80 require kms_provider='local'.  Tests 86-87 also require
+# Tests 74-79 require kms_provider='local'.  Tests 86-87 also require
 # pg_vault_tde.dev_mode=on because the forensic SQL helpers are test-only.
 # They SKIP in the default regression container (which uses kms_provider='vault');
 # this script provides a container where they all run and must PASS.
@@ -31,7 +31,7 @@ CONTAINER="pg-tde-wallet-$$"
 cleanup() { stop_container "$CONTAINER"; }
 trap cleanup EXIT
 
-log_stage "WALLET REGRESSION TESTS (kms_provider=local, tests 73-87)"
+log_stage "WALLET REGRESSION TESTS (kms_provider=local, tests 73-109)"
 
 # ── Build image ───────────────────────────────────────────────────────────
 build_pg_test_image
@@ -84,12 +84,12 @@ log_info "Copying regression_test_v16.sql into container ..."
 $RT cp "$REPO_ROOT/sql/regression_test_v16.sql" \
        "$CONTAINER:/tmp/regression_test_v16.sql"
 
-log_info "Running wallet regression tests (tests 73-80) ..."
+log_info "Running wallet regression tests (tests 73-109) ..."
 START=$(timer_start)
 if container_psql "$CONTAINER" -v ON_ERROR_STOP=1 \
         -f /tmp/regression_test_v16.sql; then
     ELAPSED=$(timer_elapsed "$START")
-    log_ok "WALLET REGRESSION: ALL 8 TESTS PASSED ($(timer_fmt "$ELAPSED"))"
+    log_ok "WALLET REGRESSION: ALL 36 TESTS PASSED ($(timer_fmt "$ELAPSED"))"
 else
     ELAPSED=$(timer_elapsed "$START")
     log_error "WALLET REGRESSION: FAILED after $(timer_fmt "$ELAPSED")"
@@ -97,5 +97,5 @@ else
     exit 2
 fi
 
-log_ok "WALLET REGRESSION COMPLETE: tests 73-107 all passed"
+log_ok "WALLET REGRESSION COMPLETE: tests 73-109 all passed"
 exit 0

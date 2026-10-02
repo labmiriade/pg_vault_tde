@@ -4,8 +4,8 @@
 
 | # | Limitation | Status |
 |---|---|---|
-| 1 | **Range scans on `tde_btree`** — `WHERE col > x` returns empty results (AES-SIV is not order-preserving) | By design, permanent |
-| 2 | **HOT updates disabled** — every `UPDATE` on an `encrypted_heap` table maintains indexes explicitly, never using a HOT update | By design, permanent (see [Encrypted Tables and Indexes](Encrypted-Tables-and-Indexes)) |
+| 1 | **`tde_btree` answers equality only** — ranges, `ORDER BY` and `min`/`max` never use it and run as sequential scans; `numeric` and nondeterministic collations cannot be indexed (AES-SIV is not order-preserving) | By design, permanent; `numeric` support planned (v1.8) |
+| 2 | **HOT updates disabled** — a changed indexed column is re-encrypted under a fresh IV so its on-disk bytes always differ (PSQLE-219), so `heap_update` never chooses a HOT update when an indexed column changed and the index stays coherent | By design, permanent (see [Encrypted Tables and Indexes](Encrypted-Tables-and-Indexes)) |
 | 3 | **Parallel index build/rebuild disabled** — `CREATE INDEX`/`REINDEX` on `tde_btree` always runs single-process | By design, permanent |
 | 4 | **All-or-nothing table encryption** — every column in an `encrypted_heap` table is encrypted; no per-column opt-out | Planned: per-column `ENABLE COLUMN ENCRYPTION` DDL (v1.8) |
 | 5 | **GIN / Hash / GiST index encryption** — only `tde_btree` (B-Tree) exists today | Planned (v1.8) |
@@ -45,6 +45,26 @@ session ends normally.
 
 ## Troubleshooting
 
+### `Ciphertext too short for AES-256-GCM` on a table that used to read fine
+
+A row whose columns are **all** NULL carries no user data, so its encrypted
+region is the AEAD framing and nothing else. Releases up to 1.7.1 rejected that
+as too short, and a single such row made every sequential scan of the table fail
+from the `INSERT` onwards.
+
+The data is not corrupt — the ciphertext on disk is intact. Upgrade to 1.7.2 and
+the rows read normally; no dump, no rewrite, no migration step.
+
+### A backend crashes on `UPDATE` after upgrading to 1.7.2
+
+Rows written before the upgrade keep the old on-disk layout until something
+rewrites them, and on that layout `heap_update()` cannot safely read the indexed
+attributes of a table whose index sits on a column behind a variable-length one.
+
+Run `VACUUM FULL` (or `CLUSTER`) on each `encrypted_heap` table once after
+upgrading — see [Compatibility and Versioning](Compatibility-and-Versioning).
+Tables created after the upgrade are unaffected.
+
 ### "GCM tag mismatch" / decryption / integrity errors
 
 This means the ciphertext, IV, or associated data did not authenticate —
@@ -64,12 +84,39 @@ result. Common causes:
   data specifically to make this fail loudly instead of silently decrypting
   as the wrong row.
 
+### `verify_integrity()` reports failed tuples, but every row reads (1.7.1)
+
+Up to 1.7.1 `pg_vault_tde_verify_integrity()` pointed the table's relcache
+entry at heapam for the length of its scan. A relcache invalidation of the
+table during the scan — autovacuum updating its statistics, an `ALTER TABLE`,
+a `GRANT` — put the encrypted access method back, and from then on every tuple
+came back already decrypted and was counted as failed ("encrypted tuple too
+short", "decryption failed"). The data was intact. Run it again, and read the
+rows (`SELECT count(*), count(md5(t::text)) FROM mytable t`); fixed in 1.7.2.
+
 ### `pg_vault_tde_wallet_init()` fails / wallet base directory error
 
 The base directory `/var/lib/pg_vault_tde/` must exist, be owned by the OS
 user running PostgreSQL, and live outside `PGDATA` before the wallet can be
 created. Package installs create it automatically; source builds do not —
 see [Installation](Installation) and [KMS: Local Wallet](KMS-Local-Wallet).
+
+### `wallet_init()` refuses: "no wallet at ..., but N key(s) of this database are wrapped under a local wallet"
+
+The wallet file is gone — lost, moved, or never copied to this server — but
+the database still has tables encrypted under it. A new wallet would hold a
+new KEK that opens none of them. Put the file back from its backup (on a
+standby, copy the primary's) and check `pg_vault_tde.wallet_path`. To start
+over with the old data abandoned, drop the encrypted tables first.
+
+A database created with `CREATE DATABASE ... TEMPLATE` from one with
+encrypted tables is in this state too — its catalog came with the template's
+keys, its wallet directory did not — and a wallet would not help its rows:
+each row's AAD names the database it was written in, so the copied rows never
+authenticate in the clone. Drop those tables there, or `TRUNCATE` them after
+copying the template's `wallet.p12` into `/var/lib/pg_vault_tde/<clone_oid>/`
+if you want to keep the empty tables. To copy encrypted data between
+databases, use `pg_dump_tde` / `pg_restore_tde`.
 
 ### A rotation or `unseal_keys()` call fails with a concurrency error
 

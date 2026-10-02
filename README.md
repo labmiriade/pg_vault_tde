@@ -16,7 +16,7 @@ decrypted after it leaves. Encryption keys are managed by **HashiCorp Vault** /
 **OpenBao** or a **local PKCS#12 wallet** and cached in shared memory with
 automatic rotation.
 
-**Current release: v1.7** — 140 regression tests (52 v1.4 + 20 v1.5 + 38 v1.6 + 30 v1.7), zero compiler warnings on PG 17 + PG 18.
+**Current release: v1.7** — 141 regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7), zero compiler warnings on PG 17 + PG 18.
 
 ### Commercial Support
 
@@ -42,9 +42,24 @@ packaged (OS, PG) combinations and what CI exercises on each in the
 
 ## Quick Start
 
-> **Already running 1.7.0 or earlier?** Do not upgrade to 1.7.1 before reading
-> [Upgrading to 1.7.1](#upgrading-to-171). Tables holding out-of-line TOAST
-> values must be dumped *before* the new binary is installed.
+> **Already running 1.7.0 or earlier?** Do not upgrade to 1.7.1 or later before
+> reading [Upgrading to 1.7.1](#upgrading-to-171). Tables holding out-of-line
+> TOAST values must be dumped *before* the new binary is installed.
+>
+> **Upgrading from 1.7.1?** If `pg_vault_tde_rotate_online()` has run since the
+> last restart, act *before* restarting: copy out a rotated table that was being
+> read or written — see [`rotate_online()` with concurrent access](#rotate_online-with-concurrent-access) —
+> and run `VACUUM FULL` on a rotated table with out-of-line values — see
+> [`rotate_online()` and out-of-line values](#rotate_online-and-out-of-line-values).
+> A standby promoted while still on 1.7.1 must be restarted before its first write —
+> see [Streaming standby and `rotate_online()`](#streaming-standby-and-rotate_online).
+> Every table ever rotated needs a `REINDEX` — see [`rotate_online()` and indexes](#rotate_online-and-indexes) —
+> and so does every partial index on an encrypted table — see [Partial indexes on encrypted tables](#partial-indexes-on-encrypted-tables).
+> Check who created each database's wallet — see [Who may call the key-management functions](#who-may-call-the-key-management-functions).
+> Otherwise nothing has to be done before installing 1.7.2, but existing
+> encrypted tables need one `VACUUM FULL` afterwards — see
+> [Upgrading to 1.7.2](#upgrading-to-172). Rows stay readable either way; until
+> they are rewritten, `UPDATE` on some of them can take the backend down.
 
 ### 1. Install
 
@@ -104,6 +119,22 @@ Add to `postgresql.conf`:
 ```
 shared_preload_libraries = 'pg_vault_tde'
 ```
+
+> **Check the WAL resource manager id first.** pg_vault_tde registers a custom WAL
+> resource manager under id **161**, reserved for it on the PostgreSQL *Custom WAL
+> Resource Managers* wiki. Extensions that follow the registry never use it, but an
+> unregistered one — typically in-house or proprietary — can. On every node that
+> will load pg_vault_tde or replay its WAL (primary, standbys, PITR restore hosts),
+> this must return **no rows** before you add it:
+>
+> ```sql
+> SELECT rm_id, rm_name FROM pg_get_wal_resource_managers()
+> WHERE rm_id = 161 OR rm_name = 'pg_vault_tde';
+> ```
+>
+> If it returns one, the server will refuse to start once pg_vault_tde is preloaded
+> (`failed to register custom resource manager "pg_vault_tde" with ID 161`). After the
+> restart the same query must return exactly `161 | pg_vault_tde`. Any role can run it.
 
 Restart PostgreSQL and create the extension in your database:
 
@@ -255,6 +286,10 @@ VALUES ('alice@example.com', '123-45-6789', '1990-01-15');
 SELECT email, ssn FROM users WHERE id = 1;
 ```
 
+Before going to production, read [Running pg_vault_tde in Production](#running-pg_vault_tde-in-production):
+primary keys, partitions, statistics, temporary files and backups all have ways of
+putting plaintext on disk.
+
 ---
 
 ## What Gets Encrypted
@@ -312,15 +347,16 @@ Index Access Method (IAM) — tde_btree                  src/iam/
    │
    ▼
 Crypto Layer — AES-256-GCM (OpenSSL 3.x EVP)           src/crypto/
-   │  [IV(12) | CIPHERTEXT | GCM-TAG(16) | VER(1) | GEN(8)] per tuple
+   │  [attributes, values encrypted | IV(12) | GCM-TAG(16) | VER(1) | GEN(8)]
    │  Per-backend EVP_CIPHER_CTX cached & keyed by (relid, generation):
    │  AES key schedule reused across tuples, only the IV rearmed per call
    │  IV batch generation: 256 IVs per pg_strong_random() call
    │
    ▼
 KMS Layer — per-relation DEK cache                     src/kms/
-   │  ┌─ TdeRelDekMap (shmem HTAB, one shared LWLock, per-relation generation)
-   │  └─ pg_vault_tde_catalog (on-disk wrapped DEKs, one row per relation)
+   │  ┌─ TdeRelDekMap (shmem HTAB keyed by (dbid, relid), one shared LWLock)
+   │  └─ pg_vault_tde_catalog (on-disk wrapped DEKs, one row per relation,
+   │     one table per database — see "DEK Cache (Shared Memory)")
    │
    ▼
 HashiCorp Vault / OpenBao (GUC-configurable endpoint)
@@ -328,22 +364,34 @@ HashiCorp Vault / OpenBao (GUC-configurable endpoint)
 
 ### Wire Format (on disk, per tuple)
 
-**v4 format** (default for `encrypted_heap` tables):
+**v5 format** (written by `encrypted_heap` tables; v4 is still read):
 
 ```
 ┌─────────────────────────────────┬───────────────────────────────────────────────────────┐
-│  HeapTupleHeader (t_hoff bytes) │   IV(12) │ Ciphertext │ GCM-Tag(16) | VER(1) │ GEN(8) | 
-│  PLAINTEXT — MVCC fields        │                                                       │
+│  HeapTupleHeader (t_hoff bytes) │  attributes, VALUES encrypted │ IV(12) │ Tag(16) │V│G│
+│  PLAINTEXT — MVCC fields        │  (attribute layout preserved) │                       │
 └─────────────────────────────────┴───────────────────────────────────────────────────────┘
-                                   ←───────────── TDE_V4_OVERHEAD = 37 bytes ─────────────→
+                                                                  ←──── 37 bytes ────→
 ```
 
-v4 overhead: **37 bytes per tuple** (12-byte IV + 16-byte GCM authentication tag +
-1-byte version `0x04` + 8-byte DEK generation counter).
-The IV-first layout keeps the version/generation bytes at the **end** so the blob has no
-byte-stable prefix — this is what structurally disables HOT updates (see
-[Limitations](#limitations-v17)).
-v4 also passes `[database_oid(4) | relid(4) | generation(8)]` as AEAD Additional
+Overhead: **37 bytes per tuple** (12-byte IV + 16-byte GCM authentication tag +
+1-byte version `0x05` + 8-byte DEK generation counter) — the same as v4, so a v5
+tuple is exactly as long as the v4 tuple for the same row.
+
+v5 is **structure preserving**: every attribute keeps its offset and its length,
+and only the bytes of the values are ciphertext. The structural bytes — varlena
+length headers, the external-datum tag, alignment padding — stay in clear,
+because PostgreSQL itself walks the on-disk tuple: `heap_update()` reads the
+indexed attributes straight off the page to decide HOT and index maintenance.
+Under v4 that walk read attribute boundaries out of one opaque blob and crashed
+the backend (PSQLE-165). The cost of v5 is that the **exact byte length of each
+variable-length column** is visible on disk; fixed-length columns leak nothing,
+and the row length and null bitmap were already visible under v4.
+
+v4 tuples are read transparently, but an existing table only moves to v5 when its
+rows are rewritten — `VACUUM FULL` does it.
+
+Both versions pass `[database_oid(4) | relid(4) | generation(8)]` as AEAD Additional
 Authenticated Data (AAD) — zero wire overhead; prevents cross-table ciphertext smuggling.
 
 ---
@@ -435,6 +483,12 @@ outside `PGDATA`, so a plain `pg_basebackup` does not copy it alongside the
 wrapped DEKs it protects. No network dependency.
 Suitable for single-server deployments, air-gapped environments, and development.
 
+The file keeps **every KEK version** (since 1.7.2): `rotate_kek()` and
+`wallet_change_passphrase()` add one and never remove any, and write it before a
+single DEK is re-wrapped. A rotation that rolls back, fails later in its statement
+or dies in a crash therefore loses nothing — every DEK still unwraps with a version
+the file holds. See [KEK versions in the local wallet](#kek-versions-in-the-local-wallet).
+
 ```ini
 pg_vault_tde.kms_provider          = 'local'
 # wallet_path defaults to /var/lib/pg_vault_tde/<DB_OID>/wallet.p12 — omit unless overriding:
@@ -457,6 +511,40 @@ SELECT pg_vault_tde_wallet_lock();
 SELECT pg_vault_tde_rotate_kek();
 ```
 
+#### Keeping the wallet on a network share
+
+The wallet file is read far more often than its size suggests. The KEK is
+**not** cached between operations — it is re-derived from the file on every
+wrap and unwrap, deliberately, so that it does not sit in process memory
+between them. A backend that gets its passphrase from
+`wallet_passphrase_env` / `_command` (rather than from an interactive
+`pg_vault_tde_wallet_unlock()`, which does cache it for that session)
+therefore opens and parses the PKCS#12 once per DEK. A startup warm-up with
+`preload_keys` does it once per relation.
+
+On local storage that is unremarkable. On NFS or SMB it means one network
+round-trip per unwrap, so:
+
+- **Mount it with client-side caching enabled** — the file changes only on
+  `wallet_init`, `wallet_change_passphrase` and `rotate_kek`, so it caches
+  well. On NFS keep the default attribute and data caching (do not mount
+  `noac` or `actimeo=0`); `fsc` with `cachefilesd` helps further on a slow
+  link.
+- **Know what caching does not fix.** It removes the network round-trip, not
+  the PBKDF2 derivation, which is CPU and runs every time regardless. If the
+  warm-up is slow on local disk too, that is what you are measuring.
+- **Invalidate after a key operation.** A cached copy is a *stale KEK* after
+  `wallet_change_passphrase()` or `rotate_kek()`. On a single server the
+  writes invalidate the local cache. If several hosts read the same wallet
+  file, drop their caches before they next touch an encrypted table — and see
+  the warning under "Key Rotation" first, because a wallet shared between
+  databases cannot have its KEK rotated safely at all.
+- **Raise `preload_max_failures`.** A network share has transient failures a
+  local disk does not, and the default of 5 is tuned for the local case.
+
+If none of that is appealing, keep the wallet on local storage and replicate
+it out of band — it is one small file that changes only when you rotate.
+
 ### Production (HashiCorp Vault / OpenBao)
 
 The KMS layer calls Vault's Transit secrets engine:
@@ -477,19 +565,52 @@ and timeout are all configurable via GUC parameters registered at startup
 
 ### DEK Cache (Shared Memory)
 
-Since v1.7 the cache is a shared-memory hash table (`HTAB`) keyed by `relid`,
-not a fixed array. A single `LWLock` from the `"TdeRelDekMap"` named tranche
-guards the whole table (no per-entry lock).
+Since v1.7 the cache is a shared-memory hash table (`HTAB`), not a fixed array.
+A single `LWLock` from the `"pg_vault_tde_rel_dek_map"` named tranche guards the whole table
+(no per-entry lock).
 
 ```
 TdeRelDekMap (shmem HTAB, ShmemInitHash, capacity = pg_vault_tde.max_encrypted_relations, default 1024)
- └─ TdeRelDekMap entry, keyed by relid:
-     ├─ relid          : Oid  (hash key)
+ └─ TdeRelDekMap entry, keyed by (dbid, relid):
+     ├─ key            : TdeRelDekMapKey  (hash key)
      ├─ dek[32]        : AES-256 key bytes (OPENSSL_cleanse'd on rotation)
      ├─ prev_dek[32]   : previous DEK (rotation window fallback)
      ├─ generation     : uint64 per-relation counter
      └─ dek_valid / prev_dek_valid : bool
 ```
+
+**The key is `(dbid, relid)`, not `relid` alone.**  A relid is unique only
+*within* a database — never across databases, and never cluster-wide — while
+this HTAB is one segment read by the backends of every database.  `CREATE
+DATABASE` is a physical copy of the template's directory, so a cloned database
+hands out pg_class OIDs identical to its template's; two unrelated databases
+sharing a relid is normal, not a corner case.
+
+```c
+typedef struct TdeRelDekMapKey
+{
+    Oid dbid;      /* always MyDatabaseId */
+    Oid relid;     /* effective relid: TOAST → parent, relrewrite → base */
+} TdeRelDekMapKey;
+```
+
+`dbid` is not part of any public signature: the catalog module fills it from
+`MyDatabaseId` when it builds the key.  Every path that reaches the cache runs
+connected to the database that owns both the relation and its
+`pg_vault_tde_catalog` row — a regular backend, the rotation BGW after
+`BackgroundWorkerInitializeConnectionByOid()`, a walsender during logical
+decoding — so deriving it in one place makes "caller passed the wrong dbid"
+unrepresentable.
+
+The on-disk side needs no such key.  `pg_vault_tde_catalog` is an ordinary
+table created by `CREATE EXTENSION` in the extension's schema, so it already
+exists once per database and its `relid` primary key is unambiguous there; the
+local wallet is likewise per-database, at
+`/var/lib/pg_vault_tde/<db_oid>/wallet.p12`.  Shared memory was the one place
+where per-database namespaces met, and the one place that needed the dbid.
+
+Note that `max_encrypted_relations` sizes a single cluster-wide segment: with
+encrypted tables in several databases, budget for their sum.
 
 DEK access via `pg_vault_tde_kms_get_rel_dek(relid)`:
 1. **Fast path**: `hash_search(HASH_FIND)` under `LW_SHARED` — O(1) average; cache hit returns immediately.
@@ -497,25 +618,31 @@ DEK access via `pg_vault_tde_kms_get_rel_dek(relid)`:
 
 ### Key Rotation
 
-**Per-table DEK rotation** (re-encrypts all tuples with a new DEK, no exclusive lock):
+**Per-table DEK rotation** (re-encrypts all tuples with a new DEK; reads continue, writes wait until it finishes):
 
 ```sql
 SELECT pg_vault_tde_rotate_online('mytable', 1000);
 -- Monitor progress:
-SELECT * FROM pg_vault_tde_rotation_status('mytable');
+SELECT * FROM pg_vault_tde_get_rotation_status('mytable');
 ```
 
 `rotate_online` accepts both table relations and `tde_btree` index relations:
 
 | Target | What happens |
 |--------|-------------|
-| `encrypted_heap` table | Generates a new table DEK, re-encrypts every tuple in-place (`RowExclusiveLock`), then rebuilds any `tde_btree` indexes on the table so their SIV ciphertexts match the new DEK. Standard `btree` indexes on encrypted columns need no rebuild. |
-| `tde_btree` index | Generates a new index DEK, then calls `reindex_index` (`AccessExclusiveLock` on the index only) to rebuild the index with keys encrypted under the new DEK. The parent table's DEK and heap data are untouched. Passing a non-`tde_btree` index raises an error before touching shmem or the catalog. |
+| `encrypted_heap` table | Generates a new table DEK, re-encrypts every tuple in-place in one transaction (`ShareRowExclusiveLock` on the table: `SELECT` continues, writes and a second rotation wait), then rebuilds any `tde_btree` indexes on the table so their SIV ciphertexts match the new DEK. Every other index — the `PRIMARY KEY` and `UNIQUE` constraints included — gets an entry for each rewritten row, as with an `UPDATE`. |
+| `tde_btree` index | Generates a new index DEK, then calls `reindex_index` (`AccessExclusiveLock` on the index, `ShareRowExclusiveLock` on its table) to rebuild the index with keys encrypted under the new DEK. The parent table's DEK and heap data are untouched. Passing a non-`tde_btree` index raises an error before touching shmem or the catalog. |
 
 When a table with `tde_btree` indexes is rotated, the index rebuild uses the new table DEK
 implicitly because the heap rows the scan reads are re-encrypted first; the index keys
 are then produced from the decrypted values and re-encrypted under the (unchanged) index DEK.
 To also rotate the index DEK, call `rotate_online` on the index relation directly afterwards.
+
+> **Logical replication:** a rotation reaches subscribers as one `UPDATE` per row, and a
+> logical slot must decode past it before the publisher restarts or the same table is
+> rotated again — the previous DEK lives only in shared memory until then. A slot that
+> falls behind that point stops with `pg_vault_tde: decryption failed`, and so does every
+> other slot of the database. Check `confirmed_flush_lsn` in `pg_replication_slots`.
 
 **KEK rotation** (re-wraps all per-table DEKs under a new KEK — tuple data untouched):
 
@@ -529,6 +656,60 @@ SELECT pg_vault_tde_rotate_kek();
 > `pg_vault_tde_rotate_kek()` call is unnecessary afterwards. The rationale: if an
 > attacker already holds the old passphrase, they already have the old KEK — changing
 > the passphrase without rotating the KEK provides no additional protection.
+
+> **KEK rotation is per-database.**  Both `pg_vault_tde_rotate_kek()` and
+> `pg_vault_tde_wallet_change_passphrase()` rewrap only the
+> `pg_vault_tde_catalog` of the database they run in — that table is
+> per-database and no backend can reach another database's copy.  With the
+> default per-database `wallet_path` (`/var/lib/pg_vault_tde/<DB_OID>/wallet.p12`)
+> that is the whole wallet.  Set `wallet_path` to one shared file and it is not:
+> up to 1.7.1 the rotation then replaced that file, and the first database to
+> rotate made every other database's data permanently unreadable.  Since 1.7.2
+> the file keeps every KEK version, so the other databases stay readable under
+> the version they were wrapped with — but each one moves to the new KEK only
+> when it rotates too, and a `wallet_change_passphrase()` in one database changes
+> the passphrase for all of them.
+>
+> Since `pg_vault_tde_wallet_init()` persists the resolved path per database
+> (`ALTER DATABASE ... SET FROM CURRENT`), and a database-level setting wins
+> over `postgresql.conf`, sharing a wallet is something you have to ask for
+> explicitly on each database rather than something you fall into. When the
+> effective wallet is not this database's own default file, both rotation
+> paths emit a `WARNING` naming the database they actually covered.
+
+> Note this is about the *KEK*, not about relids.  Per-table DEKs never
+> collide across databases: each is 32 independent random bytes in its own
+> database's catalog, and the GCM AAD binds `MyDatabaseId`, so one database's
+> key can never silently decrypt another's rows.
+
+#### One key operation at a time
+
+Each key operation is tested on its own, and against the reads and writes running
+beside it — not against the others: `rotate_online()` (of a table or of a
+`tde_btree` index), `rotate_kek()`, `wallet_change_passphrase()`, `wallet_lock()` /
+`wallet_unlock()`, `migrate_vault_to_wallet()`, `seal_keys()` / `unseal_keys()` and
+`reencrypt_table()`. Until they are (1.8), run them one at a time in each database,
+and start the next only once the previous one has returned and no rotation worker is
+left:
+
+```sql
+SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'pg_vault_tde rotation';  -- 0
+```
+
+`pg_vault_tde_rotation_status` says how each `rotate_online()` ended: `complete`, or
+`failed` when it hit an error or was stopped — `pg_cancel_backend()`,
+`pg_terminate_backend()`, a smart or fast shutdown. A rotation is one transaction, so a
+failed one has changed nothing: run it again. After a crash or an immediate shutdown
+its row stays `running` with no worker behind it; that is the same case. Up to 1.7.1 a
+terminated rotation, or one stopped by a fast shutdown, stayed `running` too.
+
+In particular:
+
+- no `rotate_kek()` or `wallet_change_passphrase()` while a `rotate_online()` runs;
+- no `wallet_lock()` while a rotation runs;
+- no second `rotate_online()`, of another table either, before the first is `complete`;
+- no `unseal_keys()` or `migrate_vault_to_wallet()` while a rotation runs;
+- no `DROP`, `TRUNCATE` or `ALTER TABLE` of a table being rotated.
 
 ---
 
@@ -553,15 +734,17 @@ startup.
 | Parameter | Type | Default | Context | Description |
 |---|---|---|---|---|
 | `kms_provider` | string | `''` (unset — must be configured) | suset | Active KMS backend: `vault`, `local` (v1.6), `pkcs11` (v1.7), `kmip` (v1.8). No default is shipped; encrypted tables cannot be used until this is set. Settable per-database via `ALTER DATABASE SET`. |
-| `wallet_path` | string | `/var/lib/pg_vault_tde/<DB_OID>/wallet.p12` | suset | Local wallet PKCS#12 file path (`kms_provider = 'local'`). Default computed at runtime — `SHOW` returns the effective path even when not set in `postgresql.conf`. Deliberately outside `PGDATA` so a plain `pg_basebackup` does not copy it. |
+| `wallet_path` | string | `/var/lib/pg_vault_tde/<DB_OID>/wallet.p12` | suset | Local wallet PKCS#12 file path (`kms_provider = 'local'`). Default computed at runtime — `SHOW` returns the effective path even when not set in `postgresql.conf`. Deliberately outside `PGDATA` so a plain `pg_basebackup` does not copy it. **Setting this in `postgresql.conf` makes every database share one KEK — see the warning under "Key Rotation" before doing so.** |
 | `wallet_passphrase_env` | string | `''` | suset | Env var name holding wallet passphrase — env var NAME only, never the value |
 | `wallet_passphrase_file` | string | `''` | suset | File path containing wallet passphrase (trimmed; `0400` permission enforced) **(v1.6)** |
 | `wallet_passphrase_command` | string | `''` | suset | Shell command to retrieve passphrase (analogous to PG's `ssl_passphrase_command`) **(v1.6)** |
-| `wallet_dev_mode_passphrase` | string | `''` | suset | Convenience passphrase for dev/CI (only honoured when `dev_mode = on`) **(v1.6)** |
+| `wallet_dev_mode_passphrase` | string | `''` | suset | Convenience passphrase for dev/CI (only honoured when `dev_mode = on`) — shown only to a superuser (others read `********`), not in `pg_settings` (v1.7.2, PSQLE-224) **(v1.6)** |
 | `dev_mode` | boolean | `off` | suset | Enable development mode features (wallet_dev_mode_passphrase) **(v1.6)** |
 | `wallet_auto_open` | boolean | `on` | suset | Auto-open wallet on startup if passphrase env var is set |
-| `max_encrypted_relations` | integer | `1024` | postmaster | Maximum number of per-table DEK entries in shmem (64–65536). Requires restart — affects shared memory sizing. |
-| `toast_encryption` | boolean | `on` | suset | Encrypt TOAST chunks with the parent relation's DEK (v1.5) |
+| `preload_keys` | boolean | `off` | suset | Warm this database's DEK cache at startup: a background worker per database unwraps every DEK in `pg_vault_tde_catalog` once the server accepts connections, so the first query on a table does not pay a KMS round-trip. Needs a KMS usable without an interactive unlock (`wallet_passphrase_command` / `wallet_passphrase_env`). Stops at `max_encrypted_relations`. Scope it with `ALTER DATABASE SET`. |
+| `preload_max_failures` | integer | `5` | suset | Consecutive DEK unwrap failures the startup preload tolerates in one database before giving up on it. Consecutive, so a missing passphrase stops the pass at once while a one-off does not. Relevant to the local wallet too: the KEK is re-derived from the wallet file on every unwrap rather than cached, so a wallet on NFS or SMB is reopened once per relation. `0` stops at the first failure. |
+| `max_encrypted_relations` | integer | `1024` | postmaster | Maximum number of per-table DEK entries in shmem (64–65536), **cluster-wide**: entries are keyed by `(dbid, relid)`, so budget for the sum across all databases. Enforced since 1.7.2 — before that the cache silently grew past it (ShmemInitHash's size is not a cap), so count your encrypted relations across all databases before upgrading. ~112 bytes per relation, reserved at startup. Max 1048576. Requires restart. |
+| `toast_encryption` | boolean | `on` | suset | **No effect since 1.7.2** (PSQLE-223): the TOAST table of an `encrypted_heap` table is always `encrypted_heap` and its chunks always encrypted with the parent relation's DEK; setting it `off` only raises a `WARNING` when a TOAST table is created. Removed in 1.8. Up to 1.7.1, a table created or rewritten with it `off` got a heap TOAST table of encrypted chunks and could not read its out-of-line values — see [Tables created with `toast_encryption = off`](#tables-created-with-toast_encryption--off) to repair one |
 
 ### Vault / OpenBao (`kms_provider = 'vault'`)
 
@@ -571,9 +754,9 @@ All parameters are `suset` — settable per-database with `ALTER DATABASE SET`.
 |---|---|---|---|---|
 | `vault_url` | string | `''` | suset | Vault / OpenBao base URL |
 | `vault_namespace` | string | `''` | suset | Vault namespace (enterprise; empty for community) |
-| `vault_token` | string | `''` | suset | Auth token — hidden from `pg_settings` (superuser only) |
-| `vault_role_id` | string | `''` | suset | AppRole role_id UUID |
-| `vault_secret_id` | string | `''` | suset | AppRole secret_id — hidden from `pg_settings` (superuser only) |
+| `vault_token` | string | `''` | suset | Auth token — shown only to a superuser (others read `********`), not in `pg_settings` (v1.7.2, PSQLE-224) |
+| `vault_role_id` | string | `''` | suset | AppRole role_id UUID — shown only to a superuser (others read `********`), not in `pg_settings` (v1.7.2, PSQLE-224) |
+| `vault_secret_id` | string | `''` | suset | AppRole secret_id — shown only to a superuser (others read `********`), not in `pg_settings` (v1.7.2, PSQLE-224) |
 | `vault_role_name` | string | `''` | suset | AppRole role name for secret_id rotation after login **(v1.4)** |
 | `vault_k8s_role` | string | `''` | suset | Kubernetes JWT auth role name |
 | `vault_transit_mount` | string | `transit` | suset | Transit secrets engine mount path |
@@ -605,7 +788,7 @@ All parameters are `suset` — settable per-database with `ALTER DATABASE SET`.
 | Parameter | Type | Default | Context | Description |
 |---|---|---|---|---|
 | `enabled` | boolean | `on` | suset | Master switch — set `off` to measure TAM overhead without crypto. Settable per-database. |
-| `allow_plaintext_index` | boolean | `off` | suset | When `off` (default), `CREATE INDEX`/`CREATE UNIQUE INDEX` with a non-`tde_btree` access method on an `encrypted_heap` table is rejected with `ERROR`. When `on`, allowed after a `WARNING` — the indexed column's plaintext value is then stored unencrypted on disk. Does not affect `PRIMARY KEY`/`UNIQUE` table constraints (always allowed, always warned — see "What Gets Encrypted" above). |
+| `allow_plaintext_index` | boolean | `off` | suset | When `off` (default), `CREATE INDEX`/`CREATE UNIQUE INDEX` with a non-`tde_btree` access method on an `encrypted_heap` table is rejected with `ERROR`. When `on`, allowed after a `WARNING` — the indexed column's plaintext value is then stored unencrypted on disk. Governs the v1.5 `tde_btree` operator classes that keep keys in plaintext (`tde_int4_ops`, `tde_int8_ops`, `tde_uuid_ops`, `tde_date_ops`, `tde_timestamptz_ops`) the same way since 1.7.2 — which is also what restoring a dump that names one needs. Does not affect `PRIMARY KEY`/`UNIQUE` table constraints (always allowed, always warned — see "What Gets Encrypted" above). |
 
 ---
 
@@ -674,16 +857,16 @@ log stream without any extension-level configuration.
 
 | Function | Returns | Description |
 |---|---|---|
-| `pg_vault_tde_health_check()` | composite | Status (5 columns: version, enabled, kms_provider, enc_ops_available, checked_at) |
-| `pg_vault_tde_verify_integrity(regclass)` | record | GCM tag audit scan of all tuples — returns `(total_tuples, failed_tuples)` |
-| `pg_vault_tde_encrypted_size(regclass)` | record | Encryption storage overhead — returns `(total_tuples, encryption_overhead_bytes)` |
-| `pg_vault_tde_reencrypt_table(regclass, int)` | void | Batch re-encrypt with current DEK (locks table); `int` = batch size, default 1000 |
-| `pg_vault_tde_rotate_online(regclass, int)` | void | BGW-based online rotation, no exclusive lock; accepts both `encrypted_heap` tables and `tde_btree` indexes **(v1.5)** |
+| `pg_vault_tde_health_check()` | composite | Status (6 columns: version, build_version, enabled, kms_provider, enc_ops_available, checked_at) |
+| `pg_vault_tde_verify_integrity(regclass)` | record | GCM tag audit scan of all tuples and every out-of-line value they reference — returns `(total_tuples, failed_tuples)`, a row counted once whichever part failed. Up to 1.7.1 it could count intact rows as failed when the table was invalidated during its scan (autovacuum updating its statistics): on 1.7.1, run it again before acting on a failure. Requires `SELECT` on the table (v1.7.2; up to 1.7.1 any role could call it on any table) |
+| `pg_vault_tde_encrypted_size(regclass)` | record | Encryption storage overhead — returns `(total_tuples, encryption_overhead_bytes)`. Requires `SELECT` on the table (v1.7.2; up to 1.7.1 any role could call it on any table) |
+| `pg_vault_tde_reencrypt_table(regclass, int)` | void | Batch re-encrypt with current DEK (locks table); `int` = batch size, default 1000. Requires `MAINTAIN` on the table (its owner, `pg_maintain`, superusers) since 1.7.2 — see [Who may call `reencrypt_table()`](#who-may-call-reencrypt_table) |
+| `pg_vault_tde_rotate_online(regclass, int)` | void | BGW-based online rotation: reads continue, writes wait until it commits; accepts both `encrypted_heap` tables and `tde_btree` indexes **(v1.5)** |
 | `pg_vault_tde_get_rotation_status(regclass)` | table | Online rotation progress for one relation (status, tuples_done/total, pct_complete, timestamps) **(v1.5)** |
 | `pg_vault_tde_rotation_status` | view | All in-progress/completed rotations across the cluster; readable by `pg_monitor` **(v1.5)** |
-| `pg_vault_tde_check_plaintext_index_keys()` | table | Lists `tde_btree` indexes still using a pre-v1.6 plaintext operator class, with a ready-to-run `REINDEX` suggestion; `pg_monitor`/superuser only |
-| `pg_vault_tde_wallet_init(text)` | void | Create local wallet and generate KEK **(v1.5)** |
-| `pg_vault_tde_wallet_change_passphrase(text, text)` | void | Re-protect wallet with new passphrase and automatically rotate the KEK (`local` provider only); no separate `rotate_kek()` needed **(v1.6)** |
+| `pg_vault_tde_check_plaintext_index_keys()` | table | Meant to list `tde_btree` indexes on a plaintext-key operator class. **Known defect: returns no rows in 1.7.x**, and its `REINDEX` suggestion would not change the operator class. Use the query in [Upgrading to 1.7.2](#upgrading-to-172) instead; replaced in 1.8. `pg_monitor`/superuser only |
+| `pg_vault_tde_wallet_init(text)` | void | Create local wallet and generate KEK **(v1.5)**; refused while keys of the database are wrapped under a wallet that is missing. Superuser only — the calling role, see [Who may call the key-management functions](#who-may-call-the-key-management-functions) |
+| `pg_vault_tde_wallet_change_passphrase(text, text)` | void | Re-protect wallet with new passphrase and automatically rotate the KEK (`local` provider only); no separate `rotate_kek()` needed. Since 1.7.2 the new passphrase is in effect as soon as the wallet file is rewritten, even if the call then fails **(v1.6)** |
 | `pg_vault_tde_wallet_status()` | composite | Wallet existence, open state, algorithm, last opened, file perms (5 cols) **(v1.6)** |
 | `pg_vault_tde_wallet_unlock(text)` | void | Interactive wallet unlock without PG restart **(v1.6)** |
 | `pg_vault_tde_wallet_lock()` | void | Evict all DEKs from shmem, mark wallet closed **(v1.6)** |
@@ -692,9 +875,9 @@ log stream without any extension-level configuration.
 | `pg_vault_tde_seal_keys(text, text, text)` | void | Write an HMAC-SHA256-signed bundle of **all** wrapped DEKs (every provider) to a file, to accompany a physical backup (`pg_basebackup`); the KEK is never included **(v1.7)** |
 | `pg_vault_tde_seal_keys_bytea(text, text)` | bytea | Same signed bundle as `pg_vault_tde_seal_keys()`, returned as `bytea` instead of written server-side — used by `pg_basebackup_tde` to store the bundle on the client host **(v1.7)** |
 | `pg_vault_tde_unseal_keys(text, text)` | void | Verify (HMAC) and re-import a bundle written by `pg_vault_tde_seal_keys()`; rejects a tampered file or wrong passphrase before writing anything **(v1.7)** |
-| `pg_vault_tde_migrate_vault_to_wallet(text)` | void | Online Vault→local wallet migration **(v1.6)** |
-| `pg_vault_tde_vault_status()` | table | Vault provider diagnostics — `(configured, auth_method, reachable)` |
-| `pg_vault_tde_refresh_token()` | boolean | Manually renew the current Vault token lease |
+| `pg_vault_tde_migrate_vault_to_wallet(text)` | void | Online Vault→local wallet migration: pass the passphrase of the wallet created with `wallet_init()`; re-wraps every Vault DEK under the wallet's KEK and switches the database to the `local` provider. Broken before 1.7.2 — see [Upgrading to 1.7.2](#migrate_vault_to_wallet-before-172) **(v1.6)** |
+| `pg_vault_tde_vault_status()` | table | Vault provider diagnostics — `(configured, auth_method, reachable)`. Superuser only (v1.7.2; up to 1.7.1 open to any role) |
+| `pg_vault_tde_refresh_token()` | boolean | Manually renew the current Vault token lease. Superuser only (v1.7.2; up to 1.7.1 open to any role) |
 | `pg_vault_tde_hw_accel_info()` | record | OpenSSL provider/cipher diagnostics — `(openssl_version, configured_provider, provider_loaded, gcm_cipher, siv_cipher, aes_ni_available)` |
 
 ---
@@ -759,9 +942,9 @@ WHERE  a.amname = 'encrypted_heap'
 
 No rows means nothing to do — install 1.7.1 and carry on.
 
-This only applies with `pg_vault_tde.toast_encryption = on`, which is the
-default. If it was turned off, TOAST chunks were never encrypted by this
-extension and the upgrade is unaffected either way.
+A table whose TOAST table was created while `pg_vault_tde.toast_encryption` was
+`off` could not read its out-of-line values before the upgrade either (PSQLE-223):
+its chunks were encrypted but its TOAST table was a plain heap one.
 
 ### Step 2 — dump those tables, still on 1.7.0
 
@@ -804,6 +987,597 @@ newer](#logical-replication-on-postgresql-1711--18x-and-newer) below.
 
 ---
 
+## Upgrading to 1.7.2
+
+1.7.2 changes the on-disk tuple layout (**v5**). Nothing has to be exported
+first — every row written by 1.7.0 or 1.7.1 keeps reading, byte for byte — but
+**each encrypted table needs one `VACUUM FULL` after the upgrade**, and until it
+has had one, `UPDATE` on some of its rows can crash the backend. Run key rotations
+and wallet operations one at a time, before and after the upgrade alike — see
+[One key operation at a time](#one-key-operation-at-a-time).
+
+### Why
+
+The encrypted region used to be one opaque blob, while the tuple header — which
+stays in plaintext, because MVCC and VACUUM need it — went on declaring that the
+row held `natts` attributes laid out per the table's tuple descriptor. Every core
+path that reads a raw on-disk tuple believes that header, and `heap_update()`
+does it on **every** `UPDATE`: it reads the indexed attributes straight off the
+page to decide whether the update can be HOT and which indexes to maintain.
+
+Past the first variable-length column an attribute's offset is not cached, so
+reaching it means walking the row — and the walk was reading varlena length
+headers out of ciphertext. A four-byte header of random bytes yields a length of
+up to 1 GB, the cursor leaves the page, and the backend dies with SIGSEGV.
+Any index on such a column is enough, `tde_btree` included: what matters is that
+the column is indexed, not which access method indexes it.
+
+v5 keeps the row physically valid — every attribute at its own offset with its
+own length, only the *values* replaced by ciphertext — so that walk is safe. The
+AEAD is unchanged: same cipher, same tag, same AAD, and the same 37 bytes of
+overhead per tuple.
+
+### What to run
+
+Rows written before the upgrade keep the old layout until something rewrites
+them, and no layout can be made walkable after the fact. `VACUUM FULL` (or
+`CLUSTER`) rewrites every row through the extension and migrates the table:
+
+```sql
+-- every encrypted table in the current database
+SELECT format('VACUUM FULL %s;', c.oid::regclass)
+FROM   pg_class c
+JOIN   pg_am    a ON a.oid = c.relam
+WHERE  a.amname = 'encrypted_heap'
+  AND  c.relkind = 'r';
+```
+
+Run the statements it prints. `VACUUM FULL` takes an `ACCESS EXCLUSIVE` lock and
+needs room for a second copy of the table, so treat it as a maintenance window.
+Verified to leave the data byte-identical (`make ci-upgrade`).
+
+Tables created *after* the upgrade are in v5 from the first row and need nothing.
+
+### Also fixed: an all-NULL row made its table unreadable
+
+Independent of the layout change, and present in every release up to 1.7.1: a row
+whose columns are **all** NULL has no user data at all, so its encrypted region is
+the AEAD framing and nothing else. That is a well-formed encoding of a
+zero-length plaintext, and the decrypt path rejected it:
+
+```
+ERROR:  [CRYPTO] Ciphertext too short for AES-256-GCM
+```
+
+One such row is enough to make the whole table fail on any sequential scan from
+that `INSERT` onwards. The row is not corrupt — the ciphertext on disk is fine —
+and 1.7.2 reads it without any migration step. If you have hit this, upgrading is
+the whole fix.
+
+### Custom WAL resource manager id: 128 → 161
+
+1.7.2 moves the custom WAL resource manager from `RM_EXPERIMENTAL_ID` (128) — the
+id upstream reserves for experimentation, and so the one every prototype uses — to
+**161**, registered for pg_vault_tde on the PostgreSQL *Custom WAL Resource
+Managers* wiki. That is what keeps pg_vault_tde from colliding with another
+extension loaded in the same cluster.
+
+**If `pg_vault_tde.toast_custom_rmgr` is off — the default — there is nothing to
+do.** No WAL record is ever written under the extension's id, so none carries 128.
+
+**If it is on**, WAL written by 1.7.1 carries id 128, which 1.7.2 no longer knows:
+replaying it fails with `resource manager with ID 128 not registered`, which is
+fatal in the startup process. WAL carries the number, not the name, so this is not
+something a restart can work around. Before switching binaries:
+
+- stop the primary with a **clean** shutdown (`pg_ctl stop -m fast` or `smart`,
+  never `immediate`), so nothing is left to replay on the next start;
+- let every **physical standby** replay up to that shutdown checkpoint, then stop
+  and upgrade it together with the primary. **No rolling upgrade**: a 1.7.2 standby
+  cannot replay a 1.7.1 primary's records, and a 1.7.1 standby cannot replay a
+  1.7.2 primary's;
+- drain every **logical replication slot** that decodes TOAST through the custom
+  resource manager;
+- take a **new base backup** after the upgrade if you keep a WAL archive for PITR.
+  Recovering into the pre-upgrade window needs the 1.7.1 binaries.
+
+**Whatever the GUC says, check the id before upgrading.** 1.7.1 claimed 128, so a
+cluster running it alongside an extension that uses 161 worked; with 1.7.2 the same
+cluster will not start. Run the check in [2. Configure PostgreSQL](#2-configure-postgresql)
+on every node first — it must return only pg_vault_tde's own row, under 128 while
+1.7.1 is still running, and nothing else.
+
+### Renamed shared-memory objects
+
+The DEK cache's shared hash table and its LWLock tranche were both called
+`TdeRelDekMap`. Both names live in cluster-wide namespaces shared with every other
+preloaded extension, and PostgreSQL reports a clash in neither: a second extension
+using the same name would silently share the lock, or attach to the existing hash
+table and read it through its own layout. In 1.7.2 both are
+**`pg_vault_tde_rel_dek_map`**, prefixed like the extension's other shared-memory
+objects.
+
+Nothing on disk changes — shared memory is rebuilt at every start. Update only
+monitoring that matches the old name in `pg_stat_activity.wait_event` or in
+`pg_shmem_allocations.name`.
+
+### `tde_btree` answers equality only
+
+Up to 1.7.1 the planner used `tde_btree` indexes for range predicates, `ORDER BY`,
+`min()`/`max()` and merge joins, reading them in ciphertext order: on `text`, `bytea` and
+`numeric` columns those queries returned wrong rows without any error. `IN (…)` failed
+with `cache lookup failed for type …`, and on `numeric` even `=` missed rows. 1.7.2
+enforces the one question AES-SIV can answer — see [Limitation 2](#limitations-v17).
+Nothing on disk changes. What you may notice:
+
+- **Queries that range-filter or sort an indexed column run as sequential scans.** They
+  are correct now, and may be slower than the wrong answer was.
+- **`IN (…)` and `= ANY (…)` work**, through bitmap index scans.
+- **`numeric` and nondeterministic-collation `tde_btree` indexes can no longer be
+  created**, by any path: `CREATE INDEX`, an `EXCLUDE` constraint, or the rebuild behind
+  `ALTER COLUMN … TYPE` — so changing a column to `numeric` now fails while it has a
+  `tde_btree` index; drop the index first. Existing ones are ignored by the planner, so
+  queries are right, but **a `UNIQUE` or `EXCLUDE` constraint on one is not enforced**:
+  the check reads the index directly, misses equal values and lets duplicates in. Find
+  them and drop them:
+
+  ```sql
+  SELECT DISTINCT ix.indexrelid::regclass AS index_name,
+         ix.indrelid::regclass   AS table_name,
+         ix.indisunique,
+         con.conname             AS constraint_name
+  FROM pg_index ix
+  JOIN pg_class ic ON ic.oid = ix.indexrelid
+  JOIN pg_am    am ON am.oid = ic.relam AND am.amname = 'tde_btree'
+  CROSS JOIN LATERAL unnest(ix.indclass::oid[], ix.indcollation::oid[]) AS k(opc, coll)
+  JOIN pg_opclass opc ON opc.oid = k.opc
+  LEFT JOIN pg_collation  c   ON c.oid = k.coll
+  LEFT JOIN pg_constraint con ON con.conindid = ix.indexrelid
+  WHERE opc.opcintype = 'numeric'::regtype OR c.collisdeterministic IS FALSE
+  ORDER BY 1;
+  ```
+
+  `REINDEX`, `CONCURRENTLY` included, still rebuilds them. A restore of a dump containing
+  one reports an error for that index and restores everything else.
+- **The v1.5 operator classes that keep keys in plaintext** — `tde_int4_ops`,
+  `tde_int8_ops`, `tde_uuid_ops`, `tde_date_ops`, `tde_timestamptz_ops` — are refused for
+  new indexes unless `pg_vault_tde.allow_plaintext_index = on`, which a restore of a dump
+  that names one also needs. Indexes already built on them keep working. This lists them,
+  each with the statements that rebuild it on the encrypted default:
+
+  ```sql
+  SELECT ix.indexrelid::regclass AS index_name,
+         ix.indrelid::regclass   AS table_name,
+         regexp_replace(
+           regexp_replace(pg_get_indexdef(ix.indexrelid),
+                          ' tde_(int4|int8|uuid|date|timestamptz)_ops\M', '', 'g'),
+           '^CREATE (UNIQUE )?INDEX (\S+) ON ', 'CREATE \1INDEX CONCURRENTLY \2_enc ON ')
+           || ';  DROP INDEX CONCURRENTLY ' || ix.indexrelid::regclass || ';' AS migrate
+  FROM pg_index ix
+  WHERE EXISTS (
+      SELECT 1 FROM pg_opclass opc
+      WHERE opc.oid = ANY (ix.indclass::oid[])
+        AND opc.opcmethod = (SELECT oid FROM pg_am WHERE amname = 'tde_btree')
+        AND opc.opcname IN ('tde_int4_ops', 'tde_int8_ops', 'tde_uuid_ops',
+                            'tde_date_ops', 'tde_timestamptz_ops'))
+  ORDER BY 1;
+  ```
+
+  Run the `migrate` statements one at a time: `CREATE INDEX CONCURRENTLY` cannot run in a
+  transaction block. `pg_vault_tde_check_plaintext_index_keys()` would be the obvious tool,
+  and returns no rows in 1.7.x — a known defect, replaced in 1.8.
+
+---
+
+### KEK versions in the local wallet
+
+Up to 1.7.1, `pg_vault_tde_rotate_kek()` and `pg_vault_tde_wallet_change_passphrase()`
+on the local wallet replaced the file's only KEK **before** their transaction
+committed. A rotation that rolled back, failed later in the same statement, or died
+in a crash left every table of the database wrapped under a KEK that no longer
+existed. A session that had run `wallet_unlock()` also kept the old KEK in its own
+memory, could not read after another session's rotation, and wrapped the DEK of any
+table it created with the old key — lost at the next restart (PSQLE-185).
+
+1.7.2 keeps every KEK version in the wallet: one PKCS#12 key bag per version, the
+current one first. A rotation adds a version, durably, before it re-wraps anything,
+and removes none. A session holding an older copy reloads the wallet from its
+passphrase source when it meets a newer version, or asks for a new `wallet_unlock()`
+if it has none. The wrapped DEKs in `pg_vault_tde_catalog` are unchanged.
+
+What to know:
+
+- **Nothing to do before upgrading.** A 1.7.1 wallet is read as version 1; the first
+  rotation on 1.7.2 writes the new layout.
+- **Downgrading after a rotation on 1.7.2:** 1.7.1 reads the first — current — KEK of
+  the file, which is every DEK's after a rotation that committed. After one that did
+  not, some DEKs are under an older version that 1.7.1 cannot use.
+- **Dumps taken before a KEK rotation restore again** with the 1.7.2 `pg_restore_tde`:
+  their DEK is under an older version, which the wallet now keeps.
+- **A session unlocked only by `wallet_unlock()`**, with no passphrase source, has to
+  unlock again after another session rotates the KEK or changes the passphrase.
+- **If a rotation on 1.7.1 did not commit and your tables stopped reading,** restore
+  the wallet file from before that rotation: the catalog is still wrapped under it.
+
+### `migrate_vault_to_wallet()` before 1.7.2
+
+Up to 1.7.1, `pg_vault_tde_migrate_vault_to_wallet()` wrapped every DEK under a key
+derived from its passphrase argument instead of the KEK held by the wallet it was told
+to use, accepted any passphrase, and left the database on the Vault provider. Every
+migrated table became unreadable, and the Vault-wrapped copy of each DEK had been
+overwritten in `pg_vault_tde_catalog` (PSQLE-188).
+
+1.7.2 opens the wallet with the passphrase — a wrong one is refused before anything
+changes — wraps under the wallet's current KEK, keeps the cached keys so sessions keep
+reading, and switches the database to `kms_provider = 'local'`. Sessions connected
+before the migration keep the Vault provider until they reconnect.
+
+**If you ran it on 1.7.1:** the tables it migrated can only come back from a backup
+taken before the migration — of the database, or of `pg_vault_tde_catalog` while the
+Vault Transit key still exists.
+
+### `rotate_online()` with concurrent access
+
+Up to 1.7.1, a `pg_vault_tde_rotate_online()` that ran while its table was read or
+written could leave rows encrypted under a key that existed only in shared memory: some
+became unreadable at once, the rest at the next restart. A single `SELECT` during the
+rotation was enough to lose the whole table at the restart, and
+`pg_vault_tde_verify_integrity()` reports nothing wrong until then (PSQLE-184).
+
+**Before the restart that installs 1.7.2:** if `rotate_online()` has run since the last
+restart on a table that was being read or written, copy that table while the server is
+still up (`CREATE TABLE … AS SELECT …` or `pg_dump`). The restart discards the only copy
+of the key; after it, only a backup brings the rows back.
+
+What changes in 1.7.2: `SELECT` keeps working during a rotation, while `INSERT`,
+`UPDATE`, `DELETE`, `COPY` and a second rotation of the same table wait for it to
+commit. The whole table is re-encrypted in one transaction, so on a large table treat a
+rotation as a window with no writes.
+
+### `rotate_online()` and out-of-line values
+
+Up to 1.7.1, `pg_vault_tde_rotate_online()` re-encrypted every row but left its
+out-of-line (TOAST) values — typically `text`, `bytea` or `jsonb` values still over
+about 2 kB after compression — under the outgoing key. The catalog keeps only the
+current key, so the outgoing one survived in shared memory alone: the values became
+unreadable at the next restart, or at once at the next rotation of the same table. No
+concurrent access is needed. The rest of each row stays readable, a `DELETE` of an
+affected row fails, and up to 1.7.1 `pg_vault_tde_verify_integrity()` reports nothing
+wrong: it checked the rows, not their TOAST values (PSQLE-189, PSQLE-196). In 1.7.2 it
+counts such a row as failed.
+
+**Before the restart that installs 1.7.2:** run `VACUUM FULL` on every table with
+out-of-line values that has been rotated once since the last restart. It rewrites the
+values under the table's current key while the outgoing one is still in shared memory;
+`UPDATE t SET col = col || ''` on each affected column does the same. This lists the
+candidates:
+
+```sql
+SELECT p.relid::regclass AS table_name, p.updated_at AS rotated_at
+FROM pg_vault_tde_rotation_progress p
+JOIN pg_class c ON c.oid = p.relid
+WHERE p.status = 'complete'
+  AND p.updated_at > pg_postmaster_start_time()
+  AND c.reltoastrelid <> 0
+  AND pg_relation_size(c.reltoastrelid) > 0;
+```
+
+A table rotated twice since the restart, or rotated before it, has already lost the
+values stored before its last rotation, and only a backup brings them back.
+`SELECT sum(length(t::text)) FROM t` reads every value of `t` and fails with
+`decryption failed` if any of them is lost. A `missing chunk number 0` from the same
+query is a different, harmless defect — see [Dropped columns and out-of-line values](#dropped-columns-and-out-of-line-values).
+
+What changes in 1.7.2: the rotation rewrites every out-of-line value under the new key
+and deletes the old chunks; dropped columns become NULL, as in any `UPDATE`, and their
+chunks go too. A rotation of a table with large
+values reads and writes all of them, so it takes longer and writes more WAL than in
+1.7.1.
+
+### Concurrent `UPDATE` of out-of-line values
+
+Up to 1.7.1, an `UPDATE` that replaced an out-of-line value deleted the old value's
+chunks before it found out whether another transaction had changed the row. When one
+had — a concurrent `UPDATE` or `DELETE` of the same row, under `READ COMMITTED` — the
+waiting `UPDATE` could (PSQLE-193):
+
+- skip the row, because its `WHERE` no longer matched the newer version, which still
+  pointed at the deleted chunks: the value kept reading until the next `VACUUM`, then
+  failed with `missing chunk number 0 for toast value …`;
+- fail with `tuple concurrently deleted` when the other transaction had replaced or
+  deleted the same value;
+- go ahead on the newer version and leave the chunks of the values it did not change
+  behind, referenced by nothing.
+
+A value already lost cannot be brought back except from a backup;
+`SELECT sum(length(t::text)) FROM t` fails on a table that has one. The orphaned
+chunks only take space, and `VACUUM FULL` drops them. In 1.7.2 the old chunks are
+deleted only once the row has been updated, and an attempt that finds the row changed
+removes the chunks it had written, so the waiting `UPDATE` behaves as on a plain heap
+table.
+
+The same change fixes a failure that needed no concurrency: an `UPDATE` turning an
+out-of-line value into a compressed inline one — `SET col = repeat('x', 6000)` over a
+value stored out of line — failed with `tuple already updated by self` (PSQLE-191). No
+data was affected; the statement rolled back.
+
+An `INSERT ... ON CONFLICT` that lost the race to a concurrent insert of the same key
+also left its out-of-line values behind, referenced by nothing (PSQLE-197). They only
+take space; `VACUUM FULL` drops them, and 1.7.2 no longer leaves them.
+
+
+### Dropped columns and out-of-line values
+
+A column dropped with `ALTER TABLE ... DROP COLUMN` keeps its values in every row until
+the row is rewritten. Up to 1.7.1 the TAM mishandled the out-of-line ones (PSQLE-192):
+
+- `DELETE` left their chunks in the TOAST relation, referenced by nothing, whenever
+  the row had no other out-of-line value — and so did a `DELETE` that waited on a
+  concurrent `UPDATE` of the row, for every value of the row;
+- `VACUUM FULL` and `CLUSTER` copied the dropped column's pointer as it was into the
+  rewritten table, where it points into the TOAST relation the rewrite replaced. The
+  live columns read normally, but a read of the whole row — `SELECT t FROM t`,
+  `t::text`, `row_to_json(t)` — fails with `missing chunk number 0 for toast value …`;
+- with the 1.7.2 fix for [out-of-line values in a rotation](#rotate_online-and-out-of-line-values)
+  alone, the same pointers made `rotate_online()` fail; that combination never shipped.
+
+**After installing 1.7.2:** the `VACUUM FULL` that [Upgrading to 1.7.2](#upgrading-to-172)
+already asks for repairs all of it: it rewrites dropped columns as NULL, as core does,
+which removes the dangling pointers and the orphaned chunks. A rotation or an `UPDATE`
+of a row repairs that row too, and `rotate_online()` and `DELETE` work on the tables
+as they are. `make ci-upgrade` checks each of these on data written by 1.7.1.
+
+
+### Streaming standby and `rotate_online()`
+
+The rotation moves the primary's shared-memory DEK cache to the new key when it
+commits; a streaming standby learns of it only from the replicated catalog row. Up to
+1.7.1 a standby that had a table's DEK cached kept the retired one (PSQLE-190):
+
+- every row of the new generation went through the catalog and the KMS — one unwrap
+  per row, an HTTP call each with Vault — until the standby restarted;
+- after a promotion the node encrypted new rows of such a table with the retired key.
+  In 1.7.1 the table stops reading at once, at the first scan that meets a new row;
+  with the rest of 1.7.2's fixes alone the rows would have been lost at the next
+  restart.
+
+**Still on 1.7.1:** after promoting a standby, restart it before the first write —
+with the local wallet, `pg_vault_tde_wallet_unlock()` in each database does the same.
+Both empty the cache, so every key comes from the catalog again.
+
+What changes in 1.7.2: a catalog read that shows a newer generation than the cached
+one replaces it, so the standby unwraps once per rotated table rather than once per
+row; and once a node leaves recovery, the first write to each table checks the key it
+cached during recovery against the catalog. `tap/34_standby_rotation.t` covers both,
+including a table first touched by an `INSERT` after the promotion.
+
+
+### `rotate_online()` and indexes
+
+The rotation rewrites every row, and a rewrite that cannot stay on its page puts the
+new version elsewhere; an `UPDATE` would then add an entry for it to every index. Up to
+1.7.1 the rotation added none (PSQLE-194). It rebuilt the table's `tde_btree` indexes
+and left every other one pointing at the retired row versions only:
+
+- after the rotation an index scan through them finds nothing — including lookups by
+  `PRIMARY KEY` or through a `UNIQUE` constraint, which on an encrypted table are
+  standard btree indexes by default;
+- `PRIMARY KEY` and `UNIQUE` no longer hold: a duplicate is accepted.
+
+Sequential scans still return every row, so nothing is lost, but queries that use
+those indexes return wrong results.
+
+**After installing 1.7.2 (or right away on 1.7.1):** run `REINDEX TABLE` on every
+table `pg_vault_tde_rotate_online()` or `pg_vault_tde_reencrypt_table()` has ever
+rewritten. The online rotations are listed by
+`SELECT relid::regclass FROM pg_vault_tde_rotation_progress WHERE status = 'complete'`.
+If duplicates got in meanwhile, `REINDEX` of the unique index fails and names the
+key: remove the extra rows first (`SELECT id, count(*) FROM t GROUP BY id HAVING
+count(*) > 1` for a key `id`).
+
+What changes in 1.7.2: the rotation inserts the index entries of every row it
+rewrites, as the executor's `UPDATE` does — partial and expression indexes and
+uniqueness checks included — and still rebuilds the `tde_btree` ones. The new entries
+take no lock beyond the rotation's own; only the `tde_btree` rebuild at the end locks
+its index. `tap/35_rotate_online_indexes.t`.
+
+
+### Partial indexes on encrypted tables
+
+`CREATE INDEX` and `REINDEX` on an encrypted table run the extension's own build scan,
+which decrypts each row before computing its keys. Up to 1.7.1 it never evaluated the
+index predicate, so a partial index (`CREATE INDEX ... WHERE ...`) received every row
+(PSQLE-198):
+
+- **queries through it can return wrong rows.** The planner drops the conditions the
+  predicate implies, trusting the index to hold only rows that satisfy it: with an
+  index on `(customer) WHERE status = 'open'`, `WHERE customer = 7 AND status = 'open'`
+  returned every order of customer 7;
+- a valid `CREATE UNIQUE INDEX ... WHERE ...` was refused when the key repeated outside
+  the predicate;
+- partial indexes were as large as full ones.
+
+**After installing 1.7.2:** `REINDEX` every partial index on an encrypted table. This
+lists them:
+
+```sql
+SELECT ix.indexrelid::regclass AS index_name, ix.indrelid::regclass AS table_name
+FROM pg_index ix
+JOIN pg_class t ON t.oid = ix.indrelid
+JOIN pg_am    a ON a.oid = t.relam AND a.amname = 'encrypted_heap'
+WHERE ix.indpred IS NOT NULL
+ORDER BY 1;
+```
+
+Until it is rebuilt, a partial index can answer wrongly; `REINDEX INDEX CONCURRENTLY`
+rebuilds it without blocking writes. `make ci-upgrade` builds one with 1.7.1 and checks
+that this query finds it and that `REINDEX` makes it answer what a sequential scan
+answers.
+
+
+### Indexes built while an older snapshot is open
+
+PostgreSQL builds an index so that transactions already running when it was built can
+use it too: it also indexes row versions that are dead for everyone else but may still
+be visible to them, and when a HOT chain changed the indexed column it marks the index
+unusable for those older transactions (`pg_index.indcheckxmin`). Up to 1.7.1 the
+extension's own build scan did neither: it indexed only what a fresh snapshot saw
+(PSQLE-201). A `REPEATABLE READ` or `SERIALIZABLE` transaction that started before a
+`CREATE INDEX` and then queried through the new index missed rows deleted or updated
+after its snapshot, and could get rows whose version visible to it does not satisfy
+the query.
+
+Only those older transactions were affected, and only until they ended: for every
+transaction started after the build, an index built by 1.7.1 is correct. Nothing needs
+to be done after installing 1.7.2, which builds indexes as heapam does. If two
+rotations of the table left row versions an old snapshot can still see under a key
+that no longer exists, the index is built without them and marked unusable for older
+transactions, as PostgreSQL does for broken HOT chains.
+
+
+### `CLUSTER` on encrypted tables
+
+Up to 1.7.1, `CLUSTER t USING idx` on an encrypted table compacted it and marked the
+index clustered, but left the rows in the order they were in (PSQLE-204): the extension
+rewrote the table with its own sequential copy and ignored the index. 1.7.2 orders the
+rows as PostgreSQL does, through an index scan or a sort, whichever the planner picks.
+
+A `tde_btree` index is ordered by the ciphertext of its keys, not by their values, so
+`CLUSTER` on one is refused with an error: use `VACUUM FULL` to compact the table, or
+cluster on a plain btree index — the `PRIMARY KEY` and `UNIQUE` constraints of an
+encrypted table are plain btree indexes by default. A table marked clustered on a
+`tde_btree` index by an earlier release makes a plain `CLUSTER t` fail the same way;
+`ALTER TABLE t SET WITHOUT CLUSTER` clears the mark. A sort that outgrows
+`maintenance_work_mem` spills decrypted rows to temporary files, as any sort does — see
+the note on `temp_tablespaces` above.
+
+
+### Who may call `reencrypt_table()`
+
+`pg_vault_tde_reencrypt_table()` rewrites every row of a table: it takes locks, writes
+WAL and leaves the old versions behind until `VACUUM`. Up to 1.7.1 the extension granted
+`EXECUTE` on it to `pg_monitor` — a role meant for monitoring — and checked nothing
+else, so any member of it could rewrite any encrypted table, including tables it had no
+privilege on (PSQLE-205). 1.7.2 also requires the caller to hold `MAINTAIN` on the
+table, as `VACUUM FULL`, `CLUSTER` and `REINDEX` do: the table's owner, members of
+`pg_maintain` and superusers hold it. Granting `EXECUTE` to another role no longer
+lets that role rewrite tables it may not maintain.
+
+**Still on 1.7.1:** take the function away from `pg_monitor`, as a superuser:
+
+```sql
+REVOKE EXECUTE ON FUNCTION pg_vault_tde_reencrypt_table(regclass, int),
+                           pg_vault_tde_reencrypt_table(text, int) FROM pg_monitor;
+```
+
+1.8 removes the grant from the extension script.
+
+Since 1.7.2 the function also refuses to run inside a **security-restricted
+operation**. `ANALYZE`, `VACUUM` and `REINDEX` run as the table's owner, and so does
+any index expression they evaluate; the role the check asks about — the session role —
+is not that owner's, so a table owner's code evaluated during a superuser's maintenance
+would have been checked against the superuser (PSQLE-225). A rewrite has no business
+inside an index expression, so it is refused there outright.
+
+
+### Who may call the key-management functions
+
+`wallet_init`, `wallet_unlock`, `wallet_lock`, `wallet_change_passphrase`,
+`migrate_vault_to_wallet`, `seal_keys`, `seal_keys_bytea`, `unseal_keys` and
+`rotate_kek` are `SECURITY DEFINER`, and each checked `superuser()` — which inside such
+a function asks about its owner, the superuser who ran `CREATE EXTENSION`, and is
+always true (PSQLE-206). Only `REVOKE ... FROM PUBLIC` kept them closed, and
+`wallet_init()` is granted to `pg_monitor`: up to 1.7.1 any member of it could create
+the wallet of a database that had none, with a passphrase of its own choosing, and so
+hold the KEK of every table later encrypted there. `pkcs11_keygen()` checked nothing.
+
+1.7.2 checks the role that called the function, whoever has been granted `EXECUTE`:
+all of them require a superuser. Delegating a database's wallet to its owner or to a
+tenant role is planned for 1.8.
+
+They also refuse inside a **security-restricted operation** — `ANALYZE`, `VACUUM`,
+`REINDEX` and the index expressions they evaluate, which run as the table's owner —
+because the session role the check asks about is not the caller there (PSQLE-225).
+
+One gap remains until 1.8: a role that holds `EXECUTE` can still reach these functions
+through code of its own that a superuser runs, such as a `SECURITY DEFINER` function it
+owns. The check cannot see past its own `SECURITY DEFINER` wrapper to that role; 1.8
+removes both the wrapper and the `pg_monitor` grants (the same `REVOKE` above is the
+mitigation meanwhile). Treat calling another role's function as a superuser the way
+PostgreSQL does in general: as running that role's code.
+
+**Still on 1.7.1:** take `wallet_init()` away from `pg_monitor`, as a superuser —
+`REVOKE EXECUTE ON FUNCTION pg_vault_tde_wallet_init(text) FROM pg_monitor;` — and
+check that every database with a wallet got it from a superuser. The wallets are the
+directories under `/var/lib/pg_vault_tde/`, one per database OID; each creation left a
+`pg_vault_tde: wallet initialized at "…"` line in the server log, which names the role
+when `log_line_prefix` includes `%u` — otherwise match its time and PID against the
+connection log (`log_connections`). If a wallet may have been created by someone else,
+change its passphrase (`pg_vault_tde_wallet_change_passphrase()`) and rotate the KEK
+(`pg_vault_tde_rotate_kek()`).
+
+### Who may call the read-only functions
+
+`pg_vault_tde_verify_integrity()` and `pg_vault_tde_encrypted_size()` open, scan and
+decrypt a whole relation; `pg_vault_tde_vault_status()` reports the server's KMS
+configuration and probes Vault, and `pg_vault_tde_refresh_token()` makes it renew its
+Vault lease. All four keep `EXECUTE` to `PUBLIC` and checked nothing up to 1.7.1, so any
+role could ask them about a table it may not read, or act on the cluster's KMS
+(PSQLE-226).
+
+1.7.2 checks the role whose code is running: the two scans require `SELECT` on the
+relation — what a `count(*)` over it would need — and the two KMS functions require a
+superuser. Nothing else changes, and a superuser is unaffected.
+
+**If you monitor with them:** a `pg_monitor` membership is not `SELECT`. Give the
+monitoring role `SELECT` on the tables it checks, or `pg_read_all_data` for all of them;
+move `vault_status()` and `refresh_token()` to a superuser connection.
+
+### Tables created with `toast_encryption = off`
+
+Up to 1.7.1, `pg_vault_tde.toast_encryption = off` did not store TOAST in plaintext, as
+documented. A table created while it was off — or rewritten by `VACUUM FULL`, `CLUSTER`
+or `SET ACCESS METHOD` — got a plain heap TOAST table whose chunks were still
+encrypted, and read them back undecrypted: every out-of-line value of the table fails
+with `unexpected chunk number … for toast value …`, and so does a `VACUUM FULL` or
+`CLUSTER` of it (PSQLE-223). 1.7.2 always gives an encrypted table an `encrypted_heap`
+TOAST table; the setting has no effect and only raises a `WARNING`.
+
+The values are not lost: the chunks are encrypted with the table's key, and only the
+access method of its TOAST table is wrong. In each database, as a superuser:
+
+1. Find the tables:
+
+   ```sql
+   SELECT c.oid::regclass AS table_name, t.oid::regclass AS toast_table
+   FROM   pg_class c
+   JOIN   pg_am    ca ON ca.oid = c.relam
+   JOIN   pg_class t  ON t.oid  = c.reltoastrelid
+   JOIN   pg_am    ta ON ta.oid = t.relam
+   WHERE  ca.amname = 'encrypted_heap' AND ta.amname <> 'encrypted_heap';
+   ```
+
+2. Check that the table is affected — reading every value of every row fails:
+
+   ```sql
+   SELECT sum(length(t::text)) FROM <table_name> t;
+   ```
+
+   If this succeeds, the table is not affected (its TOAST chunks are plaintext, from a
+   release before 1.6): leave it as it is.
+
+3. Give its TOAST table the `encrypted_heap` access method:
+
+   ```sql
+   UPDATE pg_class
+   SET    relam = (SELECT oid FROM pg_am WHERE amname = 'encrypted_heap')
+   WHERE  oid = '<toast_table>'::regclass;
+   ```
+
+4. Check: the query of step 2 now succeeds, and
+   `SELECT * FROM pg_vault_tde_verify_integrity('<table_name>')` reports
+   `failed_tuples = 0`.
+
 ## Compatibility
 
 | Feature | Status | Notes |
@@ -817,7 +1591,7 @@ newer](#logical-replication-on-postgresql-1711--18x-and-newer) below.
 | INSERT / COPY | ✅ Full | `tuple_insert` + `multi_insert` override |
 | UPDATE | ✅ Full | `tuple_update` override + ctid preservation |
 | DELETE | ✅ Full | No-op (heapam header-only delete, no column data touched) |
-| HOT chains | ✅ Full | Header plaintext → HOT chain pointers preserved |
+| HOT updates | ❌ Disabled by design | A changed indexed column is re-encrypted under a fresh IV so its on-disk bytes always differ (PSQLE-219), so `heap_update` never chooses HOT when an indexed column changed; the index stays coherent. See [Limitation 7](#limitations-v17) and [Running in Production](#running-pg_vault_tde-in-production) |
 | VACUUM | ✅ Full | Inherited from heapam (dead-tuple header only) |
 | CTAS   | ✅ Full | Per-table DEK registration before SELECT is executed |
 | `pg_dump` (plain) | ⚠️ Dump is plaintext | pg_dump reads via scan_getnextslot → decrypted. Use `pg_dump_tde` to re-encrypt the output. |
@@ -827,8 +1601,10 @@ newer](#logical-replication-on-postgresql-1711--18x-and-newer) below.
 | Logical replication (non-TOAST) | ✅ Full (v1.2) | `pg_vault_tde_pgoutput` plugin decrypts tuples before streaming. On PG ≥ 17.11 / 18.x the publisher must allow the plugin — see below |
 | TOAST (large values > ≈2 kB) | ✅ Full | Heap-level round-trips functional; per-chunk storage encryption |
 | Logical replication (TOAST columns) | ✅ Full (v1.7) | Custom WAL rmgr (`toast_custom_rmgr`) routes encrypted chunks past the reorder buffer; stitched in `change_cb`. UPDATE/DELETE need `REPLICA IDENTITY FULL` + PK. Same publisher requirement as above |
-| Range scans on TDE indexes | ⚠️ By design | `tde_btree` (GIN/Hash/GiST planned for v1.8, same AES-SIV pattern) — equality only; ranges return empty |
+| Range scans / ordering on TDE indexes | ⚠️ Equality only (by design) | `tde_btree` serves `=`, `IN`, `= ANY`; ranges, `ORDER BY`, `min`/`max` and merge joins run as sequential scans. `numeric` and nondeterministic-collation columns cannot be indexed with it — see [Limitation 2](#limitations-v17) |
 | `CREATE INDEX USING gin/gist/hash/brin/btree` on `encrypted_heap` | ⚠️ `ERROR` by default | Not encrypted AMs; rejected unless `pg_vault_tde.allow_plaintext_index = on` (then allowed with `WARNING`) |
+| `EXCLUDE` constraint, native index cloned onto an encrypted partition, or native index kept through `SET ACCESS METHOD encrypted_heap` | ⛔ Not supported (→ v1.8) | Build plaintext keys past the guard above, with no check and no warning — do not use on encrypted tables; see [Limitation 11](#limitations-v17) |
+| `tde_btree ... INCLUDE (col)` | ⚠️ `ERROR` (v1.7.2) | The included payload is not encrypted; `tde_btree` rejects `INCLUDE` |
 | Column-level encryption | 🔜 v1.8 | Per-column `ENABLE COLUMN ENCRYPTION` DDL |
 
 ### Logical replication on PostgreSQL 17.11 / 18.x and newer
@@ -889,13 +1665,26 @@ make ci-all
 PG_VERSION=17 make ci-all
 
 # Individual test stages:
-make ci-regress          # 140 SQL regression tests (vault provider) — tests 1-140 (test 110 deferred)
+make ci-regress          # 141 SQL regression tests (vault provider) — numbered 1-140 + 154-164, with gaps
+make ci-errorpath        # 13 error-path tests (141-153) — exercises the PG_CATCH handlers
+make ci-matrix           # regress + TAP on the other supported PG majors (17, 19 when published)
+make ci-scan-build       # Clang static analyzer over the sources (compile only, ~1 min)
+make ci-semgrep          # the project's own Semgrep rules (ci/semgrep/), each tested on its own file, then run on src/
+make ci-ubsan            # Extension built with -fsanitize=undefined
+make ci-asan             # Extension built with -fsanitize=address, runtime preloaded into the stock server
+make ci-valgrind         # Valgrind memcheck over the full TDE workload (slow: 10-50x)
+make ci-cassert          # SQL suites + TAP files on PostgreSQL built --enable-cassert -DUSE_VALGRIND (builds PG from source)
 make ci-wallet           # SQL regression tests (local wallet provider)
 make ci-checksums        # regression tests + page checksum compatibility
-make ci-tap              # 18 TAP test files (starts a real Vault container for the Vault-dependent ones)
-make ci-isolation        # Concurrency / MVCC isolation tests
+make ci-tap              # 49 TAP test files (starts a real Vault container for the Vault-dependent ones)
+make ci-pins             # every GitHub Action pinned by commit, every third-party image by digest, every downloaded binary checked (first stage of ci-all)
+make ci-sbom             # SPDX SBOM of the source bundle (syft), scanned by grype — informational, as on the release
+make ci-security-report  # the stages a security review cites, on this commit → doc/security/evidence/v<VERSION>.md (doc/SECURITY-REVIEW.md › Workflow)
+make ci-soak             # tap/43_soak.t alone: 30 min of random writes, rotations and immediate stops against a heap twin (SOAK_MINUTES, SOAK_SEED)
+make ci-isolation        # 3 isolation specs: DEK rotation under load, relation rewrite under a concurrent reader, UPDATE of out-of-line values racing another transaction
 make ci-vault            # Vault integration (Compose-based)
 make ci-openbao          # OpenBao Raft 3-node HA integration (12 tests)
+make ci-upgrade          # Read data written by the previous release tag (upgrade compatibility)
 make ci-bench            # Performance benchmark (encrypted vs plain heap)
 make ci-bench BENCH_ROWS=100000  # with custom row count
 
@@ -903,21 +1692,20 @@ make ci-bench BENCH_ROWS=100000  # with custom row count
 make ci-clean            # Remove test containers and images
 ```
 
-Test coverage (140 tests = 52 v1.4 + 20 v1.5 + 38 v1.6 + 30 v1.7):
-- Tests 1-11: AES-256-GCM crypto primitives, DEK rotation, tamper detection
+Test coverage — 154 SQL regression tests (44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7 + 13 error-path), plus 1173 assertions across 49 TAP files (the soak test, `tap/43`, runs only under `make ci-soak`). Numbers are one sequence shared by every file and have gaps: 5-11 and 49 no longer exist, 80 was removed in v1.7, and 110 is disabled (the `WITH HOLD` cursor spill is a permanent limitation):
+- Tests 1-4: extension loaded, access methods and SQL functions registered, wallet unlock
 - Tests 12-14: TAM INSERT/SELECT/UPDATE end-to-end
 - Test 15: DELETE
 - Test 16: All-NULL rows (zero-length user data)
 - Test 17: Index scan (`index_fetch_tuple` path)
 - Test 18: COPY/bulk insert (`multi_insert` path)
 - Test 19: Multi-column table (int, text, bool, numeric, timestamptz)
-- Test 20: Key rotation isolation (DEK-A rows rejected by DEK-B)
+- Test 20: Per-table DEK isolation (two tables independently readable)
 - Test 21: ANALYZE produces correct statistics on decrypted data
 - Test 22: SELECT FOR UPDATE (`tuple_lock` path)
 - Test 23: BitmapHeapScan (`scan_bitmap_next_tuple` path)
 - Test 24: TABLESAMPLE (`scan_sample_next_tuple` path)
 - Tests 25-48: UPSERT, MERGE, TRUNCATE, REINDEX, ALTER, JOINs, CTEs, HW accel, Vault, logical decoding
-- Test 49: Wire format v2 round-trip (version byte + generation counter) **(v1.4)**
 - Test 50: tde_btree CREATE INDEX + equality index scan **(v1.4)**
 - Test 51: health_check() `kms_provider` column coherence with GUC **(v1.6 realignment)**
 - Test 52: tde_btree UNIQUE constraint **(v1.4)**
@@ -962,9 +1750,79 @@ Test coverage (140 tests = 52 v1.4 + 20 v1.5 + 38 v1.6 + 30 v1.7):
 - Test 138: `ALTER TABLE x SET ACCESS METHOD encrypted_heap` on a **populated** table with genuinely out-of-line TOAST data (~13 KB, high-entropy so PGLZ can't compress it back inline) — verifies an exact byte-for-byte round-trip via `SELECT` (Tests 105/106 only check on-disk bytes, never read the row back) plus post-ALTER `UPDATE`/`DELETE` across all four small/large transitions **(v1.7, PSQLE-135 regression coverage)**
 - Test 139: `ALTER TABLE x SET ACCESS METHOD heap` — reverse direction of Test 138, same coverage **(v1.7, PSQLE-135 regression coverage)**
 - Test 140: `CREATE TABLE AS SELECT` from an `encrypted_heap` table with genuinely out-of-line TOAST data must re-externalize into the **destination's own** TOAST table; verifies the destination survives the (unrelated, from its own point of view) source table being dropped **(v1.7, PSQLE-135 regression coverage)**
+- Test 154: `UPDATE` on a table whose index sits on an attribute **behind a variable-length column** — the statement that segfaulted. `heap_update()` reads the indexed attributes straight off the page; under the v4 layout that walk took a varlena length header out of ciphertext and left the page. Also asserts no HOT update was chosen and that index and sequential scan agree after the indexed column changes **(v1.7.2, PSQLE-165 regression coverage)**
+- Test 155: a row whose columns are **all NULL** round-trips. Its encrypted region is the AEAD framing and nothing else — a well-formed encoding of a zero-length plaintext that used to be rejected, making the row unreadable for good **(v1.7.2)**
+- Test 156: the v5 layout keeps attribute **values** off disk while leaving the tuple structure readable; a plain-heap control proves the search would have found the needle if it were there **(v1.7.2)**
+- Test 157: every on-disk tuple is **physically walkable** with the relation's tuple descriptor — the invariant PSQLE-165 broke, asserted directly via `pageinspect` instead of through its symptom, plus a per-attribute plaintext check. Skips when `pageinspect` is unavailable **(v1.7.2)**
+- Test 158: the indexed column's **position** must not affect correctness — 8 combinations (attnum 1 / behind a varlena / behind a NULL varlena / behind a dropped column, × `tde_btree` and plaintext `btree`). PSQLE-165 hid for four releases because 38 of 38 regression tables put the key on the first column, the one position whose offset is cached and never walked **(v1.7.2)**
+- Test 159: `pg_get_wal_resource_managers()` reports id **161** as `pg_vault_tde` — the id reserved on the PostgreSQL *Custom WAL Resource Managers* wiki. Fails on any change to `TDE_RMGR_ID`, which would make the previous release's WAL unreplayable; `tap/19` pins the same id in the WAL records and the startup log **(v1.7.2, PSQLE-172)**
+- Test 160: ordering, `min()`/`max()`, ranges, `LIKE` prefixes and merge joins never read a `tde_btree` index and return what a sequential scan returns **(v1.7.2, PSQLE-173)**
+- Test 161: `=`, `IN (…)` and `= ANY (…)` use the index, and every one of 2,000 values of five types is found through it **(v1.7.2, PSQLE-173)**
+- Test 162: a range forced onto `tde_btree` is refused, never answered with wrong rows; ordering cannot be forced onto it at all **(v1.7.2, PSQLE-173)**
+- Test 163: no creation path — `CREATE INDEX`, `EXCLUDE` in `CREATE TABLE` or `ALTER TABLE`, the rebuild behind `ALTER COLUMN … TYPE` — builds a `tde_btree` index on `numeric`, a nondeterministic collation or a plaintext-key operator class; `REINDEX`, `CONCURRENTLY` included, keeps working (before the fix, `UNIQUE` and `EXCLUDE` on such an index let 1164 and 1332 exact duplicates of 2,000 in) **(v1.7.2, PSQLE-173)**
+- Test 164: shapes that could still lead the planner onto `tde_btree` — ranges it derives from `LIKE`, `^@` and regex prefixes under collation `C`, `> ANY`, row comparisons, window functions, `DISTINCT … ORDER BY`, skip scan, range joins, `IS NULL`, `ORDER BY`/`max()` across partitions — all match a sequential scan **(v1.7.2, PSQLE-173)**
+
+Error-path coverage — tests 141-153 (`sql/regression_test_errorpath.sql`, `make ci-errorpath`):
+
+Every other test file exercises the success path. These exercise the `PG_CATCH` handlers in the TAM write paths — code that only ever runs after a `longjmp`, and that cleanses plaintext key material and frees intermediates. No success-path test can reach it. The suite locks the wallet so `tde_gcm_encrypt()` raises from inside `tde_encrypt_heap_tuple()`, i.e. from inside the `PG_TRY` of every write path, then forces 145 aborted writes through those handlers.
+
+- Test 141: `pg_vault_tde_tuple_insert` handler ×25 — also the guard that the DEK really is unreachable (a vacuous run is a failure, not a pass)
+- Test 142: `pg_vault_tde_multi_insert` handler ×10 batched COPY of 100 **small** rows — the aliasing case where `toasted_inflight == plain_inflight`
+- Test 143: `pg_vault_tde_multi_insert` + `pg_vault_tde_toast_save_datum` handlers ×5 via the custom TOAST chunk writer
+- Test 144: `pg_vault_tde_tuple_update` handler ×25
+- Test 145: `pg_vault_tde_tuple_insert_speculative` handler ×25 (ON CONFLICT)
+- Tests 146-147: `pg_vault_tde_relation_copy_for_cluster` handler ×20 (VACUUM FULL, CLUSTER)
+- Test 148: fixture is byte-identical after the error storm — this is what proves 142/143/146/147 aborted rather than committed
+- Test 149: TOAST payloads still decrypt byte-for-byte
+- Tests 150-151: no plaintext in the main fork or the TOAST relation afterwards (`STORAGE EXTERNAL` is required, and asserted, so the TOAST scan cannot pass vacuously on a 0-byte file)
+- Test 152: every write path, plus VACUUM FULL and CLUSTER, healthy again after 145 longjmps
+- Test 153: core must not re-TOAST the ciphertext — sweeps 29 payload sizes across `TOAST_TUPLE_THRESHOLD` plus UPDATE, UPSERT and COPY at the boundary. Guards a segfault: `heap_toast_insert_or_update()` fires on tuple *size* as well as on external attributes, so clearing `HEAP_HASEXTERNAL` alone leaves a window as wide as the AES-GCM overhead in which core deforms ciphertext as varlena and `toast_save_datum()` crashes
+
+Deep-checking stages — five tools, five different bug classes. `run-all.sh --skip-deep` skips all of them; they are the only stages that cost more than a couple of minutes.
+
+| stage | sees | cost |
+|---|---|---|
+| `ci-scan-build` | per-path symbolic execution: NULL deref on one branch, sizes from a length that can be zero | ~1 min, compile only |
+| `ci-ubsan` | undefined behaviour: signed overflow, oversized shifts, misaligned loads, `nonnull` violations | minutes, no PG rebuild |
+| `ci-asan` | memory errors outside palloc: overflows of malloc'd, stack and global buffers (OpenSSL, libcurl, libc), use after free | minutes, no PG rebuild |
+| `ci-valgrind` | memory ownership: invalid/double `free()` of malloc'd state, out-of-bounds, uninitialised reads | 10-50x runtime |
+| `ci-cassert` | `Assert()` calls that run nowhere else, plus `MEMORY_CONTEXT_CHECKING` — the only stage that catches a double `pfree()` of a palloc chunk | builds PostgreSQL from source |
+
+`ci-cassert` is the one worth the wall-clock. `--enable-cassert` executes the `Assert()` calls this codebase is full of — none of which run in any packaged build — and turns on `MEMORY_CONTEXT_CHECKING`, which poisons freed chunks and validates the header on every `pfree()`. A double free in a `PG_CATCH` handler becomes a loud failure instead of a silent no-op that the aborting transaction covers up moments later. Neither flag exists in a PGDG or Debian package, which is why the image builds the server from source. The stage runs the four regression files, the error-path suite and the `tap/` files (the Vault ones skip): the TAP scenarios reach paths no SQL file does — a failed rotation, a restart between two statements — and a failed rotation crashed the worker on this build until the TAP files ran here.
+
+`ci-ubsan` and `ci-asan` use the `TDE_SANITIZE` Makefile knob (`make TDE_SANITIZE=undefined`, `=address`), which instruments only our objects — the server binary stays stock, so no PostgreSQL rebuild is needed. ASan's runtime is preloaded into the server with `LD_PRELOAD`, and the stage checks from a backend that it and the module are mapped before trusting a clean report. palloc'd chunks carry no redzones: those stay `ci-valgrind`'s and `ci-cassert`'s.
+
+`ci-semgrep` is not a deep stage: it takes seconds. Each rule in `ci/semgrep/` encodes a mistake this code base made or must not make — `superuser()` in a function that may be `SECURITY DEFINER`, a write to `rd_tableam`, `memcmp()` on a MAC or tag, a secret freed without `OPENSSL_cleanse()` or passed to a message, a random source other than `pg_strong_random()`, a client-tool query calling the extension unqualified — and comes with a test file saying where it must and must not fire. Any finding fails the stage; a line that is right in context carries a `nosemgrep: <rule>` comment saying why.
+
+Concurrency — `make ci-isolation` (`test/isolation/specs/`):
+
+- `per_table_dek_rotation.spec` — online DEK rotation racing readers, writers and VACUUM
+- `encrypted_rewrite_concurrency.spec` — `VACUUM FULL` / `CLUSTER` (i.e. `pg_vault_tde_relation_copy_for_cluster`) with a second backend holding a `REPEATABLE READ` snapshot across the relfilenode change, and with an uncommitted writer the rewrite must wait for. Payloads are `STORAGE EXTERNAL` so the rewrite has real TOAST chunks to migrate. This spec found the `toast_save_datum()` segfault that TEST 153 now guards; it does **not** cover `wallet_lock()`, because the stage sets `wallet_dev_mode_passphrase` and those permutations would pass vacuously — the spec says so in a comment rather than shipping a test that checks nothing
+- `toast_update_concurrency.spec` — an `UPDATE` that replaces an out-of-line value while another transaction updates or deletes the same row: the waiting `UPDATE` that skips the row, goes ahead on the newer version, or finds it deleted, and a `DELETE` waiting on an `UPDATE`. Each permutation ends with `VACUUM` and counts the values left in the TOAST relation, so a lost value and an orphaned one both show (PSQLE-193). The expected output is what the same spec prints on a plain `heap` table
+
+On-disk corruption — `tap/20_ondisk_fuzz.t`:
+
+Flips 72 random bits across the heap file over 6 rounds (fixed seed, so a failure reproduces) and classifies every row afterwards. The property under test is that the layer has exactly two behaviours under arbitrary damage — correct data, or a refusal — and never hands the client a value derived from damaged ciphertext. Data page checksums are **disabled** for this test on purpose: with them on, PostgreSQL rejects the page before the extension is asked to decrypt anything, and the test would measure core's checksums instead of AES-256-GCM.
+
+A third outcome is counted separately and accepted: the row *vanishing*. Our wire format keeps the `HeapTupleHeader` in plaintext and authenticates only the attribute values, so a flip in xmin, infomask or the null bitmap is outside the GCM tag by construction and can make the tuple invisible (what the tag does not cover: [doc/pg_vault_tde.md](doc/pg_vault_tde.md#what-the-authentication-tag-does-not-cover)). That is data loss from unauthenticated-header damage, not a forged value — the test distinguishes the two rather than conflating them.
+
+Cross-version — `make ci-matrix`:
+
+Every other stage runs on PG 18 only. This one runs the SQL regression suite **and** the TAP suite on the remaining supported majors, so a change that compiles everywhere but misbehaves on 17 cannot ship green. Not hypothetical here: `pg_vault_tde_ambuild` carries a PG17-specific impersonation, and the TAM notes a PG17 read-stream requirement in `heapgettup`.
+
+TAP is in the matrix because it is the stage that needed it most. `tap/20_ondisk_fuzz.t` passed locally on PG 18 and broke CI on PG 17: `initdb --no-data-checksums` only exists from PG 18. TAP tests depend on the `PostgreSQL::Test` framework and on `initdb`/`pg_ctl` option spellings, all of which move between majors far more than SQL does.
+
+A major whose base image is not published yet is skipped rather than failed, so PG 19 starts being covered on its own the day `postgres:19` ships.
+
+Memory safety — `make ci-valgrind` (`sql/valgrind_workload.sql`, `ci/scripts/run-valgrind.sh`):
+
+Runs the postmaster under Valgrind memcheck with `.valgrind.supp`, over a workload covering every crypto-touching path on both the success and error side, then filters findings to stacks naming `pg_vault_tde`. Costs 10-50x, so `--skip-valgrind` is available in `run-all.sh`.
+
+Note what it can and cannot see: the stock server package is not built with `-DUSE_VALGRIND` or `--enable-cassert`, so memcheck cannot see inside `palloc` — a use-after-`pfree` looks like a valid access into a malloc'd arena. It does catch invalid/double `free()` of malloc'd state (libcurl handles on the `vault_transit_request` error path), out-of-bounds access, uninitialised reads, and definite leaks. That limitation is why `ci-errorpath` exists alongside it rather than being replaced by it.
 
 > Test runner notes:
-> - `make ci-regress` (vault provider): 140/140 PASS, with conditional skips for `wal_level` (test 48), `pageinspect` (test 61) and wallet-only assertions (tests 74–80 when `kms_provider=local` is required).
+> - `make ci-regress` (vault provider): 145/145 PASS, with conditional skips for `wal_level` (test 48) and wallet-only assertions (tests 74–80 when `kms_provider=local` is required). `pageinspect` is installed by `ci/scripts/run-regress.sh`, so the storage-level tests (61, 157) run rather than skip — until that line existed they asserted nothing in CI.
+> - `make ci-errorpath` (local provider, **no** `wallet_dev_mode_passphrase`): 13/13 PASS. The absent GUC is load-bearing — with it set, `wallet_lock()` silently re-opens on the next DEK request and every statement succeeds, so the handlers are never entered. Test 141 detects that and fails rather than passing vacuously.
 > - `make ci-wallet` (local provider): tests 73–79 PASS; test 80 SKIPS unless `wallet_passphrase_env` is wired up; tests 81–109 also PASS in wallet mode.
 > - Test 110 (WITH HOLD cursor plaintext spill) is permanently deferred — the executor's tuplestore layer bypasses the TAM write path, so pg_vault_tde cannot intercept it without core modifications. The test is commented out in `regression_test_v16.sql`.
 > - Tests 138–140 exist because Tests 105/106 didn't catch two real bugs, both stemming from the same underlying cause: `tde_decrypt_heap_tuple()` copied the on-disk tuple header verbatim, including the `HEAP_HASEXTERNAL` bit that `tde_encrypt_heap_tuple()` deliberately clears so core never dereferences a TOAST pointer inside ciphertext — leaving that bit WRONG on the decrypted tuple whenever the attribute genuinely is out-of-line. (1) The AAD was also bound to the wrong (transient) relation OID during `ALTER TABLE`'s row-by-row rewrite — fixed via `resolve_effective_relid()` in `tde_compute_aad()`. (2) Any consumer trusting the stale `HEAP_HASEXTERNAL` bit instead of re-deriving it — `pg_vault_tde_toast_insert_or_update()`'s size-only gate, but also, more broadly, `CREATE TABLE AS SELECT`/`INSERT ... SELECT` reading out of an `encrypted_heap` table — silently skips re-externalizing the value, leaving it pointing at storage that later disappears. Fixed at the source: `tde_decrypt_heap_tuple()` now recomputes the bit from the actual decrypted attributes (`tde_tuple_has_external_desc()`) before returning, so every consumer sees a truthful tuple. Both only reproduce with a populated source table and a genuinely out-of-line (not just inline-compressed) value.
@@ -1056,6 +1914,29 @@ bash packaging/build_deb.sh --no-sign
 bash packaging/build_rpm.sh
 ```
 
+### Verifying a release
+
+From 1.7.2 on, every GitHub Release carries `SHA256SUMS` — the SHA-256 of every
+asset — and `SHA256SUMS.asc`, its signature by a maintainer, whose key's fingerprint
+is in [SECURITY.md](SECURITY.md#release-signing-keys). With the release's files
+downloaded:
+
+```bash
+gpg --import packaging/RELEASE-KEYS.asc          # the maintainers' public keys
+gpg --fingerprint                                # compare with SECURITY.md
+gpg --verify SHA256SUMS.asc SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+The signed review of the release (`doc/security/reviews/`, see
+[doc/SECURITY-REVIEW.md](doc/SECURITY-REVIEW.md)) is inside the source bundle, with
+its own signature next to it.
+
+Each release also carries `pg_vault_tde-X.Y.Z.spdx.json`, an SPDX SBOM of the source
+bundle, and `pg_vault_tde-X.Y.Z.grype.txt`, a vulnerability scan of it. Both are for
+information: the extension vendors no code, and links OpenSSL, libcurl and libpq
+from the system.
+
 ---
 
 ## Encrypted Backups
@@ -1074,6 +1955,9 @@ pg_restore_tde -h localhost -U postgres -d mydb -i /backup/mydb.tde
 ```
 
 >All other `pg_dump` options are fed directly to it.
+
+With the `vault` provider both tools read the Vault credentials of the server with
+`SHOW`, which since 1.7.2 returns them only to a superuser: connect as one (PSQLE-224).
 
 ### `pg_basebackup`
 It's possible to use `pg_basebackup` to create a base backup of the cluster and use it for a standby creation.
@@ -1142,7 +2026,11 @@ succeeds**, writes one bundle per database next to it:
 
 Use `--keys-dir DIR` to store the bundles elsewhere (e.g. outside `PGDATA`).
 Databases without the extension are skipped; a failed backup leaves no bundle
-files behind. The tar format (`-Ft`) is not supported — use the plain format
+files behind. Each session runs with an empty `search_path` and calls the function in
+the extension's own schema, whatever the database's settings; up to 1.7.1 it used the
+session's `search_path`, and a database with the extension in a schema off that path
+stopped the whole backup ("function pg_vault_tde_seal_keys_bytea(unknown, unknown) does
+not exist"). The tar format (`-Ft`) is not supported — use the plain format
 or run `pg_vault_tde_seal_keys()` manually.
 
 Restore stays manual, exactly as above: restore the data dir, provision the
@@ -1196,6 +2084,207 @@ or `-i` (for `pg_restore_tde`) are mandatory. Neither piping nor reading from `s
 6. Executing `pg_dump` still produces a plain-text backup
 ---
 
+## Running pg_vault_tde in Production
+
+A checklist for setting up and administering a cluster that keeps data in
+`encrypted_heap`. Each item links to the section with the detail; the queries were
+run against 1.7.2.
+
+### Before the first encrypted table
+
+- **Check the WAL resource manager id** on every node that will load pg_vault_tde or
+  replay its WAL — see [2. Configure PostgreSQL](#2-configure-postgresql).
+- **Pick a real KMS.** Vault/OpenBao, PKCS#11 or the local wallet — see
+  [KMS Provider Selection](#kms-provider-selection). `pg_vault_tde.dev_mode` and
+  `wallet_dev_mode_passphrase` are for tests: the extension logs a WARNING on every use.
+- **Size the DEK cache.** `pg_vault_tde.max_encrypted_relations` (default 1024, restart
+  required) is one budget for the whole cluster. Every encrypted table, every partition
+  *and* its partitioned parent, and every `tde_btree` index takes an entry. Past the
+  budget nothing fails, but each access to an uncached relation goes back to the KMS —
+  and the budget is also the cap on how many plaintext DEKs sit in shared memory. Count
+  in every database, sum, add headroom:
+
+  ```sql
+  SELECT count(*) FROM pg_vault_tde_catalog;
+  ```
+
+- **Warm the cache after a restart** with `pg_vault_tde.preload_keys = on` if
+  first-query latency matters — it needs a KMS that opens without an interactive unlock
+  (see [GUC Parameters](#guc-parameters)).
+- **Put temporary files on encrypted storage.** Any query that spills past `work_mem` —
+  a sort, a hash, a `WITH HOLD` cursor, or `CLUSTER`'s sort past
+  `maintenance_work_mem` — writes rows that are already decrypted to a
+  temporary file, and no extension hook can intercept it
+  ([Limitation 6](#limitations-v17)). Point `temp_tablespaces` at an encrypted
+  filesystem, and set `log_temp_files` to see how much spills.
+- **Treat the server log as sensitive.** Statement text is logged with its literals: with
+  `log_statement = 'mod'` or `'all'`, and by default for every statement that fails
+  (`log_min_error_statement = error`).
+- **Keep secrets out of statement text and out of `PGDATA`.**
+  - A passphrase given to `pg_vault_tde_wallet_init()`, `_wallet_unlock()`,
+    `_wallet_change_passphrase()`, `_migrate_vault_to_wallet()` or a seal function is
+    part of the statement: logged as above, and visible in `pg_stat_activity` to the same
+    role and to `pg_read_all_stats` while the call runs. Make those calls from a session
+    that has run `SET log_statement = 'none'` and `SET log_min_error_statement = 'panic'`.
+  - `vault_token`, `vault_role_id`, `vault_secret_id` and `wallet_dev_mode_passphrase`
+    hold the secret itself, and exist only as settings. Never set them with `SET`
+    (statement text), `ALTER SYSTEM` (it writes `postgresql.auto.conf`, inside `PGDATA` and
+    so inside every base backup) or `ALTER DATABASE`/`ALTER ROLE … SET` (stored in
+    `pg_db_role_setting`, and in every `pg_dumpall`). Put them in a file outside `PGDATA`,
+    readable only by the server's operating-system user, loaded with `include`. For the
+    wallet, prefer `wallet_passphrase_env`, `_file` or `_command`, which hold only where
+    the passphrase is. Up to 1.7.1 every member of `pg_read_all_settings` — which
+    PostgreSQL grants to `pg_monitor` — read these four with `SHOW`, `current_setting()`
+    and `pg_settings`; since 1.7.2 a role that is not a superuser reads `********`, and
+    `pg_settings` lists none of them (PSQLE-224).
+  - `wallet_passphrase_command` runs through `popen()` — a shell, as the server's
+    operating-system user — every time the wallet is opened; whatever it writes to
+    standard error reaches the server log.
+
+### Designing encrypted tables
+
+- **Keep sensitive values out of `PRIMARY KEY` and `UNIQUE` constraints.** PostgreSQL
+  backs them with a native btree, so the key column is stored **in plaintext** in that
+  index; pg_vault_tde warns when you create one. Use a surrogate primary key (`bigserial`,
+  `uuid`) and enforce uniqueness of a sensitive column with
+  `CREATE UNIQUE INDEX … USING tde_btree`. A violation of that index reports the key in
+  `DETAIL` as ciphertext, not as the value.
+- **Use `tde_btree` for equality lookups: `=`, `IN (…)`, `= ANY (…)`.** AES-SIV preserves
+  equality and nothing else, so the planner uses a `tde_btree` index for those and nothing
+  more ([Limitation 2](#limitations-v17)). Range predicates, `ORDER BY`, `min()`/`max()` and
+  merge joins run as sequential scans: correct, not index-assisted — plan for that on
+  columns you sort or range-filter. Two kinds of column cannot carry a `tde_btree` index
+  at all — no `CREATE INDEX`, `EXCLUDE` constraint or `ALTER COLUMN … TYPE` will build
+  one: **`numeric`** (correct support is planned for 1.8) and **`text` with a
+  nondeterministic collation**.
+- **Every index costs on every `UPDATE`.** HOT updates are off
+  ([Limitation 7](#limitations-v17)), so each `UPDATE` adds an entry to every index on the
+  table, whether or not its columns changed. Keep indexes to what queries need, and don't
+  lower `fillfactor` to make room for HOT: there is none to make room for.
+- **Encrypt every partition.** Encryption is per leaf. A `heap` partition under an
+  `encrypted_heap` parent stores its rows in plaintext without any error (regression
+  test 127 asserts it). Find them:
+
+  ```sql
+  SELECT p.relid::regclass AS unencrypted_leaf, parent.oid::regclass AS encrypted_parent
+  FROM pg_class parent
+  JOIN pg_am pa ON pa.oid = parent.relam AND pa.amname = 'encrypted_heap'
+  CROSS JOIN LATERAL pg_partition_tree(parent.oid) p
+  JOIN pg_class c ON c.oid = p.relid
+  LEFT JOIN pg_am a ON a.oid = c.relam
+  WHERE parent.relkind = 'p' AND p.isleaf
+    AND a.amname IS DISTINCT FROM 'encrypted_heap';
+  ```
+
+- **Keep sensitive columns out of `pg_statistic`.** `ANALYZE` computes statistics on the
+  decrypted values, so most-common values and histogram bounds land in `pg_statistic` in
+  plaintext, on disk. `ALTER TABLE t ALTER COLUMN c SET STATISTICS 0` stops that — but only
+  for future runs: a row `ANALYZE` already wrote stays. Set it right after `CREATE TABLE`,
+  before data and autovacuum's first analyze arrive. The planner then has no statistics
+  for that column. See `doc/pg_vault_tde.md` → Security Considerations.
+- **Logical replication** needs `REPLICA IDENTITY FULL` plus a primary key for
+  `UPDATE`/`DELETE`, and `pg_vault_tde.toast_custom_rmgr = on` for TOAST columns
+  ([Limitation 3](#limitations-v17)). The stream leaves the publisher **decrypted**: use
+  TLS on the subscription connection and `encrypted_heap` on the subscriber.
+
+### Routine administration
+
+- **Vacuum more, table by table.** Every `UPDATE` leaves a dead heap tuple and a dead
+  entry in every index, and autovacuum's defaults assume HOT absorbs much of that. Lower
+  the thresholds on update-heavy encrypted tables; start from something like:
+
+  ```sql
+  ALTER TABLE orders SET (autovacuum_vacuum_scale_factor  = 0.02,
+                          autovacuum_analyze_scale_factor = 0.02);
+  ```
+
+- **Measure bloat without `pgstattuple`.** `pgstattuple()` and `pgstattuple_approx()`
+  reject `encrypted_heap` ("only heap AM is supported"), and `pgstatindex()` rejects
+  `tde_btree` ("is not a btree index"). Watch the statistics views and the size trend
+  instead; `n_tup_hot_upd` is always 0 here, by design:
+
+  ```sql
+  SELECT s.relid::regclass AS table_name, s.n_live_tup, s.n_dead_tup,
+         s.n_tup_upd, s.n_tup_hot_upd, s.last_autovacuum, s.autovacuum_count
+  FROM pg_stat_user_tables s
+  JOIN pg_class c ON c.oid = s.relid
+  JOIN pg_am    a ON a.oid = c.relam
+  WHERE a.amname = 'encrypted_heap'
+  ORDER BY s.n_dead_tup DESC;
+
+  SELECT i.indexrelid::regclass AS index_name, i.indrelid::regclass AS table_name,
+         pg_size_pretty(pg_relation_size(i.indexrelid)) AS index_size
+  FROM pg_index i
+  JOIN pg_class ic ON ic.oid = i.indexrelid
+  JOIN pg_am    a  ON a.oid  = ic.relam
+  WHERE a.amname = 'tde_btree'
+  ORDER BY pg_relation_size(i.indexrelid) DESC;
+  ```
+
+- **Rebuild bloated indexes online** with `REINDEX INDEX CONCURRENTLY`. It works on
+  `tde_btree` but never in parallel ([Limitation 8](#limitations-v17)), so it takes longer
+  than on a plain btree. btree's bottom-up deletion already removes most dead versions
+  for updates that don't touch the key; what vacuum cannot give back is pages that have
+  split. `tde_btree` indexes also never deduplicate, so on low-cardinality keys they are
+  larger than a plain btree even right after a rebuild.
+- **Rotate keys on a schedule** — see [Key Rotation](#key-rotation). Online rotations are
+  tracked in the `pg_vault_tde_rotation_status` view, readable by `pg_monitor`.
+- **Rotate the DEK of write-heavy tables before it reaches 2^32 encryptions.** With
+  random 96-bit IVs, AES-GCM allows at most 2^32 (about 4.3 billion) encryptions under
+  one key (NIST SP 800-38D). Here the key is one DEK generation of one table, and every
+  tuple written counts: each `INSERT`, each `UPDATE`, each row that `VACUUM FULL`,
+  `CLUSTER` or a rotation rewrites, and each out-of-line chunk. `rotate_online()` starts
+  a new generation. At 1,000 writes a second the limit is 50 days away; at 10,000, five.
+  The statistics give an estimate — inserts and updates of the table and its TOAST
+  relation, rotations included; they miss `VACUUM FULL` and `CLUSTER` and restart from
+  zero after a crash, so note them at each rotation and keep a wide margin:
+
+  ```sql
+  SELECT s.relid::regclass AS table_name,
+         s.n_tup_ins + s.n_tup_upd + coalesce(t.n_tup_ins, 0) AS writes
+  FROM pg_stat_all_tables s
+  JOIN pg_class c ON c.oid = s.relid
+  JOIN pg_am    a ON a.oid = c.relam AND a.amname = 'encrypted_heap'
+  LEFT JOIN pg_stat_all_tables t ON t.relid = c.reltoastrelid
+  ORDER BY writes DESC;
+  ```
+- **Check integrity off-peak.** `pg_vault_tde_verify_integrity('t')` verifies the GCM
+  tag of every tuple and fetches every out-of-line value it references — a full scan of
+  the table and of its TOAST relation. It does not look at chunks no row references,
+  nor at dropped columns. Up to 1.7.1 a failure could be false — autovacuum updating the
+  table's statistics during the scan was enough — so on 1.7.1 run it a second time, and
+  check that the rows read, before treating a table as damaged.
+- **Check health.** `pg_vault_tde_health_check()`, `pg_vault_tde_hw_accel_info()` (is
+  AES-NI in use?), and `pg_vault_tde_vault_status()` or `pg_vault_tde_wallet_status()`
+  for the KMS — see [SQL Functions](#sql-functions).
+
+### Backups, standbys and upgrades
+
+- **Don't rely on plain `pg_dump`**: it writes decrypted rows. Use `pg_dump_tde` and
+  `pg_basebackup_tde` — see [Encrypted Backups](#encrypted-backups).
+- **Back up the key material separately.** A base backup carries the wrapped DEKs, never
+  the KEK. With the local provider the wallet lives outside `PGDATA`, at
+  `/var/lib/pg_vault_tde/<db_oid>/wallet.p12`, and `DROP DATABASE` deletes it. Back up the
+  wallet file and its passphrase on their own schedule: without them, every dump of that
+  database is undecryptable. If the file goes missing, put it back: `wallet_init()`
+  refuses to make a new one while any key of the database is wrapped under a local
+  wallet, since a new KEK would open none of them (before 1.7.2 it made one, and the
+  tables created afterwards were lost when the real file came back).
+- **`CREATE DATABASE ... TEMPLATE` does not copy encrypted data usably.** Every row's AAD
+  names the database it was written in, so the clone's copied rows never authenticate,
+  and its catalog holds keys wrapped under the template's wallet while its own wallet
+  directory is empty. Drop the encrypted tables in the clone — or `TRUNCATE` them, after
+  copying the template's `wallet.p12` into the clone's `/var/lib/pg_vault_tde/<db_oid>/`,
+  to keep the empty tables. Copy encrypted data between databases with `pg_dump_tde` and
+  `pg_restore_tde`.
+- **Standbys** need pg_vault_tde preloaded, the id check above, and access to the KEK —
+  a copy of the wallet, or the same Vault or HSM.
+- **Upgrades**: follow the notes for each release. [Upgrading to 1.7.2](#upgrading-to-172)
+  needs one `VACUUM FULL` per encrypted table and, with `toast_custom_rmgr` on, every
+  node stopped cleanly and upgraded together.
+
+---
+
 ## Performance
 
 ### Overhead vs Plain Heap
@@ -1205,7 +2294,7 @@ tuple read and write.  The expected overhead depends on workload and row size:
 
 | Workload | Typical Overhead | Notes |
 |----------|-----------------|-------|
-| OLTP (mixed R/W, 100–500 B rows) | **< 15%** | Target budget per copilot-instructions |
+| OLTP (mixed R/W, 100–500 B rows) | **< 15%** | Design target for this workload |
 | Bulk INSERT (1M rows) | **25–40%** | AES-GCM + `pg_strong_random` per tuple |
 | Sequential scan (1M rows, read-only) | **20–35%** | Decrypt + palloc copy per tuple |
 | Index scan (point lookups) | **< 5%** | Single tuple decrypt per fetch |
@@ -1230,9 +2319,19 @@ See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
    with AES-256-SIV, identical to varlena types. **Index-only scans are not supported**
    (by design, for security — see `doc/pg_vault_tde.md` § Index-Only Scans).
 
-2. **Range scans on TDE indexes** (by design — permanent): The `tde_btree` AM uses
-   AES-256-SIV (equality-preserving, NOT order-preserving). `WHERE col > 'x'` on a
-   `tde_btree` index returns empty results. Use sequential scans for range predicates.
+2. **TDE indexes answer equality only** (by design): `tde_btree` encrypts keys with
+   AES-256-SIV, which preserves equality but not order. The planner uses a `tde_btree`
+   index for `=`, `IN (…)` and `= ANY (…)` only; range predicates, `ORDER BY`,
+   `min()`/`max()` and merge joins never read it and run as correct sequential scans, and
+   a plan forced onto it for a range fails with
+   `tde_btree index "…" supports only equality lookups` rather than return rows.
+   No path builds a `tde_btree` index on a `numeric` column — equal values such as 1.5
+   and 1.50 do not encrypt alike, and the numeric operator class cannot order encrypted
+   keys; correct support is planned for 1.8 — and columns with a nondeterministic
+   collation, since AES-SIV only matches identical bytes. Up to 1.7.1 all of these were
+   silent defects: wrong rows on ranges, ordering and `min`/`max` for `text`, `bytea` and
+   `numeric`, `cache lookup failed for type …` on `IN`, missed rows on `numeric`
+   equality — see [Upgrading to 1.7.2](#upgrading-to-172).
 
 3. **Logical replication of TOAST columns** (✅ resolved in v1.7): Enable
    `pg_vault_tde.toast_custom_rmgr` (PGC_POSTMASTER, default off) to publish
@@ -1271,13 +2370,17 @@ See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
    (heap-only) update — every UPDATE writes new index entries, keeping `tde_btree` indexes
    coherent without a `REINDEX`.
    **How:** `heap_update` decides whether an update is HOT by comparing the indexed columns
-   byte-for-byte between the old and new tuple. Both tuples are encrypted, and the v4 wire
-   format is **IV-first**: it begins with the random GCM IV, which changes on every
-   encryption. The encrypted image therefore always differs, so `heap_update` sees the
-   indexed column as modified and skips the HOT path. The constant `[VERSION | GENERATION]`
-   bytes were moved to the **end** of the blob precisely so they fall outside the comparison
-   window. See [doc/pg_vault_tde.md](doc/pg_vault_tde.md) § Known Limitations for the full
-   analysis (including the v3 bug this resolved).
+   between the old and the new tuple, on disk. Both images are encrypted under a fresh
+   random GCM IV, so an attribute is byte-stable across an update only by chance (once in
+   256^L for a value of L bytes); when the chance hits a value that changed, the row is
+   encrypted again under another IV (PSQLE-219). `heap_update` sees every changed indexed
+   column as modified and skips the HOT path. The constant `[VERSION | GENERATION]`
+   bytes sit at the **end** of the region, outside every attribute, so they cannot create a
+   byte-stable window. See [doc/pg_vault_tde.md](doc/pg_vault_tde.md) § Known Limitations for
+   the full analysis (including the v3 and v4 bugs this resolved).
+   **Operational cost:** every `UPDATE` writes every index and leaves dead entries in all
+   of them — vacuum, bloat monitoring and `REINDEX CONCURRENTLY` are covered in
+   [Running pg_vault_tde in Production](#running-pg_vault_tde-in-production).
 
 8. **Parallel index build/rebuild is disabled by design**: the parallel workers that
    PostgreSQL uses to build or rebuild an index run in separate processes that are not
@@ -1316,6 +2419,27 @@ See [doc/ROADMAP.md](doc/ROADMAP.md) for the full gap-closure roadmap.
     **Mitigation:** always use `pg_dump_tde`/`pg_restore_tde` instead of plain
     `pg_dump`/`pg_restore` for logical backups of encrypted tables — see
     [Encrypted Backups](#encrypted-backups).
+
+11. **Three index paths are not supported on `encrypted_heap` in 1.7.2** (→ v1.8): they
+    slip past the `CREATE INDEX` guard of Limitation 9 and build a native index whose
+    keys sit in plaintext on disk, **without the `allow_plaintext_index` check and
+    without a `WARNING`**. Until 1.8 rejects them, **do not use them** on an encrypted
+    table:
+    - an **`EXCLUDE` constraint** backed by a native access method (e.g.
+      `EXCLUDE USING gist (c WITH &&)`) — it is a constraint, so it does not go through
+      the index guard;
+    - a **native index cloned onto an encrypted partition** — `CREATE TABLE … PARTITION
+      OF … USING encrypted_heap` (or `ATTACH PARTITION`) under a partitioned parent that
+      already carries a native index; the clone is created internally and skips the
+      check;
+    - a **native index carried over by `ALTER TABLE … SET ACCESS METHOD
+      encrypted_heap`** — indexes that already existed on the table stay as they were.
+
+    **Mitigation:** index encrypted tables only with `tde_btree` (equality), and add a
+    partition's indexes or convert a table to `encrypted_heap` *before* creating native
+    indexes on it; if you must keep one, do so knowingly with
+    `pg_vault_tde.allow_plaintext_index = on`. `INCLUDE` columns on a `tde_btree` index
+    had the same effect and are now rejected outright (v1.7.2).
 
 ---
 

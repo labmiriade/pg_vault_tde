@@ -10,14 +10,17 @@
 ALL gates must pass before any change is considered complete:
 
 ```bash
-# Gate 1: Full regression (110 tests: 70 baseline + 20 v1.5 + 38 v1.6 + 2 skip-guarded, vault provider)
+# Gate 1: Full regression (141 tests: 44 v1.4 + 20 v1.5 + 36 v1.6 + 41 v1.7, vault provider)
 make ci-regress
 
-# Gate 1b: Wallet provider regression (110 tests, kms_provider=local)
+# Gate 1b: Wallet provider regression (same suite, kms_provider=local)
 make ci-wallet
 
 # Gate 2: Page checksum compatibility
 make ci-checksums
+
+# Gate 2b: Upgrade compatibility — data written by the previous release tag
+make ci-upgrade
 
 # Gate 3: TAP tests (Perl, with mock Vault)
 make ci-tap
@@ -39,14 +42,33 @@ make ci-all
 
 ## Test Suite Map
 
-`sql/regression_test.sql` contains **70 tests** (52 v1.4 baseline + 18 v1.7
-TAM/TOAST additions in tests 53–70).  The v1.5 and v1.6 supplement files each
-carry their own internal numbering.  All three files together make up the
-**110-test** suite run by `make ci-regress` / `make ci-wallet`.
+Test numbers are **one sequence shared by every file**, not per file.  That is
+why `regression_test_v17.sql` jumps from 140 to 154: 141–153 belong to
+`regression_test_errorpath.sql`.  When you add a test, take the next free number
+across the whole repo, not the next one in the file you are editing.
+
+| File | Range | Run by |
+|---|---|---|
+| `sql/regression_test.sql` | 1–52 | `make ci-regress` / `ci-wallet` |
+| `sql/regression_test_v15.sql` | 53–72 | `make ci-regress` / `ci-wallet` |
+| `sql/regression_test_v16.sql` | 73–110 | `make ci-regress` / `ci-wallet` |
+| `sql/regression_test_v17.sql` | 111–140, 154–164 | `make ci-regress` / `ci-wallet` |
+| `sql/regression_test_errorpath.sql` | 141–153 | `make ci-errorpath` |
+| `sql/regression_test_schema.sql` | own 1–20 | `make ci-schema` |
+
+The ranges have gaps, so count tests, not numbers: 5–11 and 49 no longer exist, 80
+was removed in v1.7, and 110 is commented out (the `WITH HOLD` cursor spill is a
+permanent limitation). `make ci-regress` therefore runs **141 tests**: 44 + 20 + 36 + 41.
+To find the next free number, ask the files rather than this page (the error-path
+file uses a `-- ---- TEST n` header):
+
+```bash
+grep -hoE '^-- (---- )?TEST [0-9]+' sql/regression_test*.sql | grep -oE '[0-9]+' | sort -n | tail -1
+```
 
 | Test # | Category | What It Validates | File |
 |--------|----------|-------------------|------|
-| 1–11 | Crypto primitives | GCM encrypt/decrypt, IV uniqueness, tamper detection, rotation | `regression_test.sql` |
+| 1–4 | Registration | extension loaded, access methods and SQL functions registered, wallet unlock | `regression_test.sql` |
 | 12 | TAM INSERT+SELECT | Basic round-trip on `encrypted_heap` table | `regression_test.sql` |
 | 13 | On-disk absence | Raw file scan confirms no plaintext on disk | `regression_test.sql` |
 | 14 | TAM UPDATE | ctid preservation, tuple refetch, HOT chains | `regression_test.sql` |
@@ -55,7 +77,7 @@ carry their own internal numbering.  All three files together make up the
 | 17 | Index scan | `index_fetch_tuple` + `rd_tableam` impersonation | `regression_test.sql` |
 | 18 | COPY/bulk | `multi_insert` path via `COPY FROM` | `regression_test.sql` |
 | 19 | Multi-column | int, text, bool, numeric, timestamptz types | `regression_test.sql` |
-| 20 | Key rotation | DEK-A rows rejected after rotating to DEK-B | `regression_test.sql` |
+| 20 | Per-table DEK isolation | two tables independently readable | `regression_test.sql` |
 | 21 | ANALYZE | Statistics computed on decrypted data | `regression_test.sql` |
 | 22 | SELECT FOR UPDATE | `tuple_lock` path | `regression_test.sql` |
 | 23 | BitmapHeapScan | `scan_bitmap_next_tuple` via forced bitmap scan | `regression_test.sql` |
@@ -65,7 +87,6 @@ carry their own internal numbering.  All three files together make up the
 | 45–46 | BGW token renewal, multi_insert batch | v1.3 coverage | `regression_test.sql` |
 | 47 | `health_check()` state transitions | Uses `dek_available` only | `regression_test.sql` |
 | 48 | Logical decoding (skipped if `wal_level != logical`) | v1.2 | `regression_test.sql` |
-| 49 | Wire format v2 round-trip | v1.4 | `regression_test.sql` |
 | 50 | `tde_btree` CREATE INDEX + equality | v1.4 | `regression_test.sql` |
 | 51 | `health_check.kms_provider` GUC coherence | Replaces v1.4 `wrapped_dek_perms` test | `regression_test.sql` |
 | 52 | `tde_btree` UNIQUE constraint | v1.4 | `regression_test.sql` |
@@ -83,7 +104,7 @@ carry their own internal numbering.  All three files together make up the
 | 69 | UPDATE large↔large / large↔small | `old_has_external` branch in `tuple_update`; UPDATE large→large, large→small, small→large | `regression_test.sql` |
 | 70 | `toast_am` GUC | `pg_vault_tde_toast_am` returns correct AM OID based on `toast_encryption` GUC; TOAST table AM matches expectation | `regression_test.sql` |
 | 53–72 | Per-table DEK catalog, TOAST large-value, DEK isolation, tde_btree native ops, wire format v3 AAD, online rotation BGW | v1.5 coverage | `regression_test_v15.sql` |
-| 73–110 | Wallet init/unlock/lock, wallet passphrase, rotate_kek, bundle export/import, TOAST storage paths (EXTERNAL/EXTENDED), VACUUM FULL + TOAST, CLUSTER, all seven read paths with TOAST, ANALYZE, multi_insert, UPDATE old_has_external, ALTER TABLE AM switch, online rotation, CREATE TABLE AS, WITH HOLD cursor plaintext spill | v1.6 coverage | `regression_test_v16.sql` |
+| 73–109 | Wallet init/unlock/lock, wallet passphrase, rotate_kek, TOAST storage paths (EXTERNAL/EXTENDED), VACUUM FULL + TOAST, CLUSTER, all seven read paths with TOAST, ANALYZE, multi_insert, UPDATE old_has_external, ALTER TABLE AM switch, online rotation, CREATE TABLE AS (80 removed in v1.7, 110 disabled) | v1.6 coverage | `regression_test_v16.sql` |
 
 > **Skip semantics under `make ci-regress` (vault provider):**
 > Test 48 SKIP if `wal_level != logical`; Test 61 (v15) SKIP if the `pageinspect`
@@ -163,6 +184,37 @@ SELECT * FROM test_dek_b;  -- OK
 
 5. **DO NOT** rely on specific tuple ordering in sequential scans — heap
    page allocation and HOT chains affect order.
+
+6. **DO NOT** put the indexed column first in every table.  This one is not a
+   style note: it is how PSQLE-165 survived four releases.  An attribute at
+   attnum 1 has its offset cached in `attcacheoff`, so reading it never walks
+   the tuple; an attribute sitting behind a variable-length column can only be
+   reached by walking, and the walk is the code path that touches the encrypted
+   region.  38 of the 38 regression tables put the PRIMARY KEY first, so not one
+   of them ever reached it, and a segfault on every `UPDATE` of such a table
+   went unnoticed with the suite fully green.  When a test involves an index,
+   vary the key's position — test 158 is the parametrized version of this.
+
+7. **DO NOT** write a test that only reads data it wrote in the same run.  The
+   whole suite does this, which is why two format-level breakages shipped: the
+   v1.7.1 AAD change (TOAST written by <= 1.7.0 became unreadable) and
+   PSQLE-165.  Writer and reader move together, so the suite stays green while
+   existing data on disk breaks.
+
+   `make ci-upgrade` is the stage that covers it: it writes a fixture with the
+   build at the most recent `v*` tag, reads it back with the working tree, and
+   compares the outcome against `ci/upgrade-compat.expected`.  Anything that
+   touches the wire format, the AAD, or what the AAD is derived from has to go
+   through it — and if the declared expectations change, the release notes
+   change with them.
+
+- **DO NOT** prove that a TOAST value reads with `length()` (PSQLE-202).  In a
+  single-byte encoding — the cassert image runs in one — `length(text)` takes an
+  uncompressed out-of-line value's size from its pointer and reads no chunk, and
+  never decompresses a compressed one; `length(bytea)` never reads anything, in
+  any encoding.  A damaged or missing chunk then passes.  Compare the value
+  (`col = repeat('x', n)`), or its `md5()` against one taken before, and keep
+  `length()` only where the length is what is being tested.
 
 ---
 
@@ -259,12 +311,17 @@ Every regression test MUST have a corresponding expected output file:
 sql/regression_test.sql  →  expected/pg_vault_tde_init.out
 ```
 
-When adding new tests (current numbering in `regression_test.sql` goes up to 70):
+When adding new tests (take the next free number from the files — see the command
+under the Test Suite Map, never from this page):
 1. Run the test manually: `psql -f sql/regression_test.sql > expected/pg_vault_tde_init.out 2>&1`
 2. Review the output for correctness
 3. Commit the `.out` file alongside the `.sql` file
 4. NEVER hand-edit `.out` files — always regenerate
-5. v1.6 tests (73–110) live in `sql/regression_test_v16.sql`; v1.5 tests (53–72)
-   live in `sql/regression_test_v15.sql`. The baseline file `sql/regression_test.sql`
-   now contains tests 1–70: the original 52 v1.4 tests plus tests 53–70 added as
-   v1.7 TAM/TOAST coverage.
+5. See the Test Suite Map above for which file owns which range — the numbering
+   is global, so check every file before picking a number.
+6. Storage-level assertions may use `pageinspect`: `ci/scripts/run-regress.sh`
+   installs it, and tests guard themselves with a `pg_extension` lookup so a
+   standalone run without contrib skips instead of failing.  Note that
+   `tuple_data_split()` and `verify_heapam()` refuse `encrypted_heap`
+   ("only heap AM is supported") — pass the regclass of a twin plain-heap table
+   with the same row type, which is what they use for the tuple descriptor.

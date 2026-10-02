@@ -21,6 +21,81 @@ Every write callback MUST follow this sequence:
 4. Copy physical TID back to the slot
 5. `OPENSSL_cleanse` + `pfree` the plaintext copy
 
+### TOAST deletion waits for the heap operation (PSQLE-193)
+
+The pre-TOAST runs before `heap_update()`, because the new row needs its TOAST
+pointers before it is encrypted; core toasts inside `heap_update()`, once the
+row is known to be updatable.  So the pre-TOAST may insert chunks but never
+delete any: `pg_vault_tde_toast_tuple()` clears `TOAST_NEEDS_DELETE_OLD` before
+`toast_tuple_cleanup()`.  `pg_vault_tde_tuple_update()` then calls
+`tde_toast_delete_unshared()`: on `TM_Ok` it deletes the old row's values the
+new one no longer references; on any other result it kills the chunks this
+call inserted (`heap_abort_speculative`), because READ COMMITTED may skip the
+row or retry on a newer version that still points at the old ones.  The old
+row is fetched with `SnapshotAny` — after an EvalPlanQual recheck `otid` is a
+version the statement's snapshot does not see.  Regression:
+`test/isolation/specs/toast_update_concurrency.spec`.
+
+### A changed value must look changed on disk (PSQLE-219)
+
+`heap_update()` decides HOT, the tuple lock mode and whether to log the old replica
+identity by comparing attributes on disk: ciphertext.  Under v5 a changed value of L
+bytes repeats its old ciphertext once in 256^L, and the UPDATE would go HOT with the
+index missing the new value.  `pg_vault_tde_tuple_update()` asks `tde_change_hidden()`
+about the indexed attributes and encrypts again under a fresh IV until no change is
+hidden: each try is an independent draw that has to avoid one value per changed
+column, so it ends after 1 + Σ 256^-L tries on average.  Only the indexed attributes:
+with every attribute counted, 300 changed `bool` columns would cost 3 encryptions per
+UPDATE.  v4 rows are skipped: they cannot be walked.  Regression: `tap/49_hot_update_short_indexed.t`.
+
+### Dropped columns keep their values until the row is rewritten (PSQLE-192)
+
+Core nulls dropped columns whenever it rewrites a row (the executor's UPDATE
+projection, `reform_and_rewrite_tuple()` on VACUUM FULL/CLUSTER) and deletes their
+chunks with the rest.  Every TAM path must do the same: `copy_for_cluster` rewrites
+them as NULL (`tde_without_dropped()`), the rotation's fetch-back sets them to NULL,
+and `tde_toast_delete_unshared()` — used by UPDATE and DELETE — counts them.
+`tde_tuple_has_external_desc()` alone skips them, on purpose: a VACUUM FULL up to
+1.7.1 left their pointers dangling, and HEAP_HASEXTERNAL must not make core follow
+them.  Regression: `tap/33_toast_lifecycle.t`, `ci-upgrade` Probe E.
+
+### The index build scan is heapam's, on decrypted copies (PSQLE-198, PSQLE-201)
+
+`tde_index_build_heap_scan` is `heapam_index_build_range_scan`
+(`access/heap/heapam_handler.c`) with one change: each tuple heapam would index is
+decrypted before the predicate and `FormIndexDatum`, and tde_btree keys are
+encrypted.  Everything that decides which tuples reach the index — `SnapshotAny` +
+`HeapTupleSatisfiesVacuum`, recently dead tuples, `ii_BrokenHotChain`, waits on
+in-progress writers, the predicate with `reltuples` counted before it, HOT roots —
+must stay heapam's; diff it against each new PostgreSQL major.  A recently dead
+tuple that no longer decrypts is skipped with `ii_BrokenHotChain` set.  It runs
+with the relation impersonating heapam (`heap_getnext()` checks rd_tableam).
+
+### `copy_for_cluster` is heapam's, on decrypted copies (PSQLE-204)
+
+`tde_cluster_copy` is `heapam_relation_copy_for_cluster` with each kept tuple
+decrypted before it is sorted or written (the sort computes `OldIndex`'s keys from
+it) and `tde_cluster_write_tuple` in place of `reform_and_rewrite_tuple`.  The
+decrypted copy keeps the original header and is rewrite_heap_tuple()'s old tuple.
+`tuplesort_getheaptuple(state, forward)` hands back the sort's own tuple: cleanse
+it, never free it.  `CLUSTER` on a tde_btree index is refused.
+
+### Every place heapam deletes TOAST itself needs a TAM counterpart (PSQLE-197)
+
+heapam decides to delete a row's TOAST from the on-disk `HEAP_HASEXTERNAL`, which
+encrypted tuples never carry: `heap_delete()`, `heap_update()`,
+`heap_abort_speculative()`.  Each has a TAM wrapper that deletes from the decrypted
+row — `tuple_delete`, `tuple_update`, `tuple_complete_speculative`.  A new heapam
+entry point that frees a row needs one too.
+
+### Catching errors from a TOAST read needs a subtransaction (PSQLE-196)
+
+`verify_integrity()` catches per-row decrypt errors with a bare
+`PG_TRY`/`FlushErrorState()`, which is safe only because `tde_decrypt_heap_tuple()`
+holds no resource.  A TOAST fetch does (buffer pins, index scan, locks): catch its
+errors only inside `BeginInternalSubTransaction()` /
+`RollbackAndReleaseCurrentSubTransaction()`, as `tde_value_fetches()` does.
+
 ### Write Path PG_TRY Contract (v1.6 patch — fix #1)
 
 All four write callbacks (`pg_vault_tde_tuple_insert`,
@@ -126,9 +201,7 @@ external storage → multiple chunks → encrypt + decrypt → round-trip check)
 ### Read Path Contract
 
 Every read callback that populates a `TupleTableSlot` with buffer-backed
-data MUST call `pg_vault_tde_decode_slot()`. The 7 callbacks that require
-this are listed in the [copilot-instructions.md](/.github/copilot-instructions.md)
-Section 3 table.
+data MUST call `pg_vault_tde_decode_slot()`.
 
 ---
 
@@ -167,6 +240,15 @@ result = heapam_cb(rel, ...);
 leaving it corrupted causes cascading failures in subsequent operations on
 the same relcache entry.
 
+**The swap does not survive a relcache rebuild.** An invalidation of the relation
+processed while it is swapped — at any lock acquisition, and a TOAST read takes
+several — rebuilds the open entry, and `rd_tableam` is the TAM again: every later
+dispatch through it decrypts.  `verify_integrity()` counted every later tuple as
+failed that way (PSQLE-207).  Where heapam's functions can be called directly
+(`heap_beginscan()`, `heap_getnextslot()`, `heap_endscan()`), call them and leave
+`rd_tableam` alone; keep the swap only around a single heapam call that processes
+no invalidations.
+
 ### TOAST Override
 
 ```c
@@ -196,9 +278,7 @@ When adding support for PostgreSQL N+1, audit every TAM callback:
 1. **Diff `tableam.h`** between PG N and PG N+1
 2. Check each callback signature in the `TableAmRoutine` struct
 3. Add `#if PG_VERSION_NUM >= (N+1)*10000` guards where needed
-4. Update the **Version-Specific API Differences** table in
-   `copilot-instructions.md` § 0.5
-5. Run `make ci-regress` against PG N+1
+4. Run `make ci-regress` against PG N+1
 
 ### Known Version Differences (TAM)
 

@@ -4,8 +4,9 @@ name: Build
 # PostgreSQL majors. This is what the README's Build badge reports.
 #
 # Deliberately build-only: the full regression, TAP, isolation and Vault
-# suites need containers and a live KMS, and run in the canonical Bitbucket
-# pipeline (see ci/README.md and bitbucket-pipelines.yml). What this workflow
+# suites need containers and a live KMS: developers run them locally with
+# `make ci-all` (see ci/README.md), and the canonical Bitbucket pipeline runs
+# them on demand (bitbucket-pipelines.yml). What this workflow
 # guarantees is that the tree compiles cleanly — warnings included, since
 # `-Werror` is on — against both supported PostgreSQL server APIs.
 
@@ -34,7 +35,10 @@ jobs:
         pg: ["17", "18"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Actions, images and downloads are pinned
+        run: bash ci/scripts/run-pins.sh
 
       - name: Install PostgreSQL ${{ matrix.pg }} headers and build dependencies
         run: |

@@ -9,16 +9,11 @@
 
 ### Bitbucket Pipelines (`bitbucket-pipelines.yml`)
 
-5 jobs, against PostgreSQL 17 and 18 on Ubuntu 24.04:
-
-| Job | Purpose | PG Versions | Dependencies |
-|-----|---------|-------------|-------------|
-| `build` | Compile with `-Wall -Wextra`, zero warnings required | 17, 18 | None |
-| `regress` | Run 84 `pg_regress` SQL tests (vault provider) | 17, 18 | `build` |
-| `wallet` | Run 84 `pg_regress` SQL tests (local wallet provider) | 17, 18 | `build` |
-| `tap` | Run TAP tests with mock Vault | 17, 18 | `build` |
-| `isolation` | Run isolation tests (concurrency / MVCC) | 17, 18 | `build` |
-| `memcheck` | Valgrind + AddressSanitizer | 17, 18 | `build` |
+Pushes to `develop` and `master` only sync to GitHub (code and wiki). The test
+suite runs on demand, from custom pipelines: `test-all` (PG 17 and 18 in
+parallel), `test-pg-17`, `test-pg-18`. Each one runs `ci/scripts/run-all.sh`,
+the same stages as `make ci-all`, so developers are expected to run that locally
+before pushing.
 
 ### Local CI Pipeline (`ci/`)
 
@@ -81,7 +76,11 @@ Two kinds of release, and they touch different files.
       baked in via `-DPG_VAULT_TDE_BUILD_VERSION` would stay stale
 - [ ] Verify at runtime: `SELECT pg_vault_tde_build_version()` reports the new
       version while `pg_extension.extversion` still reports the old one
-- [ ] Tag the release commit
+- [ ] On the release commit: `make ci-all` (or the Bitbucket custom pipeline
+      `test-all`) and `make ci-security-report` (or `security-report`); then the
+      signed review, committed with the evidence
+      ([doc/SECURITY-REVIEW.md › Workflow](../doc/SECURITY-REVIEW.md#workflow))
+- [ ] Tag the release commit, signed (`git tag -s`)
 
 **Minor/major release (SQL objects changed)** — e.g. 1.7.x → 1.8:
 - [ ] Everything above, plus:
@@ -101,12 +100,13 @@ The pipeline auto-detects `podman` or `docker` and uses a mock Vault for integra
 
 | Command | What It Tests |
 |---------|---------------|
-| `make ci-regress` | 84-test SQL regression suite (vault provider) |
-| `make ci-wallet` | 84-test SQL regression suite (local wallet provider) |
+| `make ci-regress` | SQL regression suite (vault provider) |
+| `make ci-wallet` | SQL regression suite (local wallet provider) |
 | `make ci-checksums` | Same + page checksums (`initdb -k`) |
 | `make ci-tap` | TAP tests (extension load, backup hooks) |
 | `make ci-isolation` | MVCC / DEK rotation concurrency |
 | `make ci-vault` | Vault Transit API integration (Compose) |
+| `make ci-upgrade` | Data written by the previous release tag still reads |
 | `make ci-bench` | Performance benchmark (informational) |
 | `make ci-all` | All of the above in sequence |
 
@@ -133,8 +133,9 @@ When PostgreSQL N+1 becomes GA:
 3. **DEB changelog**: Add entry mentioning PG N+1 support
 4. **Containerfile**: Verify `postgres:N+1` base image exists on Docker Hub
 5. **CI matrix**: Add PG N+1 to GitHub Actions matrix and Bitbucket steps
-6. **`ci/.env`**: Add N+1 to `PG_SUPPORTED_VERSIONS`
+6. **`ci/scripts/run-matrix.sh`**: Add N+1 to the `PG_MAJORS` default, and the
+   matching rows to `packaging/build-matrix.json`
 7. **Makefile**: Update `TDE_PG_MAX` to N+1
-8. **Test**: Run `PG_VERSION=N+1 make ci-all` — all 84 tests must pass
+8. **Test**: Run `PG_VERSION=N+1 make ci-all` — every suite must pass
 9. **`build_deb.sh` / `build_rpm.sh`**: Verify scripts work with new PG version
 10. **Tag release**: Include "Added PG N+1 support" in release notes

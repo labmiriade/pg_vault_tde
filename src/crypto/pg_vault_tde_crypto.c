@@ -15,23 +15,35 @@
  * We do NOT hardcode an ENGINE; the default provider handles this, meaning
  * the code benefits from AES-NI on modern x86/ARM without any extra work.
  *
- * Ciphertext wire format (v4 IV-first trailer):
+ * AEAD blob produced by this module, IV first:
  *   [ IV(12) ][ CIPHERTEXT(plaintext_len) ][ GCM TAG(16) ][ VERSION(1) ][ GEN(8) ]
+ *
+ * That is what callers storing the blob whole see: index keys, TOAST chunks and
+ * backup blocks.  A heap tuple does NOT look like this on disk.  The v5 layout
+ * re-frames the blob — ciphertext scattered back into each attribute's own
+ * position, IV moved into the trailer — so the tuple stays walkable by core.
+ * Read the layout comment above tde_value_ranges() in pg_vault_tde_tam.c before
+ * reasoning about on-disk tuple bytes from here.
  *
  * A 12-byte (96-bit) IV is the NIST-recommended size for GCM.
  * We generate it via PostgreSQL's pg_strong_random() which is /dev/urandom
- * backed on Linux \u2014 we do NOT use OpenSSL's RAND_bytes to stay within the
+ * backed on Linux - we do NOT use OpenSSL's RAND_bytes to stay within the
  * PostgreSQL memory/resource model.
  *
- * IV-first so the blob differs from byte 0 every time: heap_update never sees
- * a constant prefix, so HOT is never wrongly chosen and tde_btree stays coherent.
+ * The fresh IV per row version is what keeps HOT off: heap_update compares
+ * indexed columns byte by byte over ciphertext, so an indexed column looks
+ * changed even when it is not, and no HOT update is chosen.  Not always: in v5
+ * a value of L bytes repeats its old ciphertext once in 256^L, and when the
+ * value did change that UPDATE went HOT and the index missed it.
+ * pg_vault_tde_tuple_update() re-encrypts until every change shows (PSQLE-219).
  */
 #include "postgres.h"
-#include "miscadmin.h"          /* MyDatabaseId — needed for AAD binding */
+#include "miscadmin.h"          /* MyDatabaseId (AAD), MyProcPid (IV batch) */
 #include "utils/memutils.h"
 #include "common/pg_prng.h"
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#include <unistd.h>             /* getpid — the Assert in tde_next_iv() */
 
 #include "src/include/pg_vault_tde_kms.h"
 #include "src/include/pg_vault_tde_crypto.h"
@@ -54,6 +66,11 @@
  *
  * Thread safety: each PostgreSQL backend is single-threaded, so no locking
  * is required for these file-scope statics.
+ *
+ * No dbid in this key, unlike the shmem TdeRelDekMap: these are process-local
+ * statics and a backend is bound to one database for its whole life, so relid
+ * cannot be ambiguous here.  The shmem cache is shared across databases and
+ * therefore does need (dbid, relid) — see tde_rel_dek_key().
  * ============================================================ */
 /* One reusable EVP context per direction; re-keyed only when (relid, gen) changes. */
 typedef struct TdeCipherSlot
@@ -73,12 +90,18 @@ static TdeCipherSlot tde_dec = { NULL, InvalidOid, 0 };
  * We amortise that cost by requesting 256 IVs at once and serving them from
  * a local array.  The array is wiped in tde_crypto_ctx_cleanup().
  *
- * Security note: AES-256-GCM with random 96-bit IVs has an IV-collision
- * probability of roughly 2^{-32} after 2^{32} encryptions under the same DEK
- * (birthday bound).  With DEK rotation at sane intervals this is far below
- * the safety threshold.  pg_strong_random uses /dev/urandom which is
- * automatically reseeded after fork() via getrandom(GRND_NONBLOCK);
- * fork-safety is maintained.
+ * The batch belongs to the process that filled it.  A fork() copies it, and
+ * two processes serving the same IVs under one DEK would void GCM for those
+ * tuples; the kernel reseeding pg_strong_random() after a fork does not help
+ * a copy already drawn.  No PostgreSQL process forks after drawing an IV —
+ * the postmaster encrypts nothing — so every process starts with an empty
+ * batch; iv_batch_pid keeps it so if that ever changes (PSQLE-178).
+ *
+ * Limit: with random 96-bit IVs, NIST SP 800-38D allows at most 2^32
+ * encryptions under one key.  Here that is one DEK generation: every tuple
+ * written — INSERT, UPDATE, each row VACUUM FULL, CLUSTER or a rotation
+ * rewrites, each TOAST chunk.  rotate_online() starts a new generation; see
+ * the README, "Routine administration".
  * ============================================================ */
 #define TDE_IV_BATCH_SIZE   256
 #define TDE_IV_BATCH_BYTES  (TDE_IV_BATCH_SIZE * TDE_GCM_IV_LEN)
@@ -91,6 +114,9 @@ static char  iv_batch[TDE_IV_BATCH_BYTES];
  */
 static int   iv_batch_pos = TDE_IV_BATCH_SIZE;
 
+/* The process that filled iv_batch; 0 while it is empty. */
+static int   iv_batch_pid = 0;
+
 /*
  * tde_next_iv -- return the next IV from the per-backend batch.
  *
@@ -100,13 +126,17 @@ static int   iv_batch_pos = TDE_IV_BATCH_SIZE;
 static void
 tde_next_iv(unsigned char *iv_out)
 {
-    if (iv_batch_pos >= TDE_IV_BATCH_SIZE)
+    /* Every process PostgreSQL forks sets MyProcPid first thing. */
+    Assert(MyProcPid == getpid());
+
+    if (iv_batch_pos >= TDE_IV_BATCH_SIZE || iv_batch_pid != MyProcPid)
     {
         /* Refill: one system call covers 256 IVs */
         if (!pg_strong_random(iv_batch, TDE_IV_BATCH_BYTES))
             ereport(ERROR,
                     (errmsg("[CRYPTO] Failed to generate IV batch")));
         iv_batch_pos = 0;
+        iv_batch_pid = MyProcPid;
     }
     memcpy(iv_out, iv_batch + iv_batch_pos * TDE_GCM_IV_LEN, TDE_GCM_IV_LEN);
     iv_batch_pos++;
@@ -149,6 +179,7 @@ tde_crypto_ctx_cleanup(void)
 
     OPENSSL_cleanse(iv_batch, TDE_IV_BATCH_BYTES);
     iv_batch_pos = TDE_IV_BATCH_SIZE;
+    iv_batch_pid = 0;
 }
 
 /*
@@ -221,7 +252,7 @@ tde_compute_aad(Oid relid, uint64 generation, unsigned char aad[TDE_V4_AAD_LEN])
  */
 
 static char* 
-tde_gcm_encrypt_core(const unsigned char* dek, int dek_len, Oid relid,
+tde_gcm_encrypt_core(const unsigned char* dek, int dek_len, uint64 gen, Oid relid,
                                  const char* plaintext, Size plaintext_len, Size *out_len)
 {
     EVP_CIPHER_CTX* ctx;
@@ -234,7 +265,6 @@ tde_gcm_encrypt_core(const unsigned char* dek, int dek_len, Oid relid,
     int             olen = 0;
     int             flen = 0;
     Size            total;
-    uint64          gen;
 
     Assert(plaintext != NULL);
     Assert(out_len != NULL);
@@ -254,7 +284,6 @@ tde_gcm_encrypt_core(const unsigned char* dek, int dek_len, Oid relid,
 
     version_ptr[0] = TDE_V4_VERSION_BYTE;
 
-    gen = pg_vault_tde_catalog_get_rel_generation(relid);
     memcpy(gen_ptr, &gen, TDE_V4_GEN_LEN);
 
 
@@ -330,17 +359,19 @@ tde_gcm_encrypt(Oid relid, const char *plaintext, Size plaintext_len, Size *out_
 {
 
     unsigned char   dek[TDE_DEK_LEN];
+    uint64          gen;
     char*           encrypted;
     Size            enc_len;
 
     Assert(plaintext != NULL);
     Assert(out_len != NULL);
 
-    if (!pg_vault_tde_kms_get_rel_dek(relid, (unsigned char *) dek, TDE_DEK_LEN))
+    /* One call: a DEK and a generation read apart can straddle a rotation. */
+    if (!pg_vault_tde_kms_get_rel_dek_gen(relid, dek, TDE_DEK_LEN, &gen))
         ereport(ERROR,
                 (errmsg("[CRYPTO] DEK unavailable for relid=%u; cannot encrypt data", relid)));
 
-    if(!(encrypted = tde_gcm_encrypt_core(dek, TDE_DEK_LEN, relid, 
+    if(!(encrypted = tde_gcm_encrypt_core(dek, TDE_DEK_LEN, gen, relid, 
                             plaintext, plaintext_len, &enc_len)))
     {
         OPENSSL_cleanse(dek, TDE_DEK_LEN);
@@ -386,12 +417,17 @@ tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len,
                         flen = 0;
     int                 auth_ok;
     uint64              stored_gen;
-    uint64              current_gen;
 
     Assert(ciphertext != NULL);
     Assert(out_len != NULL);
 
-    if (ciphertext_len <= (Size) TDE_V4_OVERHEAD)
+    /*
+     * TDE_V4_OVERHEAD bytes exactly is the well-formed encoding of a
+     * zero-length plaintext, which is what an all-NULL row produces (the null
+     * bitmap lives in the tuple header, no column data follows).  Rejecting it
+     * made such a row unreadable once written.
+     */
+    if (ciphertext_len < (Size) TDE_V4_OVERHEAD)
         ereport(ERROR,
                 (errmsg("[CRYPTO] Ciphertext too short for AES-256-GCM")));
 
@@ -406,49 +442,11 @@ tde_gcm_decrypt(Oid relid, const char *ciphertext, Size ciphertext_len,
     if ((unsigned char) version_ptr[0] != TDE_V4_VERSION_BYTE)
         return false;
 
-    {
+    memcpy(&stored_gen, gen_ptr, TDE_V4_GEN_LEN);
 
-        TdeRelDekMap cache_entry;
-        Oid dek_relid = resolve_effective_relid(relid);
-        bool    found = false;
-
-        memcpy(&stored_gen, gen_ptr, TDE_V4_GEN_LEN);
-
-        if(!tde_catalog_cache_entry(dek_relid, &cache_entry))
-        {   
-            current_gen = pg_vault_tde_catalog_get_rel_generation(dek_relid);
-                
-            if(stored_gen == current_gen)
-            {
-                found = pg_vault_tde_kms_get_rel_dek(dek_relid, (unsigned char *) dek, TDE_DEK_LEN);
-            } 
-            else if(stored_gen == current_gen - 1)
-            {
-                found = pg_vault_tde_kms_get_rel_prev_dek(dek_relid, (unsigned char *) dek, TDE_DEK_LEN);
-            }
-        }
-        else
-        {
-            current_gen = cache_entry.generation;
-
-            if(stored_gen == current_gen && cache_entry.dek_valid)
-            {
-                memcpy(dek, cache_entry.dek, TDE_DEK_LEN);
-                found = true;
-            }
-            else if(stored_gen == current_gen - 1 && cache_entry.prev_dek_valid)
-            {
-                memcpy(dek, cache_entry.prev_dek, TDE_DEK_LEN);
-                found = true;
-            }
-        }
-
-        OPENSSL_cleanse(&cache_entry, sizeof(TdeRelDekMap));
-
-        if(!found)
-            return false;
-
-    }
+    if (!pg_vault_tde_kms_get_rel_dek_for_gen(relid, stored_gen,
+                                              (unsigned char *) dek, TDE_DEK_LEN))
+        return false;
 
     /* Cache key is stored_gen: the generation of the DEK loaded above. */
     if (!tde_crypto_ctx_init())

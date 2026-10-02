@@ -37,6 +37,7 @@
 #include "catalog/pg_am_d.h"     /* BTREE_AM_OID */
 #include "parser/parsetree.h"    /* rt_fetch */
 #endif
+#include "optimizer/plancat.h"   /* get_relation_info_hook */
 
 #include "src/include/pg_vault_tde_kms.h"
 #include "src/include/pg_vault_tde_tam.h"
@@ -74,6 +75,8 @@ char *pg_vault_tde_vault_k8s_role       = NULL;
 char *pg_vault_tde_vault_k8s_mount      = NULL;
 char *pg_vault_tde_crypto_provider      = NULL;
 bool        pg_vault_tde_bgw_enabled              = false;
+bool        pg_vault_tde_preload_keys             = false;
+int         pg_vault_tde_preload_max_failures      = 5;
 int         pg_vault_tde_token_renewal_interval   = 3600;
 char *pg_vault_tde_extension_name       = "pg_vault_tde";
 
@@ -136,6 +139,15 @@ static shmem_request_hook_type    prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type    prev_shmem_startup_hook = NULL;
 static ProcessUtility_hook_type   prev_process_utility_hook = NULL;
 static object_access_hook_type    prev_object_access_hook = NULL;
+static get_relation_info_hook_type prev_get_relation_info_hook = NULL;
+
+/*
+ * True while a REINDEX runs in this backend.  REINDEX CONCURRENTLY rebuilds an
+ * existing index by creating a copy, which tde_object_access_hook sees as an
+ * ordinary index creation (is_internal is false there); the new-index policy
+ * must not refuse routine maintenance of indexes that already exist.
+ */
+static bool tde_reindex_in_progress = false;
 #if PG_VERSION_NUM < 180000
 static ExecutorStart_hook_type    prev_executor_start_hook = NULL;
 #endif
@@ -338,6 +350,56 @@ tde_kms_config_assign_string(const char *newval, void *extra)
     tde_kms_provider_invalidate();
 }
 
+/*
+ * Show hooks of the settings that hold a secret (PSQLE-224).
+ *
+ * GUC_SUPERUSER_ONLY does not keep a value from members of
+ * pg_read_all_settings, which PostgreSQL grants to pg_monitor.  These hooks
+ * give SHOW and current_setting() the value only when the current user is a
+ * superuser — the client tools read these settings with SHOW — and a mask to
+ * everyone else; GUC_NO_SHOW_ALL keeps the settings out of pg_settings, whose
+ * reset_val and boot_val columns do not go through a show hook.  An unset
+ * secret reads as empty: whether one is set is not hidden.  The server keeps
+ * using the variables themselves.
+ */
+static const char *
+tde_show_secret(const char *value)
+{
+    if (value == NULL || value[0] == '\0')
+        return "";
+    /*
+     * The current user, as core's own GUC visibility (GetUserId()): code of a
+     * lesser role's SECURITY DEFINER function, even when a superuser runs it,
+     * reads the mask.  The session role would hand it the value.
+     */
+    /* nosemgrep: tde-caller-superuser — the reader is the current user, as for core GUC visibility */
+    return superuser() ? value : "********";
+}
+
+static const char *
+tde_show_vault_token(void)
+{
+    return tde_show_secret(pg_vault_tde_vault_token);
+}
+
+static const char *
+tde_show_vault_role_id(void)
+{
+    return tde_show_secret(pg_vault_tde_vault_role_id);
+}
+
+static const char *
+tde_show_vault_secret_id(void)
+{
+    return tde_show_secret(pg_vault_tde_vault_secret_id);
+}
+
+static const char *
+tde_show_wallet_dev_mode_passphrase(void)
+{
+    return tde_show_secret(pg_vault_tde_wallet_dev_mode_passphrase);
+}
+
 static void
 tde_kms_config_assign_bool(bool newval, void *extra)
 {
@@ -390,12 +452,18 @@ static bool
 tde_is_safe_index_am(const char *am_name)
 {
     int i;
-    for(i = 0; tde_safe_index_ams[i] != NULL; i++)
+    int num_ams;
+    /* introduce the mesaure of array lenght to avoid static code false positive */
+    num_ams=sizeof(tde_safe_index_ams) / sizeof(tde_safe_index_ams[0]);
+
+    for(i = 0; i < num_ams && tde_safe_index_ams[i] != NULL; i++)
     {
         if(strcmp(tde_safe_index_ams[i], am_name) == 0)
             return true;
     }
+    
     return false;
+
 }
 
 /*
@@ -414,17 +482,24 @@ tde_rel_or_inheritors_use_encrypted_heap(Oid relid)
 
     foreach_oid(irid, inheritors_oids)
     {
-        Relation irel = try_relation_open(irid, NoLock);
+        /*
+         * AccessShareLock, not NoLock: try_relation_open() asserts that a
+         * NoLock caller already holds a lock on the relation, and this hook
+         * runs before the utility command takes its own.  Weakest mode that
+         * makes reading rd_rel->relam safe against a concurrent drop.
+         * (Caught by make ci-cassert.)
+         */
+        Relation irel = try_relation_open(irid, AccessShareLock);
         if (irel != NULL)
         {
             if (OidIsValid(irel->rd_rel->relam) &&
                 strcmp(get_am_name(irel->rd_rel->relam), "encrypted_heap") == 0)
             {
                 found = true;
-                relation_close(irel, NoLock);
+                relation_close(irel, AccessShareLock);
                 break;
             }
-            relation_close(irel, NoLock);
+            relation_close(irel, AccessShareLock);
         }
     }
     return found;
@@ -568,6 +643,22 @@ tde_object_access_hook(ObjectAccessType access, Oid classId, Oid objectId,
     amname = get_am_name(relam);
     if (amname == NULL || (strcmp(amname, "encrypted_heap") != 0 && strcmp(amname, "tde_btree") != 0))
         return;
+
+    /*
+     * tde_btree answers equality only: refuse, whatever created it, an index
+     * that could not (numeric, nondeterministic collation) or that would store
+     * plaintext keys.  Here and not in the ProcessUtility hook, because EXCLUDE
+     * constraints, ALTER COLUMN ... TYPE rebuilds and ALTER TABLE ... ADD
+     * CONSTRAINT all create indexes without passing through it — and UNIQUE
+     * and EXCLUDE enforcement uses the index directly, planner or not.
+     */
+    if (relkind == RELKIND_INDEX && strcmp(amname, "tde_btree") == 0 &&
+        !tde_reindex_in_progress)
+    {
+        ObjectAccessPostCreate *pc = (ObjectAccessPostCreate *) arg;
+
+        tde_iam_check_new_index(objectId, pc != NULL && pc->is_internal);
+    }
 
     /*
      * Register a fresh per-table DEK now, while we are still inside the
@@ -758,7 +849,41 @@ tde_executor_start_hook(QueryDesc *queryDesc, int eflags)
         list_free(swapped);
     }
 }
-#endif                          /* PG_VERSION_NUM < 180000 */
+#endif                          /*
+ * Hand a utility statement to the next hook in the chain, or to core.  A
+ * REINDEX runs with tde_reindex_in_progress set; the PG_TRY lives here rather
+ * than in tde_process_utility_hook so that none of that function's locals sit
+ * across a setjmp.
+ */
+static void
+tde_next_process_utility(PlannedStmt *pstmt, const char *queryString,
+                         bool readOnlyTree, ProcessUtilityContext context,
+                         ParamListInfo params, QueryEnvironment *queryEnv,
+                         DestReceiver *dest, QueryCompletion *qc,
+                         bool is_reindex)
+{
+    bool        save_reindex_in_progress = tde_reindex_in_progress;
+
+    if (is_reindex)
+        tde_reindex_in_progress = true;
+
+    PG_TRY();
+    {
+        if (prev_process_utility_hook)
+            prev_process_utility_hook(pstmt, queryString, readOnlyTree,
+                                      context, params, queryEnv, dest, qc);
+        else
+            standard_ProcessUtility(pstmt, queryString, readOnlyTree,
+                                    context, params, queryEnv, dest, qc);
+    }
+    PG_FINALLY();
+    {
+        tde_reindex_in_progress = save_reindex_in_progress;
+    }
+    PG_END_TRY();
+}
+
+/* PG_VERSION_NUM < 180000 */
 
 static void
 tde_process_utility_hook(PlannedStmt *pstmt,
@@ -814,7 +939,7 @@ tde_process_utility_hook(PlannedStmt *pstmt,
 
                 if (OidIsValid(rid))
                 {
-                    Relation rel = try_relation_open(rid, NoLock);
+                    Relation rel = try_relation_open(rid, AccessShareLock);
                     if (rel != NULL)
                     {
                         if (OidIsValid(rel->rd_rel->relam) &&
@@ -838,7 +963,7 @@ tde_process_utility_hook(PlannedStmt *pstmt,
                                         evict_only_oids,
                                         rel->rd_rel->reltoastrelid);
                         }
-                        relation_close(rel, NoLock);
+                        relation_close(rel, AccessShareLock);
                     }
                 }
             }
@@ -855,7 +980,18 @@ tde_process_utility_hook(PlannedStmt *pstmt,
                 AlterTableCmd* cmd = lfirst_node(AlterTableCmd, lc);
 
                 if(cmd->subtype == AT_SetAccessMethod) {
-                    if(strcmp(cmd->name, "encrypted_heap") == 0)
+                    /*
+                     * SET ACCESS METHOD DEFAULT (PG17+) leaves cmd->name
+                     * NULL: the target is default_table_access_method,
+                     * resolved by core later.  strcmp(NULL, ...) here
+                     * crashed the backend before any permission check
+                     * (PSQLE-220).  Resolve it now, so DEFAULT is treated
+                     * as the explicit form of the same access method.
+                     */
+                    const char *am = cmd->name ? cmd->name
+                                               : default_table_access_method;
+
+                    if(strcmp(am, "encrypted_heap") == 0)
                         alter_tam_into = true;
                     else
                         alter_tam_away = true;
@@ -921,7 +1057,7 @@ tde_process_utility_hook(PlannedStmt *pstmt,
 
             if (OidIsValid(rid))
             {
-                Relation rel = try_relation_open(rid, NoLock);
+                Relation rel = try_relation_open(rid, AccessShareLock);
                 if (rel != NULL)
                 {
                     bool guard = tde_rel_or_inheritors_use_encrypted_heap(rid);
@@ -951,7 +1087,7 @@ tde_process_utility_hook(PlannedStmt *pstmt,
                                         "pg_vault_tde.allow_plaintext_index = on to allow "
                                         "this with a WARNING.")));
                     }
-                    relation_close(rel, NoLock);
+                    relation_close(rel, AccessShareLock);
                 }
             }
 
@@ -1003,12 +1139,9 @@ tde_process_utility_hook(PlannedStmt *pstmt,
     }
 
     /* Run the actual DDL statement through the hook chain */
-    if (prev_process_utility_hook)
-        prev_process_utility_hook(pstmt, queryString, readOnlyTree,
-                                  context, params, queryEnv, dest, qc);
-    else
-        standard_ProcessUtility(pstmt, queryString, readOnlyTree,
-                                context, params, queryEnv, dest, qc);
+    tde_next_process_utility(pstmt, queryString, readOnlyTree,
+                             context, params, queryEnv, dest, qc,
+                             IsA(parsetree, ReindexStmt));
 
     /*
      * Post-processing for ALTER TABLE ADD CONSTRAINT ... {PRIMARY KEY|UNIQUE}
@@ -1259,7 +1392,18 @@ tde_event_string(TdeAuditEvent event)
 
 static void tde_audit_handler(TdeAuditEvent event, const char* reloid, bool success)
 {
-    const char *rolname = OidIsValid(GetUserId())
+    /*
+     * GetUserId() cannot be used as its own validity test: it opens with
+     * Assert(OidIsValid(CurrentUserId)), so the assertion fires before the
+     * ternary can choose "(system)".  _PG_init runs in the postmaster during
+     * process_shared_preload_libraries(), where no session user exists yet,
+     * and AUDIT_LOG_START is emitted from there — which kills an
+     * assert-enabled server at startup (found by make ci-cassert).
+     *
+     * IsNormalProcessingMode() is false until InitPostgres has run
+     * InitializeSessionUserId, so it has to be the first test.
+     */
+    const char *rolname = (IsNormalProcessingMode() && OidIsValid(GetUserId()))
                           ? GetUserNameFromId(GetUserId(), true)
                           : "(system)";
     ereport(LOG,
@@ -1352,6 +1496,20 @@ pg_vault_tde_shmem_startup(void)
  * do NOT call any shmem functions here; shared memory is not yet allocated
  * at this point.
  */
+/*
+ * tde_get_relation_info_hook — let earlier hooks shape the relation first,
+ * then enforce tde_btree's equality-only contract on what they left.
+ */
+static void
+tde_get_relation_info_hook(PlannerInfo *root, Oid relationObjectId,
+                           bool inhparent, RelOptInfo *rel)
+{
+    if (prev_get_relation_info_hook)
+        prev_get_relation_info_hook(root, relationObjectId, inhparent, rel);
+
+    tde_iam_get_relation_info(root, relationObjectId, inhparent, rel);
+}
+
 void
 _PG_init(void)
 {
@@ -1395,11 +1553,12 @@ _PG_init(void)
         NULL, &pg_vault_tde_vault_namespace, "", PGC_SUSET,
         GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
-    /* Vault token — secret, not shown in pg_settings (GUC_NOT_IN_SAMPLE) */
+    /* Vault token — secret: shown only to a superuser (tde_show_secret) */
     DefineCustomStringVariable("pg_vault_tde.vault_token",
         "Vault token for authentication",
         NULL, &pg_vault_tde_vault_token, "", PGC_SUSET,
-        GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+        GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE | GUC_NO_SHOW_ALL,
+        NULL, NULL, tde_show_vault_token);
 
     /*
      * vault_transit_mount — PGC_SUSET so databases can use dedicated Transit
@@ -1469,19 +1628,22 @@ _PG_init(void)
         GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
     /*
-     * vault_role_id / vault_secret_id — PGC_SUSET + GUC_NOT_IN_SAMPLE so each
-     * database can supply its own AppRole credentials without the secrets
-     * appearing in pg_settings, pg_file_settings, or config file samples.
+     * vault_role_id / vault_secret_id — PGC_SUSET so each database can supply
+     * its own AppRole credentials.  GUC_NOT_IN_SAMPLE only keeps them out of
+     * postgresql.conf.sample; GUC_NO_SHOW_ALL and the show hook keep them from
+     * roles that are not superusers (PSQLE-224).
      */
     DefineCustomStringVariable("pg_vault_tde.vault_role_id",
         "Vault AppRole role_id for authentication",
         NULL, &pg_vault_tde_vault_role_id, "", PGC_SUSET,
-        GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+        GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE | GUC_NO_SHOW_ALL,
+        NULL, NULL, tde_show_vault_role_id);
 
     DefineCustomStringVariable("pg_vault_tde.vault_secret_id",
         "Vault AppRole secret_id for authentication",
         NULL, &pg_vault_tde_vault_secret_id, "", PGC_SUSET,
-        GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+        GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE | GUC_NO_SHOW_ALL,
+        NULL, NULL, tde_show_vault_secret_id);
 
     /* AppRole role name (v1.4) — used for secret_id rotation after login */
     DefineCustomStringVariable("pg_vault_tde.vault_role_name",
@@ -1580,22 +1742,55 @@ _PG_init(void)
         &pg_vault_tde_wallet_auto_open, true, PGC_SUSET,
         GUC_SUPERUSER_ONLY, NULL, tde_kms_config_assign_bool, NULL);
 
+    /* Startup DEK cache warm-up (v1.7) */
+    DefineCustomBoolVariable("pg_vault_tde.preload_keys",
+        "Load this database's DEKs into the shared cache at startup",
+        "A background worker per database unwraps every DEK in "
+        "pg_vault_tde_catalog once the server is accepting connections, so "
+        "the first query on a table does not pay for a KMS round-trip.  "
+        "Requires a KMS usable without an interactive unlock.  Stops at "
+        "pg_vault_tde.max_encrypted_relations, which every database shares.  "
+        "Can be scoped with ALTER DATABASE SET.",
+        &pg_vault_tde_preload_keys, false, PGC_SUSET,
+        GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_vault_tde.preload_max_failures",
+        "Consecutive DEK unwrap failures the startup preload tolerates",
+        "Applies per database, and counts CONSECUTIVE failures, so that a "
+        "systemic fault stops the pass at once while a one-off does not: a "
+        "missing passphrase fails every relation, whereas a timeout does not "
+        "and the next success clears the count.  This matters for the local "
+        "wallet too, not just a remote KMS — the KEK is deliberately "
+        "re-derived from the wallet file on every unwrap rather than cached, "
+        "so a wallet on NFS or SMB is reopened once per relation.  0 stops at "
+        "the first failure.  Only meaningful with pg_vault_tde.preload_keys "
+        "on.",
+        &pg_vault_tde_preload_max_failures, 5, 0, 10000,
+        PGC_SUSET, GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+
     /* Max encrypted relations in shmem cache (v1.5) */
     DefineCustomIntVariable("pg_vault_tde.max_encrypted_relations",
         "Maximum number of independently-keyed encrypted_heap relations",
         "Controls the size of the per-table DEK cache in shared memory.  "
-        "Increase if you have more than 1024 encrypted tables.  "
+        "Increase if you have more than 1024 encrypted tables; note the cache "
+        "is one cluster-wide segment keyed by (dbid, relid), so this budgets "
+        "every database together.  Costs about 112 bytes per relation, "
+        "reserved at startup whether used or not.  "
         "Requires server restart to take effect.",
         &pg_vault_tde_max_encrypted_relations,
-        TDE_REL_DEK_CACHE_DEFAULT, 64, 65536,
+        TDE_REL_DEK_CACHE_DEFAULT, 64, 1048576,
         PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
-    /* TOAST encryption switch (v1.5) */
+    /*
+     * TOAST encryption switch (v1.5).  No effect since 1.7.2 (PSQLE-223):
+     * chunks are always encrypted, so the TOAST relation is always
+     * encrypted_heap; kept so configurations that set it still load.
+     */
     DefineCustomBoolVariable("pg_vault_tde.toast_encryption",
-        "Encrypt TOAST chunks for encrypted_heap tables",
-        "When true (default in v1.5), TOAST tables for encrypted_heap "
-        "relations use encrypted_heap AM and encrypt each chunk with "
-        "AES-256-GCM.  Set to false only for debugging or migration.",
+        "No effect since 1.7.2; TOAST of encrypted_heap tables is always encrypted",
+        "TOAST chunks of encrypted_heap tables are always encrypted with "
+        "AES-256-GCM.  Setting this off only raises a WARNING when a TOAST "
+        "table is created; the parameter is removed in 1.8.",
         &pg_vault_tde_toast_encryption, true, PGC_SUSET,
         0, NULL, NULL, NULL);
 
@@ -1655,8 +1850,9 @@ _PG_init(void)
         "Convenience for CI pipelines.  Never set in production.  "
         "Emits a WARNING on every use.  Ignored when dev_mode = off.",
         &pg_vault_tde_wallet_dev_mode_passphrase, "",
-        PGC_SUSET, GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE,
-        NULL, tde_kms_config_assign_string, NULL);
+        PGC_SUSET, GUC_SUPERUSER_ONLY | GUC_NOT_IN_SAMPLE | GUC_NO_SHOW_ALL,
+        NULL, tde_kms_config_assign_string,
+        tde_show_wallet_dev_mode_passphrase);
 
     /*
      * dev_mode — enable development conveniences (v1.6).
@@ -1780,6 +1976,14 @@ _PG_init(void)
     prev_object_access_hook = object_access_hook;
     object_access_hook = tde_object_access_hook;
 
+    /*
+     * Planner hook: tde_btree answers equality only, so take the sort order
+     * away from its indexes and drop the ones that cannot answer equality —
+     * see tde_iam_get_relation_info().
+     */
+    prev_get_relation_info_hook = get_relation_info_hook;
+    get_relation_info_hook = tde_get_relation_info_hook;
+
     audit_hook_ptr = tde_audit_handler;
     tde_audit(AUDIT_LOG_START, NULL, true);
 
@@ -1825,6 +2029,14 @@ _PG_init(void)
      * Only starts if bgw_enabled=true; the BGW itself checks auth_method.
      */
     pg_vault_tde_register_bgw();
+
+    /*
+     * Startup DEK cache warm-up (v1.7).  Registered unconditionally:
+     * preload_keys can be turned on for a single database with ALTER
+     * DATABASE SET, which is invisible from here, and the launcher is
+     * a few milliseconds when no database wants it.
+     */
+    pg_vault_tde_register_preload_bgw();
 
     ereport(LOG,
             (errmsg("pg_vault_tde: hooks registered, awaiting shmem startup")));

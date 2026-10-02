@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ci/scripts/run-isolation.sh — Run isolation (concurrency) tests
 #
-# Executes the DEK rotation isolation spec which verifies that concurrent
-# reads/writes during key rotation behave correctly under MVCC.
+# Executes every spec in test/isolation/specs/: concurrent reads and writes
+# during key rotation, a relation rewrite, and UPDATEs of out-of-line values.
 #
 # Exit code: 0 on success, 4 on failure.
 #

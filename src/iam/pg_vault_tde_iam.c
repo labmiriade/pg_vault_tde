@@ -17,10 +17,11 @@
  * equality semantics (equal plaintexts → equal ciphertexts), which is
  * sufficient for B-Tree equality lookups.
  *
- * KNOWN LIMITATION: Range scans (>, <, BETWEEN) on TDE-encrypted indexed
- * columns are NOT supported and will return empty results.  Users requiring
- * range queries must either accept unencrypted indexes (SQL ACL protection
- * only) or restructure their queries.  This trade-off is inherent to
+ * CONSEQUENCE: tde_btree answers equality (=, IN, = ANY) and nothing else.
+ * Range predicates, ORDER BY, min()/max() and merge joins are never served
+ * from it — they run as sequential scans and stay correct — and a plan forced
+ * onto it for a range fails with an error rather than return wrong rows.  See
+ * "PLANNER: EQUALITY ONLY" below.  This trade-off is inherent to
  * deterministic encryption, not specific to this implementation.
  *
  * AES-SIV is available in OpenSSL 3.x via EVP_aes_256_siv().  It provides:
@@ -40,7 +41,10 @@
 #include "utils/syscache.h"     /* SearchSysCache1, ReleaseSysCache, CLAOID */
 #include "utils/uuid.h"         /* DatumGetUUIDP, pg_uuid_t */
 #include "catalog/pg_opclass.h" /* Form_pg_opclass */
+#include "catalog/pg_index.h"   /* Anum_pg_index_indclass */
 #include "catalog/pg_am_d.h"    /* BTREE_AM_OID */
+#include "nodes/pathnodes.h"    /* IndexOptInfo, IndexPath, IndexClause */
+#include "utils/lsyscache.h"    /* get_op_opfamily_strategy, get_collation_isdeterministic */
 #include "storage/lwlock.h"
 #include <openssl/evp.h>
 #include <openssl/crypto.h>
@@ -69,6 +73,7 @@
 #include "src/include/pg_vault_tde_catalog.h"
 #include "src/include/pg_vault_tde_iam.h"
 #include "src/include/pg_vault_tde_hw_accel.h"
+#include "src/include/pg_vault_tde_guc.h"   /* pg_vault_tde_allow_plaintext_index */
 
 /* AES-SIV produces a 16-byte synthetic IV prepended to ciphertext. */
 #define TDE_SIV_OVERHEAD 16
@@ -93,7 +98,6 @@ typedef struct TdeCipherSlot
 } TdeCipherSlot;
 
 static TdeCipherSlot idx_enc = {NULL, InvalidOid, 0, {0}};
-static TdeCipherSlot idx_dec = {NULL, InvalidOid, 0, {0}};
 
 /* Free a slot and wipe its cached key (shared by cleanup and error paths). */
 static void
@@ -117,7 +121,6 @@ void
 tde_iam_ctx_cleanup(void)
 {
     tde_iam_ctx_drop(&idx_enc);
-    tde_iam_ctx_drop(&idx_dec);
 }
 
 /*
@@ -125,13 +128,14 @@ tde_iam_ctx_cleanup(void)
  * message.  enc: 1 = encrypt, 0 = decrypt.  Raises ERROR on failure.
  *
  * On (idx_oid, generation) change the SIV key is re-derived from `dek` and the
- * cipher + key installed; otherwise only the cached key is re-armed.
+ * cipher + key installed; otherwise only the cached key is re-armed.  gen must
+ * be the generation OF dek, read with it (pg_vault_tde_kms_get_rel_dek_gen):
+ * the cached key is looked up by it.
  */
 static EVP_CIPHER_CTX *
 tde_iam_ctx_prepare(TdeCipherSlot *slot, Oid idx_oid,
-                    const unsigned char *dek, int dek_len, int enc)
+                    const unsigned char *dek, int dek_len, uint64 gen, int enc)
 {
-    uint64 gen = pg_vault_tde_catalog_get_rel_generation(idx_oid);
 
     /* Allocate once per backend in TopMemoryContext (survives per-tuple resets). */
     if (slot->ctx == NULL)
@@ -213,7 +217,7 @@ tde_iam_ctx_prepare(TdeCipherSlot *slot, Oid idx_oid,
  * Side effects: reads DEK from shared-memory KMS cache under shared LWLock.
  */
 char *
-tde_iam_encrypt_key(Oid idx_oid, const char* dek, int dek_len,
+tde_iam_encrypt_key(Oid idx_oid, const char* dek, int dek_len, uint64 gen,
                     const char *plaintext, Size plaintext_len, Size *out_len)
 {
     EVP_CIPHER_CTX *ctx;
@@ -225,7 +229,7 @@ tde_iam_encrypt_key(Oid idx_oid, const char* dek, int dek_len,
     Assert(out_len != NULL);
 
     out_buf = (char *) palloc0(plaintext_len + TDE_SIV_OVERHEAD);
-    ctx = tde_iam_ctx_prepare(&idx_enc, idx_oid, (const unsigned char *) dek, dek_len, 1);
+    ctx = tde_iam_ctx_prepare(&idx_enc, idx_oid, (const unsigned char *) dek, dek_len, gen, 1);
 
     /*
      * AES-256-SIV: no IV (synthetic IV derived internally).  The 16-byte SIV
@@ -249,62 +253,6 @@ tde_iam_encrypt_key(Oid idx_oid, const char* dek, int dek_len,
     }
 
     *out_len = (Size)(TDE_SIV_OVERHEAD + olen1 + olen2);
-    return out_buf;
-}
-
-/*
- * tde_iam_decrypt_key
- *
- * Decrypts an AES-256-SIV encrypted index key back to plaintext.
- * Returns a palloc'd buffer.  Caller MUST OPENSSL_cleanse + pfree after use.
- *
- * @param ciphertext      encrypted key buffer
- * @param ciphertext_len  length including SIV overhead
- * @param out_len         set to plaintext length on success
- * @returns               palloc'd plaintext buffer, or NULL on DEK miss
- */
-char *
-tde_iam_decrypt_key(Oid idx_oid, const char* dek, int dek_len,
-                    const char *ciphertext, Size ciphertext_len, Size *out_len)
-{
-    EVP_CIPHER_CTX *ctx;
-    char           *out_buf;
-    int             olen1 = 0,
-                    olen2 = 0;
-
-    Assert(ciphertext != NULL);
-    Assert(out_len != NULL);
-
-    if (ciphertext_len <= TDE_SIV_OVERHEAD)
-        ereport(ERROR,
-                (errmsg("[IAM] Ciphertext too short for AES-SIV decryption")));
-
-    out_buf = (char *) palloc0(ciphertext_len);
-    ctx = tde_iam_ctx_prepare(&idx_dec, idx_oid, (const unsigned char *) dek, dek_len, 0);
-
-    /*
-     * The first TDE_SIV_OVERHEAD bytes are the SIV tag; provide it via SET_TAG
-     * before Update.  DecryptFinal returns <= 0 on auth failure (tampered key
-     * or wrong DEK) — treated as a hard error.
-     */
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG,
-                            TDE_SIV_OVERHEAD, (void *) ciphertext) != 1 ||
-        EVP_DecryptUpdate(ctx, (unsigned char *) out_buf, &olen1,
-                          (const unsigned char *) ciphertext + TDE_SIV_OVERHEAD,
-                          (int)(ciphertext_len - TDE_SIV_OVERHEAD)) != 1 ||
-        EVP_DecryptFinal_ex(ctx,
-                            (unsigned char *) out_buf + olen1, &olen2) != 1)
-    {
-        OPENSSL_cleanse(out_buf, ciphertext_len);
-        pfree(out_buf);
-        tde_iam_ctx_drop(&idx_dec);
-        ereport(ERROR,
-                (errcode(ERRCODE_DATA_CORRUPTED),
-                 errmsg("[IAM] AES-256-SIV authentication/decryption failed: "
-                        "index key integrity violation or wrong DEK")));
-    }
-
-    *out_len = (Size)(olen1 + olen2);
     return out_buf;
 }
 
@@ -426,6 +374,86 @@ tde_iam_serialize_fixed_type(Datum datum, Oid typoid, uint8 *buf)
 }
 
 /*
+ * tde_iam_type_is_serializable — does tde_iam_serialize_fixed_type() above
+ * handle this type, or does it fall through to `return 0`?
+ *
+ * This must list exactly the typoids that switch accepts.  The scan-key
+ * lifetime logic below decides whether a datum left behind in scan->keyData
+ * was allocated here, and freeing one that was not is a wild pfree: when the
+ * serializer declines, tde_iam_encrypt_fixed_type_datum() hands the caller's
+ * own datum straight back, and for a by-value type that "pointer" is the
+ * value itself.
+ */
+static bool
+tde_iam_type_is_serializable(Oid typoid)
+{
+    switch (typoid)
+    {
+        case INT4OID:
+        case DATEOID:
+        case INT8OID:
+        case TIMESTAMPTZOID:
+        case UUIDOID:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/*
+ * tde_iam_owns_scan_key — would the encrypt path have allocated for this
+ * column, rather than returning its input unchanged?
+ */
+static bool
+tde_iam_owns_scan_key(Relation index, int col)
+{
+    Form_pg_attribute att;
+
+    if (col < 0 || col >= index->rd_att->natts)
+        return false;
+
+    if (TDE_IS_ENC_OPS_COL(index, col))
+        return tde_iam_type_is_serializable(index->rd_opcintype[col]);
+
+    att = TupleDescAttr(index->rd_att, col);
+    return att->attlen == -1 || att->attlen == -2;
+}
+
+/*
+ * tde_iam_release_scan_key — free the encrypted key slot i was given earlier.
+ *
+ * The keys cannot be released where they are built: btrescan() memmoves the
+ * ScanKeyData into scan->keyData and reads the datum for the whole scan, so
+ * the earliest safe moment is the next rescan — or amendscan for the last set.
+ * Without this a nested loop pays one encrypted key per outer row and keeps
+ * every one of them.
+ *
+ * Ownership is not guessed from the pointer: it is recomputed from the index
+ * and the key, which cannot change between rescans of one scan.  The NULL test
+ * is what makes the first rescan safe, and it only works because
+ * pg_vault_tde_ambeginscan() zeroes keyData — RelationGetIndexScan() allocates
+ * it with palloc(), not palloc0(), so it arrives full of garbage that would
+ * otherwise be pfree'd as if it were ours.
+ */
+static void
+tde_iam_release_scan_key(IndexScanDesc scan, int i)
+{
+    if (scan->keyData == NULL || i < 0 || i >= scan->numberOfKeys)
+        return;
+    if (DatumGetPointer(scan->keyData[i].sk_argument) == NULL)
+        return;
+    if ((scan->keyData[i].sk_flags & SK_ISNULL) != 0)
+        return;
+    if (scan->keyData[i].sk_strategy != BTEqualStrategyNumber)
+        return;
+    if (!tde_iam_owns_scan_key(scan->indexRelation, scan->keyData[i].sk_attno - 1))
+        return;
+
+    pfree(DatumGetPointer(scan->keyData[i].sk_argument));
+    scan->keyData[i].sk_argument = (Datum) 0;
+}
+
+/*
  * tde_iam_encrypt_fixed_type_datum
  *
  * Encrypts a fixed-size typed Datum using AES-256-SIV.
@@ -443,12 +471,13 @@ Datum
 tde_iam_encrypt_fixed_type_datum(Relation index_rel, Datum datum, Oid typoid)
 {
     uint8   plain_buf[16];   /* max 16 bytes for uuid */
-    Size    plain_len;
+    Size volatile plain_len;   /* live across the PG_TRY sigsetjmp */
     Size    enc_len    = 0;
     char   *encrypted;
     bytea  *enc_bytea  = NULL;
 
     unsigned char dek[TDE_DEK_LEN];
+    uint64        gen;
 
     plain_len = tde_iam_serialize_fixed_type(datum, typoid, plain_buf);
 
@@ -460,7 +489,7 @@ tde_iam_encrypt_fixed_type_datum(Relation index_rel, Datum datum, Oid typoid)
         return datum;
     }
 
-    if(!pg_vault_tde_kms_get_rel_dek(RelationGetRelid(index_rel), dek, sizeof(dek)))
+    if(!pg_vault_tde_kms_get_rel_dek_gen(RelationGetRelid(index_rel), dek, sizeof(dek), &gen))
     {
         ereport(ERROR, 
                 (errmsg("[IAM] tde_iam_encrypt_fixed_type_datum: "
@@ -474,7 +503,7 @@ tde_iam_encrypt_fixed_type_datum(Relation index_rel, Datum datum, Oid typoid)
     PG_TRY();
     {
         encrypted = tde_iam_encrypt_key(RelationGetRelid(index_rel),
-                                        (const char *) dek, sizeof(dek),
+                                        (const char *) dek, sizeof(dek), gen,
                                         (const char *) plain_buf, plain_len, &enc_len);
         OPENSSL_cleanse(plain_buf, sizeof(plain_buf));
 
@@ -482,6 +511,7 @@ tde_iam_encrypt_fixed_type_datum(Relation index_rel, Datum datum, Oid typoid)
         SET_VARSIZE(enc_bytea, VARHDRSZ + enc_len);
         memcpy(VARDATA(enc_bytea), encrypted, enc_len);
         OPENSSL_cleanse(encrypted, enc_len);
+        pfree(encrypted);
     }
     PG_CATCH();
     {
@@ -493,7 +523,14 @@ tde_iam_encrypt_fixed_type_datum(Relation index_rel, Datum datum, Oid typoid)
 
     OPENSSL_cleanse(dek, sizeof(dek));
 
-    /* Do NOT pfree(encrypted) — let ecxt_per_tuple_memory reset reclaim it. */
+    /*
+     * The intermediate buffer is released here, not left to a context reset:
+     * aminsert runs in ExecutorState, which lives for the whole statement, not
+     * in ecxt_per_tuple_memory.  Measured on a single 8M-row INSERT before this
+     * pfree: ExecutorState held 34 MB against 0.7 MB for the same INSERT into a
+     * plain heap with a plain btree.  enc_bytea is the return value and is
+     * freed by the caller once the index tuple has copied it.
+     */
     return PointerGetDatum(enc_bytea);
 }
 
@@ -570,6 +607,7 @@ tde_iam_encrypt_index_datum(Relation index_rel, Datum datum, bool typbyval, int1
         char       *encrypted;
         bytea      *enc_bytea  = NULL;
         unsigned char dek[TDE_DEK_LEN];
+        uint64        gen;
 
         if (typlen == -1)
         {
@@ -590,7 +628,7 @@ tde_iam_encrypt_index_datum(Relation index_rel, Datum datum, bool typbyval, int1
             plen  = strlen(plain) + 1;   /* include null terminator */
         }   
 
-        if(!pg_vault_tde_kms_get_rel_dek(RelationGetRelid(index_rel), dek, sizeof(dek)))
+        if(!pg_vault_tde_kms_get_rel_dek_gen(RelationGetRelid(index_rel), dek, sizeof(dek), &gen))
         {
             ereport(ERROR, 
                     errmsg("[IAM] tde_iam_encrypt_index_datum: "
@@ -603,13 +641,14 @@ tde_iam_encrypt_index_datum(Relation index_rel, Datum datum, bool typbyval, int1
         PG_TRY();
         {
             encrypted = tde_iam_encrypt_key(RelationGetRelid(index_rel),
-                                            (const char *) dek, sizeof(dek),
+                                            (const char *) dek, sizeof(dek), gen,
                                             plain, plen, &enc_len);
 
             enc_bytea = (bytea *) palloc(VARHDRSZ + enc_len);
             SET_VARSIZE(enc_bytea, VARHDRSZ + enc_len);
             memcpy(VARDATA(enc_bytea), encrypted, enc_len);
             OPENSSL_cleanse(encrypted, enc_len);
+            pfree(encrypted);
         }
         PG_CATCH();
         {
@@ -620,7 +659,15 @@ tde_iam_encrypt_index_datum(Relation index_rel, Datum datum, bool typbyval, int1
 
         OPENSSL_cleanse(dek, sizeof(dek));
 
-        /* Do NOT pfree(encrypted) — let ecxt_per_tuple_memory reset reclaim it. */
+        /*
+         * Both intermediates go back now — see the note in
+         * tde_iam_encrypt_fixed_type_datum(): the caller is in ExecutorState,
+         * which is reset once per statement, not once per tuple.  `plain`
+         * points inside bval, so this has to come after the encrypt call.
+         */
+        if (bval != NULL)
+            pfree(bval);
+
         return PointerGetDatum(enc_bytea);
     }
 }
@@ -657,23 +704,48 @@ tde_iam_encrypt_index_datum(Relation index_rel, Datum datum, bool typbyval, int1
  * non-btree relam. Forcing a single-process build keeps every scan/sort
  * call inside this (correctly impersonated) backend.
  */
+/*
+ * tde_assert_not_impersonated
+ *
+ * pg_vault_tde_ambuild and pg_vault_tde_aminsert temporarily set
+ * rd_rel->relam = BTREE_AM_OID around their delegation to nbtree, and must
+ * restore it on every exit path including the error one.
+ *
+ * A leaked impersonation is invisible to every checking stage we run: a stale
+ * relam is not invalid memory (valgrind), not undefined behaviour (UBSan), not
+ * an unreachable branch (scan-build), and not something PostgreSQL itself
+ * asserts on (cassert).  It is simply wrong, and it persists in the backend's
+ * relcache until an unrelated invalidation happens to heal it.  The only way
+ * to make that class visible is to state the invariant ourselves.
+ *
+ * The invariant needs no oid lookup: tde_btree_methods is returned by our
+ * handler alone, which is registered for the tde_btree access method, so every
+ * relation reaching these callbacks must still carry tde_btree's oid.  If one
+ * carries btree's, an earlier delegated call leaked out of its window.
+ *
+ * Compiles to nothing without --enable-cassert; see make ci-cassert.
+ */
+static inline void
+tde_assert_not_impersonated(Relation index)
+{
+    Assert(index->rd_rel->relam != BTREE_AM_OID);
+}
+
 static IndexBuildResult *
 pg_vault_tde_ambuild(Relation heap, Relation index, IndexInfo *index_info)
 {
     IndexBuildResult *result;
     Oid               saved_relam = index->rd_rel->relam;
-      
+
     Assert(saved_btree_methods_valid);
+    tde_assert_not_impersonated(index);
     
     /*
-     * On PG17, tuplesort_begin_index_btree() hard-asserts
-     * indexRel->rd_rel->relam == BTREE_AM_OID before it will build a sort
-     * for the index (removed/relaxed in PG18). Since tde_btree registers
-     * its own AM oid, btbuild() would fail with "unexpected non-btree AM"
-     * for every build. Impersonate BTREE_AM_OID for the duration of the
-     * delegated build call, same pattern used for rd_tableam in
-     * pg_vault_tde_relation_copy_for_cluster (tam.c) — RelationData is
-     * per-backend, so the swap is safe from concurrency.
+     * nbtree reads BTGetFillFactor/BTGetTargetPageFreeSpace/BTGetDeduplicateItems
+     * (nbtree.h), macros whose AssertMacro requires rd_rel->relam == BTREE_AM_OID.
+     * On the build path they expand at nbtsort.c:667 and :1154.  PG17 also
+     * asserted in tuplesort_begin_index_btree().  Both reasons are live; 
+     * do not drop this swap on the assumption that PG18 relaxed it.
      */
     index->rd_rel->relam = BTREE_AM_OID;
 
@@ -706,8 +778,11 @@ pg_vault_tde_aminsert(Relation index, Datum *values, bool *isnull,
     bool    enc_isnull[INDEX_MAX_KEYS];
     int     ncols = index_info->ii_NumIndexAttrs;
     int     i;
+    bool    result;
+    Oid     saved_relam;
 
     Assert(saved_btree_methods_valid);
+    tde_assert_not_impersonated(index);
 
     memcpy(enc_isnull, isnull, ncols * sizeof(bool));
 
@@ -736,10 +811,63 @@ pg_vault_tde_aminsert(Relation index, Datum *values, bool *isnull,
         }
     }
 
-    return saved_btree_methods.aminsert(index, enc_values, enc_isnull,
+    /*
+     * nbtree reads BTGetDeduplicateItems (nbtinsert.c:2779, the dedup /
+     * bottom-up delete pass) and BTGetFillFactor (nbtsplitloc.c:172, via
+     * _bt_split), macros in nbtree.h whose AssertMacro requires
+     * rd_rel->relam == BTREE_AM_OID.  tde_btree registers its own AM oid, so
+     * impersonate btree for the delegated call — same pattern as
+     * pg_vault_tde_ambuild above and rd_tableam in
+     * pg_vault_tde_relation_copy_for_cluster (tam.c).  RelationData is a
+     * per-backend relcache copy, so the swap is invisible to other backends.
+     *
+     * Neither macro is reached until a leaf page fills, which is why a single
+     * INSERT never trips the assert and only a bulk load catches a regression.
+     *
+     * The swap sits AFTER the encryption loop on purpose: tde_iam_encrypt_*
+     * can ereport(ERROR), and an error thrown before the swap has nothing to
+     * restore.  Widening this window would leave relam impersonated in the
+     * relcache for the rest of the session — a corruption no assert, no
+     * sanitizer and no memory checker can see.
+     *
+     * PG_TRY restores relam even if the delegated aminsert raises.
+     */
+    saved_relam = index->rd_rel->relam;
+    index->rd_rel->relam = BTREE_AM_OID;
+
+    
+    PG_TRY();
+    { 
+        result = saved_btree_methods.aminsert(index, enc_values, enc_isnull,
                                     heap_tid, heap,
                                     check_unique, index_unchanged,
                                     index_info);
+    }
+    PG_CATCH();
+    {
+        index->rd_rel->relam = saved_relam;
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+
+    index->rd_rel->relam = saved_relam;
+
+    /*
+     * btinsert has copied the key into an IndexTuple of its own, so the bytea
+     * this function produced per column is dead.  Releasing it here matters
+     * because aminsert runs in ExecutorState — reset once per statement, not
+     * once per tuple — so on a bulk load these accumulate for the whole
+     * INSERT.  A datum that came back unchanged was never ours: tde_btree
+     * stores fixed-size keys without an enc_ops opclass in plaintext, and
+     * tde_iam_encrypt_fixed_type_datum returns its input on an unknown typoid.
+     */
+    for (i = 0; i < ncols; i++)
+    {
+        if (!isnull[i] && DatumGetPointer(enc_values[i]) != DatumGetPointer(values[i]))
+            pfree(DatumGetPointer(enc_values[i]));
+    }
+
+    return result;
 }
 
 /* ── AMBEGINSCAN ────────────────────────────────────────────────────────── */
@@ -747,12 +875,27 @@ pg_vault_tde_aminsert(Relation index, Datum *values, bool *isnull,
 static IndexScanDesc
 pg_vault_tde_ambeginscan(Relation index, int nkeys, int norderbys)
 {
+    tde_assert_not_impersonated(index);
     /*
      * Delegate entirely to btree.  The ScanKey encryption happens in
      * amrescan, called immediately after by the executor.
      */
     Assert(saved_btree_methods_valid);
-    return saved_btree_methods.ambeginscan(index, nkeys, norderbys);
+    {
+        IndexScanDesc scan = saved_btree_methods.ambeginscan(index, nkeys, norderbys);
+
+        /*
+         * RelationGetIndexScan() allocates keyData with palloc(), not
+         * palloc0(), and nothing reads it until btrescan() overwrites it
+         * wholesale.  Zeroing it here buys the one piece of per-scan state the
+         * key lifetime logic needs: on the first rescan an empty slot is
+         * reliably NULL instead of garbage that looks like a pointer.
+         */
+        if (scan->keyData != NULL && scan->numberOfKeys > 0)
+            memset(scan->keyData, 0, scan->numberOfKeys * sizeof(ScanKeyData));
+
+        return scan;
+    }
 }
 
 /* ── AMRESCAN ───────────────────────────────────────────────────────────── */
@@ -763,17 +906,51 @@ pg_vault_tde_amrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 {
     int i;
 
+    tde_assert_not_impersonated(scan->indexRelation);
+
     Assert(saved_btree_methods_valid);
 
     /*
-     * Encrypt equality scan keys (strategy == BTEqualStrategyNumber = 3)
-     * so they match the encrypted values stored in the index.
+     * tde_btree answers equality only.  AES-SIV preserves equality and
+     * nothing else, so a range key walked against the ciphertext order
+     * returns wrong rows without any error.  The planner never builds such a
+     * scan on its own — pg_vault_tde_amcostestimate() prices it out and
+     * tde_iam_get_relation_info() strips the index of its sort order — so a
+     * key reaching this point means the plan was forced.  Fail it here,
+     * before anything is encrypted, rather than return wrong rows.
      *
-     * Range scan keys (strategy != 3) are passed through unchanged.
-     * They will produce incorrect or empty results because AES-SIV
-     * encrypted values do not preserve ordering — this is the documented
-     * v1.4 limitation of tde_btree.
+     * An array key cannot reach us either: amsearcharray is off, so the
+     * executor expands IN / = ANY into one scalar rescan per element.  If one
+     * ever does, encrypting it as a scalar would hand btree an array header
+     * made of ciphertext.
      */
+    for (i = 0; keys != NULL && i < nkeys; i++)
+    {
+        if ((keys[i].sk_flags & SK_ISNULL) != 0)
+            continue;           /* IS NULL / IS NOT NULL: no value compared */
+
+        if ((keys[i].sk_flags & SK_SEARCHARRAY) != 0)
+            elog(ERROR, "tde_btree received an array scan key although amsearcharray is off");
+
+        if (keys[i].sk_strategy != BTEqualStrategyNumber)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("pg_vault_tde: tde_btree index \"%s\" supports only equality lookups",
+                            RelationGetRelationName(scan->indexRelation)),
+                     errdetail("Index keys are encrypted with AES-SIV, which preserves equality "
+                               "but not order: a range comparison through this index would "
+                               "return wrong rows."),
+                     errhint("The planner avoids tde_btree for such conditions unless the plan "
+                             "is forced; check enable_seqscan and enable_bitmapscan.")));
+    }
+
+    /*
+     * Release what the previous rescan built, before btrescan() overwrites the
+     * pointers with this round's keys and they become unreachable.
+     */
+    for (i = 0; i < scan->numberOfKeys; i++)
+        tde_iam_release_scan_key(scan, i);
+
     if (keys != NULL)
     {
         for (i = 0; i < nkeys; i++)
@@ -805,6 +982,22 @@ pg_vault_tde_amrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
     }
 
     saved_btree_methods.amrescan(scan, keys, nkeys, orderbys, norderbys);
+}
+
+/* ── AMENDSCAN ──────────────────────────────────────────────────────────── */
+
+static void
+pg_vault_tde_amendscan(IndexScanDesc scan)
+{
+    int i;
+
+    Assert(saved_btree_methods_valid);
+
+    /* The set the last rescan built has no next rescan to release it. */
+    for (i = 0; i < scan->numberOfKeys; i++)
+        tde_iam_release_scan_key(scan, i);
+
+    saved_btree_methods.amendscan(scan);
 }
 
 /* ── AMVALIDATE ─────────────────────────────────────────────────────────── */
@@ -861,6 +1054,284 @@ pg_vault_tde_amvalidate(Oid opclassoid)
     return saved_btree_methods.amvalidate(opclassoid);
 }
 
+/* ── PLANNER: EQUALITY ONLY ──────────────────────────────────────────────── */
+
+/*
+ * What the planner may ask of a tde_btree index, and why nothing else.
+ *
+ * AES-SIV maps equal plaintexts to equal ciphertexts and preserves nothing
+ * else, so an equality lookup is the only question the tree can answer.
+ * The v1.5 operator classes tde_text_ops, tde_bytea_ops and tde_numeric_ops
+ * nevertheless declare < <= >= > as well, and the planner believed them:
+ * range predicates, ORDER BY ... LIMIT, min()/max() and merge joins read the
+ * index in ciphertext order and returned wrong rows without any error.  The
+ * operator classes cannot be amended in place (ALTER OPERATOR FAMILY ... DROP
+ * OPERATOR is refused while the class exists), so the rule is enforced here,
+ * where the planner meets the index:
+ *
+ *   - tde_iam_get_relation_info() takes the sort order away from every
+ *     tde_btree index, which removes ORDER BY, min()/max() and merge-join
+ *     uses, and drops the indexes that cannot even answer equality;
+ *   - pg_vault_tde_amcostestimate() prices out any path whose index clauses
+ *     are not all equality, so range predicates go to a sequential scan;
+ *   - pg_vault_tde_amrescan() fails a range key that reaches it anyway,
+ *     which only a forced plan can do.
+ *
+ * AM-level amcanorder = false would be the obvious lever and is not an
+ * option: PrepareSortSupportFromIndexRel() rejects a non-amcanorder index
+ * during the btree-impersonated build (see pg_vault_tde_ambuild()).
+ */
+
+/* Added to both cost figures of a path that tde_btree must not serve. */
+#define TDE_IAM_NON_EQUALITY_COST   1.0e10
+
+/*
+ * v1.5 operator classes for fixed-size types.  Their keys are stored in
+ * plaintext (tde_iam_encrypt_index_datum() cannot widen a fixed-length key),
+ * and v1.7 replaced them with the tde_*_enc_ops defaults.  Kept only so that
+ * indexes built on them keep working; new indexes may not use them.
+ */
+static const char *const tde_iam_legacy_opclasses[] = {
+    "tde_int4_ops", "tde_int8_ops", "tde_uuid_ops",
+    "tde_date_ops", "tde_timestamptz_ops"
+};
+
+/*
+ * tde_iam_path_is_equality_only — would this index path ask the tree
+ * anything but "which entries equal these values"?
+ */
+static bool
+tde_iam_path_is_equality_only(IndexPath *path)
+{
+    ListCell   *lc;
+
+    /* No ordered use.  tde_iam_get_relation_info() already prevents it. */
+    if (path->path.pathkeys != NIL || path->indexorderbys != NIL)
+        return false;
+
+    foreach(lc, path->indexclauses)
+    {
+        IndexClause *iclause = lfirst_node(IndexClause, lc);
+        Oid          opfamily = path->indexinfo->opfamily[iclause->indexcol];
+        ListCell    *lc2;
+
+        foreach(lc2, iclause->indexquals)
+        {
+            Node   *clause = (Node *) lfirst_node(RestrictInfo, lc2)->clause;
+            Oid     opno;
+
+            if (IsA(clause, NullTest))
+                continue;
+            else if (IsA(clause, OpExpr))
+                opno = ((OpExpr *) clause)->opno;
+            else if (IsA(clause, ScalarArrayOpExpr))
+                opno = ((ScalarArrayOpExpr *) clause)->opno;
+            else
+                return false;   /* RowCompareExpr, or anything unforeseen */
+
+            if (get_op_opfamily_strategy(opno, opfamily) != BTEqualStrategyNumber)
+                return false;
+        }
+    }
+
+    return true;
+}
+
+/*
+ * pg_vault_tde_amcostestimate — btree's estimate, plus a prohibitive cost
+ * for any path that is not equality-only.  Pricing rather than removing the
+ * path keeps the planner's search intact: a sequential scan always exists,
+ * and it wins.
+ */
+static void
+pg_vault_tde_amcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
+                            Cost *indexStartupCost, Cost *indexTotalCost,
+                            Selectivity *indexSelectivity, double *indexCorrelation,
+                            double *indexPages)
+{
+    saved_btree_methods.amcostestimate(root, path, loop_count,
+                                       indexStartupCost, indexTotalCost,
+                                       indexSelectivity, indexCorrelation,
+                                       indexPages);
+
+    if (!tde_iam_path_is_equality_only(path))
+    {
+        *indexStartupCost += TDE_IAM_NON_EQUALITY_COST;
+        *indexTotalCost   += TDE_IAM_NON_EQUALITY_COST;
+    }
+}
+
+/*
+ * tde_iam_index_cannot_answer_equality — index columns on which even an
+ * equality lookup through the tree misses rows.
+ *
+ *   numeric: tde_numeric_ops compares with numeric_cmp, applied to the
+ *     ciphertext bytes as if they were a numeric; that is not an ordering,
+ *     and the descent misses keys.  Equal values can also differ in bytes
+ *     (1.5 and 1.50), which AES-SIV then keeps apart.
+ *   nondeterministic collation: equality under the collation is not byte
+ *     equality, and AES-SIV can only match identical bytes.
+ */
+static bool
+tde_iam_index_cannot_answer_equality(IndexOptInfo *info)
+{
+    int         i;
+
+    for (i = 0; i < info->nkeycolumns; i++)
+    {
+        Oid     collid = info->indexcollations[i];
+
+        if (info->opcintype[i] == NUMERICOID)
+            return true;
+        if (OidIsValid(collid) && !get_collation_isdeterministic(collid))
+            return true;
+    }
+    return false;
+}
+
+/*
+ * tde_iam_get_relation_info — called from the get_relation_info_hook
+ * (pg_vault_tde.c) for every relation the planner considers.
+ */
+void
+tde_iam_get_relation_info(PlannerInfo *root, Oid relationObjectId,
+                          bool inhparent, RelOptInfo *rel)
+{
+    ListCell   *lc;
+
+    foreach(lc, rel->indexlist)
+    {
+        IndexOptInfo *info = lfirst_node(IndexOptInfo, lc);
+
+        if (info->amcostestimate != pg_vault_tde_amcostestimate)
+            continue;           /* not a tde_btree index */
+
+        /*
+         * An index that misses rows on equality is not offered to the
+         * planner at all: the query runs as a sequential scan and is correct.
+         * Writes still maintain it, and uniqueness and ON CONFLICT inference
+         * read the index list from the relcache, not from here.
+         */
+        if (tde_iam_index_cannot_answer_equality(info))
+        {
+            rel->indexlist = foreach_delete_current(rel->indexlist, lc);
+            continue;
+        }
+
+        /*
+         * No sort order: no ORDER BY, min()/max() or merge-join input.
+         * sortopfamily is the one field the planner reads to decide whether
+         * an index is ordered (build_index_pathkeys, and the min/max probe
+         * in get_actual_variable_range).  reverse_sort and nulls_first must
+         * stay: btcostestimate() reads reverse_sort[0] unconditionally for
+         * the correlation estimate, and a NULL there is a segfault.
+         */
+        info->sortopfamily = NULL;
+    }
+}
+
+/*
+ * tde_iam_check_new_index — refuse a tde_btree index that cannot answer
+ * equality, or that would store its keys in plaintext.
+ *
+ * Called from the object_access_hook at OAT_POST_CREATE, which every index
+ * creation reaches: CREATE INDEX, the EXCLUDE constraints of CREATE TABLE and
+ * ALTER TABLE ... ADD CONSTRAINT, the rebuild ALTER COLUMN ... TYPE performs,
+ * pg_restore.  A check in the ProcessUtility hook sees only the first of
+ * those, and the others matter most: UNIQUE and EXCLUDE enforcement reads the
+ * index directly, without the planner, so an index that misses equal values
+ * silently lets duplicates in.  REINDEX is exempted by the caller: it
+ * rebuilds what already exists.
+ *
+ * `is_internal` is ObjectAccessPostCreate's flag, true for the rebuild of an
+ * existing index (ALTER COLUMN ... TYPE): the plaintext-key classes are then
+ * let through, as they only carry over an index someone already built.
+ */
+void
+tde_iam_check_new_index(Oid indexOid, bool is_internal)
+{
+    Relation    index = index_open(indexOid, NoLock);
+    Oid         heapOid = index->rd_index->indrelid;
+    oidvector  *indclass;
+    int         i;
+
+    indclass = (oidvector *) DatumGetPointer(
+        SysCacheGetAttrNotNull(INDEXRELID, index->rd_indextuple, Anum_pg_index_indclass));
+
+    for (i = 0; i < IndexRelationGetNumberOfKeyAttributes(index); i++)
+    {
+        AttrNumber  attnum = index->rd_index->indkey.values[i];
+        const char *column = attnum != 0 ? get_attname(heapOid, attnum, false) : "expression";
+        Oid         collid = index->rd_indcollation[i];
+        HeapTuple   opctup;
+        const char *opcname;
+        int         j;
+
+        if (index->rd_opcintype[i] == NUMERICOID)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("pg_vault_tde: tde_btree cannot index numeric column \"%s\"",
+                            column),
+                     errdetail("Equal numeric values do not always encrypt to equal index "
+                               "keys (1.5 and 1.50 are equal), and the numeric operator class "
+                               "cannot order encrypted keys: lookups, UNIQUE and EXCLUDE "
+                               "checks through such an index miss equal values."),
+                     errhint("Leave the column unindexed, or drop the tde_btree index before "
+                             "changing the column to numeric. Correct numeric support is "
+                             "planned for pg_vault_tde 1.8.")));
+
+        if (OidIsValid(collid) && !get_collation_isdeterministic(collid))
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("pg_vault_tde: tde_btree cannot index column \"%s\" with "
+                            "nondeterministic collation \"%s\"",
+                            column, get_collation_name(collid)),
+                     errdetail("Encrypted index keys can only match byte-identical values, so "
+                               "equality under this collation — and UNIQUE or EXCLUDE checks "
+                               "relying on it — would miss equal values."),
+                     errhint("Index the column with a deterministic collation.")));
+
+        if (is_internal)
+            continue;
+
+        opctup = SearchSysCache1(CLAOID, ObjectIdGetDatum(indclass->values[i]));
+        if (!HeapTupleIsValid(opctup))
+            elog(ERROR, "cache lookup failed for operator class %u", indclass->values[i]);
+        opcname = pstrdup(NameStr(((Form_pg_opclass) GETSTRUCT(opctup))->opcname));
+        ReleaseSysCache(opctup);
+
+        /*
+         * A plaintext-key operator class is the same exposure as a plaintext
+         * index access method, so it follows the same rule: refused, unless
+         * pg_vault_tde.allow_plaintext_index is on — which is also what lets
+         * a dump that names one (pg_dump writes non-default classes out) be
+         * restored.
+         */
+        for (j = 0; j < (int) lengthof(tde_iam_legacy_opclasses); j++)
+        {
+            if (strcmp(opcname, tde_iam_legacy_opclasses[j]) != 0)
+                continue;
+
+            ereport(pg_vault_tde_allow_plaintext_index ? WARNING : ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("pg_vault_tde: operator class \"%s\" stores index keys in "
+                            "plaintext", opcname),
+                     errdetail("It is a v1.5 operator class, kept only so that indexes "
+                               "already built on it keep working."),
+                     pg_vault_tde_allow_plaintext_index
+                     ? errhint("Allowed because pg_vault_tde.allow_plaintext_index is on. "
+                               "Omit the operator class to use the encrypted default, "
+                               "%.*s_enc_ops.", (int) (strlen(opcname) - 4), opcname)
+                     : errhint("Omit the operator class to use the encrypted default, "
+                               "%.*s_enc_ops, or set pg_vault_tde.allow_plaintext_index = on "
+                               "to allow it with a WARNING.",
+                               (int) (strlen(opcname) - 4), opcname)));
+        }
+    }
+
+    index_close(index, NoLock);
+}
+
 /* ── INIT + HANDLER ─────────────────────────────────────────────────────── */
 
 /*
@@ -910,12 +1381,22 @@ tde_iam_init(void)
     tde_btree_methods.ambuild     = pg_vault_tde_ambuild;
     tde_btree_methods.aminsert    = pg_vault_tde_aminsert;
     tde_btree_methods.ambeginscan = pg_vault_tde_ambeginscan;
+    tde_btree_methods.amendscan   = pg_vault_tde_amendscan;
     tde_btree_methods.amrescan    = pg_vault_tde_amrescan;
     tde_btree_methods.amvalidate  = pg_vault_tde_amvalidate;
 
 
     /* Encrypted tuples are unencryptable only if they comes from the table */
     tde_btree_methods.amcanreturn = NULL;
+
+    /*
+     * No INCLUDE columns.  An included column is a non-key payload that
+     * tde_iam_encrypt_index_datum never encrypts, so it would reach the leaf
+     * page in plaintext, bypassing allow_plaintext_index (PSQLE-222).  With
+     * amcanreturn NULL there is no index-only scan to benefit from one either,
+     * so core rejects INCLUDE on a tde_btree index outright.
+     */
+    tde_btree_methods.amcaninclude = false;
 
     /*
      * Disable parallel index build.  pg_vault_tde_ambuild delegates to
@@ -930,6 +1411,22 @@ tde_iam_init(void)
      * keeps every scan/sort call inside the (correctly impersonated) leader.
      */
     tde_btree_methods.amcanbuildparallel = false;
+
+    /*
+     * IN (...) / = ANY (...): let the executor expand the array into one
+     * scalar rescan per element.  With amsearcharray on, btree receives a
+     * single SK_SEARCHARRAY key whose argument is the array itself, and
+     * pg_vault_tde_amrescan() has no way to encrypt the elements in place.
+     * The planner then uses bitmap index scans for such clauses.
+     */
+    tde_btree_methods.amsearcharray = false;
+
+    /*
+     * Price out every path that would compare anything but equality — see
+     * pg_vault_tde_amcostestimate().  The function pointer also identifies
+     * tde_btree indexes to the planner hook, tde_iam_get_relation_info().
+     */
+    tde_btree_methods.amcostestimate = pg_vault_tde_amcostestimate;
 
     /*
      * Allow STORAGE type ≠ opcintype for tde_*_enc_ops operator classes.
@@ -989,11 +1486,35 @@ PG_FUNCTION_INFO_V1(tde_enc_bytea_cmp);
 Datum
 tde_enc_bytea_cmp(PG_FUNCTION_ARGS)
 {
-    bytea  *a   = PG_GETARG_BYTEA_PP(0);
-    bytea  *b   = PG_GETARG_BYTEA_PP(1);
-    int     la  = VARSIZE_ANY_EXHDR(a);
-    int     lb  = VARSIZE_ANY_EXHDR(b);
-    int     cmp = memcmp(VARDATA_ANY(a), VARDATA_ANY(b), Min(la, lb));
+    bytea  *a;
+    bytea  *b;
+    int     la, lb, cmp;
+
+    /*
+     * This is btree support function 1 for the tde_btree operator classes.
+     * The index machinery calls it with the stored bytea SIV ciphertext and
+     * no expression info.  The per-type wrappers (tde_int4_enc_cmp(int4,int4),
+     * ...) bind this same C function under non-bytea argument types and keep
+     * EXECUTE to PUBLIC: called straight from SQL, reading a by-value datum as
+     * a varlena pointer dereferenced it and crashed the backend, reachable by
+     * any role (PSQLE-221).  Refuse any call whose argument type is known and
+     * is not bytea; a call from the index AM has no expression info, so the
+     * type is InvalidOid and the comparison proceeds.
+     */
+    if (OidIsValid(get_fn_expr_argtype(fcinfo->flinfo, 0)) &&
+        get_fn_expr_argtype(fcinfo->flinfo, 0) != BYTEAOID)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("tde_btree comparator cannot be called directly"),
+                 errdetail("It is a btree support function for encrypted "
+                           "index keys and is used only by the index "
+                           "machinery.")));
+
+    a   = PG_GETARG_BYTEA_PP(0);
+    b   = PG_GETARG_BYTEA_PP(1);
+    la  = VARSIZE_ANY_EXHDR(a);
+    lb  = VARSIZE_ANY_EXHDR(b);
+    cmp = memcmp(VARDATA_ANY(a), VARDATA_ANY(b), Min(la, lb));
 
     if (cmp != 0)
         PG_RETURN_INT32(cmp > 0 ? 1 : -1);

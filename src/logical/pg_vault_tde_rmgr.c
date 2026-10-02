@@ -485,7 +485,8 @@ tde_toast_stitch(Relation relation, ReorderBufferChange *change,
          *
          * DO NOT remove the copy-back in favour of a pointer swap: it is the fix
          * for an intermittent walsender crash under streaming (multiple TOAST
-         * txns in a burst).  See doc/logical_decoding_research.md.
+         * txns in a burst).  See doc/logical_decoding_research.md.  The
+         * output plugin puts the original t_len back after pgoutput has run.
          */
         MemoryContextSwitchTo(oldcxt);
         tmphtup = heap_form_tuple(desc, attrs, isnull);
@@ -642,6 +643,9 @@ tde_toast_wal_insert(Relation relation, HeapTuple tup, CommandId cid,
     Buffer      buffer;
     Buffer      vmbuffer = InvalidBuffer;
     bool        all_visible_cleared = false;
+#ifdef TDE_HAVE_VM_CLEAR_LOCKED
+    bool        vmbuffer_modified = false;
+#endif
 
     /* Caller hands us a toast chunk tuple — never externally toasted. */
     Assert(HeapTupleHeaderGetNatts(tup->t_data) <=
@@ -673,12 +677,40 @@ tde_toast_wal_insert(Relation relation, HeapTuple tup, CommandId cid,
 
     CheckForSerializableConflictIn(relation, NULL, InvalidBlockNumber);
 
+#ifdef TDE_HAVE_VM_CLEAR_LOCKED
+    /*
+     * Lock the visibility-map buffer before the critical section and keep it
+     * locked across the WAL insert, so the record can register it: a VM change
+     * left out of the record is missed by the WAL summarizer (incremental
+     * backups) and gets no full-page image, so a torn VM page is never
+     * repaired.  heap_insert does the same since the PostgreSQL fix of
+     * 2026-07-15 (PSQLE-227).
+     */
+    if (PageIsAllVisible(BufferGetPage(buffer)))
+    {
+        LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+        all_visible_cleared = true;
+    }
+#endif
+
     /* NO EREPORT(ERROR) FROM HERE TILL CHANGES ARE LOGGED */
     START_CRIT_SECTION();
 
     RelationPutHeapTuple(relation, buffer, tup,
                          (options & HEAP_INSERT_SPECULATIVE) != 0);
 
+#ifdef TDE_HAVE_VM_CLEAR_LOCKED
+    if (all_visible_cleared)
+    {
+        /* the bits may already have been clear */
+        if (visibilitymap_clear_locked(relation,
+                                       ItemPointerGetBlockNumber(&(tup->t_self)),
+                                       vmbuffer, VISIBILITYMAP_VALID_BITS))
+            vmbuffer_modified = true;
+
+        PageClearAllVisible(BufferGetPage(buffer));
+    }
+#else
     if (PageIsAllVisible(BufferGetPage(buffer)))
     {
         all_visible_cleared = true;
@@ -687,6 +719,7 @@ tde_toast_wal_insert(Relation relation, HeapTuple tup, CommandId cid,
                             ItemPointerGetBlockNumber(&(tup->t_self)),
                             vmbuffer, VISIBILITYMAP_VALID_BITS);
     }
+#endif
 
     MarkBufferDirty(buffer);
 
@@ -769,15 +802,35 @@ tde_toast_wal_insert(Relation relation, HeapTuple tup, CommandId cid,
         /* filtering by origin on each row is too fine-grained */
         XLogSetRecordFlags(XLOG_INCLUDE_ORIGIN);
 
+#ifdef TDE_HAVE_VM_CLEAR_LOCKED
+        if (vmbuffer_modified)
+            XLogRegisterBuffer(1, vmbuffer, 0);
+#endif
+
         /* ONLY deviation from heap_insert: route to our custom resource mgr. */
         recptr = XLogInsert(TDE_RMGR_ID, info);
 
         PageSetLSN(page, recptr);
+
+#ifdef TDE_HAVE_VM_CLEAR_LOCKED
+        if (vmbuffer_modified)
+            PageSetLSN(BufferGetPage(vmbuffer), recptr);
+#endif
     }
 
     END_CRIT_SECTION();
 
     UnlockReleaseBuffer(buffer);
+
+#ifdef TDE_HAVE_VM_CLEAR_LOCKED
+    /*
+     * The buffer was locked whenever the page was all-visible, whether or not
+     * the bits turned out to need clearing.
+     */
+    if (all_visible_cleared)
+        LockBuffer(vmbuffer, BUFFER_LOCK_UNLOCK);
+#endif
+
     if (vmbuffer != InvalidBuffer)
         ReleaseBuffer(vmbuffer);
 

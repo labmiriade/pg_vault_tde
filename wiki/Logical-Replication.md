@@ -76,11 +76,11 @@ ALTER TABLE secrets REPLICA IDENTITY FULL;   -- required on any table that is
   per-abort memory leak in the decoding process, not a per-row leak; restart
   the logical decoding worker/`walsender` periodically if your workload has
   many such aborts.
-- **Resource manager ID.** The custom WAL resource manager currently uses the
-  experimental ID `RM_EXPERIMENTAL_ID` (128); a stable ID will be reserved
-  with the PostgreSQL community before this feature reaches general
-  availability. Confirm no other extension on the same server also claims
-  this experimental ID.
+- **Resource manager ID.** The custom WAL resource manager uses id **161**,
+  registered for pg_vault_tde on the PostgreSQL *Custom WAL Resource Managers*
+  wiki. Releases up to 1.7.1 used the experimental id 128: upgrading a cluster
+  that had this feature on needs a clean shutdown and primary and standbys
+  upgraded together — see "Upgrading to 1.7.2" in the README.
 
 ## See Also
 - [Encrypted Tables and Indexes](Encrypted-Tables-and-Indexes)
