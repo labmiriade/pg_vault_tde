@@ -74,6 +74,8 @@ ISOLATION = per_table_dek_rotation
 ISOLATION_OPTS = --inputdir=test/isolation
 
 PGXS        := $(shell $(PG_CONFIG) --pgxs)
+TDE_CALLER_CFLAGS := $(CFLAGS)
+TDE_CALLER_LDFLAGS := $(LDFLAGS)
 include $(PGXS)
 
 TDE_BUILD_VERSION := $(shell cat VERSION)
@@ -400,16 +402,16 @@ PG_DUMP_TDE_LDFLAGS = \
 # Must be declared before include $(PGXS) would shadow it, but we define
 # it after so PGXS %.o rules are not confused.
 %_bin.o: %.c
-	$(CC) $(PG_DUMP_TDE_CFLAGS) -c -o $@ $<
+	$(CC) $(PG_DUMP_TDE_CFLAGS) $(TDE_CALLER_CFLAGS) -c -o $@ $<
 
 pg_dump_tde: $(PG_DUMP_TDE_OBJS)
-	$(CC) -o $@ $^ $(PG_DUMP_TDE_LDFLAGS)
+	$(CC) $(TDE_CALLER_LDFLAGS) -o $@ $^ $(PG_DUMP_TDE_LDFLAGS)
 
 pg_restore_tde: $(PG_RESTORE_TDE_OBJS)
-	$(CC) -o $@ $^ $(PG_DUMP_TDE_LDFLAGS)
+	$(CC) $(TDE_CALLER_LDFLAGS) -o $@ $^ $(PG_DUMP_TDE_LDFLAGS)
 
 pg_basebackup_tde: $(PG_BASEBACKUP_TDE_OBJS)
-	$(CC) -o $@ $^ $(PG_DUMP_TDE_LDFLAGS)
+	$(CC) $(TDE_CALLER_LDFLAGS) -o $@ $^ $(PG_DUMP_TDE_LDFLAGS)
 
 # Hook into the standard PGXS targets so the frontend tools are always
 # built, installed, and cleaned together with the extension.
